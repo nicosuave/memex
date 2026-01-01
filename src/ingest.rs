@@ -1,7 +1,7 @@
 use crate::config::Paths;
 use crate::embed::EmbedderHandle;
 use crate::index::SearchIndex;
-use crate::progress::{Progress, spawn_reporter};
+use crate::progress::Progress;
 use crate::state::{FileState, IngestState};
 use crate::types::{Record, SourceKind};
 use anyhow::{Result, anyhow};
@@ -34,6 +34,7 @@ pub struct IngestOptions {
 #[derive(Debug)]
 pub struct IngestReport {
     pub records_added: usize,
+    pub records_embedded: usize,
     pub files_scanned: usize,
     pub files_skipped: usize,
 }
@@ -202,7 +203,6 @@ pub fn ingest_all(
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     let progress = Arc::new(Progress::new(totals, file_totals, options.embeddings));
-    let reporter = spawn_reporter(progress.clone());
 
     let (tx_record, rx_record) = unbounded::<Record>();
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
@@ -258,8 +258,7 @@ pub fn ingest_all(
         .join()
         .map_err(|_| anyhow!("writer thread panicked"))?;
     progress.finish();
-    let _ = reporter.join();
-    let records_added = writer_result?;
+    let (records_added, records_embedded) = writer_result?;
 
     let mut updated_files = HashMap::new();
     while let Ok(update) = rx_update.recv() {
@@ -275,6 +274,7 @@ pub fn ingest_all(
 
     Ok(IngestReport {
         records_added,
+        records_embedded,
         files_scanned,
         files_skipped,
     })
@@ -288,13 +288,14 @@ fn writer_loop(
     do_backfill_embeddings: bool,
     vector_dir: PathBuf,
     progress: Arc<Progress>,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     let mut writer = index.writer()?;
     for path in delete_paths {
         index.delete_by_source_path(&mut writer, &path);
     }
 
     let mut count = 0usize;
+    let mut embedded_count = 0usize;
     let mut vector_index = None;
     let mut embedder: Option<EmbedderHandle> = None;
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
@@ -325,7 +326,7 @@ fn writer_loop(
                 }
             }
             if embedder.is_some() && embed_buffer.len() >= EMBED_BATCH_SIZE {
-                flush_embeddings(
+                embedded_count += flush_embeddings(
                     &mut embed_buffer,
                     embedder.as_mut().unwrap(),
                     vector_index.as_mut().unwrap(),
@@ -339,7 +340,7 @@ fn writer_loop(
     writer.commit()?;
     if embeddings {
         if do_backfill_embeddings {
-            backfill_embeddings(
+            embedded_count += backfill_embeddings(
                 &index,
                 embedder.as_mut().unwrap(),
                 vector_index.as_mut().unwrap(),
@@ -348,7 +349,7 @@ fn writer_loop(
         }
 
         if !embed_buffer.is_empty() {
-            flush_embeddings(
+            embedded_count += flush_embeddings(
                 &mut embed_buffer,
                 embedder.as_mut().unwrap(),
                 vector_index.as_mut().unwrap(),
@@ -362,7 +363,7 @@ fn writer_loop(
             std::mem::forget(handle);
         }
     }
-    Ok(count)
+    Ok((count, embedded_count))
 }
 
 fn backfill_embeddings(
@@ -370,7 +371,9 @@ fn backfill_embeddings(
     embedder: &mut EmbedderHandle,
     vector_index: &mut crate::vector::VectorIndex,
     progress: &Arc<Progress>,
-) -> Result<()> {
+) -> Result<usize> {
+    use std::cell::Cell;
+    let embedded_count = Cell::new(0usize);
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     index.for_each_record(|record| {
         if record.text.is_empty()
@@ -387,14 +390,16 @@ fn backfill_embeddings(
             record.source,
         ));
         if embed_buffer.len() >= EMBED_BATCH_SIZE {
-            flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
+            let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
+            embedded_count.set(embedded_count.get() + n);
         }
         Ok(())
     })?;
     if !embed_buffer.is_empty() {
-        flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
+        let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
+        embedded_count.set(embedded_count.get() + n);
     }
-    Ok(())
+    Ok(embedded_count.get())
 }
 
 fn collect_claude_files(source: &Path, include_agents: bool) -> Result<Vec<PathBuf>> {
@@ -1046,10 +1051,11 @@ fn flush_embeddings(
     embedder: &mut EmbedderHandle,
     vindex: &mut crate::vector::VectorIndex,
     progress: &Arc<Progress>,
-) -> Result<()> {
+) -> Result<usize> {
     if buffer.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let mut count = 0;
     for (doc_id, text, source) in buffer.drain(..) {
         let text = truncate_for_embedding(text);
         if text.is_empty() {
@@ -1059,10 +1065,10 @@ fn flush_embeddings(
         if let Some(vec) = embeddings.get(0) {
             vindex.add(doc_id, vec)?;
             progress.add_embedded(source, 1);
-            progress.sub_embed_pending(source, 1);
+            count += 1;
         }
     }
-    Ok(())
+    Ok(count)
 }
 
 fn compute_totals(tasks: &[FileTask]) -> [u64; 3] {

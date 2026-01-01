@@ -267,10 +267,17 @@ fn run_index(
     };
 
     let report = ingest_all(&paths, &index, &opts)?;
-    println!(
-        "indexed {} records across {} files (skipped {})",
-        report.records_added, report.files_scanned, report.files_skipped
-    );
+    if report.records_embedded > 0 {
+        println!(
+            "indexed {} records, embedded {} across {} files (skipped {})",
+            report.records_added, report.records_embedded, report.files_scanned, report.files_skipped
+        );
+    } else {
+        println!(
+            "indexed {} records across {} files (skipped {})",
+            report.records_added, report.files_scanned, report.files_skipped
+        );
+    }
     Ok(())
 }
 
@@ -282,7 +289,6 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
 
     let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 3], [0; 3], true));
     progress.set_embed_ready();
-    let reporter = crate::progress::spawn_reporter(progress.clone());
 
     let mut embedded_counts = [0u64; 3];
     let mut embedded_total = 0u64;
@@ -310,7 +316,6 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
 
     vector.save()?;
     progress.finish();
-    let _ = reporter.join();
     println!(
         "embedded {} vectors (claude {}, codex {}, history {})",
         embedded_total,

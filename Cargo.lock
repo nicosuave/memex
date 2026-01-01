@@ -137,6 +137,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "directories",
+ "indicatif",
  "memchr",
  "memmap2",
  "model2vec-rs",
