@@ -10,19 +10,19 @@ cargo build
 
 Binary:
 ```
-./target/debug/automem
+./target/debug/memex
 ```
 
 ## Quickstart
 
 Index (incremental):
 ```
-./target/debug/automem index
+./target/debug/memex index
 ```
 
 Search (JSONL default):
 ```
-./target/debug/automem search "your query" --limit 20
+./target/debug/memex search "your query" --limit 20
 ```
 
 Notes:
@@ -31,17 +31,17 @@ Notes:
 
 Full transcript:
 ```
-./target/debug/automem session <session_id>
+./target/debug/memex session <session_id>
 ```
 
 Single record:
 ```
-./target/debug/automem show <doc_id>
+./target/debug/memex show <doc_id>
 ```
 
 Human output:
 ```
-./target/debug/automem search "your query" -v
+./target/debug/memex search "your query" -v
 ```
 
 ## Search modes
@@ -72,16 +72,34 @@ Human output:
 
 Disable:
 ```
-./target/debug/automem index --no-embeddings
+./target/debug/memex index --no-embeddings
+```
+
+## Embedding model
+
+Select via `--model` flag or `MEMEX_MODEL` env var:
+
+| Model | Dims | Speed | Quality |
+|-------|------|-------|---------|
+| minilm | 384 | Fastest | Good |
+| bge | 384 | Fast | Better |
+| nomic | 768 | Moderate | Good |
+| gemma | 768 | Slowest | Best (default) |
+
+```
+./target/debug/memex index --model minilm
+# or
+MEMEX_MODEL=minilm ./target/debug/memex index
 ```
 
 ## Config (optional)
 
-Create `~/.automem/config.toml` (or `<root>/config.toml` if you use `--root`):
+Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 
 ```toml
 embeddings = true
 auto_index_on_search = true
+model = "gemma"  # minilm, bge, nomic, gemma
 ```
 
 SKILL.md is included as an example.

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "automem",
+    name = "memex",
     version,
     about = "Fast local history search for Claude and Codex"
 )]
@@ -40,6 +40,9 @@ enum Commands {
         embeddings: bool,
         #[arg(long)]
         no_embeddings: bool,
+        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality)
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -54,10 +57,16 @@ enum Commands {
         embeddings: bool,
         #[arg(long)]
         no_embeddings: bool,
+        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality)
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         root: Option<PathBuf>,
     },
     Embed {
+        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality)
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -133,6 +142,7 @@ pub fn run() -> Result<()> {
             codex,
             embeddings,
             no_embeddings,
+            model,
             root,
         } => {
             run_index(
@@ -141,6 +151,7 @@ pub fn run() -> Result<()> {
                 codex,
                 embeddings,
                 no_embeddings,
+                model,
                 root,
                 false,
             )?;
@@ -151,6 +162,7 @@ pub fn run() -> Result<()> {
             codex,
             embeddings,
             no_embeddings,
+            model,
             root,
         } => {
             run_index(
@@ -159,12 +171,13 @@ pub fn run() -> Result<()> {
                 codex,
                 embeddings,
                 no_embeddings,
+                model,
                 root,
                 true,
             )?;
         }
-        Commands::Embed { root } => {
-            run_embed(root)?;
+        Commands::Embed { model, root } => {
+            run_embed(model, root)?;
         }
         Commands::Search {
             query,
@@ -234,17 +247,25 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_index(
     source: Option<PathBuf>,
     include_agents: bool,
     codex: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
+    model: Option<String>,
     root: Option<PathBuf>,
     reindex: bool,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+
+    // Model priority: CLI flag > config file > env var > default
+    if let Some(m) = model.or_else(|| config.model().map(String::from)) {
+        // SAFETY: single-threaded at this point, before any parallel work
+        unsafe { std::env::set_var("MEMEX_MODEL", m) };
+    }
     let embeddings = resolve_flag(
         config.embeddings_default(),
         embeddings_flag,
@@ -287,10 +308,18 @@ fn run_index(
     Ok(())
 }
 
-fn run_embed(root: Option<PathBuf>) -> Result<()> {
+fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     const BATCH_SIZE: usize = 256;
 
     let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+
+    // Model priority: CLI flag > config file > env var > default
+    if let Some(m) = model.or_else(|| config.model().map(String::from)) {
+        // SAFETY: single-threaded at this point, before any parallel work
+        unsafe { std::env::set_var("MEMEX_MODEL", m) };
+    }
+
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut embedder = EmbedderHandle::new()?;
     let mut vector = VectorIndex::open_or_create(&paths.vectors, embedder.dims)?;

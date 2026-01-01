@@ -185,33 +185,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "automem"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "crossbeam-channel",
- "directories",
- "fastembed",
- "indicatif",
- "memchr",
- "memmap2",
- "once_cell",
- "ort",
- "rayon",
- "regex",
- "serde",
- "serde_json",
- "simd-json",
- "tantivy",
- "tempfile",
- "toml",
- "usearch",
- "walkdir",
-]
-
-[[package]]
 name = "av-scenechange"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1852,6 +1825,33 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+
+[[package]]
+name = "memex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossbeam-channel",
+ "directories",
+ "fastembed",
+ "indicatif",
+ "memchr",
+ "memmap2",
+ "once_cell",
+ "ort",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tantivy",
+ "tempfile",
+ "toml",
+ "usearch",
+ "walkdir",
+]
 
 [[package]]
 name = "memmap2"

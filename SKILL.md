@@ -1,35 +1,36 @@
 ---
-name: automem-search
-description: Search, filter, and retrieve Claude/Codex history indexed by the automem CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
+name: memex-search
+description: Search, filter, and retrieve Claude/Codex history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
 ---
 
-# Automem Search
+# Memex Search
 
 Use this skill to index local history and retrieve results in a structured, LLM-friendly way.
 
 ## Indexing
 
 - Build or update the index (incremental):
-  - `./target/debug/automem index`
+  - `./target/debug/memex index`
 - Full rebuild (clears index):
-  - `./target/debug/automem reindex`
+  - `./target/debug/memex reindex`
 - Embeddings are on by default.
 - Disable embeddings:
-  - `./target/debug/automem index --no-embeddings`
+  - `./target/debug/memex index --no-embeddings`
 - Backfill embeddings only:
-  - `./target/debug/automem embed`
+  - `./target/debug/memex embed`
 - Common flags:
   - `--source <path>` for Claude logs
   - `--include-agents` to include agent transcripts
   - `--codex/--no-codex` to include or skip Codex logs
-  - `--root <path>` to change data root (default: `~/.automem`)
+  - `--model <minilm|bge|nomic|gemma>` to select embedding model
+  - `--root <path>` to change data root (default: `~/.memex`)
 
 ## Search (LLM default JSON)
 
 Run a search; output is JSON lines by default.
 
 ```
-./target/debug/automem search "query" --limit 20
+./target/debug/memex search "query" --limit 20
 ```
 
 Each JSON line includes:
@@ -76,7 +77,7 @@ Each JSON line includes:
 1) Global search with `--limit`
 2) Reduce with `--project` and `--since/--until`
 3) Optionally `--top-n-per-session` or `--unique-session`
-4) `./target/debug/automem session <id>` for full context
+4) `./target/debug/memex session <id>` for full context
 
 ### Practical narrowing tips
 
@@ -89,11 +90,12 @@ Each JSON line includes:
 
 ## Config
 
-Create `~/.automem/config.toml` (or `<root>/config.toml` if you use `--root`):
+Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 
 ```toml
 embeddings = true
 auto_index_on_search = true
+model = "gemma"  # minilm, bge, nomic, gemma
 ```
 
 `auto_index_on_search` runs an incremental index update before each search.
@@ -109,9 +111,9 @@ auto_index_on_search = true
 ## Fetch Full Context
 
 - One record:
-  - `./target/debug/automem show <doc_id>`
+  - `./target/debug/memex show <doc_id>`
 - Full transcript:
-  - `./target/debug/automem session <session_id>`
+  - `./target/debug/memex session <session_id>`
 
 Both commands return JSON by default.
 
@@ -119,13 +121,13 @@ Both commands return JSON by default.
 
 Use `-v/--verbose` for human-readable output:
 
-- `./target/debug/automem search "query" -v`
-- `./target/debug/automem show <doc_id> -v`
-- `./target/debug/automem session <session_id> -v`
+- `./target/debug/memex search "query" -v`
+- `./target/debug/memex show <doc_id> -v`
+- `./target/debug/memex session <session_id> -v`
 
 ## Recommended LLM Flow
 
-1) `./target/debug/automem search "query" --limit 20`
+1) `./target/debug/memex search "query" --limit 20`
 2) Pick hits using `matches` or `snippet`
-3) `./target/debug/automem show <doc_id>` or `./target/debug/automem session <session_id>`
+3) `./target/debug/memex show <doc_id>` or `./target/debug/memex session <session_id>`
 4) Refine with `--session`, `--role`, or time filters

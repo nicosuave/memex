@@ -17,7 +17,7 @@ impl Paths {
             Some(path) => path,
             None => {
                 let base = BaseDirs::new().ok_or_else(|| anyhow!("missing home dir"))?;
-                base.home_dir().join(".automem")
+                base.home_dir().join(".memex")
             }
         };
 
@@ -41,6 +41,8 @@ impl Paths {
 pub struct UserConfig {
     pub embeddings: Option<bool>,
     pub auto_index_on_search: Option<bool>,
+    /// Embedding model: minilm, bge, nomic, gemma (default)
+    pub model: Option<String>,
 }
 
 impl UserConfig {
@@ -60,5 +62,9 @@ impl UserConfig {
 
     pub fn auto_index_on_search_default(&self) -> bool {
         self.auto_index_on_search.unwrap_or(true)
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 }
