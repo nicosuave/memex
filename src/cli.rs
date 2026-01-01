@@ -302,28 +302,27 @@ fn run_embed(root: Option<PathBuf>) -> Result<()> {
     let mut embedded_total = 0u64;
     let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
 
-    let flush_batch =
-        |batch: &mut Vec<(u64, String, crate::types::SourceKind)>,
-         embedder: &mut EmbedderHandle,
-         vector: &mut VectorIndex,
-         progress: &crate::progress::Progress,
-         embedded_counts: &mut [u64; 3],
-         embedded_total: &mut u64| {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
-            let embeddings = embedder.embed_texts(&texts)?;
+    let flush_batch = |batch: &mut Vec<(u64, String, crate::types::SourceKind)>,
+                       embedder: &mut EmbedderHandle,
+                       vector: &mut VectorIndex,
+                       progress: &crate::progress::Progress,
+                       embedded_counts: &mut [u64; 3],
+                       embedded_total: &mut u64| {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
+        let embeddings = embedder.embed_texts(&texts)?;
 
-            for ((doc_id, _, source), vec) in batch.iter().zip(embeddings.iter()) {
-                vector.add(*doc_id, vec)?;
-                progress.add_embedded(*source, 1);
-                embedded_counts[source.idx()] += 1;
-                *embedded_total += 1;
-            }
-            batch.clear();
-            Ok::<_, anyhow::Error>(())
-        };
+        for ((doc_id, _, source), vec) in batch.iter().zip(embeddings.iter()) {
+            vector.add(*doc_id, vec)?;
+            progress.add_embedded(*source, 1);
+            embedded_counts[source.idx()] += 1;
+            *embedded_total += 1;
+        }
+        batch.clear();
+        Ok::<_, anyhow::Error>(())
+    };
 
     index.for_each_record(|record| {
         if record.text.is_empty() || !is_embedding_role(&record.role) {
