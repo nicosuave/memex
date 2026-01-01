@@ -1,98 +1,83 @@
 use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 pub struct VectorIndex {
     dims: usize,
     path: PathBuf,
-    vectors: Vec<f32>,
-    doc_ids: Vec<u64>,
+    index: Index,
     doc_id_set: HashSet<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct VectorMeta {
-    dimensions: usize,
 }
 
 impl VectorIndex {
     pub fn open_or_create(dir: &Path, dimensions: usize) -> Result<Self> {
         fs::create_dir_all(dir)?;
-        let meta_path = dir.join("meta.json");
-        let vectors_path = dir.join("vectors.f32");
-        let ids_path = dir.join("doc_ids.u64");
+        let index_path = dir.join("usearch.index");
+        let ids_path = dir.join("doc_ids.bin");
 
-        let mut reset = false;
-        if meta_path.exists() {
-            let data = fs::read_to_string(&meta_path)?;
-            let meta: VectorMeta = serde_json::from_str(&data)?;
-            if meta.dimensions != dimensions {
-                reset = true;
+        // Check if existing index has different dimensions
+        if index_path.exists() {
+            let existing = Index::new(&IndexOptions::default())?;
+            existing.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
+            if existing.dimensions() != dimensions {
+                // Dimension mismatch, remove old files
+                let _ = fs::remove_file(&index_path);
+                let _ = fs::remove_file(&ids_path);
             }
         }
 
-        if reset {
-            let _ = fs::remove_file(&meta_path);
-            let _ = fs::remove_file(&vectors_path);
-            let _ = fs::remove_file(&ids_path);
-        }
-
-        if !meta_path.exists() {
-            let meta = VectorMeta { dimensions };
-            fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
-        }
-
-        let (doc_ids, vectors) = if vectors_path.exists() && ids_path.exists() {
-            let ids_bytes = fs::read(&ids_path)?;
-            let vec_bytes = fs::read(&vectors_path)?;
-            let doc_ids = bytes_to_u64(&ids_bytes);
-            let vectors = bytes_to_f32(&vec_bytes);
-            if doc_ids.len() * dimensions != vectors.len() {
-                return Err(anyhow!("vector index corrupt"));
-            }
-            (doc_ids, vectors)
-        } else {
-            (Vec::new(), Vec::new())
+        let options = IndexOptions {
+            dimensions,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            ..IndexOptions::default()
         };
 
-        let doc_id_set = doc_ids.iter().copied().collect();
+        let index = Index::new(&options)?;
+
+        let doc_id_set = if index_path.exists() {
+            index.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
+            if ids_path.exists() {
+                load_doc_ids(&ids_path)?
+            } else {
+                HashSet::new()
+            }
+        } else {
+            index.reserve(10000)?;
+            HashSet::new()
+        };
 
         Ok(Self {
             dims: dimensions,
             path: dir.to_path_buf(),
-            vectors,
-            doc_ids,
+            index,
             doc_id_set,
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
-        let meta_path = dir.join("meta.json");
-        let vectors_path = dir.join("vectors.f32");
-        let ids_path = dir.join("doc_ids.u64");
-        if !meta_path.exists() || !vectors_path.exists() || !ids_path.exists() {
+        let index_path = dir.join("usearch.index");
+        let ids_path = dir.join("doc_ids.bin");
+
+        if !index_path.exists() {
             return Err(anyhow!("vector index not found"));
         }
-        let data = fs::read_to_string(&meta_path)?;
-        let meta: VectorMeta = serde_json::from_str(&data)?;
 
-        let ids_bytes = fs::read(&ids_path)?;
-        let vec_bytes = fs::read(&vectors_path)?;
-        let doc_ids = bytes_to_u64(&ids_bytes);
-        let vectors = bytes_to_f32(&vec_bytes);
-        if doc_ids.len() * meta.dimensions != vectors.len() {
-            return Err(anyhow!("vector index corrupt"));
-        }
-        let doc_id_set = doc_ids.iter().copied().collect();
+        let index = Index::new(&IndexOptions::default())?;
+        index.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
+
+        let doc_id_set = if ids_path.exists() {
+            load_doc_ids(&ids_path)?
+        } else {
+            HashSet::new()
+        };
 
         Ok(Self {
-            dims: meta.dimensions,
+            dims: index.dimensions(),
             path: dir.to_path_buf(),
-            vectors,
-            doc_ids,
+            index,
             doc_id_set,
         })
     }
@@ -108,10 +93,14 @@ impl VectorIndex {
         if !self.doc_id_set.insert(doc_id) {
             return Ok(());
         }
-        let mut vec = embedding.to_vec();
-        normalize(&mut vec);
-        self.doc_ids.push(doc_id);
-        self.vectors.extend_from_slice(&vec);
+
+        // Expand capacity if needed
+        if self.index.size() >= self.index.capacity() {
+            let new_capacity = (self.index.capacity() * 2).max(10000);
+            self.index.reserve(new_capacity)?;
+        }
+
+        self.index.add(doc_id, embedding)?;
         Ok(())
     }
 
@@ -123,45 +112,25 @@ impl VectorIndex {
                 embedding.len()
             ));
         }
-        if self.doc_ids.is_empty() {
+        if self.index.size() == 0 {
             return Ok(Vec::new());
         }
-        let mut query = embedding.to_vec();
-        normalize(&mut query);
 
-        let mut heap: Vec<(u64, f32)> = Vec::new();
-        for (idx, doc_id) in self.doc_ids.iter().copied().enumerate() {
-            let start = idx * self.dims;
-            let end = start + self.dims;
-            let vec = &self.vectors[start..end];
-            let dot = dot_product(&query, vec);
-            let distance = 1.0 - dot;
-            if heap.len() < limit {
-                heap.push((doc_id, distance));
-                if heap.len() == limit {
-                    heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                }
-            } else if let Some(top) = heap.first_mut() {
-                if distance < top.1 {
-                    *top = (doc_id, distance);
-                    heap.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                }
-            }
-        }
-
-        heap.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        Ok(heap)
+        let results = self.index.search(embedding, limit)?;
+        Ok(results.keys.into_iter().zip(results.distances).collect())
     }
 
     pub fn save(&self) -> Result<()> {
-        let vectors_path = self.path.join("vectors.f32");
-        let ids_path = self.path.join("doc_ids.u64");
-        let tmp_vectors = self.path.join("vectors.f32.tmp");
-        let tmp_ids = self.path.join("doc_ids.u64.tmp");
-        fs::write(&tmp_vectors, f32_to_bytes(&self.vectors))?;
-        fs::write(&tmp_ids, u64_to_bytes(&self.doc_ids))?;
-        fs::rename(&tmp_vectors, &vectors_path)?;
-        fs::rename(&tmp_ids, &ids_path)?;
+        let index_path = self.path.join("usearch.index");
+        let ids_path = self.path.join("doc_ids.bin");
+
+        // Save index
+        self.index
+            .save(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
+
+        // Save doc_ids
+        save_doc_ids(&ids_path, &self.doc_id_set)?;
+
         Ok(())
     }
 
@@ -175,54 +144,169 @@ impl VectorIndex {
     }
 }
 
-fn normalize(vec: &mut [f32]) {
-    let mut sum = 0.0f32;
-    for v in vec.iter() {
-        sum += v * v;
-    }
-    if sum <= 0.0 {
-        return;
-    }
-    let inv = sum.sqrt().recip();
-    for v in vec.iter_mut() {
-        *v *= inv;
-    }
-}
-
-fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        sum += x * y;
-    }
-    sum
-}
-
-fn bytes_to_u64(bytes: &[u8]) -> Vec<u64> {
-    bytes
+fn load_doc_ids(path: &Path) -> Result<HashSet<u64>> {
+    let bytes = fs::read(path)?;
+    let ids: Vec<u64> = bytes
         .chunks_exact(8)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .collect()
+        .collect();
+    Ok(ids.into_iter().collect())
 }
 
-fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect()
-}
-
-fn u64_to_bytes(values: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 8);
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
+fn save_doc_ids(path: &Path, ids: &HashSet<u64>) -> Result<()> {
+    let mut bytes = Vec::with_capacity(ids.len() * 8);
+    for id in ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
     }
-    out
+    let tmp = path.with_extension("bin.tmp");
+    fs::write(&tmp, &bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
-fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for v in values {
-        out.extend_from_slice(&v.to_le_bytes());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_vector(dims: usize, seed: f32) -> Vec<f32> {
+        (0..dims).map(|i| (i as f32 + seed).sin()).collect()
     }
-    out
+
+    #[test]
+    fn test_create_and_add() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+
+        let v1 = make_vector(64, 1.0);
+        idx.add(1, &v1).unwrap();
+
+        assert!(idx.contains(1));
+        assert!(!idx.contains(2));
+        assert_eq!(idx.dimensions(), 64);
+    }
+
+    #[test]
+    fn test_duplicate_add_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+
+        let v1 = make_vector(64, 1.0);
+        idx.add(1, &v1).unwrap();
+        idx.add(1, &v1).unwrap(); // duplicate
+
+        assert!(idx.contains(1));
+    }
+
+    #[test]
+    fn test_dimension_mismatch_error() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+
+        let wrong_dims = make_vector(32, 1.0);
+        let result = idx.add(1, &wrong_dims);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_search_empty_index() {
+        let tmp = TempDir::new().unwrap();
+        let idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+
+        let query = make_vector(64, 1.0);
+        let results = idx.search(&query, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_returns_nearest() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+
+        let v1 = make_vector(64, 1.0);
+        let v2 = make_vector(64, 2.0);
+        let v3 = make_vector(64, 3.0);
+
+        idx.add(1, &v1).unwrap();
+        idx.add(2, &v2).unwrap();
+        idx.add(3, &v3).unwrap();
+
+        // Search with v1 as query, should return v1 first (distance ~0)
+        let results = idx.search(&v1, 3).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 1); // v1 should be first match
+        assert!(results[0].1 < 0.01); // distance should be near zero
+    }
+
+    #[test]
+    fn test_save_and_reload() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create and populate index
+        {
+            let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+            let v1 = make_vector(64, 1.0);
+            let v2 = make_vector(64, 2.0);
+            idx.add(100, &v1).unwrap();
+            idx.add(200, &v2).unwrap();
+            idx.save().unwrap();
+        }
+
+        // Reload and verify
+        {
+            let idx = VectorIndex::open(tmp.path()).unwrap();
+            assert!(idx.contains(100));
+            assert!(idx.contains(200));
+            assert!(!idx.contains(300));
+            assert_eq!(idx.dimensions(), 64);
+
+            // Verify search still works
+            let query = make_vector(64, 1.0);
+            let results = idx.search(&query, 2).unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].0, 100);
+        }
+    }
+
+    #[test]
+    fn test_open_nonexistent_fails() {
+        let tmp = TempDir::new().unwrap();
+        let result = VectorIndex::open(tmp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dimension_change_resets_index() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create index with 64 dims
+        {
+            let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+            let v = make_vector(64, 1.0);
+            idx.add(1, &v).unwrap();
+            idx.save().unwrap();
+        }
+
+        // Reopen with different dims, should reset
+        {
+            let idx = VectorIndex::open_or_create(tmp.path(), 128).unwrap();
+            assert!(!idx.contains(1)); // old data should be gone
+            assert_eq!(idx.dimensions(), 128);
+        }
+    }
+
+    #[test]
+    fn test_search_with_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64).unwrap();
+
+        for i in 0..10 {
+            let v = make_vector(64, i as f32);
+            idx.add(i, &v).unwrap();
+        }
+
+        let query = make_vector(64, 0.0);
+        let results = idx.search(&query, 3).unwrap();
+        assert_eq!(results.len(), 3);
+    }
 }

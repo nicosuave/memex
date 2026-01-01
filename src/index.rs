@@ -251,14 +251,14 @@ fn build_query(
         ));
     }
 
-    if let Some(source) = options.source {
-        if let Some(field) = fields.source {
-            let term = Term::from_field_text(field, source.as_str());
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-            ));
-        }
+    if let Some(source) = options.source
+        && let Some(field) = fields.source
+    {
+        let term = Term::from_field_text(field, source.as_str());
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+        ));
     }
 
     if let Some(session_id) = &options.session_id {

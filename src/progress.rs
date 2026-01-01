@@ -35,7 +35,11 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn new(_totals_bytes: [u64; SOURCE_COUNT], files_total: [u64; SOURCE_COUNT], embeddings: bool) -> Self {
+    pub fn new(
+        _totals_bytes: [u64; SOURCE_COUNT],
+        files_total: [u64; SOURCE_COUNT],
+        embeddings: bool,
+    ) -> Self {
         let multi = MultiProgress::new();
 
         let claude_files = files_total[SourceKind::Claude.idx()];
@@ -46,9 +50,9 @@ impl Progress {
         let header_style = ProgressStyle::with_template("{msg}").unwrap();
 
         // Spinner style for all phases
-        let spinner_style = ProgressStyle::with_template(
-            "  {spinner:.cyan} {msg}"
-        ).unwrap().tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+        let spinner_style = ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
 
         // Claude header
         let claude_header = multi.add(ProgressBar::new_spinner());
@@ -59,7 +63,7 @@ impl Progress {
         // Claude spinners
         let claude_parse = multi.add(ProgressBar::new_spinner());
         claude_parse.set_style(spinner_style.clone());
-        claude_parse.set_message(format!("parsed 0 B / {} files", claude_files));
+        claude_parse.set_message(format!("parsed 0 B / {claude_files} files"));
         claude_parse.enable_steady_tick(Duration::from_millis(80));
 
         let claude_index = multi.add(ProgressBar::new_spinner());
@@ -85,7 +89,7 @@ impl Progress {
         // Codex spinners
         let codex_parse = multi.add(ProgressBar::new_spinner());
         codex_parse.set_style(spinner_style.clone());
-        codex_parse.set_message(format!("parsed 0 B / {} files", codex_files));
+        codex_parse.set_message(format!("parsed 0 B / {codex_files} files"));
         codex_parse.enable_steady_tick(Duration::from_millis(80));
 
         let codex_index = multi.add(ProgressBar::new_spinner());
@@ -138,7 +142,8 @@ impl Progress {
             SourceKind::CodexSession | SourceKind::CodexHistory => {
                 self.codex_parse.inc(bytes);
                 let total = self.codex_parse.position();
-                let files_done = self.files_done[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let files_done = self.files_done[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.files_done[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
                 self.codex_parse.set_message(format!(
                     "parsed {} {}/{} files",
@@ -167,7 +172,8 @@ impl Progress {
                 }
             }
             SourceKind::CodexSession | SourceKind::CodexHistory => {
-                let codex_done = self.files_done[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let codex_done = self.files_done[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.files_done[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
                 if codex_done >= self.codex_files_total {
                     let bytes = self.codex_parse.position();
@@ -194,23 +200,29 @@ impl Progress {
                 let files_done = self.files_done[SourceKind::Claude.idx()].load(Ordering::Relaxed);
                 // If parsing done and all produced are indexed, finish
                 if files_done >= self.claude_files_total && indexed >= produced && produced > 0 {
-                    self.claude_index.finish_with_message(format!("indexed {} rec done", format_count(indexed)));
+                    self.claude_index
+                        .finish_with_message(format!("indexed {} rec done", format_count(indexed)));
                 } else {
-                    self.claude_index.set_message(format!("indexed {} rec", format_count(indexed)));
+                    self.claude_index
+                        .set_message(format!("indexed {} rec", format_count(indexed)));
                 }
             }
             SourceKind::CodexSession | SourceKind::CodexHistory => {
                 self.codex_index.inc(count);
                 let indexed = self.codex_index.position();
-                let produced = self.produced[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let produced = self.produced[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.produced[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
-                let files_done = self.files_done[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let files_done = self.files_done[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.files_done[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
                 // If parsing done and all produced are indexed, finish
                 if files_done >= self.codex_files_total && indexed >= produced && produced > 0 {
-                    self.codex_index.finish_with_message(format!("indexed {} rec done", format_count(indexed)));
+                    self.codex_index
+                        .finish_with_message(format!("indexed {} rec done", format_count(indexed)));
                 } else {
-                    self.codex_index.set_message(format!("indexed {} rec", format_count(indexed)));
+                    self.codex_index
+                        .set_message(format!("indexed {} rec", format_count(indexed)));
                 }
             }
         }
@@ -244,7 +256,9 @@ impl Progress {
 
         match source {
             SourceKind::Claude => self.claude_embed.set_message(msg),
-            SourceKind::CodexSession | SourceKind::CodexHistory => self.codex_embed.set_message(msg),
+            SourceKind::CodexSession | SourceKind::CodexHistory => {
+                self.codex_embed.set_message(msg)
+            }
         }
     }
 
@@ -259,23 +273,28 @@ impl Progress {
                 let produced = self.produced[SourceKind::Claude.idx()].load(Ordering::Relaxed);
                 // If indexing done and all embeddings done, finish
                 if indexed >= produced && pending == 0 && embedded >= total && total > 0 {
-                    self.claude_embed.finish_with_message(format!("embedded {} done", format_count(embedded)));
+                    self.claude_embed
+                        .finish_with_message(format!("embedded {} done", format_count(embedded)));
                     return;
                 }
             }
             SourceKind::CodexSession | SourceKind::CodexHistory => {
                 self.codex_embed.inc(count);
                 let embedded = self.codex_embed.position();
-                let total = self.embed_total[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let total = self.embed_total[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.embed_total[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
-                let pending = self.embed_pending[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let pending = self.embed_pending[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.embed_pending[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
                 let indexed = self.codex_index.position();
-                let produced = self.produced[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                let produced = self.produced[SourceKind::CodexSession.idx()]
+                    .load(Ordering::Relaxed)
                     + self.produced[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
                 // If indexing done and all embeddings done, finish
                 if indexed >= produced && pending == 0 && embedded >= total && total > 0 {
-                    self.codex_embed.finish_with_message(format!("embedded {} done", format_count(embedded)));
+                    self.codex_embed
+                        .finish_with_message(format!("embedded {} done", format_count(embedded)));
                     return;
                 }
             }
@@ -289,7 +308,8 @@ impl Progress {
             if self.embed_total[SourceKind::Claude.idx()].load(Ordering::Relaxed) == 0 {
                 self.claude_embed.set_message("embedded 0 ready");
             }
-            let codex_total = self.embed_total[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+            let codex_total = self.embed_total[SourceKind::CodexSession.idx()]
+                .load(Ordering::Relaxed)
                 + self.embed_total[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed);
             if codex_total == 0 {
                 self.codex_embed.set_message("embedded 0 ready");
@@ -327,13 +347,15 @@ impl Progress {
         // Finish index bars
         let claude_indexed = self.claude_index.position();
         if claude_indexed > 0 {
-            self.claude_index.finish_with_message(format!("indexed {} rec", format_count(claude_indexed)));
+            self.claude_index
+                .finish_with_message(format!("indexed {} rec", format_count(claude_indexed)));
         } else {
             self.claude_index.finish_and_clear();
         }
         let codex_indexed = self.codex_index.position();
         if codex_indexed > 0 {
-            self.codex_index.finish_with_message(format!("indexed {} rec", format_count(codex_indexed)));
+            self.codex_index
+                .finish_with_message(format!("indexed {} rec", format_count(codex_indexed)));
         } else {
             self.codex_index.finish_and_clear();
         }
@@ -341,13 +363,15 @@ impl Progress {
         // Finish embed bars
         let claude_embedded = self.claude_embed.position();
         if self.embeddings_enabled && claude_embedded > 0 {
-            self.claude_embed.finish_with_message(format!("embedded {}", format_count(claude_embedded)));
+            self.claude_embed
+                .finish_with_message(format!("embedded {}", format_count(claude_embedded)));
         } else {
             self.claude_embed.finish_and_clear();
         }
         let codex_embedded = self.codex_embed.position();
         if self.embeddings_enabled && codex_embedded > 0 {
-            self.codex_embed.finish_with_message(format!("embedded {}", format_count(codex_embedded)));
+            self.codex_embed
+                .finish_with_message(format!("embedded {}", format_count(codex_embedded)));
         } else {
             self.codex_embed.finish_and_clear();
         }
@@ -381,6 +405,6 @@ fn format_bytes(bytes: u64) -> String {
     } else if b >= KB {
         format!("{:.1} KiB", b / KB)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
