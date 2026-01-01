@@ -17,8 +17,8 @@ impl EmbedderHandle {
         };
 
         #[cfg(not(target_os = "macos"))]
-        let opts = InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
-            .with_show_download_progress(false);
+        let opts =
+            InitOptions::new(EmbeddingModel::EmbeddingGemma300M).with_show_download_progress(false);
 
         let model = TextEmbedding::try_new(opts)?;
         // EmbeddingGemma outputs 768-dim embeddings
