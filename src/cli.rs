@@ -6,7 +6,7 @@ use crate::types::SourceFilter;
 use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
 use chrono::SecondsFormat;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use regex::RegexBuilder;
 use serde::Serialize;
 use serde_json::Value;
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -26,42 +27,43 @@ pub struct Cli {
     command: Commands,
 }
 
+#[derive(Args, Clone)]
+struct IndexArgs {
+    #[arg(long)]
+    source: Option<PathBuf>,
+    #[arg(long)]
+    include_agents: bool,
+    #[arg(long, default_value_t = true)]
+    codex: bool,
+    #[arg(long)]
+    embeddings: bool,
+    #[arg(long)]
+    no_embeddings: bool,
+    /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     Index {
+        #[command(flatten)]
+        index: IndexArgs,
         #[arg(long)]
-        source: Option<PathBuf>,
-        #[arg(long)]
-        include_agents: bool,
-        #[arg(long, default_value_t = true)]
-        codex: bool,
-        #[arg(long)]
-        embeddings: bool,
-        #[arg(long)]
-        no_embeddings: bool,
-        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        root: Option<PathBuf>,
+        watch: bool,
+        #[arg(
+            long = "watch-interval",
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        watch_interval: u64,
     },
     Reindex {
-        #[arg(long)]
-        source: Option<PathBuf>,
-        #[arg(long)]
-        include_agents: bool,
-        #[arg(long, default_value_t = true)]
-        codex: bool,
-        #[arg(long)]
-        embeddings: bool,
-        #[arg(long)]
-        no_embeddings: bool,
-        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        root: Option<PathBuf>,
+        #[command(flatten)]
+        index: IndexArgs,
     },
     Embed {
         /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
@@ -113,6 +115,11 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Run indexing as a background service via launchd (macOS only)
+    IndexService {
+        #[command(subcommand)]
+        action: IndexServiceCommand,
+    },
     Session {
         session_id: String,
         #[arg(short, long)]
@@ -148,48 +155,50 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum IndexServiceCommand {
+    Enable {
+        #[command(flatten)]
+        index: IndexArgs,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(
+            long,
+            default_value_t = 3600,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        interval: u64,
+        #[arg(long)]
+        stdout: Option<PathBuf>,
+        #[arg(long)]
+        stderr: Option<PathBuf>,
+        #[arg(long)]
+        plist: Option<PathBuf>,
+    },
+    Disable {
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        plist: Option<PathBuf>,
+    },
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Index {
-            source,
-            include_agents,
-            codex,
-            embeddings,
-            no_embeddings,
-            model,
-            root,
+            index,
+            watch,
+            watch_interval,
         } => {
-            run_index(
-                source,
-                include_agents,
-                codex,
-                embeddings,
-                no_embeddings,
-                model,
-                root,
-                false,
-            )?;
+            if watch {
+                run_index_loop(&index, watch_interval)?;
+            } else {
+                run_index_args(&index, false)?;
+            }
         }
-        Commands::Reindex {
-            source,
-            include_agents,
-            codex,
-            embeddings,
-            no_embeddings,
-            model,
-            root,
-        } => {
-            run_index(
-                source,
-                include_agents,
-                codex,
-                embeddings,
-                no_embeddings,
-                model,
-                root,
-                true,
-            )?;
+        Commands::Reindex { index } => {
+            run_index_args(&index, true)?;
         }
         Commands::Embed { model, root } => {
             run_embed(model, root)?;
@@ -241,6 +250,23 @@ pub fn run() -> Result<()> {
                 root,
             )?;
         }
+        Commands::IndexService { action } => match action {
+            IndexServiceCommand::Enable {
+                index,
+                label,
+                interval,
+                stdout,
+                stderr,
+                plist,
+            } => {
+                run_index_service_enable(
+                    &index, label, interval, stdout, stderr, plist,
+                )?;
+            }
+            IndexServiceCommand::Disable { label, plist } => {
+                run_index_service_disable(label, plist)?;
+            }
+        },
         Commands::Session {
             session_id,
             verbose,
@@ -268,6 +294,27 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_index_loop(index: &IndexArgs, interval_secs: u64) -> Result<()> {
+    loop {
+        run_index_args(index, false)?;
+        std::io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_secs(interval_secs));
+    }
+}
+
+fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index(
+        index.source.clone(),
+        index.include_agents,
+        index.codex,
+        index.embeddings,
+        index.no_embeddings,
+        index.model.clone(),
+        index.root.clone(),
+        reindex,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -967,6 +1014,210 @@ fn run_skill_install(
     }
 
     Ok(())
+}
+
+fn run_index_service_enable(
+    index: &IndexArgs,
+    label: Option<String>,
+    interval: u64,
+    stdout: Option<PathBuf>,
+    stderr: Option<PathBuf>,
+    plist: Option<PathBuf>,
+) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Err(anyhow!("launchd scheduling is only supported on macOS"));
+    }
+    if index.embeddings && index.no_embeddings {
+        return Err(anyhow!("--embeddings and --no-embeddings cannot be used together"));
+    }
+    let (label, plist_path) = resolve_service_paths(label, plist)?;
+
+    if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let exe = std::env::current_exe()?;
+    let mut program_args = Vec::new();
+    program_args.push(exe.to_string_lossy().to_string());
+    program_args.extend(build_index_command_args(index));
+
+    let contents = build_launchd_plist(
+        &label,
+        &program_args,
+        interval,
+        stdout.as_ref(),
+        stderr.as_ref(),
+    );
+    std::fs::write(&plist_path, contents)?;
+
+    println!("wrote launchd plist: {}", plist_path.display());
+    let status = std::process::Command::new("launchctl")
+        .arg("load")
+        .arg("-w")
+        .arg(&plist_path)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("launchctl load failed"));
+    }
+    println!("enabled launchd job: {label}");
+    Ok(())
+}
+
+fn run_index_service_disable(label: Option<String>, plist: Option<PathBuf>) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Err(anyhow!("launchd scheduling is only supported on macOS"));
+    }
+    let (label, plist_path) = resolve_service_paths(label, plist)?;
+    if !plist_path.exists() {
+        println!("no launchd plist found: {}", plist_path.display());
+        return Ok(());
+    }
+    let status = std::process::Command::new("launchctl")
+        .arg("unload")
+        .arg("-w")
+        .arg(&plist_path)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("launchctl unload failed"));
+    }
+    std::fs::remove_file(&plist_path)?;
+    println!("disabled launchd job: {label}");
+    Ok(())
+}
+
+fn resolve_service_paths(
+    label: Option<String>,
+    plist: Option<PathBuf>,
+) -> Result<(String, PathBuf)> {
+    let label = match (label, plist.as_ref()) {
+        (Some(label), _) => label,
+        (None, Some(path)) => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "com.memex.index".to_string()),
+        (None, None) => "com.memex.index".to_string(),
+    };
+    validate_launchd_label(&label)?;
+    let plist_path = match plist {
+        Some(path) => path,
+        None => default_launchd_plist_path(&label)?,
+    };
+    Ok((label, plist_path))
+}
+
+fn validate_launchd_label(label: &str) -> Result<()> {
+    if label.trim().is_empty() {
+        return Err(anyhow!("launchd label cannot be empty"));
+    }
+    if label.contains('/') || label.contains('\\') {
+        return Err(anyhow!("launchd label cannot contain path separators"));
+    }
+    Ok(())
+}
+
+fn build_index_command_args(index: &IndexArgs) -> Vec<String> {
+    let mut args = Vec::new();
+    args.push("index".to_string());
+
+    if let Some(source) = &index.source {
+        args.push("--source".to_string());
+        args.push(source.to_string_lossy().to_string());
+    }
+    if index.include_agents {
+        args.push("--include-agents".to_string());
+    }
+    args.push("--codex".to_string());
+    args.push(format!("{}", index.codex));
+    if index.embeddings {
+        args.push("--embeddings".to_string());
+    }
+    if index.no_embeddings {
+        args.push("--no-embeddings".to_string());
+    }
+    if let Some(model) = &index.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    if let Some(root) = &index.root {
+        args.push("--root".to_string());
+        args.push(root.to_string_lossy().to_string());
+    }
+    args
+}
+
+fn build_launchd_plist(
+    label: &str,
+    program_args: &[String],
+    interval: u64,
+    stdout: Option<&PathBuf>,
+    stderr: Option<&PathBuf>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+    );
+    out.push_str("<plist version=\"1.0\">\n");
+    out.push_str("<dict>\n");
+    out.push_str("  <key>Label</key>\n");
+    out.push_str(&format!("  <string>{}</string>\n", xml_escape(label)));
+    out.push_str("  <key>ProgramArguments</key>\n");
+    out.push_str("  <array>\n");
+    for arg in program_args {
+        out.push_str(&format!("    <string>{}</string>\n", xml_escape(arg)));
+    }
+    out.push_str("  </array>\n");
+    out.push_str("  <key>RunAtLoad</key>\n");
+    out.push_str("  <true/>\n");
+    out.push_str("  <key>StartInterval</key>\n");
+    out.push_str(&format!("  <integer>{interval}</integer>\n"));
+
+    if let Some(stdout) = stdout {
+        out.push_str("  <key>StandardOutPath</key>\n");
+        out.push_str(&format!(
+            "  <string>{}</string>\n",
+            xml_escape(&stdout.to_string_lossy())
+        ));
+    }
+    if let Some(stderr) = stderr {
+        out.push_str("  <key>StandardErrorPath</key>\n");
+        out.push_str(&format!(
+            "  <string>{}</string>\n",
+            xml_escape(&stderr.to_string_lossy())
+        ));
+    }
+
+    out.push_str("</dict>\n");
+    out.push_str("</plist>\n");
+    out
+}
+
+fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn default_launchd_plist_path(label: &str) -> Result<PathBuf> {
+    let home = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("cannot determine home directory"))?
+        .home_dir()
+        .to_path_buf();
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist")))
 }
 
 fn default_claude_source() -> PathBuf {

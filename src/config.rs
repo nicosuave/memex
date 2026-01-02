@@ -44,7 +44,7 @@ pub struct UserConfig {
     /// Embedding model: minilm, bge, nomic, gemma, potion (default)
     pub model: Option<String>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
-    /// skip re-scanning on search. Default: 30 seconds.
+    /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
 }
 
@@ -72,6 +72,6 @@ impl UserConfig {
     }
 
     pub fn scan_cache_ttl(&self) -> u64 {
-        self.scan_cache_ttl.unwrap_or(30)
+        self.scan_cache_ttl.unwrap_or(3600)
     }
 }

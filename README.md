@@ -37,6 +37,11 @@ Index (incremental):
 ./target/debug/memex index
 ```
 
+Continuous index (polling):
+```
+./target/debug/memex index --watch --watch-interval 30
+```
+
 Search (JSONL default):
 ```
 ./target/debug/memex search "your query" --limit 20
@@ -85,12 +90,29 @@ Human output:
 - `--fields score,ts,doc_id,session_id,snippet`
 - `--json-array`
 
+## Background index service (macOS launchd)
+
+Enable the launchd service that runs indexing on a timer:
+
+```
+./target/debug/memex index-service enable --interval 3600 --label com.memex.index.example --stdout ~/Library/Logs/memex-index.log
+```
+
+Disable it:
+```
+./target/debug/memex index-service disable --label com.memex.index.example
+```
+
 ## Embeddings
 
 Disable:
 ```
 ./target/debug/memex index --no-embeddings
 ```
+
+Recommended when embeddings are on (especially non-`potion` models): run the background
+index service or `index --watch`, and consider setting `auto_index_on_search = false`
+to keep searches fast.
 
 ## Embedding model
 
@@ -118,6 +140,9 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 embeddings = true
 auto_index_on_search = true
 model = "gemma"  # minilm, bge, nomic, gemma, potion
+scan_cache_ttl = 3600  # seconds (default 1 hour)
 ```
+
+`scan_cache_ttl` controls how long auto-indexing considers scans fresh.
 
 The skill definition is bundled in `skills/memex-search/SKILL.md`.

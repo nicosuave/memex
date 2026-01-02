@@ -12,6 +12,8 @@ Use this skill to index local history and retrieve results in a structured, LLM-
 
 - Build or update the index (incremental):
   - `memex index`
+- Continuous index (polling):
+  - `memex index --watch --watch-interval 30`
 - Full rebuild (clears index):
   - `memex reindex`
 - Embeddings are on by default.
@@ -73,6 +75,13 @@ Each JSON line includes:
 - `--fields score,ts,doc_id,session_id,snippet` to reduce output
 - `-v/--verbose` for human output
 
+### Background index service (macOS launchd)
+
+```
+memex index-service enable --interval 3600 --label com.memex.index.example --stdout ~/Library/Logs/memex-index.log
+memex index-service disable --label com.memex.index.example
+```
+
 ### Narrow first (fastest reducers)
 
 1) Global search with `--limit`
@@ -97,9 +106,15 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 embeddings = true
 auto_index_on_search = true
 model = "gemma"  # minilm, bge, nomic, gemma, potion
+scan_cache_ttl = 3600  # seconds (default 1 hour)
 ```
 
 `auto_index_on_search` runs an incremental index update before each search.
+`scan_cache_ttl` sets the maximum scan staleness for auto-indexing.
+
+Recommended when embeddings are on (especially non-`potion` models): run the
+background index service or `index --watch`, and consider setting
+`auto_index_on_search = false` to keep searches fast.
 
 ### Semantic and Hybrid
 
