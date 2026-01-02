@@ -36,11 +36,9 @@ impl ModelChoice {
             "bge" | "bge-small" | "bgesmall" => Ok(ModelChoice::BGESmall),
             "nomic" => Ok(ModelChoice::Nomic),
             "gemma" | "embeddinggemma" | "default" => Ok(ModelChoice::Gemma),
-            "potion"
-            | "potion8m"
-            | "potion-8m"
-            | "potion-base-8m"
-            | "model2vec" => Ok(ModelChoice::Potion),
+            "potion" | "potion8m" | "potion-8m" | "potion-base-8m" | "model2vec" => {
+                Ok(ModelChoice::Potion)
+            }
             _ => Err(anyhow!(
                 "unknown model '{s}', options: minilm, bge, nomic, gemma, potion"
             )),
@@ -89,9 +87,7 @@ impl EmbedderHandle {
                 let compute_units = std::env::var("MEMEX_COMPUTE_UNITS")
                     .ok()
                     .map(|v| match v.to_lowercase().as_str() {
-                        "ane" | "neural" | "neuralengine" => {
-                            CoreMLComputeUnits::CPUAndNeuralEngine
-                        }
+                        "ane" | "neural" | "neuralengine" => CoreMLComputeUnits::CPUAndNeuralEngine,
                         "gpu" => CoreMLComputeUnits::CPUAndGPU,
                         "cpu" => CoreMLComputeUnits::CPUOnly,
                         _ => CoreMLComputeUnits::All,
@@ -114,12 +110,7 @@ impl EmbedderHandle {
                 dims,
             })
         } else {
-            let model = StaticModel::from_pretrained(
-                "minishlab/potion-base-8M",
-                None,
-                None,
-                None,
-            )?;
+            let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
             let dims = model
                 .encode(&[String::from("dimension_check")])
                 .first()
@@ -153,15 +144,15 @@ mod tests {
 
     fn fastembed_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock fastembed")
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock fastembed")
     }
 
     #[test]
     fn test_embedder_init() {
         let _guard = fastembed_test_lock();
-        let env_model = std::env::var("MEMEX_MODEL")
-            .ok()
-            .map(|s| s.to_lowercase());
+        let env_model = std::env::var("MEMEX_MODEL").ok().map(|s| s.to_lowercase());
         let embedder = EmbedderHandle::new().expect("failed to init embedder");
         // Default is Gemma with 768 dims, but env var could change it
         let is_potion = matches!(

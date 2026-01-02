@@ -8,7 +8,11 @@ fn main() -> Result<()> {
     if embeddings.is_empty() {
         anyhow::bail!("no embeddings returned");
     }
-    println!("embeddings: {} vectors, dims {}", embeddings.len(), embedder.dims);
+    println!(
+        "embeddings: {} vectors, dims {}",
+        embeddings.len(),
+        embedder.dims
+    );
     if let Some(first) = embeddings.first() {
         let preview: Vec<String> = first.iter().take(8).map(|v| format!("{v:.4}")).collect();
         println!("first: [{}]", preview.join(", "));
