@@ -131,6 +131,21 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Install the memex-search skill for Claude and/or Codex
+    SkillInstall {
+        /// Install for Claude Code (default: true)
+        #[arg(long, default_value_t = true)]
+        claude: bool,
+        /// Skip Claude Code installation
+        #[arg(long)]
+        no_claude: bool,
+        /// Install for Codex
+        #[arg(long)]
+        codex: bool,
+        /// Skip Codex installation
+        #[arg(long)]
+        no_codex: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -242,6 +257,14 @@ pub fn run() -> Result<()> {
         }
         Commands::Stats { root } => {
             run_stats(root)?;
+        }
+        Commands::SkillInstall {
+            claude,
+            no_claude,
+            codex,
+            no_codex,
+        } => {
+            run_skill_install(claude, no_claude, codex, no_codex)?;
         }
     }
     Ok(())
@@ -889,6 +912,58 @@ fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
         "vectors: {} (dims {}, ids {}, vectors.f32 {}, doc_ids.u64 {})",
         vecs, meta.dimensions, ids, vec_bytes, ids_bytes
     );
+    Ok(())
+}
+
+fn run_skill_install(
+    claude_flag: bool,
+    no_claude: bool,
+    codex_flag: bool,
+    no_codex: bool,
+) -> Result<()> {
+    let install_claude = resolve_flag(true, claude_flag && !no_claude, no_claude, "claude")?;
+    let install_codex = resolve_flag(false, codex_flag, no_codex, "codex")?;
+
+    if !install_claude && !install_codex {
+        println!("nothing to install (both --no-claude and --no-codex specified)");
+        return Ok(());
+    }
+
+    let home = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("cannot determine home directory"))?
+        .home_dir()
+        .to_path_buf();
+
+    let skill_content = include_str!("../skills/memex-search/SKILL.md");
+
+    let mut installed = Vec::new();
+
+    if install_claude {
+        let claude_skills = home.join(".claude").join("skills").join("memex-search");
+        std::fs::create_dir_all(&claude_skills)?;
+        let skill_path = claude_skills.join("SKILL.md");
+        std::fs::write(&skill_path, skill_content)?;
+        installed.push(format!("claude: {}", skill_path.display()));
+    }
+
+    if install_codex {
+        let codex_skills = home.join(".codex").join("skills").join("memex-search");
+        std::fs::create_dir_all(&codex_skills)?;
+        let skill_path = codex_skills.join("SKILL.md");
+        std::fs::write(&skill_path, skill_content)?;
+        installed.push(format!("codex: {}", skill_path.display()));
+    }
+
+    if installed.is_empty() {
+        println!("no skills installed");
+    } else {
+        println!("installed memex-search skill:");
+        for path in installed {
+            println!("  {path}");
+        }
+        println!("\nrestart claude/codex to load the skill");
+    }
+
     Ok(())
 }
 

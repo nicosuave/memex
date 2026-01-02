@@ -13,6 +13,23 @@ Binary:
 ./target/debug/memex
 ```
 
+## Install Skill
+
+Install the memex-search skill so Claude/Codex can use it automatically:
+
+```bash
+# Install for Claude Code only (default)
+./target/debug/memex skill-install
+
+# Install for both Claude and Codex
+./target/debug/memex skill-install --codex
+
+# Install for Codex only
+./target/debug/memex skill-install --no-claude --codex
+```
+
+Restart Claude/Codex to load the skill.
+
 ## Quickstart
 
 Index (incremental):
@@ -102,4 +119,4 @@ auto_index_on_search = true
 model = "gemma"  # minilm, bge, nomic, gemma
 ```
 
-SKILL.md is included as an example.
+The skill definition is bundled in `skills/memex-search/SKILL.md`.
