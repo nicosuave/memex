@@ -123,8 +123,8 @@ Select via `--model` flag or `MEMEX_MODEL` env var:
 | minilm | 384 | Fastest | Good |
 | bge | 384 | Fast | Better |
 | nomic | 768 | Moderate | Good |
-| gemma | 768 | Slowest | Best (default) |
-| potion | 256 | Fastest (tiny) | Lowest |
+| gemma | 768 | Slowest | Best |
+| potion | 256 | Fastest (tiny) | Lowest (default) |
 
 ```
 ./target/debug/memex index --model minilm
@@ -139,7 +139,7 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 ```toml
 embeddings = true
 auto_index_on_search = true
-model = "gemma"  # minilm, bge, nomic, gemma, potion
+model = "potion"  # minilm, bge, nomic, gemma, potion
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 ```
 
