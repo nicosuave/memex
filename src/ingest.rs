@@ -21,7 +21,7 @@ use walkdir::WalkDir;
 
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
-const INDEX_PROGRESS_BATCH: u64 = 100;
+const INDEX_PROGRESS_BATCH: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
