@@ -1027,6 +1027,7 @@ fn run_skill_install(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_index_service_enable(
     index: &IndexArgs,
     label: Option<String>,
