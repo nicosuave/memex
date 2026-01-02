@@ -1,5 +1,5 @@
 use crate::config::Paths;
-use crate::embed::EmbedderHandle;
+use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::progress::Progress;
 use crate::state::{FileState, IngestState, ScanCache};
@@ -30,6 +30,7 @@ pub struct IngestOptions {
     pub include_codex: bool,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
+    pub model: ModelChoice,
 }
 
 #[derive(Debug)]
@@ -240,6 +241,7 @@ pub fn ingest_all(
     let writer_index = index.clone();
     let embeddings = options.embeddings;
     let backfill_embeddings = options.backfill_embeddings;
+    let model = options.model;
     let vector_dir = paths.vectors.clone();
     let progress_for_writer = progress.clone();
     let writer_handle = std::thread::spawn(move || {
@@ -251,6 +253,7 @@ pub fn ingest_all(
             backfill_embeddings,
             vector_dir,
             progress_for_writer,
+            model,
         )
     });
 
@@ -318,6 +321,7 @@ fn writer_loop(
     do_backfill_embeddings: bool,
     vector_dir: PathBuf,
     progress: Arc<Progress>,
+    model: ModelChoice,
 ) -> Result<(usize, usize)> {
     let mut writer = index.writer()?;
     for path in delete_paths {
@@ -334,7 +338,7 @@ fn writer_loop(
         unsafe {
             std::env::set_var("HF_HUB_DISABLE_PROGRESS_BARS", "1");
         }
-        let handle = EmbedderHandle::new()?;
+        let handle = EmbedderHandle::with_model(model)?;
         let dims = handle.dims;
         vector_index = Some(crate::vector::VectorIndex::open_or_create(
             &vector_dir,
