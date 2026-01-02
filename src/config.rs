@@ -45,8 +45,26 @@ pub struct UserConfig {
     /// Embedding model: minilm, bge, nomic, gemma (default), potion
     pub model: Option<String>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
-    /// skip re-scanning on search. Default: 30 seconds.
+    /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
+    /// Background index service mode: "interval" or "continuous".
+    pub index_service_mode: Option<String>,
+    /// Run background index service continuously (legacy).
+    #[serde(alias = "index_service_watch")]
+    pub index_service_continuous: Option<bool>,
+    /// Background index service interval in seconds (ignored when continuous is true).
+    pub index_service_interval: Option<u64>,
+    /// Background index service poll interval in seconds.
+    #[serde(alias = "index_service_watch_interval")]
+    pub index_service_poll_interval: Option<u64>,
+    /// Background index service launchd label.
+    pub index_service_label: Option<String>,
+    /// Background index service stdout log path.
+    pub index_service_stdout: Option<PathBuf>,
+    /// Background index service stderr log path.
+    pub index_service_stderr: Option<PathBuf>,
+    /// Background index service plist path.
+    pub index_service_plist: Option<PathBuf>,
 }
 
 impl UserConfig {
@@ -82,6 +100,22 @@ impl UserConfig {
     }
 
     pub fn scan_cache_ttl(&self) -> u64 {
-        self.scan_cache_ttl.unwrap_or(30)
+        self.scan_cache_ttl.unwrap_or(3600)
+    }
+
+    pub fn index_service_mode(&self) -> Option<&str> {
+        self.index_service_mode.as_deref()
+    }
+
+    pub fn index_service_continuous_default(&self) -> bool {
+        self.index_service_continuous.unwrap_or(false)
+    }
+
+    pub fn index_service_interval(&self) -> u64 {
+        self.index_service_interval.unwrap_or(3600)
+    }
+
+    pub fn index_service_poll_interval(&self) -> u64 {
+        self.index_service_poll_interval.unwrap_or(30)
     }
 }
