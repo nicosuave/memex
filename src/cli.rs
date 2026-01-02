@@ -162,12 +162,12 @@ enum IndexServiceCommand {
         index: IndexArgs,
         #[arg(long)]
         label: Option<String>,
-        #[arg(
-            long,
-            default_value_t = 3600,
-            value_parser = clap::value_parser!(u64).range(1..)
-        )]
-        interval: u64,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        watch_interval: Option<u64>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: Option<u64>,
         #[arg(long)]
         stdout: Option<PathBuf>,
         #[arg(long)]
@@ -180,6 +180,8 @@ enum IndexServiceCommand {
         label: Option<String>,
         #[arg(long)]
         plist: Option<PathBuf>,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 }
 
@@ -254,15 +256,26 @@ pub fn run() -> Result<()> {
             IndexServiceCommand::Enable {
                 index,
                 label,
+                watch,
+                watch_interval,
                 interval,
                 stdout,
                 stderr,
                 plist,
             } => {
-                run_index_service_enable(&index, label, interval, stdout, stderr, plist)?;
+                run_index_service_enable(
+                    &index,
+                    label,
+                    watch,
+                    watch_interval,
+                    interval,
+                    stdout,
+                    stderr,
+                    plist,
+                )?;
             }
-            IndexServiceCommand::Disable { label, plist } => {
-                run_index_service_disable(label, plist)?;
+            IndexServiceCommand::Disable { label, plist, root } => {
+                run_index_service_disable(label, plist, root)?;
             }
         },
         Commands::Session {
@@ -1017,7 +1030,9 @@ fn run_skill_install(
 fn run_index_service_enable(
     index: &IndexArgs,
     label: Option<String>,
-    interval: u64,
+    watch: bool,
+    watch_interval: Option<u64>,
+    interval: Option<u64>,
     stdout: Option<PathBuf>,
     stderr: Option<PathBuf>,
     plist: Option<PathBuf>,
@@ -1030,6 +1045,15 @@ fn run_index_service_enable(
             "--embeddings and --no-embeddings cannot be used together"
         ));
     }
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let watch = watch || watch_interval.is_some() || config.index_service_watch_default();
+    let watch_interval = watch_interval.unwrap_or(config.index_service_watch_interval());
+    let interval = interval.unwrap_or(config.index_service_interval());
+    let label = label.or_else(|| config.index_service_label.clone());
+    let stdout = stdout.or_else(|| config.index_service_stdout.clone());
+    let stderr = stderr.or_else(|| config.index_service_stderr.clone());
+    let plist = plist.or_else(|| config.index_service_plist.clone());
     let (label, plist_path) = resolve_service_paths(label, plist)?;
 
     if let Some(parent) = plist_path.parent() {
@@ -1039,12 +1063,18 @@ fn run_index_service_enable(
     let exe = std::env::current_exe()?;
     let mut program_args = Vec::new();
     program_args.push(exe.to_string_lossy().to_string());
-    program_args.extend(build_index_command_args(index));
+    program_args.extend(build_index_command_args(index, watch, watch_interval));
+    let (interval, keep_alive) = if watch {
+        (None, true)
+    } else {
+        (Some(interval), false)
+    };
 
     let contents = build_launchd_plist(
         &label,
         &program_args,
         interval,
+        keep_alive,
         stdout.as_ref(),
         stderr.as_ref(),
     );
@@ -1063,10 +1093,18 @@ fn run_index_service_enable(
     Ok(())
 }
 
-fn run_index_service_disable(label: Option<String>, plist: Option<PathBuf>) -> Result<()> {
+fn run_index_service_disable(
+    label: Option<String>,
+    plist: Option<PathBuf>,
+    root: Option<PathBuf>,
+) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Err(anyhow!("launchd scheduling is only supported on macOS"));
     }
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let label = label.or_else(|| config.index_service_label.clone());
+    let plist = plist.or_else(|| config.index_service_plist.clone());
     let (label, plist_path) = resolve_service_paths(label, plist)?;
     if !plist_path.exists() {
         println!("no launchd plist found: {}", plist_path.display());
@@ -1116,7 +1154,7 @@ fn validate_launchd_label(label: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_index_command_args(index: &IndexArgs) -> Vec<String> {
+fn build_index_command_args(index: &IndexArgs, watch: bool, watch_interval: u64) -> Vec<String> {
     let mut args = Vec::new();
     args.push("index".to_string());
 
@@ -1127,13 +1165,19 @@ fn build_index_command_args(index: &IndexArgs) -> Vec<String> {
     if index.include_agents {
         args.push("--include-agents".to_string());
     }
-    args.push("--codex".to_string());
-    args.push(format!("{}", index.codex));
+    if !index.codex {
+        args.push("--no-codex".to_string());
+    }
     if index.embeddings {
         args.push("--embeddings".to_string());
     }
     if index.no_embeddings {
         args.push("--no-embeddings".to_string());
+    }
+    if watch {
+        args.push("--watch".to_string());
+        args.push("--watch-interval".to_string());
+        args.push(format!("{watch_interval}"));
     }
     if let Some(model) = &index.model {
         args.push("--model".to_string());
@@ -1149,7 +1193,8 @@ fn build_index_command_args(index: &IndexArgs) -> Vec<String> {
 fn build_launchd_plist(
     label: &str,
     program_args: &[String],
-    interval: u64,
+    interval: Option<u64>,
+    keep_alive: bool,
     stdout: Option<&PathBuf>,
     stderr: Option<&PathBuf>,
 ) -> String {
@@ -1171,8 +1216,14 @@ fn build_launchd_plist(
     out.push_str("  </array>\n");
     out.push_str("  <key>RunAtLoad</key>\n");
     out.push_str("  <true/>\n");
-    out.push_str("  <key>StartInterval</key>\n");
-    out.push_str(&format!("  <integer>{interval}</integer>\n"));
+    if let Some(interval) = interval {
+        out.push_str("  <key>StartInterval</key>\n");
+        out.push_str(&format!("  <integer>{interval}</integer>\n"));
+    }
+    if keep_alive {
+        out.push_str("  <key>KeepAlive</key>\n");
+        out.push_str("  <true/>\n");
+    }
 
     if let Some(stdout) = stdout {
         out.push_str("  <key>StandardOutPath</key>\n");

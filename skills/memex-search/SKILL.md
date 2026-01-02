@@ -78,8 +78,8 @@ Each JSON line includes:
 ### Background index service (macOS launchd)
 
 ```
-memex index-service enable --interval 3600 --label com.memex.index.example --stdout ~/Library/Logs/memex-index.log
-memex index-service disable --label com.memex.index.example
+memex index-service enable
+memex index-service disable
 ```
 
 ### Narrow first (fastest reducers)
@@ -105,12 +105,20 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 ```toml
 embeddings = true
 auto_index_on_search = true
-model = "gemma"  # minilm, bge, nomic, gemma, potion
+model = "potion"  # minilm, bge, nomic, gemma, potion
 scan_cache_ttl = 3600  # seconds (default 1 hour)
+index_service_watch = false  # true = continuous background watch
+index_service_interval = 3600  # seconds (ignored when watch = true)
+index_service_watch_interval = 30  # seconds
+index_service_label = "com.memex.index"
+index_service_stdout = "/path/to/memex-index.log"
+index_service_stderr = "/path/to/memex-index.err.log"
+index_service_plist = "/path/to/com.memex.index.plist"
 ```
 
 `auto_index_on_search` runs an incremental index update before each search.
 `scan_cache_ttl` sets the maximum scan staleness for auto-indexing.
+`index-service` reads config defaults (mode, interval, label, log paths). Flags override.
 
 Recommended when embeddings are on (especially non-`potion` models): run the
 background index service or `index --watch`, and consider setting

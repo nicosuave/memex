@@ -37,7 +37,7 @@ Index (incremental):
 ./target/debug/memex index
 ```
 
-Continuous index (polling):
+Continuous index (foreground):
 ```
 ./target/debug/memex index --watch --watch-interval 30
 ```
@@ -92,16 +92,17 @@ Human output:
 
 ## Background index service (macOS launchd)
 
-Enable the launchd service that runs indexing on a timer:
+Enable:
+```
+./target/debug/memex index-service enable
+```
 
+Disable:
 ```
-./target/debug/memex index-service enable --interval 3600 --label com.memex.index.example --stdout ~/Library/Logs/memex-index.log
+./target/debug/memex index-service disable
 ```
 
-Disable it:
-```
-./target/debug/memex index-service disable --label com.memex.index.example
-```
+`index-service` reads config defaults (mode, interval, label, log paths). Flags override.
 
 ## Embeddings
 
@@ -141,6 +142,13 @@ embeddings = true
 auto_index_on_search = true
 model = "potion"  # minilm, bge, nomic, gemma, potion
 scan_cache_ttl = 3600  # seconds (default 1 hour)
+index_service_watch = false  # true = continuous background watch
+index_service_interval = 3600  # seconds (ignored when watch = true)
+index_service_watch_interval = 30  # seconds
+index_service_label = "com.memex.index"
+index_service_stdout = "/path/to/memex-index.log"
+index_service_stderr = "/path/to/memex-index.err.log"
+index_service_plist = "/path/to/com.memex.index.plist"
 ```
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
