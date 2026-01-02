@@ -138,8 +138,8 @@ embeddings = true
 auto_index_on_search = true
 model = "potion"  # minilm, bge, nomic, gemma, potion
 scan_cache_ttl = 3600  # seconds (default 1 hour)
-index_service_continuous = false  # true = continuous background watch
-index_service_interval = 3600  # seconds (ignored when continuous = true)
+index_service_mode = "interval"  # interval or continuous
+index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
 ```
 

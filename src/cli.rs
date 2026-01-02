@@ -1056,12 +1056,22 @@ fn run_index_service_enable(
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
     let cli_continuous = continuous || poll_interval.is_some();
+    let config_continuous = match config.index_service_mode() {
+        Some("interval") => false,
+        Some("continuous") => true,
+        Some(other) => {
+            return Err(anyhow!(
+                "invalid index_service_mode: {other} (expected \"interval\" or \"continuous\")"
+            ));
+        }
+        None => config.index_service_continuous_default(),
+    };
     let continuous = if cli_continuous {
         true
     } else if interval.is_some() {
         false
     } else {
-        config.index_service_continuous_default()
+        config_continuous
     };
     let poll_interval = poll_interval.unwrap_or(config.index_service_poll_interval());
     let interval = interval.unwrap_or(config.index_service_interval());

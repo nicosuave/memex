@@ -46,7 +46,9 @@ pub struct UserConfig {
     /// Scan cache TTL in seconds. If a scan was done within this time,
     /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
-    /// Run background index service continuously.
+    /// Background index service mode: "interval" or "continuous".
+    pub index_service_mode: Option<String>,
+    /// Run background index service continuously (legacy).
     #[serde(alias = "index_service_watch")]
     pub index_service_continuous: Option<bool>,
     /// Background index service interval in seconds (ignored when continuous is true).
@@ -89,6 +91,10 @@ impl UserConfig {
 
     pub fn scan_cache_ttl(&self) -> u64 {
         self.scan_cache_ttl.unwrap_or(3600)
+    }
+
+    pub fn index_service_mode(&self) -> Option<&str> {
+        self.index_service_mode.as_deref()
     }
 
     pub fn index_service_continuous_default(&self) -> bool {
