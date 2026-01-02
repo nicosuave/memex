@@ -37,11 +37,6 @@ Index (incremental):
 ./target/debug/memex index
 ```
 
-Continuous index (foreground):
-```
-./target/debug/memex index --watch --watch-interval 30
-```
-
 Search (JSONL default):
 ```
 ./target/debug/memex search "your query" --limit 20
@@ -95,6 +90,7 @@ Human output:
 Enable:
 ```
 ./target/debug/memex index-service enable
+./target/debug/memex index-service enable --continuous
 ```
 
 Disable:
@@ -102,7 +98,7 @@ Disable:
 ./target/debug/memex index-service disable
 ```
 
-`index-service` reads config defaults (mode, interval, label, log paths). Flags override.
+`index-service` reads config defaults (mode, interval, log paths). Flags override.
 
 ## Embeddings
 
@@ -142,14 +138,12 @@ embeddings = true
 auto_index_on_search = true
 model = "potion"  # minilm, bge, nomic, gemma, potion
 scan_cache_ttl = 3600  # seconds (default 1 hour)
-index_service_watch = false  # true = continuous background watch
-index_service_interval = 3600  # seconds (ignored when watch = true)
-index_service_watch_interval = 30  # seconds
-index_service_label = "com.memex.index"
-index_service_stdout = "/path/to/memex-index.log"
-index_service_stderr = "/path/to/memex-index.err.log"
-index_service_plist = "/path/to/com.memex.index.plist"
+index_service_continuous = false  # true = continuous background watch
+index_service_interval = 3600  # seconds (ignored when continuous = true)
+index_service_poll_interval = 30  # seconds
 ```
+
+Service logs and the plist live under `~/.memex` by default.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
 

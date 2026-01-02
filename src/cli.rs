@@ -52,12 +52,13 @@ enum Commands {
     Index {
         #[command(flatten)]
         index: IndexArgs,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         watch: bool,
         #[arg(
             long = "watch-interval",
             default_value_t = 30,
-            value_parser = clap::value_parser!(u64).range(1..)
+            value_parser = clap::value_parser!(u64).range(1..),
+            hide = true
         )]
         watch_interval: u64,
     },
@@ -163,9 +164,9 @@ enum IndexServiceCommand {
         #[arg(long)]
         label: Option<String>,
         #[arg(long)]
-        watch: bool,
+        continuous: bool,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        watch_interval: Option<u64>,
+        poll_interval: Option<u64>,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         interval: Option<u64>,
         #[arg(long)]
@@ -256,8 +257,8 @@ pub fn run() -> Result<()> {
             IndexServiceCommand::Enable {
                 index,
                 label,
-                watch,
-                watch_interval,
+                continuous,
+                poll_interval,
                 interval,
                 stdout,
                 stderr,
@@ -266,8 +267,8 @@ pub fn run() -> Result<()> {
                 run_index_service_enable(
                     &index,
                     label,
-                    watch,
-                    watch_interval,
+                    continuous,
+                    poll_interval,
                     interval,
                     stdout,
                     stderr,
@@ -1031,8 +1032,8 @@ fn run_skill_install(
 fn run_index_service_enable(
     index: &IndexArgs,
     label: Option<String>,
-    watch: bool,
-    watch_interval: Option<u64>,
+    continuous: bool,
+    poll_interval: Option<u64>,
     interval: Option<u64>,
     stdout: Option<PathBuf>,
     stderr: Option<PathBuf>,
@@ -1046,17 +1047,41 @@ fn run_index_service_enable(
             "--embeddings and --no-embeddings cannot be used together"
         ));
     }
+    if continuous && interval.is_some() {
+        return Err(anyhow!(
+            "--continuous and --interval cannot be used together"
+        ));
+    }
+
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
-    let watch = watch || watch_interval.is_some() || config.index_service_watch_default();
-    let watch_interval = watch_interval.unwrap_or(config.index_service_watch_interval());
+    let cli_continuous = continuous || poll_interval.is_some();
+    let continuous = if cli_continuous {
+        true
+    } else if interval.is_some() {
+        false
+    } else {
+        config.index_service_continuous_default()
+    };
+    let poll_interval = poll_interval.unwrap_or(config.index_service_poll_interval());
     let interval = interval.unwrap_or(config.index_service_interval());
-    let label = label.or_else(|| config.index_service_label.clone());
-    let stdout = stdout.or_else(|| config.index_service_stdout.clone());
-    let stderr = stderr.or_else(|| config.index_service_stderr.clone());
-    let plist = plist.or_else(|| config.index_service_plist.clone());
-    let (label, plist_path) = resolve_service_paths(label, plist)?;
+    let default_label = default_index_service_label();
+    let default_plist = default_index_service_plist(&paths.root);
+    let label = label
+        .or_else(|| config.index_service_label.clone())
+        .unwrap_or(default_label);
+    let stdout = stdout
+        .or_else(|| config.index_service_stdout.clone())
+        .unwrap_or(default_index_service_stdout(&paths.root));
+    let stderr = stderr
+        .or_else(|| config.index_service_stderr.clone())
+        .unwrap_or(default_index_service_stderr(&paths.root));
+    let plist_path = plist
+        .or_else(|| config.index_service_plist.clone())
+        .unwrap_or(default_plist);
+    validate_launchd_label(&label)?;
 
+    std::fs::create_dir_all(&paths.root)?;
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1064,8 +1089,8 @@ fn run_index_service_enable(
     let exe = std::env::current_exe()?;
     let mut program_args = Vec::new();
     program_args.push(exe.to_string_lossy().to_string());
-    program_args.extend(build_index_command_args(index, watch, watch_interval));
-    let (interval, keep_alive) = if watch {
+    program_args.extend(build_index_command_args(index, continuous, poll_interval));
+    let (interval, keep_alive) = if continuous {
         (None, true)
     } else {
         (Some(interval), false)
@@ -1076,8 +1101,8 @@ fn run_index_service_enable(
         &program_args,
         interval,
         keep_alive,
-        stdout.as_ref(),
-        stderr.as_ref(),
+        Some(&stdout),
+        Some(&stderr),
     );
     std::fs::write(&plist_path, contents)?;
 
@@ -1104,9 +1129,15 @@ fn run_index_service_disable(
     }
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let label = label.or_else(|| config.index_service_label.clone());
-    let plist = plist.or_else(|| config.index_service_plist.clone());
-    let (label, plist_path) = resolve_service_paths(label, plist)?;
+    let default_label = default_index_service_label();
+    let default_plist = default_index_service_plist(&paths.root);
+    let label = label
+        .or_else(|| config.index_service_label.clone())
+        .unwrap_or(default_label);
+    let plist_path = plist
+        .or_else(|| config.index_service_plist.clone())
+        .unwrap_or(default_plist);
+    validate_launchd_label(&label)?;
     if !plist_path.exists() {
         println!("no launchd plist found: {}", plist_path.display());
         return Ok(());
@@ -1124,27 +1155,6 @@ fn run_index_service_disable(
     Ok(())
 }
 
-fn resolve_service_paths(
-    label: Option<String>,
-    plist: Option<PathBuf>,
-) -> Result<(String, PathBuf)> {
-    let label = match (label, plist.as_ref()) {
-        (Some(label), _) => label,
-        (None, Some(path)) => path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "com.memex.index".to_string()),
-        (None, None) => "com.memex.index".to_string(),
-    };
-    validate_launchd_label(&label)?;
-    let plist_path = match plist {
-        Some(path) => path,
-        None => default_launchd_plist_path(&label)?,
-    };
-    Ok((label, plist_path))
-}
-
 fn validate_launchd_label(label: &str) -> Result<()> {
     if label.trim().is_empty() {
         return Err(anyhow!("launchd label cannot be empty"));
@@ -1155,7 +1165,11 @@ fn validate_launchd_label(label: &str) -> Result<()> {
     Ok(())
 }
 
-fn build_index_command_args(index: &IndexArgs, watch: bool, watch_interval: u64) -> Vec<String> {
+fn build_index_command_args(
+    index: &IndexArgs,
+    continuous: bool,
+    poll_interval: u64,
+) -> Vec<String> {
     let mut args = Vec::new();
     args.push("index".to_string());
 
@@ -1175,10 +1189,10 @@ fn build_index_command_args(index: &IndexArgs, watch: bool, watch_interval: u64)
     if index.no_embeddings {
         args.push("--no-embeddings".to_string());
     }
-    if watch {
+    if continuous {
         args.push("--watch".to_string());
         args.push("--watch-interval".to_string());
-        args.push(format!("{watch_interval}"));
+        args.push(format!("{poll_interval}"));
     }
     if let Some(model) = &index.model {
         args.push("--model".to_string());
@@ -1261,15 +1275,20 @@ fn xml_escape(input: &str) -> String {
     out
 }
 
-fn default_launchd_plist_path(label: &str) -> Result<PathBuf> {
-    let home = directories::BaseDirs::new()
-        .ok_or_else(|| anyhow!("cannot determine home directory"))?
-        .home_dir()
-        .to_path_buf();
-    Ok(home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{label}.plist")))
+fn default_index_service_label() -> String {
+    "com.memex.index".to_string()
+}
+
+fn default_index_service_stdout(root: &std::path::Path) -> PathBuf {
+    root.join("index-service.log")
+}
+
+fn default_index_service_stderr(root: &std::path::Path) -> PathBuf {
+    root.join("index-service.err.log")
+}
+
+fn default_index_service_plist(root: &std::path::Path) -> PathBuf {
+    root.join("index-service.plist")
 }
 
 fn default_claude_source() -> PathBuf {

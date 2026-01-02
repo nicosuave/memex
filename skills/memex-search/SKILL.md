@@ -12,8 +12,8 @@ Use this skill to index local history and retrieve results in a structured, LLM-
 
 - Build or update the index (incremental):
   - `memex index`
-- Continuous index (polling):
-  - `memex index --watch --watch-interval 30`
+- Continuous index:
+  - `memex index-service enable --continuous`
 - Full rebuild (clears index):
   - `memex reindex`
 - Embeddings are on by default.
@@ -79,6 +79,7 @@ Each JSON line includes:
 
 ```
 memex index-service enable
+memex index-service enable --continuous
 memex index-service disable
 ```
 
@@ -107,18 +108,15 @@ embeddings = true
 auto_index_on_search = true
 model = "potion"  # minilm, bge, nomic, gemma, potion
 scan_cache_ttl = 3600  # seconds (default 1 hour)
-index_service_watch = false  # true = continuous background watch
-index_service_interval = 3600  # seconds (ignored when watch = true)
-index_service_watch_interval = 30  # seconds
-index_service_label = "com.memex.index"
-index_service_stdout = "/path/to/memex-index.log"
-index_service_stderr = "/path/to/memex-index.err.log"
-index_service_plist = "/path/to/com.memex.index.plist"
+index_service_continuous = false  # true = continuous background watch
+index_service_interval = 3600  # seconds (ignored when continuous = true)
+index_service_poll_interval = 30  # seconds
 ```
 
 `auto_index_on_search` runs an incremental index update before each search.
 `scan_cache_ttl` sets the maximum scan staleness for auto-indexing.
-`index-service` reads config defaults (mode, interval, label, log paths). Flags override.
+`index-service` reads config defaults (mode, interval, log paths). Flags override.
+Service logs and the plist live under `~/.memex` by default.
 
 Recommended when embeddings are on (especially non-`potion` models): run the
 background index service or `index --watch`, and consider setting
