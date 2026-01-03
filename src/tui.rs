@@ -9,12 +9,12 @@ use crossterm::event::{
     MouseEvent, MouseEventKind,
 };
 use crossterm::{execute, terminal};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Terminal;
 use std::collections::{HashMap, HashSet};
 use std::io::{Stdout, Write};
 use std::path::PathBuf;
@@ -149,7 +149,9 @@ pub fn run(root: Option<PathBuf>) -> Result<()> {
     let (index_tx, index_rx) = std::sync::mpsc::channel();
     let (search_tx, search_rx) = std::sync::mpsc::channel();
 
-    let mut app = App::new(paths, config, index, index_tx, index_rx, search_tx, search_rx);
+    let mut app = App::new(
+        paths, config, index, index_tx, index_rx, search_tx, search_rx,
+    );
     app.kickoff_index_refresh();
     app.kickoff_search();
 
@@ -392,9 +394,7 @@ impl App {
             }
         }
         self.project_options = options;
-        if self.project_options.is_empty() {
-            self.project_selected = 0;
-        } else if self.project_selected >= self.project_options.len() {
+        if self.project_options.is_empty() || self.project_selected >= self.project_options.len() {
             self.project_selected = 0;
         }
     }
@@ -454,8 +454,7 @@ impl App {
             return;
         }
         let max_scroll = self.detail_lines.len().saturating_sub(1);
-        let next = (self.detail_scroll as isize + delta)
-            .clamp(0, max_scroll as isize) as usize;
+        let next = (self.detail_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.detail_scroll = next;
     }
 
@@ -568,9 +567,7 @@ fn handle_key(
         return Ok(false);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('q'))
-    {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
         return Ok(true);
     }
 
@@ -795,7 +792,10 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
 fn draw_header(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let border = Block::default().borders(Borders::ALL).title("sessions");
 
-    let highlight = Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let idle = Style::default().fg(Color::Gray);
 
     let query_style = if matches!(app.focus, Focus::Query) {
@@ -812,13 +812,21 @@ fn draw_header(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let line = Line::from(vec![
         Span::styled(" query: ", Style::default().fg(Color::Yellow)),
         Span::styled(
-            if app.query.is_empty() { "<empty>" } else { app.query.as_str() },
+            if app.query.is_empty() {
+                "<empty>"
+            } else {
+                app.query.as_str()
+            },
             query_style,
         ),
         Span::raw("   "),
         Span::styled("project: ", Style::default().fg(Color::Yellow)),
         Span::styled(
-            if app.project.is_empty() { "<any>" } else { app.project.as_str() },
+            if app.project.is_empty() {
+                "<any>"
+            } else {
+                app.project.as_str()
+            },
             project_style,
         ),
         Span::raw("   "),
@@ -833,7 +841,10 @@ fn draw_header(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 app.find_query.as_str()
             },
             if matches!(app.focus, Focus::Find) {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             },
@@ -900,7 +911,8 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         let mut project_state = ListState::default();
         if !app.project_options.is_empty() {
             project_state.select(Some(
-                app.project_selected.min(app.project_options.len().saturating_sub(1)),
+                app.project_selected
+                    .min(app.project_options.len().saturating_sub(1)),
             ));
         }
         frame.render_stateful_widget(project_list, project_area, &mut project_state);
@@ -929,7 +941,10 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     Span::raw(" "),
                     Span::styled(ts, Style::default().fg(Color::Gray)),
                     Span::raw(" "),
-                    Span::styled(session.session_id.as_str(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        session.session_id.as_str(),
+                        Style::default().fg(Color::White),
+                    ),
                 ]);
                 ListItem::new(line)
             })
@@ -957,7 +972,11 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
 fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let help = "enter search | s source | pgup/pgdn scroll (preview)";
-    let status = if app.status.is_empty() { "ready" } else { &app.status };
+    let status = if app.status.is_empty() {
+        "ready"
+    } else {
+        &app.status
+    };
     let status_line = Line::from(vec![
         Span::styled("status: ", Style::default().fg(Color::Yellow)),
         Span::raw(status),
@@ -1048,16 +1067,18 @@ fn add_record_to_session(
     score: f32,
     record: Record,
 ) {
-    let entry = sessions.entry(record.session_id.clone()).or_insert(SessionSummary {
-        session_id: record.session_id.clone(),
-        project: record.project.clone(),
-        source: record.source,
-        last_ts: record.ts,
-        hit_count: 0,
-        top_score: score,
-        snippet: summarize(&record.text, 160),
-        source_path: record.source_path.clone(),
-    });
+    let entry = sessions
+        .entry(record.session_id.clone())
+        .or_insert(SessionSummary {
+            session_id: record.session_id.clone(),
+            project: record.project.clone(),
+            source: record.source,
+            last_ts: record.ts,
+            hit_count: 0,
+            top_score: score,
+            snippet: summarize(&record.text, 160),
+            source_path: record.source_path.clone(),
+        });
     entry.hit_count += 1;
     if record.ts > entry.last_ts {
         entry.last_ts = record.ts;
@@ -1088,7 +1109,10 @@ fn build_detail_lines(
     });
     let header = Line::from(vec![
         Span::styled("session ", Style::default().fg(Color::Yellow)),
-        Span::styled(session.session_id.clone(), Style::default().fg(Color::White)),
+        Span::styled(
+            session.session_id.clone(),
+            Style::default().fg(Color::White),
+        ),
         Span::raw("  "),
         Span::styled(session.project.clone(), Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -1158,8 +1182,9 @@ fn build_detail_lines(
                         for idx in indices {
                             let start = idx.saturating_sub(CONTEXT_AROUND_MATCH);
                             let end = (idx + CONTEXT_AROUND_MATCH).min(records.len() - 1);
-                            for i in start..=end {
-                                if !show_tools && is_tool_role(&records[i].role) {
+                            for (i, record) in records.iter().enumerate().take(end + 1).skip(start)
+                            {
+                                if !show_tools && is_tool_role(&record.role) {
                                     continue;
                                 }
                                 if let Some(last) = last_added
@@ -1168,7 +1193,6 @@ fn build_detail_lines(
                                     continue;
                                 }
                                 last_added = Some(i);
-                                let record = &records[i];
                                 append_record(&mut lines, record, true);
                             }
                             lines.push(Line::from(""));
@@ -1198,12 +1222,11 @@ fn expand_resume_template(template: &str, session: &SessionSummary) -> String {
 }
 
 fn default_resume_template(cmd: &str) -> Option<String> {
-    let resolved = match cmd {
+    match cmd {
         "claude" => find_in_path("claude").map(|_| "claude --resume {session_id}".to_string()),
         "codex" => find_in_path("codex").map(|_| "codex resume {session_id}".to_string()),
         _ => None,
-    };
-    resolved
+    }
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -1497,9 +1520,5 @@ fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize)
         return None;
     }
     let row = (pos.y - content_y) as usize;
-    if row < len {
-        Some(row)
-    } else {
-        None
-    }
+    if row < len { Some(row) } else { None }
 }

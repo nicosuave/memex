@@ -144,8 +144,8 @@ impl SearchIndex {
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let query = AllQuery;
-        let collector = TopDocs::with_limit(limit.max(1))
-            .order_by_fast_field::<u64>("ts", Order::Desc);
+        let collector =
+            TopDocs::with_limit(limit.max(1)).order_by_fast_field::<u64>("ts", Order::Desc);
         let top_docs: Vec<(u64, tantivy::DocAddress)> = searcher.search(&query, &collector)?;
         let mut records = Vec::with_capacity(top_docs.len());
         for (_ts, addr) in top_docs {
