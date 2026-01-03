@@ -78,7 +78,6 @@ memex setup
 ```
 
 This detects which tools are installed (Claude/Codex) and presents an interactive menu to select which to configure.
-
 ## Search modes
 
 | Need | Command |
