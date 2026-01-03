@@ -102,6 +102,7 @@ struct SessionSummary {
     top_score: f32,
     snippet: String,
     source_path: String,
+    source_dir: String,
 }
 
 struct App {
@@ -1078,6 +1079,7 @@ fn add_record_to_session(
             top_score: score,
             snippet: summarize(&record.text, 160),
             source_path: record.source_path.clone(),
+            source_dir: parent_dir(&record.source_path),
         });
     entry.hit_count += 1;
     if record.ts > entry.last_ts {
@@ -1090,6 +1092,7 @@ fn add_record_to_session(
             entry.snippet = snippet;
         }
         entry.source_path = record.source_path;
+        entry.source_dir = parent_dir(&entry.source_path);
     }
 }
 
@@ -1219,11 +1222,13 @@ fn expand_resume_template(template: &str, session: &SessionSummary) -> String {
         .replace("{project}", &session.project)
         .replace("{source}", session.source.label())
         .replace("{source_path}", &session.source_path)
+        .replace("{source_dir}", &session.source_dir)
 }
 
 fn default_resume_template(cmd: &str) -> Option<String> {
     match cmd {
-        "claude" => find_in_path("claude").map(|_| "claude --resume {session_id}".to_string()),
+        "claude" => find_in_path("claude")
+            .map(|_| "cd {source_dir} && claude --resume {session_id}".to_string()),
         "codex" => find_in_path("codex").map(|_| "codex resume {session_id}".to_string()),
         _ => None,
     }
@@ -1406,6 +1411,12 @@ fn is_tool_role(role: &str) -> bool {
     role == "tool_use" || role == "tool_result"
 }
 
+fn parent_dir(path: &str) -> String {
+    std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
 fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result<Vec<String>> {
     let mut set = HashSet::new();
     index.for_each_record(|record| {
