@@ -145,20 +145,13 @@ enum Commands {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Install the memex-search skill for Claude and/or Codex
-    SkillInstall {
-        /// Install for Claude Code (default: true)
-        #[arg(long, default_value_t = true)]
-        claude: bool,
-        /// Skip Claude Code installation
-        #[arg(long)]
-        no_claude: bool,
-        /// Install for Codex
-        #[arg(long)]
-        codex: bool,
-        /// Skip Codex installation
-        #[arg(long)]
-        no_codex: bool,
+    /// Install the automem-search skill/prompt for Claude and/or Codex
+    Setup,
+    /// Update memex to the latest version
+    Update {
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -305,13 +298,11 @@ pub fn run() -> Result<()> {
         Commands::Stats { root } => {
             run_stats(root)?;
         }
-        Commands::SkillInstall {
-            claude,
-            no_claude,
-            codex,
-            no_codex,
-        } => {
-            run_skill_install(claude, no_claude, codex, no_codex)?;
+        Commands::Setup => {
+            run_setup()?;
+        }
+        Commands::Update { yes } => {
+            run_update(yes)?;
         }
     }
     Ok(())
@@ -996,56 +987,128 @@ fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn run_skill_install(
-    claude_flag: bool,
-    no_claude: bool,
-    codex_flag: bool,
-    no_codex: bool,
-) -> Result<()> {
-    let install_claude = resolve_flag(true, claude_flag && !no_claude, no_claude, "claude")?;
-    let install_codex = resolve_flag(false, codex_flag, no_codex, "codex")?;
+fn run_setup() -> Result<()> {
+    use dialoguer::{MultiSelect, theme::ColorfulTheme};
 
-    if !install_claude && !install_codex {
-        println!("nothing to install (both --no-claude and --no-codex specified)");
+    let theme = ColorfulTheme::default();
+
+    // Detect installed tools
+    let claude_path = find_in_path("claude");
+    let codex_path = find_in_path("codex");
+
+    if claude_path.is_none() && codex_path.is_none() {
+        return Err(anyhow!("Neither claude nor codex found in PATH"));
+    }
+
+    // Show what will be installed
+    println!("This will install:");
+    if claude_path.is_some() {
+        println!("  Claude Code: automem-search skill");
+    }
+    if codex_path.is_some() {
+        println!("  Codex: automem-search prompt");
+    }
+    println!();
+
+    // Build selection list (only installed tools)
+    let mut items: Vec<(&str, String)> = Vec::new();
+    let mut defaults = Vec::new();
+
+    if let Some(path) = &claude_path {
+        items.push(("claude", format!("Claude Code ({})", path.display())));
+        defaults.push(true);
+    }
+    if let Some(path) = &codex_path {
+        items.push(("codex", format!("Codex ({})", path.display())));
+        defaults.push(true);
+    }
+
+    let labels: Vec<&str> = items.iter().map(|(_, label)| label.as_str()).collect();
+
+    let selected = MultiSelect::with_theme(&theme)
+        .with_prompt("Select tools to configure")
+        .items(&labels)
+        .defaults(&defaults)
+        .interact()?;
+
+    if selected.is_empty() {
+        println!("Nothing selected.");
         return Ok(());
     }
+
+    println!();
 
     let home = directories::BaseDirs::new()
         .ok_or_else(|| anyhow!("cannot determine home directory"))?
         .home_dir()
         .to_path_buf();
 
-    let skill_content = include_str!("../skills/memex-search/SKILL.md");
+    let claude_skill = include_str!("../skills/memex-search/SKILL.md");
+    let codex_prompt = include_str!("../skills/codex/automem-search.md");
 
-    let mut installed = Vec::new();
-
-    if install_claude {
-        let claude_skills = home.join(".claude").join("skills").join("memex-search");
-        std::fs::create_dir_all(&claude_skills)?;
-        let skill_path = claude_skills.join("SKILL.md");
-        std::fs::write(&skill_path, skill_content)?;
-        installed.push(format!("claude: {}", skill_path.display()));
-    }
-
-    if install_codex {
-        let codex_skills = home.join(".codex").join("skills").join("memex-search");
-        std::fs::create_dir_all(&codex_skills)?;
-        let skill_path = codex_skills.join("SKILL.md");
-        std::fs::write(&skill_path, skill_content)?;
-        installed.push(format!("codex: {}", skill_path.display()));
-    }
-
-    if installed.is_empty() {
-        println!("no skills installed");
-    } else {
-        println!("installed memex-search skill:");
-        for path in installed {
-            println!("  {path}");
+    for index in selected {
+        let (tool, _) = &items[index];
+        match *tool {
+            "claude" => {
+                let dest_dir = home.join(".claude").join("skills").join("automem-search");
+                let dest = dest_dir.join("SKILL.md");
+                if dest.exists() {
+                    println!(
+                        "Skipping Claude skill (already installed at {}).",
+                        dest.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(&dest_dir)?;
+                    std::fs::write(&dest, claude_skill)?;
+                    println!("Installed Claude skill to {}.", dest.display());
+                }
+            }
+            "codex" => {
+                let dest_dir = home.join(".codex").join("prompts");
+                let dest = dest_dir.join("automem-search.md");
+                if dest.exists() {
+                    println!(
+                        "Skipping Codex prompt (already installed at {}).",
+                        dest.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(&dest_dir)?;
+                    std::fs::write(&dest, codex_prompt)?;
+                    println!("Installed Codex prompt to {}.", dest.display());
+                }
+            }
+            _ => {}
         }
-        println!("\nrestart claude/codex to load the skill");
     }
+
+    println!();
+    println!("Done! Restart Claude Code / Codex to pick up changes.");
 
     Ok(())
+}
+
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.is_file() && is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1567,4 +1630,147 @@ fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Resul
         return Ok(false);
     }
     Ok(default)
+}
+
+const REPO: &str = "nicosuave/memex";
+
+fn run_update(skip_confirm: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = fetch_latest_version()?;
+
+    if current == latest {
+        println!("memex is already up to date (v{current})");
+        return Ok(());
+    }
+
+    println!("Current version: v{current}");
+    println!("Latest version:  v{latest}");
+    println!();
+
+    if !skip_confirm {
+        use dialoguer::{Confirm, theme::ColorfulTheme};
+        let confirm = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt(format!("Update to v{latest}?"))
+            .default(true)
+            .interact()?;
+        if !confirm {
+            println!("Update cancelled.");
+            return Ok(());
+        }
+    }
+
+    let (os, arch) = detect_platform()?;
+    let url = format!(
+        "https://github.com/{REPO}/releases/download/v{latest}/memex-{latest}-{os}-{arch}.tar.gz"
+    );
+
+    println!("Downloading {url}...");
+
+    let tmp_dir = tempfile::tempdir()?;
+    let archive_path = tmp_dir.path().join("memex.tar.gz");
+
+    // Download using curl
+    let status = std::process::Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(&archive_path)
+        .arg(&url)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("Failed to download release"));
+    }
+
+    // Extract
+    let status = std::process::Command::new("tar")
+        .args(["-xzf"])
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(tmp_dir.path())
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("Failed to extract release"));
+    }
+
+    let new_binary = tmp_dir.path().join("memex");
+    if !new_binary.exists() {
+        return Err(anyhow!("Binary not found in release archive"));
+    }
+
+    // Replace current binary
+    let current_exe = std::env::current_exe()?;
+    let backup = current_exe.with_extension("old");
+
+    // Move current to backup, move new to current
+    if backup.exists() {
+        std::fs::remove_file(&backup)?;
+    }
+    std::fs::rename(&current_exe, &backup)?;
+    std::fs::copy(&new_binary, &current_exe)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Remove backup
+    let _ = std::fs::remove_file(&backup);
+
+    println!("Updated memex to v{latest}");
+    Ok(())
+}
+
+fn fetch_latest_version() -> Result<String> {
+    let output = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            &format!("https://api.github.com/repos/{REPO}/releases/latest"),
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to fetch latest version"));
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let tag = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No tag_name in release"))?;
+
+    Ok(tag.trim_start_matches('v').to_string())
+}
+
+fn detect_platform() -> Result<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return Err(anyhow!("Unsupported OS"));
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        return Err(anyhow!("Unsupported architecture"));
+    };
+
+    Ok((os, arch))
+}
+
+/// Check for updates in the background and print a warning if outdated.
+/// This is non-blocking and fails silently.
+pub fn check_for_update_async() {
+    std::thread::spawn(|| {
+        if let Ok(latest) = fetch_latest_version() {
+            let current = env!("CARGO_PKG_VERSION");
+            if current != latest {
+                eprintln!(
+                    "\x1b[33mA new version of memex is available: v{latest} (current: v{current})\x1b[0m"
+                );
+                eprintln!("\x1b[33mRun 'memex update' to upgrade.\x1b[0m");
+            }
+        }
+    });
 }
