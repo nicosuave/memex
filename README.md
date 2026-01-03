@@ -75,6 +75,14 @@ Human output:
 memex search "your query" -v
 ```
 
+## TUI
+
+```
+memex tui
+```
+
+![memex tui](docs/tui.png)
+
 ## Search modes
 
 | Need | Command |
