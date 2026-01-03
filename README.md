@@ -37,6 +37,11 @@ TUI:
 memex tui
 ```
 
+TUI:
+```
+./target/debug/memex tui
+```
+
 Notes:
 - Embeddings are enabled by default.
 - Searches run an incremental reindex by default (configurable).
@@ -165,6 +170,6 @@ Service logs and the plist live under `~/.memex` by default.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
 
-Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`.
+Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`.
 
 The skill/prompt definitions are bundled in `skills/`.
