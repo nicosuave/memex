@@ -2,6 +2,10 @@
 
 Fast local history search for Claude and Codex logs. Uses BM-25 and optionally embeds your transcripts locally and layers on hybrid search.
 
+Mostly intended for agents to use via skill. Intended workflow is to ask agent about a previous session & then it can narrow things down & retrieve history as needed.
+
+There is now a fast, interactive TUI for browsing sessions and jumping back into context.
+
 ## Install
 
 ```bash
