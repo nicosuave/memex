@@ -20,35 +20,6 @@ memex setup
 
 Restart Claude/Codex after setup.
 
-## Build from source
-
-```
-cargo build --release
-```
-
-Binary:
-```
-./target/release/memex
-```
-
-## Setup (manual)
-
-If you built from source, run setup to install:
-
-```bash
-memex setup
-```
-
-This detects which tools are installed (Claude/Codex) and presents an interactive menu to select which to configure.
-
-## TUI
-
-```
-memex tui
-```
-
-![memex tui](docs/tui.png)
-
 ## Quickstart
 
 Index (incremental):
@@ -84,6 +55,27 @@ Human output:
 ```
 memex search "your query" -v
 ```
+
+## Build from source
+
+```
+cargo build --release
+```
+
+Binary:
+```
+./target/release/memex
+```
+
+## Setup (manual)
+
+If you built from source, run setup to install:
+
+```bash
+memex setup
+```
+
+This detects which tools are installed (Claude/Codex) and presents an interactive menu to select which to configure.
 
 ## Search modes
 
