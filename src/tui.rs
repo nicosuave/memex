@@ -1803,13 +1803,17 @@ fn strip_ansi_and_controls(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut count = 0usize;
-    while let Some(ch) = chars.next() {
+    loop {
+        let Some(ch) = chars.next() else {
+            break;
+        };
         if ch == '\u{1b}' {
             if matches!(chars.peek(), Some('[')) {
                 chars.next();
-                while let Some(c) = chars.next() {
-                    if c.is_ascii_alphabetic() {
-                        break;
+                loop {
+                    match chars.next() {
+                        Some(c) if !c.is_ascii_alphabetic() => continue,
+                        Some(_) | None => break,
                     }
                 }
             }
