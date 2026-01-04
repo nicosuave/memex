@@ -1155,8 +1155,10 @@ fn run_setup() -> Result<()> {
                 }
 
                 // Install instruction-improver skill
-                let improver_dir =
-                    home.join(".claude").join("skills").join("instruction-improver");
+                let improver_dir = home
+                    .join(".claude")
+                    .join("skills")
+                    .join("instruction-improver");
                 let improver_dest = improver_dir.join("SKILL.md");
                 if improver_dest.exists() {
                     println!(
