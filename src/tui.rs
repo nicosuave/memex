@@ -14,12 +14,27 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
-use std::io::{Stdout, Write};
+#[cfg(not(unix))]
+use std::io::Stdout;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+
+type TuiBackend = CrosstermBackend<TuiWriter>;
+type TuiTerminal = Terminal<TuiBackend>;
+
+#[cfg(unix)]
+type TuiWriter = std::fs::File;
+#[cfg(not(unix))]
+type TuiWriter = Stdout;
 
 enum IndexUpdate {
     Started,
@@ -41,9 +56,30 @@ enum SearchUpdate {
 const RESULT_LIMIT: usize = 200;
 const DETAIL_TAIL_LINES: usize = 10;
 const MAX_MESSAGE_CHARS: usize = 4000;
+const PREVIEW_LINE_MAX_CHARS: usize = 320;
 const CONTEXT_AROUND_MATCH: usize = 1;
 const RECENT_SESSIONS_LIMIT: usize = 200;
 const RECENT_RECORDS_MULTIPLIER: usize = 50;
+
+const OUTER_PAD_X: u16 = 0;
+const OUTER_PAD_Y: u16 = 0;
+const PANEL_PAD_X: u16 = 2;
+const PANEL_PAD_Y: u16 = 1;
+const PANEL_TITLE_HEIGHT: u16 = 1;
+const HEADER_HEIGHT: u16 = 3;
+const FOOTER_HEIGHT: u16 = 2;
+const PROJECT_PANEL_HEIGHT: u16 = 6;
+const SPLIT_GAP: u16 = 1;
+
+const COLOR_BASE: Color = Color::Black;
+const COLOR_PANEL: Color = Color::Black;
+const COLOR_PANEL_ALT: Color = Color::Black;
+const COLOR_TEXT: Color = Color::Rgb(220, 220, 220);
+const COLOR_MUTED: Color = Color::Rgb(140, 140, 140);
+const COLOR_ACCENT: Color = Color::Rgb(198, 150, 115);
+const COLOR_SELECTION_BG: Color = Color::Rgb(214, 160, 120);
+const COLOR_SELECTION_FG: Color = Color::Rgb(20, 20, 20);
+const COLOR_DIVIDER: Color = Color::Rgb(36, 36, 36);
 
 #[derive(Clone, Copy, Debug)]
 enum Focus {
@@ -123,7 +159,7 @@ struct App {
     preview_mode: PreviewMode,
     show_tools: bool,
     find_query: String,
-    detail_lines: Vec<Line<'static>>,
+    detail_lines: Vec<PreviewLine>,
     detail_scroll: usize,
     last_detail_session: Option<String>,
     last_detail_query: Option<String>,
@@ -144,6 +180,156 @@ struct App {
     project_area: Option<Rect>,
     left_width: Option<u16>,
     dragging: bool,
+    stdio_redirect: Option<StdIoRedirect>,
+}
+
+#[derive(Clone, Debug)]
+enum PreviewLine {
+    SessionHeader {
+        project: String,
+        source: String,
+        session_id: String,
+    },
+    Meta {
+        role: String,
+        ts: String,
+        highlight: bool,
+    },
+    Text(String),
+    Empty,
+}
+
+struct Theme {
+    base: Style,
+    panel: Style,
+    panel_alt: Style,
+    text: Style,
+    text_bold: Style,
+    muted: Style,
+    accent: Style,
+    focus: Style,
+    selection: Style,
+}
+
+impl Theme {
+    fn new() -> Self {
+        Self {
+            base: Style::default().bg(COLOR_BASE).fg(COLOR_TEXT),
+            panel: Style::default().bg(COLOR_PANEL).fg(COLOR_TEXT),
+            panel_alt: Style::default().bg(COLOR_PANEL_ALT).fg(COLOR_TEXT),
+            text: Style::default().fg(COLOR_TEXT),
+            text_bold: Style::default()
+                .fg(COLOR_TEXT)
+                .add_modifier(Modifier::BOLD),
+            muted: Style::default().fg(COLOR_MUTED),
+            accent: Style::default().fg(COLOR_ACCENT),
+            focus: Style::default()
+                .fg(COLOR_ACCENT)
+                .add_modifier(Modifier::BOLD),
+            selection: Style::default()
+                .fg(COLOR_SELECTION_FG)
+                .bg(COLOR_SELECTION_BG)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct StdIoRedirect {
+    stdout_fd: i32,
+    stderr_fd: i32,
+    devnull_fd: i32,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl StdIoRedirect {
+    fn new() -> Result<Self> {
+        let devnull = CString::new("/dev/null").unwrap();
+        let devnull_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_WRONLY) };
+        if devnull_fd < 0 {
+            return Err(anyhow::anyhow!("failed to open /dev/null"));
+        }
+        let stdout_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if stdout_fd < 0 {
+            unsafe { libc::close(devnull_fd) };
+            return Err(anyhow::anyhow!("failed to dup stdout"));
+        }
+        let stderr_fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if stderr_fd < 0 {
+            unsafe {
+                libc::close(devnull_fd);
+                libc::close(stdout_fd);
+            }
+            return Err(anyhow::anyhow!("failed to dup stderr"));
+        }
+        Ok(Self {
+            stdout_fd,
+            stderr_fd,
+            devnull_fd,
+            active: false,
+        })
+    }
+
+    fn enable(&mut self) -> Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        let stdout_rc = unsafe { libc::dup2(self.devnull_fd, libc::STDOUT_FILENO) };
+        if stdout_rc < 0 {
+            return Err(anyhow::anyhow!("failed to redirect stdout"));
+        }
+        let stderr_rc = unsafe { libc::dup2(self.devnull_fd, libc::STDERR_FILENO) };
+        if stderr_rc < 0 {
+            return Err(anyhow::anyhow!("failed to redirect stderr"));
+        }
+        self.active = true;
+        Ok(())
+    }
+
+    fn disable(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let stdout_rc = unsafe { libc::dup2(self.stdout_fd, libc::STDOUT_FILENO) };
+        if stdout_rc < 0 {
+            return Err(anyhow::anyhow!("failed to restore stdout"));
+        }
+        let stderr_rc = unsafe { libc::dup2(self.stderr_fd, libc::STDERR_FILENO) };
+        if stderr_rc < 0 {
+            return Err(anyhow::anyhow!("failed to restore stderr"));
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StdIoRedirect {
+    fn drop(&mut self) {
+        let _ = self.disable();
+        unsafe {
+            libc::close(self.devnull_fd);
+            libc::close(self.stdout_fd);
+            libc::close(self.stderr_fd);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StdIoRedirect;
+
+#[cfg(not(unix))]
+impl StdIoRedirect {
+    fn new() -> Result<Self> {
+        Ok(Self)
+    }
+    fn enable(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn disable(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub fn run(
@@ -159,12 +345,15 @@ pub fn run(
     let mut app = App::new(
         paths, config, index, index_tx, index_rx, search_tx, search_rx,
     );
+    app.stdio_redirect = Some(StdIoRedirect::new()?);
     app.update_rx = update_rx;
     app.kickoff_index_refresh();
     app.kickoff_search();
 
     let mut terminal = enter_terminal()?;
+    app.suppress_stdio()?;
     let res = run_loop(&mut terminal, &mut app);
+    app.restore_stdio()?;
     exit_terminal(&mut terminal)?;
     res
 }
@@ -217,6 +406,7 @@ impl App {
             project_area: None,
             left_width: None,
             dragging: false,
+            stdio_redirect: None,
         }
     }
 
@@ -271,12 +461,12 @@ impl App {
 
     fn update_detail(&mut self) {
         let Some(idx) = self.selected.selected() else {
-            self.detail_lines = vec![Line::from("no session selected")];
+            self.detail_lines = vec![PreviewLine::Text("no session selected".to_string())];
             self.detail_scroll = 0;
             return;
         };
         if idx >= self.results.len() {
-            self.detail_lines = vec![Line::from("no session selected")];
+            self.detail_lines = vec![PreviewLine::Text("no session selected".to_string())];
             self.detail_scroll = 0;
             return;
         }
@@ -323,7 +513,7 @@ impl App {
                 self.last_detail_find = Some(find_now);
             }
             Err(err) => {
-                self.detail_lines = vec![Line::from(format!("detail error: {err}"))];
+                self.detail_lines = vec![PreviewLine::Text(format!("detail error: {err}"))];
                 self.detail_scroll = 0;
                 self.last_detail_session = None;
                 self.last_detail_query = None;
@@ -414,13 +604,15 @@ impl App {
         self.last_status_at = Some(Instant::now());
     }
 
-    fn clear_status_if_old(&mut self) {
+    fn clear_status_if_old(&mut self) -> bool {
         if let Some(at) = self.last_status_at
             && at.elapsed() > Duration::from_secs(4)
         {
             self.status.clear();
             self.last_status_at = None;
+            return true;
         }
+        false
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -463,7 +655,12 @@ impl App {
         if self.detail_lines.is_empty() {
             return;
         }
-        let max_scroll = self.detail_lines.len().saturating_sub(1);
+        let view_height = self.preview_area.height as usize;
+        let max_scroll = if view_height == 0 {
+            self.detail_lines.len().saturating_sub(1)
+        } else {
+            self.detail_lines.len().saturating_sub(view_height)
+        };
         let next = (self.detail_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.detail_scroll = next;
     }
@@ -473,7 +670,7 @@ impl App {
         self.update_detail();
     }
 
-    fn resume_selected(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    fn resume_selected(&mut self, terminal: &mut TuiTerminal) -> Result<()> {
         let Some(idx) = self.selected.selected() else {
             self.set_status("no session selected");
             return Ok(());
@@ -500,21 +697,35 @@ impl App {
         };
         let cwd = resolve_session_cwd(session).unwrap_or_else(|| session.source_dir.clone());
         let command = expand_resume_template(&template, session, &cwd);
-        run_external_command(terminal, &command)?;
+        run_external_command(self, terminal, &command)?;
         self.set_status(format!("ran: {command}"));
+        Ok(())
+    }
+
+    fn suppress_stdio(&mut self) -> Result<()> {
+        if let Some(redirect) = self.stdio_redirect.as_mut() {
+            redirect.enable()?;
+        }
+        Ok(())
+    }
+
+    fn restore_stdio(&mut self) -> Result<()> {
+        if let Some(redirect) = self.stdio_redirect.as_mut() {
+            redirect.disable()?;
+        }
         Ok(())
     }
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
     loop {
-        app.clear_status_if_old();
+        let mut dirty = app.clear_status_if_old();
         if let Some(update_rx) = app.update_rx.as_ref() {
             while let Ok(message) = update_rx.try_recv() {
                 app.update_message = Some(message);
+                dirty = true;
             }
         }
-        terminal.draw(|f| draw_ui(f, app))?;
         if let Ok(update) = app.index_rx.try_recv() {
             match update {
                 IndexUpdate::Started => app.set_status("indexing..."),
@@ -524,6 +735,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                 }
                 IndexUpdate::Error(msg) => app.set_status(format!("index error: {msg}")),
             }
+            dirty = true;
         }
         while let Ok(update) = app.search_rx.try_recv() {
             match update {
@@ -547,20 +759,34 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                 }
                 SearchUpdate::Error(msg) => app.set_status(format!("search error: {msg}")),
             }
+            dirty = true;
         }
-        if !crossterm::event::poll(Duration::from_millis(100))? {
-            continue;
-        }
-        match crossterm::event::read()? {
-            Event::Key(key) => {
-                if handle_key(key, terminal, app)? {
+        let mut should_quit = false;
+        if crossterm::event::poll(Duration::from_millis(16))? {
+            loop {
+                match crossterm::event::read()? {
+                    Event::Key(key) => {
+                        if handle_key(key, terminal, app)? {
+                            should_quit = true;
+                            break;
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        handle_mouse(mouse, app);
+                    }
+                    _ => {}
+                }
+                dirty = true;
+                if !crossterm::event::poll(Duration::from_millis(0))? {
                     break;
                 }
             }
-            Event::Mouse(mouse) => {
-                handle_mouse(mouse, app);
-            }
-            _ => {}
+        }
+        if should_quit {
+            break;
+        }
+        if dirty {
+            terminal.draw(|f| draw_ui(f, app))?;
         }
     }
     Ok(())
@@ -568,7 +794,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
 
 fn handle_key(
     key: KeyEvent,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut TuiTerminal,
     app: &mut App,
 ) -> Result<bool> {
     if matches!(key.code, KeyCode::Esc) {
@@ -787,167 +1013,163 @@ fn handle_key(
 }
 
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
-    frame.render_widget(Clear, frame.area());
+    let theme = Theme::new();
+    frame.render_widget(Block::default().style(theme.base), frame.area());
+    let area = inset(frame.area(), OUTER_PAD_X, OUTER_PAD_X, OUTER_PAD_Y, OUTER_PAD_Y);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(FOOTER_HEIGHT),
         ])
-        .split(frame.area());
+        .split(area);
 
     app.header_area = root[0];
     app.body_area = root[1];
 
-    draw_header(frame, app, root[0]);
-    draw_body(frame, app, root[1]);
-    draw_footer(frame, app, root[2]);
+    draw_header(frame, app, &theme, root[0]);
+    draw_body(frame, app, &theme, root[1]);
+    draw_footer(frame, app, &theme, root[2]);
 }
 
-fn draw_header(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let border = Block::default().borders(Borders::ALL).title("sessions");
-
-    let highlight = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let idle = Style::default().fg(Color::Gray);
+fn draw_header(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
+    frame.render_widget(Block::default().style(theme.panel), area);
+    let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
 
     let query_style = if matches!(app.focus, Focus::Query) {
-        highlight
+        theme.focus
     } else {
-        idle
+        theme.text
     };
     let project_style = if matches!(app.focus, Focus::Project) {
-        highlight
+        theme.focus
     } else {
-        idle
+        theme.text
+    };
+    let find_style = if matches!(app.focus, Focus::Find) {
+        theme.focus
+    } else {
+        theme.text
     };
 
-    let line = Line::from(vec![
-        Span::styled(" query: ", Style::default().fg(Color::Yellow)),
+    let line1 = Line::from(vec![
+        Span::styled("memex", theme.text_bold),
+        Span::raw("  "),
+        Span::styled("source ", theme.muted),
+        Span::styled(app.source.label(), theme.accent),
+        Span::raw("  "),
+        Span::styled("mode ", theme.muted),
         Span::styled(
-            if app.query.is_empty() {
-                "<empty>"
-            } else {
-                app.query.as_str()
+            match app.preview_mode {
+                PreviewMode::Matches => "matches",
+                PreviewMode::History => "history",
             },
-            query_style,
-        ),
-        Span::raw("   "),
-        Span::styled("project: ", Style::default().fg(Color::Yellow)),
-        Span::styled(
-            if app.project.is_empty() {
-                "<any>"
-            } else {
-                app.project.as_str()
-            },
-            project_style,
-        ),
-        Span::raw("   "),
-        Span::styled("source: ", Style::default().fg(Color::Yellow)),
-        Span::styled(app.source.label(), Style::default().fg(Color::Green)),
-        Span::raw("   "),
-        Span::styled("find: ", Style::default().fg(Color::Yellow)),
-        Span::styled(
-            if app.find_query.is_empty() {
-                "<none>"
-            } else {
-                app.find_query.as_str()
-            },
-            if matches!(app.focus, Focus::Find) {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            },
+            theme.text,
         ),
     ]);
-    let mut shortcuts = vec![
-        Span::styled("keys: ", Style::default().fg(Color::Yellow)),
-        Span::raw("tab/shift+tab focus "),
-        Span::raw("| / query (clear) "),
-        Span::raw("| f find "),
-        Span::raw("| p project "),
-        Span::raw("| j/k move "),
-        Span::raw("| h/l pane "),
-        Span::raw("| m mode "),
-        Span::raw("| t tools "),
-        Span::raw("| r resume "),
-        Span::raw("| i index "),
-        Span::raw("| esc/ctrl+q quit"),
-    ];
-    if let Some(message) = &app.update_message {
-        shortcuts.push(Span::raw(" | "));
-        shortcuts.push(Span::styled(
-            message.as_str(),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    let shortcuts = Line::from(shortcuts);
 
-    let paragraph = Paragraph::new(vec![line, shortcuts])
-        .block(border)
-        .alignment(Alignment::Left);
-    frame.render_widget(paragraph, area);
+    let query_value = if app.query.is_empty() {
+        Span::styled("<empty>", theme.muted)
+    } else {
+        Span::styled(app.query.as_str(), query_style)
+    };
+    let project_value = if app.project.is_empty() {
+        Span::styled("<any>", theme.muted)
+    } else {
+        Span::styled(app.project.as_str(), project_style)
+    };
+    let find_value = if app.find_query.is_empty() {
+        Span::styled("<none>", theme.muted)
+    } else {
+        Span::styled(app.find_query.as_str(), find_style)
+    };
+
+    let line2 = Line::from(vec![
+        Span::styled("query ", theme.muted),
+        query_value,
+        Span::raw("   "),
+        Span::styled("project ", theme.muted),
+        project_value,
+        Span::raw("   "),
+        Span::styled("find ", theme.muted),
+        find_value,
+    ]);
+
+    let paragraph = Paragraph::new(vec![line1, line2]).alignment(Alignment::Left);
+    frame.render_widget(paragraph, inner);
 }
 
-fn draw_body(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
     let min_left = 20u16;
     let min_right = 24u16;
-    let total = area.width.max(min_left + min_right);
+    let total = area.width.max(min_left + min_right + SPLIT_GAP);
     let mut left_width = app.left_width.unwrap_or(total.saturating_mul(45) / 100);
-    left_width = left_width.clamp(min_left, total.saturating_sub(min_right));
+    left_width = left_width.clamp(min_left, total.saturating_sub(min_right + SPLIT_GAP));
     app.left_width = Some(left_width);
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(left_width), Constraint::Min(min_right)])
+        .constraints([
+            Constraint::Length(left_width),
+            Constraint::Length(SPLIT_GAP),
+            Constraint::Min(min_right),
+        ])
         .split(area);
+
+    if SPLIT_GAP > 0 {
+        let divider_style = Style::default().bg(COLOR_DIVIDER);
+        frame.render_widget(Block::default().style(divider_style), chunks[1]);
+    }
 
     let mut project_area = None;
     let mut sessions_area = chunks[0];
     if matches!(app.focus, Focus::Project) {
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(5)])
+            .constraints([Constraint::Length(PROJECT_PANEL_HEIGHT), Constraint::Min(5)])
             .split(chunks[0]);
         project_area = Some(left_chunks[0]);
         sessions_area = left_chunks[1];
     }
 
     if let Some(project_area) = project_area {
-        let project_items: Vec<ListItem> = if app.project_options.is_empty() {
-            vec![ListItem::new(Line::from("no projects"))]
-        } else {
-            app.project_options
-                .iter()
-                .map(|project| ListItem::new(Line::from(project.as_str())))
-                .collect()
-        };
-        let project_list = List::new(project_items)
-            .block(Block::default().borders(Borders::ALL).title("projects"))
-            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
-            .highlight_symbol("> ");
-        let mut project_state = ListState::default();
-        if !app.project_options.is_empty() {
-            project_state.select(Some(
-                app.project_selected
-                    .min(app.project_options.len().saturating_sub(1)),
-            ));
-        }
-        frame.render_stateful_widget(project_list, project_area, &mut project_state);
+        let content_area = draw_project_panel(frame, app, theme, project_area);
+        app.project_area = Some(content_area);
+    } else {
+        app.project_area = None;
     }
 
-    app.project_area = project_area;
-    app.list_area = sessions_area;
-    app.preview_area = chunks[1];
+    let list_content = draw_sessions_panel(frame, app, theme, sessions_area);
+    app.list_area = list_content;
+    app.preview_area = draw_preview_panel(frame, app, theme, chunks[2]);
+}
+
+fn draw_sessions_panel(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+) -> Rect {
+    frame.render_widget(Block::default().style(theme.panel), area);
+    let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
+    let header = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: PANEL_TITLE_HEIGHT.min(inner.height),
+    };
+    let content = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(PANEL_TITLE_HEIGHT),
+        width: inner.width,
+        height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
+    };
+    let title = Paragraph::new(Line::from(Span::styled("Sessions", theme.text_bold)));
+    frame.render_widget(title, header);
 
     let list_items: Vec<ListItem> = if app.results.is_empty() {
-        vec![ListItem::new(Line::from("no sessions"))]
+        vec![ListItem::new(Line::from(Span::styled("no sessions", theme.muted)))]
     } else {
         app.results
             .iter()
@@ -956,18 +1178,18 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 let line = Line::from(vec![
                     Span::styled(
                         format!("{:>4}", session.hit_count),
-                        Style::default().fg(Color::Yellow),
+                        theme.accent,
                     ),
                     Span::raw(" "),
-                    Span::styled(session.project.as_str(), Style::default().fg(Color::Cyan)),
+                    Span::styled(session.project.as_str(), theme.text),
                     Span::raw(" "),
-                    Span::styled(session.source.label(), Style::default().fg(Color::Magenta)),
+                    Span::styled(session.source.label(), theme.muted),
                     Span::raw(" "),
-                    Span::styled(ts, Style::default().fg(Color::Gray)),
+                    Span::styled(ts, theme.muted),
                     Span::raw(" "),
                     Span::styled(
                         session.session_id.as_str(),
-                        Style::default().fg(Color::White),
+                        theme.text,
                     ),
                 ]);
                 ListItem::new(line)
@@ -976,49 +1198,142 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     };
 
     let list = List::new(list_items)
-        .block(Block::default().borders(Borders::ALL).title("sessions"))
-        .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
-        .highlight_symbol("> ");
+        .style(theme.text)
+        .highlight_style(theme.selection)
+        .highlight_symbol("");
 
-    frame.render_stateful_widget(list, sessions_area, &mut app.selected);
-
-    let detail_title = match app.preview_mode {
-        PreviewMode::Matches => "preview: matches",
-        PreviewMode::History => "preview: history",
-    };
-    let detail_block = Block::default().borders(Borders::ALL).title(detail_title);
-    let detail = Paragraph::new(app.detail_lines.clone())
-        .block(detail_block)
-        .scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(detail, chunks[1]);
+    frame.render_stateful_widget(list, content, &mut app.selected);
+    content
 }
 
-fn draw_footer(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let help = "enter search | s source | pgup/pgdn scroll (preview)";
+fn draw_project_panel(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+) -> Rect {
+    frame.render_widget(Block::default().style(theme.panel_alt), area);
+    let inner = panel_inner(area);
+    let header = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: PANEL_TITLE_HEIGHT.min(inner.height),
+    };
+    let content = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(PANEL_TITLE_HEIGHT),
+        width: inner.width,
+        height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
+    };
+    let title = Paragraph::new(Line::from(Span::styled("Projects", theme.text_bold)));
+    frame.render_widget(title, header);
+
+    let project_items: Vec<ListItem> = if app.project_options.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled("no projects", theme.muted)))]
+    } else {
+        app.project_options
+            .iter()
+            .map(|project| ListItem::new(Line::from(Span::styled(project.as_str(), theme.text))))
+            .collect()
+    };
+    let project_list = List::new(project_items)
+        .style(theme.text)
+        .highlight_style(theme.selection)
+        .highlight_symbol("");
+    let mut project_state = ListState::default();
+    if !app.project_options.is_empty() {
+        project_state.select(Some(
+            app.project_selected
+                .min(app.project_options.len().saturating_sub(1)),
+        ));
+    }
+    frame.render_stateful_widget(project_list, content, &mut project_state);
+    content
+}
+
+fn draw_preview_panel(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+) -> Rect {
+    frame.render_widget(Block::default().style(theme.panel_alt), area);
+    let inner = panel_inner(area);
+    let header = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: PANEL_TITLE_HEIGHT.min(inner.height),
+    };
+    let content = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(PANEL_TITLE_HEIGHT),
+        width: inner.width,
+        height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
+    };
+    let detail_title = match app.preview_mode {
+        PreviewMode::Matches => "Preview · Matches",
+        PreviewMode::History => "Preview · History",
+    };
+    let title = Paragraph::new(Line::from(Span::styled(detail_title, theme.text_bold)));
+    frame.render_widget(title, header);
+    let view_height = content.height as usize;
+    let start = app.detail_scroll.min(app.detail_lines.len());
+    let end = if view_height == 0 {
+        start
+    } else {
+        (start + view_height).min(app.detail_lines.len())
+    };
+    let visible_lines: Vec<Line> = app.detail_lines[start..end]
+        .iter()
+        .map(|line| render_preview_line(line, theme))
+        .collect();
+    let detail = Paragraph::new(visible_lines)
+        .style(theme.text)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, content);
+    content
+}
+
+fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
     let status = if app.status.is_empty() {
         "ready"
     } else {
         &app.status
     };
+    frame.render_widget(Block::default().style(theme.panel), area);
+    let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
     let status_line = Line::from(vec![
-        Span::styled("status: ", Style::default().fg(Color::Yellow)),
-        Span::raw(status),
+        Span::styled("status ", theme.muted),
+        Span::styled(status, theme.text),
         Span::raw("  "),
-        Span::styled("mode: ", Style::default().fg(Color::Yellow)),
-        Span::raw(match app.preview_mode {
-            PreviewMode::Matches => "matches",
-            PreviewMode::History => "history",
-        }),
+        Span::styled("tools ", theme.muted),
+        Span::styled(if app.show_tools { "on" } else { "off" }, theme.text),
         Span::raw("  "),
-        Span::styled("tools: ", Style::default().fg(Color::Yellow)),
-        Span::raw(if app.show_tools { "on" } else { "off" }),
+        Span::styled("focus ", theme.muted),
+        Span::styled(format!("{:?}", app.focus).to_lowercase(), theme.text),
     ]);
-    let block = Block::default().borders(Borders::ALL);
-    let paragraph = Paragraph::new(vec![status_line, Line::from(help)])
-        .block(block)
-        .style(Style::default().fg(Color::Gray));
-    frame.render_widget(paragraph, area);
+    let shortcuts_line = Line::from(vec![
+        Span::styled("tab", theme.accent),
+        Span::styled(" focus  ", theme.muted),
+        Span::styled("/", theme.accent),
+        Span::styled(" query  ", theme.muted),
+        Span::styled("f", theme.accent),
+        Span::styled(" find  ", theme.muted),
+        Span::styled("p", theme.accent),
+        Span::styled(" project  ", theme.muted),
+        Span::styled("m", theme.accent),
+        Span::styled(" mode  ", theme.muted),
+        Span::styled("t", theme.accent),
+        Span::styled(" tools  ", theme.muted),
+        Span::styled("r", theme.accent),
+        Span::styled(" resume  ", theme.muted),
+        Span::styled("esc", theme.accent),
+        Span::styled(" quit", theme.muted),
+    ]);
+    let paragraph = Paragraph::new(vec![status_line, shortcuts_line]);
+    frame.render_widget(paragraph, inner);
 }
 
 fn sessions_from_query(
@@ -1125,7 +1440,7 @@ fn build_detail_lines(
     mode: PreviewMode,
     query: &str,
     show_tools: bool,
-) -> Result<Vec<Line<'static>>> {
+) -> Result<Vec<PreviewLine>> {
     let mut records = index.records_by_session_id(&session.session_id)?;
     records.sort_by(|a, b| {
         a.turn_id
@@ -1133,29 +1448,20 @@ fn build_detail_lines(
             .then_with(|| a.ts.cmp(&b.ts))
             .then_with(|| a.doc_id.cmp(&b.doc_id))
     });
-    let header = Line::from(vec![
-        Span::styled("session ", Style::default().fg(Color::Yellow)),
-        Span::styled(
-            session.session_id.clone(),
-            Style::default().fg(Color::White),
-        ),
-        Span::raw("  "),
-        Span::styled(session.project.clone(), Style::default().fg(Color::Cyan)),
-        Span::raw("  "),
-        Span::styled(session.source.label(), Style::default().fg(Color::Magenta)),
-    ]);
-    let mut lines = vec![header];
+    let mut lines = vec![PreviewLine::SessionHeader {
+        project: session.project.clone(),
+        source: session.source.label().to_string(),
+        session_id: session.session_id.clone(),
+    }];
     if records.is_empty() {
-        lines.push(Line::from("no records in session"));
+        lines.push(PreviewLine::Text("no records in session".to_string()));
         return Ok(lines);
     }
     if !session.snippet.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("top hit: ", Style::default().fg(Color::Green)),
-            Span::raw(session.snippet.clone()),
-        ]));
+        let snippet = strip_ansi_and_controls(&session.snippet);
+        lines.push(PreviewLine::Text(format!("top hit: {snippet}")));
     }
-    lines.push(Line::from(""));
+    lines.push(PreviewLine::Empty);
 
     match mode {
         PreviewMode::Matches => {
@@ -1170,7 +1476,7 @@ fn build_detail_lines(
             } else {
                 let matchers = build_matchers(query)?;
                 if matchers.is_empty() {
-                    lines.push(Line::from("no valid query terms"));
+                    lines.push(PreviewLine::Text("no valid query terms".to_string()));
                 } else {
                     let mut matches_all = false;
                     let mut matches_non_tools = false;
@@ -1193,15 +1499,15 @@ fn build_detail_lines(
                     }
                     if indices.is_empty() {
                         if !matches_all {
-                            lines.push(Line::from(
-                                "no literal matches (search matched via tokenizer)",
+                            lines.push(PreviewLine::Text(
+                                "no literal matches (search matched via tokenizer)".to_string(),
                             ));
                         } else if !show_tools && !matches_non_tools {
-                            lines.push(Line::from(
-                                "matches only in tool messages (press t to show)",
+                            lines.push(PreviewLine::Text(
+                                "matches only in tool messages (press t to show)".to_string(),
                             ));
                         } else {
-                            lines.push(Line::from("no matches in session"));
+                            lines.push(PreviewLine::Text("no matches in session".to_string()));
                         }
                     } else {
                         let mut last_added: Option<usize> = None;
@@ -1221,7 +1527,6 @@ fn build_detail_lines(
                                 last_added = Some(i);
                                 append_record(&mut lines, record, true);
                             }
-                            lines.push(Line::from(""));
                         }
                     }
                 }
@@ -1271,9 +1576,11 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 }
 
 fn run_external_command(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    terminal: &mut TuiTerminal,
     command: &str,
 ) -> Result<()> {
+    app.restore_stdio()?;
     exit_terminal(terminal)?;
     let status = std::process::Command::new("sh")
         .arg("-lc")
@@ -1290,20 +1597,34 @@ fn run_external_command(
     println!("press Enter to return to memex");
     let _ = std::io::stdin().read_line(&mut String::new());
     *terminal = enter_terminal()?;
+    app.suppress_stdio()?;
     Ok(())
 }
 
-fn enter_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+#[cfg(unix)]
+fn open_tty() -> Result<TuiWriter> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?)
+}
+
+#[cfg(not(unix))]
+fn open_tty() -> Result<TuiWriter> {
+    Ok(std::io::stdout())
+}
+
+fn enter_terminal() -> Result<TuiTerminal> {
+    let mut writer = open_tty()?;
     terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
+    execute!(writer, terminal::EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
     Ok(terminal)
 }
 
-fn exit_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn exit_terminal(terminal: &mut TuiTerminal) -> Result<()> {
     terminal::disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -1392,7 +1713,7 @@ fn matches_any(text: &str, matchers: &[regex::Regex]) -> bool {
     matchers.iter().any(|re| re.is_match(text))
 }
 
-fn append_records<'a, I>(lines: &mut Vec<Line<'static>>, records: I)
+fn append_records<'a, I>(lines: &mut Vec<PreviewLine>, records: I)
 where
     I: IntoIterator<Item = &'a Record>,
 {
@@ -1401,35 +1722,121 @@ where
     }
 }
 
-fn append_record(lines: &mut Vec<Line<'static>>, record: &Record, highlight: bool) {
+fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool) {
     let role = if record.role.is_empty() {
         "unknown"
     } else {
         record.role.as_str()
     };
     let ts = format_ts(record.ts);
-    let style = if highlight {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    lines.push(Line::from(vec![
-        Span::styled(ts, style),
-        Span::raw(" "),
-        Span::styled(role.to_string(), Style::default().fg(Color::Yellow)),
-    ]));
+    lines.push(PreviewLine::Meta {
+        role: role.to_string(),
+        ts,
+        highlight,
+    });
     let text = if record.text.len() > MAX_MESSAGE_CHARS {
         let trimmed = summarize(&record.text, MAX_MESSAGE_CHARS);
         format!("{trimmed} …")
     } else {
         record.text.clone()
     };
-    if !text.is_empty() {
-        lines.push(Line::from(text));
+    let sanitized = sanitize_preview_lines(&text);
+    if sanitized.is_empty() {
+        lines.push(PreviewLine::Text("<empty>".to_string()));
     } else {
-        lines.push(Line::from("<empty>"));
+        for line in sanitized {
+            lines.push(PreviewLine::Text(line));
+        }
     }
-    lines.push(Line::from(""));
+    lines.push(PreviewLine::Empty);
+}
+
+fn sanitize_preview_lines(text: &str) -> Vec<String> {
+    text.split('\n').map(strip_ansi_and_controls).collect()
+}
+
+fn role_color(role: &str) -> Color {
+    match role {
+        "user" => Color::Rgb(198, 150, 115),
+        "assistant" => Color::Rgb(160, 180, 200),
+        "system" => Color::Rgb(170, 150, 200),
+        "tool_use" | "tool_result" | "tool" => Color::Rgb(150, 180, 150),
+        _ => COLOR_MUTED,
+    }
+}
+
+fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
+    match line {
+        PreviewLine::SessionHeader {
+            project,
+            source,
+            session_id,
+        } => Line::from(vec![
+            Span::styled("project ", theme.muted),
+            Span::styled(project.as_str(), theme.accent),
+            Span::raw("  "),
+            Span::styled("source ", theme.muted),
+            Span::styled(source.as_str(), theme.muted),
+            Span::raw("  "),
+            Span::styled("session ", theme.muted),
+            Span::styled(session_id.as_str(), theme.text),
+        ]),
+        PreviewLine::Meta { role, ts, highlight } => {
+            let meta_style = if *highlight {
+                Style::default().fg(COLOR_ACCENT)
+            } else {
+                Style::default().fg(COLOR_MUTED)
+            };
+            let mut role_style = Style::default().fg(role_color(role));
+            if *highlight {
+                role_style = role_style.add_modifier(Modifier::BOLD);
+            }
+            Line::from(vec![
+                Span::styled(role.as_str(), role_style),
+                Span::raw(" "),
+                Span::styled(ts.as_str(), meta_style),
+            ])
+        }
+        PreviewLine::Text(text) => Line::from(Span::raw(text.as_str())),
+        PreviewLine::Empty => Line::from(""),
+    }
+}
+
+fn strip_ansi_and_controls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut count = 0usize;
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\t' {
+            out.push(' ');
+            count += 1;
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+        count += 1;
+        if count >= PREVIEW_LINE_MAX_CHARS {
+            out.push_str("...");
+            break;
+        }
+    }
+    out
 }
 
 fn is_tool_role(role: &str) -> bool {
@@ -1507,7 +1914,11 @@ fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if near_divider(mouse.column, app.body_area, app.list_area) {
+            if near_divider(
+                mouse.column,
+                app.body_area,
+                app.left_width.unwrap_or(0),
+            ) {
                 app.dragging = true;
                 return;
             }
@@ -1566,11 +1977,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     }
 }
 
-fn near_divider(x: u16, body: Rect, list: Rect) -> bool {
+fn near_divider(x: u16, body: Rect, left_width: u16) -> bool {
     if body.width == 0 {
         return false;
     }
-    let divider_x = list.x.saturating_add(list.width);
+    let divider_x = body.x.saturating_add(left_width).saturating_add(SPLIT_GAP / 2);
     let min_x = divider_x.saturating_sub(1);
     let max_x = divider_x.saturating_add(1);
     x >= min_x && x <= max_x
@@ -1579,26 +1990,45 @@ fn near_divider(x: u16, body: Rect, list: Rect) -> bool {
 fn resize_split(x: u16, app: &mut App) {
     let min_left = 20u16;
     let min_right = 24u16;
-    let total = app.body_area.width.max(min_left + min_right);
+    let total = app.body_area.width.max(min_left + min_right + SPLIT_GAP);
     let mut left = x.saturating_sub(app.body_area.x);
     if left < min_left {
         left = min_left;
     }
-    if left > total.saturating_sub(min_right) {
-        left = total.saturating_sub(min_right);
+    if left > total.saturating_sub(min_right + SPLIT_GAP) {
+        left = total.saturating_sub(min_right + SPLIT_GAP);
     }
     app.left_width = Some(left);
+}
+
+fn inset(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
+    let x = area.x.saturating_add(left);
+    let y = area.y.saturating_add(top);
+    let width = area.width.saturating_sub(left + right);
+    let height = area.height.saturating_sub(top + bottom);
+
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn panel_inner(area: Rect) -> Rect {
+    inset(area, PANEL_PAD_X, PANEL_PAD_X, PANEL_PAD_Y, PANEL_PAD_Y)
 }
 
 fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize) -> Option<usize> {
     if len == 0 {
         return None;
     }
-    let content_y = area.y.saturating_add(1);
-    let content_h = area.height.saturating_sub(2);
-    if pos.y < content_y || pos.y >= content_y.saturating_add(content_h) {
+    if area.height == 0 || area.width == 0 {
         return None;
     }
-    let row = (pos.y - content_y) as usize;
+    if !area.contains(pos) {
+        return None;
+    }
+    let row = (pos.y - area.y) as usize;
     if row < len { Some(row) } else { None }
 }

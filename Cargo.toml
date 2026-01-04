@@ -29,5 +29,6 @@ indicatif = "0.17"
 ratatui = "0.28"
 crossterm = "0.27"
 tempfile = "3"
+libc = "0.2"
 
 [dev-dependencies]

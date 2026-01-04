@@ -1990,6 +1990,7 @@ dependencies = [
  "directories",
  "fastembed",
  "indicatif",
+ "libc",
  "memchr",
  "memmap2",
  "model2vec-rs",
