@@ -1092,7 +1092,7 @@ fn run_setup() -> Result<()> {
     // Show what will be installed
     println!("This will install:");
     if claude_path.is_some() {
-        println!("  Claude Code: automem-search skill");
+        println!("  Claude Code: automem-search skill, instruction-improver skill");
     }
     if codex_path.is_some() {
         println!("  Codex: automem-search prompt");
@@ -1133,12 +1133,14 @@ fn run_setup() -> Result<()> {
         .to_path_buf();
 
     let claude_skill = include_str!("../skills/memex-search/SKILL.md");
+    let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
     let codex_prompt = include_str!("../skills/codex/automem-search.md");
 
     for index in selected {
         let (tool, _) = &items[index];
         match *tool {
             "claude" => {
+                // Install automem-search skill
                 let dest_dir = home.join(".claude").join("skills").join("automem-search");
                 let dest = dest_dir.join("SKILL.md");
                 if dest.exists() {
@@ -1150,6 +1152,24 @@ fn run_setup() -> Result<()> {
                     std::fs::create_dir_all(&dest_dir)?;
                     std::fs::write(&dest, claude_skill)?;
                     println!("Installed Claude skill to {}.", dest.display());
+                }
+
+                // Install instruction-improver skill
+                let improver_dir =
+                    home.join(".claude").join("skills").join("instruction-improver");
+                let improver_dest = improver_dir.join("SKILL.md");
+                if improver_dest.exists() {
+                    println!(
+                        "Skipping instruction-improver skill (already installed at {}).",
+                        improver_dest.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(&improver_dir)?;
+                    std::fs::write(&improver_dest, instruction_improver_skill)?;
+                    println!(
+                        "Installed instruction-improver skill to {}.",
+                        improver_dest.display()
+                    );
                 }
             }
             "codex" => {
