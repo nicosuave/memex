@@ -18,6 +18,9 @@ pre-release-commit-message = "Release {{crate_name}} version {{version}}"
 sign-commit = false
 sign-tag = false
 
+# Don't publish to crates.io (GitHub releases handle distribution)
+publish = false
+
 # Pre-release replacements (update version references in other files)
 # Uncomment and adjust if you have version references elsewhere
 # [[pre-release-replacements]]
