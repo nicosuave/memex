@@ -1,6 +1,6 @@
 ---
 name: instruction-improver
-description: Search memex for user feedback patterns (frustration, corrections, praise, successful outcomes) to identify recurring mistakes and wins, then generate CLAUDE.md improvements.
+description: Search memex for user feedback patterns (frustration, corrections, praise, successful outcomes) to identify recurring mistakes and wins, then generate CLAUDE.md or AGENTS.md improvements.
 allowed-tools: Bash(memex:*)
 ---
 
