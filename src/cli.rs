@@ -21,7 +21,15 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude and Codex"
+    about = "Fast local history search for Claude and Codex",
+    after_help = "\
+QUICK START:
+    memex index                     # Index your Claude/Codex history
+    memex search \"error handling\"   # Search for keywords
+    memex tui                       # Browse sessions interactively
+
+LEARN MORE:
+    memex <command> --help          # Detailed help for each command"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -30,19 +38,25 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 struct IndexArgs {
+    /// Path to Claude projects directory [default: ~/.claude/projects]
     #[arg(long)]
     source: Option<PathBuf>,
+    /// Include agent subprocess conversations (Claude Code subagents)
     #[arg(long)]
     include_agents: bool,
+    /// Index Codex sessions from ~/.codex [default: true]
     #[arg(long, default_value_t = true)]
     codex: bool,
+    /// Generate embeddings for semantic search during indexing
     #[arg(long)]
     embeddings: bool,
+    /// Skip embedding generation (overrides config default)
     #[arg(long)]
     no_embeddings: bool,
     /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
     #[arg(long)]
     model: Option<String>,
+    /// Path to memex data directory [default: ~/.memex]
     #[arg(long)]
     root: Option<PathBuf>,
 }
@@ -50,6 +64,13 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Index Claude and Codex conversation history
+    #[command(after_help = "\
+EXAMPLES:
+    memex index                         # Index all Claude and Codex history
+    memex index --embeddings            # Also generate embeddings for semantic search
+    memex index --include-agents        # Include Claude Code subagent conversations
+    memex index --source ~/custom/path  # Use custom Claude projects directory")]
     Index {
         #[command(flatten)]
         index: IndexArgs,
@@ -63,62 +84,102 @@ enum Commands {
         )]
         watch_interval: u64,
     },
+    /// Delete existing index and rebuild from scratch
     Reindex {
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Generate embeddings for semantic search (requires existing index)
     Embed {
         /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
         #[arg(long)]
         model: Option<String>,
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Search indexed conversation history
+    #[command(after_help = "\
+EXAMPLES:
+    memex search \"error handling\"
+    memex search \"API design\" --source claude --limit 50
+    memex search \"auth\" --since 2024-01-01T00:00:00Z --semantic
+    memex search \"bug\" --fields score,session_id,snippet --json-array
+
+TIMESTAMP FORMAT:
+    RFC3339: 2024-01-15T10:30:00Z or 2024-01-15T10:30:00-05:00
+    Unix seconds: 1705315800
+    Unix milliseconds: 1705315800000
+
+OUTPUT FIELDS (--fields):
+    score, ts, doc_id, project, role, session_id, source_path, text, snippet, matches")]
     Search {
+        /// Search query (keywords or natural language for semantic search)
         query: String,
+        /// Filter by project name
         #[arg(long)]
         project: Option<String>,
+        /// Filter by role (user, assistant, tool_use, tool_result)
         #[arg(long)]
         role: Option<String>,
+        /// Filter by tool name (e.g., Read, Edit, Bash)
         #[arg(long)]
         tool: Option<String>,
+        /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
+        /// Filter by source: claude or codex
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Use semantic (embedding-based) search instead of keyword search
         #[arg(long)]
         semantic: bool,
+        /// Use hybrid search combining BM25 keyword and semantic scores
         #[arg(long)]
         hybrid: bool,
+        /// Minimum score threshold to include in results
         #[arg(long)]
         min_score: Option<f32>,
+        /// Weight for recency boost (0 = no boost, higher = more recent preferred)
         #[arg(long, default_value_t = 1.0)]
         recency_weight: f32,
+        /// Half-life in days for recency decay (lower = faster decay)
         #[arg(long, default_value_t = 30.0)]
         recency_half_life_days: f32,
-        #[arg(long)]
+        /// Only include results after this timestamp (RFC3339 or unix seconds/ms)
+        #[arg(long, value_name = "TIMESTAMP")]
         since: Option<String>,
-        #[arg(long)]
+        /// Only include results before this timestamp (RFC3339 or unix seconds/ms)
+        #[arg(long, value_name = "TIMESTAMP")]
         until: Option<String>,
+        /// Maximum number of results to return
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        #[arg(long = "top-n-per-session")]
+        /// Limit results per session (useful for getting variety)
+        #[arg(long = "top-n-per-session", value_name = "N")]
         top_n_per_session: Option<usize>,
+        /// Return at most one result per session (shorthand for --top-n-per-session 1)
         #[arg(long)]
         unique_session: bool,
+        /// Output results as a single JSON array instead of newline-delimited JSON
         #[arg(long)]
         json_array: bool,
-        #[arg(long)]
+        /// Comma-separated list of fields to include in output
+        #[arg(long, value_name = "FIELDS")]
         fields: Option<String>,
+        /// Sort results by score or timestamp
         #[arg(long, value_enum, default_value = "score")]
         sort: SortBy,
+        /// Show verbose output with inline text preview
         #[arg(short, long)]
         verbose: bool,
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -127,21 +188,31 @@ enum Commands {
         #[command(subcommand)]
         action: IndexServiceCommand,
     },
+    /// Display all messages from a specific session
     Session {
+        /// Session ID (from search results or TUI)
         session_id: String,
+        /// Show human-readable output with timestamps and role labels
         #[arg(short, long)]
         verbose: bool,
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Display a single document by its internal ID
     Show {
+        /// Document ID (from search results)
         doc_id: u64,
+        /// Pretty-print JSON output
         #[arg(short, long)]
         verbose: bool,
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Show index statistics (document count, vector count, storage paths)
     Stats {
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -157,29 +228,41 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum IndexServiceCommand {
+    /// Enable automatic background indexing via launchd
     Enable {
         #[command(flatten)]
         index: IndexArgs,
+        /// launchd job label [default: com.memex.index]
         #[arg(long)]
         label: Option<String>,
+        /// Run as a long-lived process instead of periodic execution
         #[arg(long)]
         continuous: bool,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        /// Seconds between index checks in continuous mode [default: 30]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         poll_interval: Option<u64>,
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        /// Seconds between launchd invocations in interval mode [default: 300]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         interval: Option<u64>,
+        /// Path for stdout log file [default: ~/.memex/index-service.log]
         #[arg(long)]
         stdout: Option<PathBuf>,
+        /// Path for stderr log file [default: ~/.memex/index-service.err.log]
         #[arg(long)]
         stderr: Option<PathBuf>,
+        /// Path to write launchd plist [default: ~/.memex/index-service.plist]
         #[arg(long)]
         plist: Option<PathBuf>,
     },
+    /// Disable and remove the background indexing service
     Disable {
+        /// launchd job label [default: com.memex.index]
         #[arg(long)]
         label: Option<String>,
+        /// Path to launchd plist to unload [default: ~/.memex/index-service.plist]
         #[arg(long)]
         plist: Option<PathBuf>,
+        /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
