@@ -19,6 +19,12 @@ Or
 curl -fsSL https://raw.githubusercontent.com/nicosuave/memex/main/scripts/setup.sh | sh
 ```
 
+Or (from the [AUR](https://aur.archlinux.org/packages/memex) on Arch Linux):
+
+```bash
+paru -S memex
+```
+
 Then run setup to install the skill/prompt:
 
 ```bash
