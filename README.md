@@ -1,10 +1,10 @@
 # memex
 
-Fast local history search for Claude and Codex logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI & OpenCode logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
-Includes a TUI for browsing, finding and resumign both Claude Code & Codex CLI sessions.
+Includes a TUI for browsing, finding and resuming both agent CLI sessions.
 
 ![memex tui](docs/tui.png?raw=1&v=2)
 
