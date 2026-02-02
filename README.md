@@ -96,7 +96,7 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
 
 </details>
 
-Then run setup to install the skill/prompt:
+Then run setup to install the skills:
 
 ```bash
 memex setup
@@ -256,4 +256,4 @@ Service logs and the plist live under `~/.memex` by default (macOS). On Linux, s
 
 Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`.
 
-The skill/prompt definitions are bundled in `skills/`.
+The skill definitions are bundled in `skills/`.

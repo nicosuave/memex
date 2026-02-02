@@ -1195,9 +1195,36 @@ fn run_setup(force: bool) -> Result<()> {
         .home_dir()
         .to_path_buf();
 
+    // Clean up stale skill/prompt files from previous versions
+    let stale_paths: Vec<PathBuf> = vec![
+        // Gen 1: automem-era paths
+        home.join(".claude/skills/automem-search"),
+        home.join(".codex/prompts/automem-search.md"),
+        home.join(".local/share/opencode/prompts/automem-search.md"),
+        // Gen 2: flat-file skill paths (now directory-based)
+        home.join(".codex/skills/memex-search.md"),
+        home.join(".local/share/opencode/skills/memex-search.md"),
+    ];
+    for path in &stale_paths {
+        if path.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(path) {
+                eprintln!("Warning: failed to remove stale {}: {e}", path.display());
+            } else {
+                println!("Removed stale {}.", path.display());
+            }
+        } else if path.is_file() {
+            if let Err(e) = std::fs::remove_file(path) {
+                eprintln!("Warning: failed to remove stale {}: {e}", path.display());
+            } else {
+                println!("Removed stale {}.", path.display());
+            }
+        }
+    }
+
     let claude_skill = include_str!("../skills/memex-search/SKILL.md");
     let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
-    let codex_skill = include_str!("../skills/codex/memex-search.md");
+    let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
+    let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
 
     for index in selected {
         let (tool, _) = &items[index];
@@ -1248,8 +1275,8 @@ fn run_setup(force: bool) -> Result<()> {
                 }
             }
             "codex" => {
-                let dest_dir = home.join(".codex").join("skills");
-                let dest = dest_dir.join("memex-search.md");
+                let dest_dir = home.join(".codex").join("skills").join("memex-search");
+                let dest = dest_dir.join("SKILL.md");
                 if dest.exists() && !force {
                     println!(
                         "Skipping Codex skill (already installed at {}). Use --force to overwrite.",
@@ -1271,8 +1298,9 @@ fn run_setup(force: bool) -> Result<()> {
                     .join(".local")
                     .join("share")
                     .join("opencode")
-                    .join("skills");
-                let dest = dest_dir.join("memex-search.md");
+                    .join("skills")
+                    .join("memex-search");
+                let dest = dest_dir.join("SKILL.md");
                 if dest.exists() && !force {
                     println!(
                         "Skipping Opencode skill (already installed at {}). Use --force to overwrite.",
@@ -1280,7 +1308,7 @@ fn run_setup(force: bool) -> Result<()> {
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, codex_skill)?;
+                    std::fs::write(&dest, opencode_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {

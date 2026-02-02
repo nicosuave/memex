@@ -1,7 +1,6 @@
 ---
-name: opencode
+name: memex-search
 description: Search, filter, and retrieve Opencode history via memex CLI. Use for context resumption, finding past code/decisions, and self-correction based on history.
-allowed-tools: Bash(memex:*)
 ---
 
 # Memex for Opencode
