@@ -1534,6 +1534,7 @@ fn run_index_service_enable_launchd(
     } else {
         (Some(interval), false)
     };
+    let env_vars = launchd_environment_variables(paths)?;
 
     let contents = build_launchd_plist(
         &label,
@@ -1542,18 +1543,52 @@ fn run_index_service_enable_launchd(
         keep_alive,
         Some(&stdout),
         Some(&stderr),
+        &env_vars,
     );
     std::fs::write(&plist_path, contents)?;
 
     println!("wrote launchd plist: {}", plist_path.display());
-    let status = std::process::Command::new("launchctl")
-        .arg("load")
-        .arg("-w")
+    let (domain_target, service_target) = launchctl_targets(&label)?;
+
+    // Replace any existing job with the same label to avoid stale launchd state.
+    let _ = launchctl_bootout_service(&service_target)?;
+
+    let bootstrap = std::process::Command::new("launchctl")
+        .arg("bootstrap")
+        .arg(&domain_target)
         .arg(&plist_path)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("launchctl load failed"));
+        .output()?;
+    if !bootstrap.status.success() {
+        return Err(anyhow!(
+            "launchctl bootstrap failed: {}",
+            format_command_output(&bootstrap)
+        ));
     }
+
+    let enable = std::process::Command::new("launchctl")
+        .arg("enable")
+        .arg(&service_target)
+        .output()?;
+    if !enable.status.success() {
+        return Err(anyhow!(
+            "launchctl enable failed: {}",
+            format_command_output(&enable)
+        ));
+    }
+
+    let kickstart = std::process::Command::new("launchctl")
+        .arg("kickstart")
+        .arg("-k")
+        .arg(&service_target)
+        .output()?;
+    if !kickstart.status.success() {
+        return Err(anyhow!(
+            "launchctl kickstart failed: {}",
+            format_command_output(&kickstart)
+        ));
+    }
+
+    verify_launchd_job_loaded(&service_target, &plist_path)?;
     println!("enabled launchd job: {label}");
     Ok(())
 }
@@ -1658,21 +1693,121 @@ fn run_index_service_disable_launchd(
         .or_else(|| config.index_service_plist.clone())
         .unwrap_or(default_plist);
     validate_service_label(&label)?;
-    if !plist_path.exists() {
+    let (_domain_target, service_target) = launchctl_targets(&label)?;
+    let _ = launchctl_bootout_service(&service_target)?;
+
+    if plist_path.exists() {
+        std::fs::remove_file(&plist_path)?;
+    } else {
         println!("no launchd plist found: {}", plist_path.display());
-        return Ok(());
     }
-    let status = std::process::Command::new("launchctl")
-        .arg("unload")
-        .arg("-w")
-        .arg(&plist_path)
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("launchctl unload failed"));
-    }
-    std::fs::remove_file(&plist_path)?;
+
     println!("disabled launchd job: {label}");
     Ok(())
+}
+
+fn current_uid() -> Result<u32> {
+    if let Ok(uid) = std::env::var("UID")
+        && let Ok(parsed) = uid.trim().parse::<u32>()
+    {
+        return Ok(parsed);
+    }
+    let output = std::process::Command::new("id").arg("-u").output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to determine uid: {}",
+            format_command_output(&output)
+        ));
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    uid.parse::<u32>()
+        .map_err(|_| anyhow!("invalid uid from id -u: {uid}"))
+}
+
+fn launchctl_targets(label: &str) -> Result<(String, String)> {
+    let uid = current_uid()?;
+    let domain = format!("gui/{uid}");
+    let service = format!("{domain}/{label}");
+    Ok((domain, service))
+}
+
+fn launchctl_bootout_service(service_target: &str) -> Result<bool> {
+    let output = std::process::Command::new("launchctl")
+        .arg("bootout")
+        .arg(service_target)
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if launchctl_not_found(&output) {
+        return Ok(false);
+    }
+    if !launchctl_service_exists(service_target)? {
+        return Ok(false);
+    }
+    Err(anyhow!(
+        "launchctl bootout failed: {}",
+        format_command_output(&output)
+    ))
+}
+
+fn launchctl_service_exists(service_target: &str) -> Result<bool> {
+    let output = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(service_target)
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if launchctl_not_found(&output) {
+        return Ok(false);
+    }
+    Err(anyhow!(
+        "launchctl print failed: {}",
+        format_command_output(&output)
+    ))
+}
+
+fn verify_launchd_job_loaded(service_target: &str, plist_path: &std::path::Path) -> Result<()> {
+    let output = std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(service_target)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "launchctl print failed: {}",
+            format_command_output(&output)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected_path = plist_path.to_string_lossy();
+    if !stdout.contains(&format!("path = {expected_path}")) {
+        return Err(anyhow!(
+            "launchd job state mismatch; expected path {}, launchctl output did not match",
+            plist_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn launchctl_not_found(output: &std::process::Output) -> bool {
+    let message = format_command_output(output).to_lowercase();
+    message.contains("could not find service")
+        || message.contains("no such process")
+        || message.contains("not found")
+        || message.contains("service is disabled")
+}
+
+fn format_command_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("status {}", output.status),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stderr}; {stdout}"),
+    }
 }
 
 fn run_index_service_disable_systemd(
@@ -1783,6 +1918,7 @@ fn build_launchd_plist(
     keep_alive: bool,
     stdout: Option<&PathBuf>,
     stderr: Option<&PathBuf>,
+    env_vars: &[(String, String)],
 ) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -1825,10 +1961,42 @@ fn build_launchd_plist(
             xml_escape(&stderr.to_string_lossy())
         ));
     }
+    if !env_vars.is_empty() {
+        out.push_str("  <key>EnvironmentVariables</key>\n");
+        out.push_str("  <dict>\n");
+        for (key, value) in env_vars {
+            out.push_str(&format!("    <key>{}</key>\n", xml_escape(key)));
+            out.push_str(&format!("    <string>{}</string>\n", xml_escape(value)));
+        }
+        out.push_str("  </dict>\n");
+    }
 
     out.push_str("</dict>\n");
     out.push_str("</plist>\n");
     out
+}
+
+fn launchd_environment_variables(paths: &Paths) -> Result<Vec<(String, String)>> {
+    let mut vars = Vec::new();
+    if let Some(base) = directories::BaseDirs::new() {
+        vars.push((
+            "HOME".to_string(),
+            base.home_dir().to_string_lossy().to_string(),
+        ));
+    }
+    let path = std::env::var("PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
+    vars.push(("PATH".to_string(), path));
+
+    let embed_cache = paths.root.join("embed-cache");
+    std::fs::create_dir_all(&embed_cache)?;
+    let embed_cache = embed_cache.to_string_lossy().to_string();
+    vars.push(("FASTEMBED_CACHE_DIR".to_string(), embed_cache.clone()));
+    vars.push(("HF_HOME".to_string(), embed_cache));
+
+    Ok(vars)
 }
 
 fn xml_escape(input: &str) -> String {
