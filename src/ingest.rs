@@ -529,20 +529,25 @@ fn collect_claude_files(source: &Path, include_agents: bool) -> Result<Vec<PathB
 }
 
 fn collect_codex_session_files() -> Result<Vec<PathBuf>> {
-    let root = codex_sessions_root();
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
+    collect_codex_session_files_from_roots(&codex_session_roots())
+}
+
+fn collect_codex_session_files_from_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file() {
+    for root in roots {
+        if !root.exists() {
             continue;
         }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
+        for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            files.push(path.to_path_buf());
         }
-        files.push(path.to_path_buf());
     }
     Ok(files)
 }
@@ -568,11 +573,19 @@ fn collect_opencode_files() -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn codex_sessions_root() -> PathBuf {
+fn codex_root() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".codex").join("sessions")
+    home.join(".codex")
+}
+
+fn codex_session_roots() -> Vec<PathBuf> {
+    let codex_root = codex_root();
+    vec![
+        codex_root.join("sessions"),
+        codex_root.join("archived_sessions"),
+    ]
 }
 
 fn opencode_root() -> PathBuf {
@@ -598,10 +611,7 @@ fn opencode_parts_root() -> PathBuf {
 }
 
 fn codex_history_path() -> PathBuf {
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".codex").join("history.jsonl")
+    codex_root().join("history.jsonl")
 }
 
 fn parse_claude_file(
@@ -1374,4 +1384,35 @@ fn truncate_for_embedding(mut text: String) -> String {
 
 fn is_embedding_role(role: &str) -> bool {
     role == "user" || role == "assistant"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn collect_codex_session_files_includes_archived_sessions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = tmp.path().join("sessions");
+        let archived_root = tmp.path().join("archived_sessions");
+
+        let sessions_day = sessions_root.join("2026/02/11");
+        fs::create_dir_all(&sessions_day).expect("create sessions day");
+        fs::create_dir_all(archived_root.join("state")).expect("create archived state");
+
+        let live = sessions_day.join("session-live.jsonl");
+        let archived = archived_root.join("rollout-archive.jsonl");
+        let ignored = archived_root.join("state/ingest.json");
+
+        fs::write(&live, "{}\n").expect("write live");
+        fs::write(&archived, "{}\n").expect("write archived");
+        fs::write(&ignored, "{}\n").expect("write ignored");
+
+        let mut files = collect_codex_session_files_from_roots(&[sessions_root, archived_root])
+            .expect("collect codex sessions");
+        files.sort();
+
+        assert_eq!(files, vec![archived, live]);
+    }
 }

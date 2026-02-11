@@ -29,7 +29,11 @@ impl SourceKind {
     }
 
     pub fn from_path(path: &str) -> Self {
-        if path.contains(".codex/sessions") || path.contains(".codex\\sessions") {
+        if path.contains(".codex/sessions")
+            || path.contains(".codex\\sessions")
+            || path.contains(".codex/archived_sessions")
+            || path.contains(".codex\\archived_sessions")
+        {
             SourceKind::CodexSession
         } else if path.contains(".codex/history.jsonl") || path.contains(".codex\\history.jsonl") {
             SourceKind::CodexHistory
@@ -89,4 +93,22 @@ pub struct Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<String>,
     pub source_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceKind;
+
+    #[test]
+    fn from_path_recognizes_archived_codex_sessions() {
+        let unix_path = "/tmp/.codex/archived_sessions/rollout-2026-02-10T11-16-28-abc.jsonl";
+        let windows_path =
+            "C:\\tmp\\.codex\\archived_sessions\\rollout-2026-02-10T11-16-28-abc.jsonl";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::CodexSession);
+        assert_eq!(
+            SourceKind::from_path(windows_path),
+            SourceKind::CodexSession
+        );
+    }
 }
