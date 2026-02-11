@@ -151,3 +151,71 @@ impl UserConfig {
         self.index_service_poll_interval.unwrap_or(30)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvVarGuard {
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var("MEMEX_COMPUTE_UNITS").ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("MEMEX_COMPUTE_UNITS", v),
+                    None => std::env::remove_var("MEMEX_COMPUTE_UNITS"),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.as_deref() {
+                    Some(v) => std::env::set_var("MEMEX_COMPUTE_UNITS", v),
+                    None => std::env::remove_var("MEMEX_COMPUTE_UNITS"),
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock MEMEX_COMPUTE_UNITS env")
+    }
+
+    #[test]
+    fn resolve_compute_units_prefers_config_over_env() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(Some("gpu"));
+        let config = UserConfig {
+            compute_units: Some("ane".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(config.resolve_compute_units().as_deref(), Some("ane"));
+    }
+
+    #[test]
+    fn resolve_compute_units_uses_env_fallback() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(Some("cpu"));
+        let config = UserConfig::default();
+        assert_eq!(config.resolve_compute_units().as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn resolve_compute_units_none_when_unset() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(None);
+        let config = UserConfig::default();
+        assert_eq!(config.resolve_compute_units(), None);
+    }
+}
