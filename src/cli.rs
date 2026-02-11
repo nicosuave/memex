@@ -478,6 +478,7 @@ fn run_index(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    config.apply_embed_runtime_env();
 
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
@@ -505,6 +506,7 @@ fn run_index(
         embeddings,
         backfill_embeddings,
         model: model_choice,
+        compute_units: config.resolve_compute_units(),
     };
 
     let report = ingest_all(&paths, &index, &opts)?;
@@ -530,6 +532,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    config.apply_embed_runtime_env();
 
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
@@ -646,6 +649,7 @@ fn run_search(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    config.apply_embed_runtime_env();
     let model_choice = config.resolve_model(None)?;
     let auto_index_on_search = config.auto_index_on_search_default();
     let embeddings_default = config.embeddings_default();
@@ -665,6 +669,7 @@ fn run_search(
             embeddings: embeddings_default,
             backfill_embeddings,
             model: model_choice,
+            compute_units: config.resolve_compute_units(),
         };
         // Skip indexing if we recently scanned (within TTL)
         let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;

@@ -32,6 +32,7 @@ pub struct IngestOptions {
     pub embeddings: bool,
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
+    pub compute_units: Option<String>,
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ struct WriterContext {
     vector_dir: PathBuf,
     progress: Arc<Progress>,
     model: ModelChoice,
+    compute_units: Option<String>,
 }
 
 /// Check if scan cache is fresh; if so, skip indexing entirely.
@@ -297,6 +299,7 @@ pub fn ingest_all(
         vector_dir: paths.vectors.clone(),
         progress: progress.clone(),
         model: options.model,
+        compute_units: options.compute_units.clone(),
     };
     let writer_handle =
         std::thread::spawn(move || writer_loop(writer_index, rx_record, delete_paths, writer_ctx));
@@ -372,6 +375,7 @@ fn writer_loop(
         vector_dir,
         progress,
         model,
+        compute_units,
     } = ctx;
     let mut writer = index.writer()?;
     for path in delete_paths {
@@ -385,6 +389,11 @@ fn writer_loop(
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     let mut index_pending: [u64; 4] = [0, 0, 0, 0];
     if embeddings {
+        if let Some(units) = compute_units.as_deref() {
+            unsafe {
+                std::env::set_var("MEMEX_COMPUTE_UNITS", units);
+            }
+        }
         unsafe {
             std::env::set_var("HF_HUB_DISABLE_PROGRESS_BARS", "1");
         }

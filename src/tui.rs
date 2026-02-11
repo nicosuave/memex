@@ -442,6 +442,7 @@ impl App {
                     embeddings: embeddings_default,
                     backfill_embeddings,
                     model: model_choice,
+                    compute_units: config.resolve_compute_units(),
                 };
                 ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl())
             })();

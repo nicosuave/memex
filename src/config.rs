@@ -51,6 +51,8 @@ pub struct UserConfig {
     pub auto_index_on_search: Option<bool>,
     /// Embedding model: minilm, bge, nomic, gemma (default), potion
     pub model: Option<String>,
+    /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
+    pub compute_units: Option<String>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
     /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
@@ -114,6 +116,21 @@ impl UserConfig {
         Ok(ModelChoice::default())
     }
 
+    pub fn resolve_compute_units(&self) -> Option<String> {
+        if let Some(units) = self.compute_units.as_deref() {
+            return Some(units.to_string());
+        }
+        std::env::var("MEMEX_COMPUTE_UNITS").ok()
+    }
+
+    pub fn apply_embed_runtime_env(&self) {
+        if let Some(units) = self.resolve_compute_units() {
+            unsafe {
+                std::env::set_var("MEMEX_COMPUTE_UNITS", units);
+            }
+        }
+    }
+
     pub fn scan_cache_ttl(&self) -> u64 {
         self.scan_cache_ttl.unwrap_or(3600)
     }
@@ -132,5 +149,73 @@ impl UserConfig {
 
     pub fn index_service_poll_interval(&self) -> u64 {
         self.index_service_poll_interval.unwrap_or(30)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvVarGuard {
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var("MEMEX_COMPUTE_UNITS").ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("MEMEX_COMPUTE_UNITS", v),
+                    None => std::env::remove_var("MEMEX_COMPUTE_UNITS"),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.as_deref() {
+                    Some(v) => std::env::set_var("MEMEX_COMPUTE_UNITS", v),
+                    None => std::env::remove_var("MEMEX_COMPUTE_UNITS"),
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock MEMEX_COMPUTE_UNITS env")
+    }
+
+    #[test]
+    fn resolve_compute_units_prefers_config_over_env() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(Some("gpu"));
+        let config = UserConfig {
+            compute_units: Some("ane".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(config.resolve_compute_units().as_deref(), Some("ane"));
+    }
+
+    #[test]
+    fn resolve_compute_units_uses_env_fallback() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(Some("cpu"));
+        let config = UserConfig::default();
+        assert_eq!(config.resolve_compute_units().as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn resolve_compute_units_none_when_unset() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(None);
+        let config = UserConfig::default();
+        assert_eq!(config.resolve_compute_units(), None);
     }
 }

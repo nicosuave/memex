@@ -84,6 +84,7 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
           settings = {
             embeddings = true;
             model = "minilm";
+            compute_units = "ane"; # macOS: ane, gpu, cpu, all
             auto_index_on_search = true;
             index_service_interval = 3600;
           };
@@ -224,7 +225,7 @@ Select via `--model` flag or `MEMEX_MODEL` env var:
 | bge | 384 | Fast | Better |
 | nomic | 768 | Moderate | Good |
 | gemma | 768 | Slowest | Best |
-| potion | 256 | Fastest (tiny) | Lowest (default) |
+| potion | 256 | Fastest (tiny) | Lowest |
 
 ```
 memex index --model minilm
@@ -239,7 +240,8 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 ```toml
 embeddings = true
 auto_index_on_search = true
-model = "potion"  # minilm, bge, nomic, gemma, potion
+model = "minilm"  # minilm, bge, nomic, gemma, potion
+compute_units = "ane"  # macOS only: ane, gpu, cpu, all
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
