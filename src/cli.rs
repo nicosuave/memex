@@ -559,6 +559,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 
         for ((doc_id, _, source), vec) in batch.iter().zip(embeddings.iter()) {
             vector.add(*doc_id, vec)?;
+            progress.sub_embed_pending(*source, 1);
             progress.add_embedded(*source, 1);
             embedded_counts[source.idx()] += 1;
             *embedded_total += 1;
@@ -577,6 +578,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         let text = truncate_for_embedding(record.text);
         if !text.is_empty() {
             progress.add_embed_total(record.source, 1);
+            progress.add_embed_pending(record.source, 1);
             batch.push((record.doc_id, text, record.source));
 
             if batch.len() >= BATCH_SIZE {

@@ -1337,6 +1337,7 @@ fn flush_embeddings(
     let mut count = 0;
     for ((doc_id, _, source), vec) in items.iter().zip(embeddings.iter()) {
         vindex.add(*doc_id, vec)?;
+        progress.sub_embed_pending(*source, 1);
         progress.add_embedded(*source, 1);
         count += 1;
     }

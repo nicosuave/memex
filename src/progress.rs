@@ -306,8 +306,8 @@ impl Progress {
     }
 
     pub fn add_embed_total(&self, source: SourceKind, count: u64) {
-        // Just track the total - embed stays as spinner since we don't know final count
         self.embed_total[source.idx()].fetch_add(count, Ordering::Relaxed);
+        self.update_embed_message(source);
     }
 
     pub fn add_embed_pending(&self, source: SourceKind, count: u64) {
@@ -330,8 +330,49 @@ impl Progress {
             SourceKind::CodexSession | SourceKind::CodexHistory => self.codex_embed.position(),
             SourceKind::Opencode => self.opencode_embed.position(),
         };
+        let total = match source {
+            SourceKind::Claude => {
+                self.embed_total[SourceKind::Claude.idx()].load(Ordering::Relaxed)
+            }
+            SourceKind::CodexSession | SourceKind::CodexHistory => {
+                self.embed_total[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                    + self.embed_total[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed)
+            }
+            SourceKind::Opencode => {
+                self.embed_total[SourceKind::Opencode.idx()].load(Ordering::Relaxed)
+            }
+        };
+        let pending = match source {
+            SourceKind::Claude => {
+                self.embed_pending[SourceKind::Claude.idx()].load(Ordering::Relaxed)
+            }
+            SourceKind::CodexSession | SourceKind::CodexHistory => {
+                self.embed_pending[SourceKind::CodexSession.idx()].load(Ordering::Relaxed)
+                    + self.embed_pending[SourceKind::CodexHistory.idx()].load(Ordering::Relaxed)
+            }
+            SourceKind::Opencode => {
+                self.embed_pending[SourceKind::Opencode.idx()].load(Ordering::Relaxed)
+            }
+        };
 
-        let msg = format!("embedded {}", format_count(embedded));
+        let msg = if total > 0 {
+            if pending > 0 {
+                format!(
+                    "embedded {} / {} ({} queued)",
+                    format_count(embedded),
+                    format_count(total),
+                    format_count(pending)
+                )
+            } else {
+                format!(
+                    "embedded {} / {}",
+                    format_count(embedded),
+                    format_count(total)
+                )
+            }
+        } else {
+            format!("embedded {}", format_count(embedded))
+        };
 
         match source {
             SourceKind::Claude => self.claude_embed.set_message(msg),
