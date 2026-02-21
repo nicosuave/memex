@@ -868,7 +868,12 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         return Ok(false);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('q')) {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('d')
+        )
+    {
         return Ok(true);
     }
 
