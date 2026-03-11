@@ -6,6 +6,10 @@ description = "CLI tool for indexing and searching Claude Code conversation hist
 license = "MIT"
 repository = "https://github.com/nicosuave/memex"
 
+[features]
+default = []
+cuda = ["ort/cuda", "dep:libloading"]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -33,5 +37,6 @@ ratatui = "0.28"
 crossterm = "0.27"
 tempfile = "3"
 libc = "0.2"
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]

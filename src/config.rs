@@ -1,4 +1,4 @@
-use crate::embed::ModelChoice;
+use crate::embed::{EmbedRuntimeConfig, ExecutionProviderChoice, ModelChoice};
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use serde::Deserialize;
@@ -51,6 +51,14 @@ pub struct UserConfig {
     pub auto_index_on_search: Option<bool>,
     /// Embedding model: minilm, bge, nomic, gemma (default), potion
     pub model: Option<String>,
+    /// Execution provider: auto, cpu, coreml, cuda
+    pub execution_provider: Option<String>,
+    /// CUDA device index when execution_provider is "cuda"
+    pub cuda_device_id: Option<i32>,
+    /// Additional search paths for CUDA runtime libraries
+    pub cuda_library_paths: Option<Vec<PathBuf>>,
+    /// Additional search paths for cuDNN runtime libraries
+    pub cudnn_library_paths: Option<Vec<PathBuf>>,
     /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
     pub compute_units: Option<String>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
@@ -116,6 +124,57 @@ impl UserConfig {
         Ok(ModelChoice::default())
     }
 
+    pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderChoice> {
+        if let Some(provider) = self.execution_provider.as_deref() {
+            return ExecutionProviderChoice::parse(provider);
+        }
+        match std::env::var("MEMEX_EXECUTION_PROVIDER") {
+            Ok(provider) => ExecutionProviderChoice::parse(&provider),
+            Err(std::env::VarError::NotPresent) => Ok(ExecutionProviderChoice::Auto),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(anyhow!("MEMEX_EXECUTION_PROVIDER is not valid unicode"))
+            }
+        }
+    }
+
+    pub fn resolve_cuda_device_id(&self) -> Result<Option<i32>> {
+        if let Some(device_id) = self.cuda_device_id {
+            return Ok(Some(device_id));
+        }
+        match std::env::var("MEMEX_CUDA_DEVICE_ID") {
+            Ok(device_id) => {
+                let parsed = device_id
+                    .parse::<i32>()
+                    .map_err(|err| anyhow!("MEMEX_CUDA_DEVICE_ID must be an integer: {err}"))?;
+                Ok(Some(parsed))
+            }
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(anyhow!("MEMEX_CUDA_DEVICE_ID is not valid unicode"))
+            }
+        }
+    }
+
+    pub fn resolve_cuda_library_paths(&self) -> Result<Vec<PathBuf>> {
+        if let Some(paths) = &self.cuda_library_paths {
+            return Ok(paths.clone());
+        }
+        match std::env::var_os("MEMEX_CUDA_LIBRARY_PATHS") {
+            Some(paths) => Ok(std::env::split_paths(&paths).collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn resolve_cudnn_library_paths(&self) -> Result<Vec<PathBuf>> {
+        if let Some(paths) = &self.cudnn_library_paths {
+            return Ok(paths.clone());
+        }
+        match std::env::var_os("MEMEX_CUDNN_LIBRARY_PATHS") {
+            Some(paths) => Ok(std::env::split_paths(&paths).collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub fn resolve_compute_units(&self) -> Option<String> {
         if let Some(units) = self.compute_units.as_deref() {
             return Some(units.to_string());
@@ -123,12 +182,19 @@ impl UserConfig {
         std::env::var("MEMEX_COMPUTE_UNITS").ok()
     }
 
-    pub fn apply_embed_runtime_env(&self) {
-        if let Some(units) = self.resolve_compute_units() {
-            unsafe {
-                std::env::set_var("MEMEX_COMPUTE_UNITS", units);
-            }
-        }
+    pub fn resolve_embed_runtime(&self) -> Result<EmbedRuntimeConfig> {
+        Ok(EmbedRuntimeConfig {
+            execution_provider: self.resolve_execution_provider()?,
+            compute_units: self.resolve_compute_units(),
+            cuda_device_id: self.resolve_cuda_device_id()?,
+            cuda_library_paths: self.resolve_cuda_library_paths()?,
+            cudnn_library_paths: self.resolve_cudnn_library_paths()?,
+        })
+    }
+
+    pub fn apply_embed_runtime_env(&self) -> Result<()> {
+        self.resolve_embed_runtime()?.apply_env()?;
+        Ok(())
     }
 
     pub fn scan_cache_ttl(&self) -> u64 {
@@ -155,47 +221,12 @@ impl UserConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    struct EnvVarGuard {
-        prev: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(value: Option<&str>) -> Self {
-            let prev = std::env::var("MEMEX_COMPUTE_UNITS").ok();
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var("MEMEX_COMPUTE_UNITS", v),
-                    None => std::env::remove_var("MEMEX_COMPUTE_UNITS"),
-                }
-            }
-            Self { prev }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.as_deref() {
-                    Some(v) => std::env::set_var("MEMEX_COMPUTE_UNITS", v),
-                    None => std::env::remove_var("MEMEX_COMPUTE_UNITS"),
-                }
-            }
-        }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock MEMEX_COMPUTE_UNITS env")
-    }
+    use crate::test_support::{EnvVarGuard, env_lock};
 
     #[test]
     fn resolve_compute_units_prefers_config_over_env() {
         let _guard = env_lock();
-        let _env = EnvVarGuard::set(Some("gpu"));
+        let _env = EnvVarGuard::set(&[("MEMEX_COMPUTE_UNITS", Some("gpu"))]);
         let config = UserConfig {
             compute_units: Some("ane".to_string()),
             ..UserConfig::default()
@@ -206,7 +237,7 @@ mod tests {
     #[test]
     fn resolve_compute_units_uses_env_fallback() {
         let _guard = env_lock();
-        let _env = EnvVarGuard::set(Some("cpu"));
+        let _env = EnvVarGuard::set(&[("MEMEX_COMPUTE_UNITS", Some("cpu"))]);
         let config = UserConfig::default();
         assert_eq!(config.resolve_compute_units().as_deref(), Some("cpu"));
     }
@@ -214,8 +245,162 @@ mod tests {
     #[test]
     fn resolve_compute_units_none_when_unset() {
         let _guard = env_lock();
-        let _env = EnvVarGuard::set(None);
+        let _env = EnvVarGuard::set(&[("MEMEX_COMPUTE_UNITS", None)]);
         let config = UserConfig::default();
         assert_eq!(config.resolve_compute_units(), None);
+    }
+
+    #[test]
+    fn resolve_execution_provider_prefers_config_over_env() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_EXECUTION_PROVIDER", Some("cpu"))]);
+        let config = UserConfig {
+            execution_provider: Some("cuda".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            config
+                .resolve_execution_provider()
+                .expect("resolve execution provider"),
+            ExecutionProviderChoice::Cuda
+        );
+    }
+
+    #[test]
+    fn resolve_execution_provider_uses_env_fallback() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_EXECUTION_PROVIDER", Some("coreml"))]);
+        let config = UserConfig::default();
+        assert_eq!(
+            config
+                .resolve_execution_provider()
+                .expect("resolve execution provider"),
+            ExecutionProviderChoice::CoreML
+        );
+    }
+
+    #[test]
+    fn resolve_execution_provider_defaults_to_auto() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_EXECUTION_PROVIDER", None)]);
+        let config = UserConfig::default();
+        assert_eq!(
+            config
+                .resolve_execution_provider()
+                .expect("resolve execution provider"),
+            ExecutionProviderChoice::Auto
+        );
+    }
+
+    #[test]
+    fn resolve_cuda_device_id_prefers_config_over_env() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_CUDA_DEVICE_ID", Some("1"))]);
+        let config = UserConfig {
+            cuda_device_id: Some(3),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            config
+                .resolve_cuda_device_id()
+                .expect("resolve cuda device id"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn resolve_cuda_device_id_uses_env_fallback() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_CUDA_DEVICE_ID", Some("2"))]);
+        let config = UserConfig::default();
+        assert_eq!(
+            config
+                .resolve_cuda_device_id()
+                .expect("resolve cuda device id"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn resolve_cuda_device_id_none_when_unset() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_CUDA_DEVICE_ID", None)]);
+        let config = UserConfig::default();
+        assert_eq!(
+            config
+                .resolve_cuda_device_id()
+                .expect("resolve cuda device id"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_cuda_library_paths_prefers_config_over_env() {
+        let _guard = env_lock();
+        let env_paths = std::env::join_paths(["/env/cuda/lib64"]).expect("join env paths");
+        let _env = EnvVarGuard::set_os(&[("MEMEX_CUDA_LIBRARY_PATHS", Some(&env_paths))]);
+        let config = UserConfig {
+            cuda_library_paths: Some(vec![PathBuf::from("/config/cuda/lib64")]),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            config
+                .resolve_cuda_library_paths()
+                .expect("resolve cuda library paths"),
+            vec![PathBuf::from("/config/cuda/lib64")]
+        );
+    }
+
+    #[test]
+    fn resolve_cuda_library_paths_uses_env_fallback() {
+        let _guard = env_lock();
+        let env_paths =
+            std::env::join_paths(["/env/cuda/lib64", "/env/cuda/extras"]).expect("join env paths");
+        let _env = EnvVarGuard::set_os(&[("MEMEX_CUDA_LIBRARY_PATHS", Some(&env_paths))]);
+        let config = UserConfig::default();
+        assert_eq!(
+            config
+                .resolve_cuda_library_paths()
+                .expect("resolve cuda library paths"),
+            vec![
+                PathBuf::from("/env/cuda/lib64"),
+                PathBuf::from("/env/cuda/extras")
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_cudnn_library_paths_prefers_config_over_env() {
+        let _guard = env_lock();
+        let env_paths = std::env::join_paths(["/env/cudnn/lib64"]).expect("join env paths");
+        let _env = EnvVarGuard::set_os(&[("MEMEX_CUDNN_LIBRARY_PATHS", Some(&env_paths))]);
+        let config = UserConfig {
+            cudnn_library_paths: Some(vec![PathBuf::from("/config/cudnn/lib64")]),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            config
+                .resolve_cudnn_library_paths()
+                .expect("resolve cudnn library paths"),
+            vec![PathBuf::from("/config/cudnn/lib64")]
+        );
+    }
+
+    #[test]
+    fn resolve_cudnn_library_paths_uses_env_fallback() {
+        let _guard = env_lock();
+        let env_paths = std::env::join_paths(["/env/cudnn/lib64", "/env/cudnn/extras"])
+            .expect("join env paths");
+        let _env = EnvVarGuard::set_os(&[("MEMEX_CUDNN_LIBRARY_PATHS", Some(&env_paths))]);
+        let config = UserConfig::default();
+        assert_eq!(
+            config
+                .resolve_cudnn_library_paths()
+                .expect("resolve cudnn library paths"),
+            vec![
+                PathBuf::from("/env/cudnn/lib64"),
+                PathBuf::from("/env/cudnn/extras")
+            ]
+        );
     }
 }
