@@ -2,9 +2,14 @@
 name = "memex"
 version = "0.3.1"
 edition = "2024"
+build = "build.rs"
 description = "CLI tool for indexing and searching Claude Code conversation history"
 license = "MIT"
 repository = "https://github.com/nicosuave/memex"
+
+[features]
+default = []
+cuda = ["ort/cuda", "dep:libloading"]
 
 [dependencies]
 anyhow = "1.0"
@@ -33,5 +38,6 @@ ratatui = "0.28"
 crossterm = "0.27"
 tempfile = "3"
 libc = "0.2"
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]

@@ -1,5 +1,5 @@
 use crate::config::{Paths, UserConfig, default_claude_source};
-use crate::embed::{EmbedderHandle, ModelChoice};
+use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
 use crate::tui;
@@ -478,10 +478,10 @@ fn run_index(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    config.apply_embed_runtime_env();
 
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
+    let embed_runtime = config.resolve_embed_runtime()?;
     let embeddings = resolve_flag(
         config.embeddings_default(),
         embeddings_flag,
@@ -506,7 +506,7 @@ fn run_index(
         embeddings,
         backfill_embeddings,
         model: model_choice,
-        compute_units: config.resolve_compute_units(),
+        embed_runtime,
     };
 
     let report = ingest_all(&paths, &index, &opts)?;
@@ -532,13 +532,13 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    config.apply_embed_runtime_env();
 
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
+    let embed_runtime = config.resolve_embed_runtime()?;
 
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let mut embedder = EmbedderHandle::with_model(model_choice)?;
+    let mut embedder = EmbedderHandle::with_model_and_runtime(model_choice, &embed_runtime)?;
     let mut vector = VectorIndex::open_or_create(&paths.vectors, embedder.dims)?;
 
     let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 4], [0; 4], true));
@@ -649,8 +649,8 @@ fn run_search(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    config.apply_embed_runtime_env();
     let model_choice = config.resolve_model(None)?;
+    let embed_runtime = config.resolve_embed_runtime()?;
     let auto_index_on_search = config.auto_index_on_search_default();
     let embeddings_default = config.embeddings_default();
     let scan_cache_ttl = config.scan_cache_ttl();
@@ -669,7 +669,7 @@ fn run_search(
             embeddings: embeddings_default,
             backfill_embeddings,
             model: model_choice,
-            compute_units: config.resolve_compute_units(),
+            embed_runtime: embed_runtime.clone(),
         };
         // Skip indexing if we recently scanned (within TTL)
         let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;
@@ -720,6 +720,7 @@ fn run_search(
                 render: &render,
                 paths: &paths,
                 model_choice,
+                embed_runtime: &embed_runtime,
                 recency_weight,
                 recency_half_life_days,
             },
@@ -734,6 +735,7 @@ fn run_search(
                 render: &render,
                 paths: &paths,
                 model_choice,
+                embed_runtime: &embed_runtime,
                 recency_weight,
                 recency_half_life_days,
             },
@@ -753,6 +755,7 @@ struct SearchContext<'a> {
     render: &'a RenderOptions,
     paths: &'a Paths,
     model_choice: ModelChoice,
+    embed_runtime: &'a EmbedRuntimeConfig,
     recency_weight: f32,
     recency_half_life_days: f32,
 }
@@ -764,7 +767,7 @@ fn run_semantic_search(
     ctx: &SearchContext,
 ) -> Result<()> {
     let vector = VectorIndex::open(&ctx.paths.vectors)?;
-    let mut embedder = EmbedderHandle::with_model(ctx.model_choice)?;
+    let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
     let embedding = embeddings
         .first()
@@ -798,7 +801,7 @@ fn run_hybrid_search(
     ctx: &SearchContext,
 ) -> Result<()> {
     let vector = VectorIndex::open(&ctx.paths.vectors)?;
-    let mut embedder = EmbedderHandle::with_model(ctx.model_choice)?;
+    let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
 
     let bm25_k = (limit * 5).clamp(50, 500);
     let vector_k = (limit * 5).clamp(50, 500);

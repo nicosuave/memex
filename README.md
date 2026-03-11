@@ -84,7 +84,11 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
           settings = {
             embeddings = true;
             model = "minilm";
-            compute_units = "ane"; # macOS: ane, gpu, cpu, all
+            execution_provider = "auto"; # coreml on macOS, cpu elsewhere
+            cuda_device_id = 0; # optional when execution_provider = "cuda"
+            cuda_library_paths = ["/usr/local/cuda/lib64"]; # optional override
+            cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]; # optional override
+            compute_units = "ane"; # CoreML only: ane, gpu, cpu, all
             auto_index_on_search = true;
             index_service_interval = 3600;
           };
@@ -145,6 +149,12 @@ memex search "your query" -v
 
 ```
 cargo build --release
+```
+
+Linux with NVIDIA CUDA support:
+
+```
+cargo build --release --features cuda
 ```
 
 Binary:
@@ -233,6 +243,27 @@ memex index --model minilm
 MEMEX_MODEL=minilm memex index
 ```
 
+## Execution provider
+
+Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:
+
+| Provider | Platforms | Notes |
+|----------|-----------|-------|
+| auto | all | Default. Uses CoreML on macOS, CPU elsewhere |
+| cpu | all | Force CPU execution |
+| coreml | macOS | Uses CoreML; `compute_units` controls ane/gpu/cpu/all |
+| cuda | Linux/NVIDIA | Requires a binary built with `--features cuda` and CUDA 12/cuDNN runtime libraries |
+
+When `execution_provider = "cuda"`, you can optionally select a GPU with
+`cuda_device_id` or `MEMEX_CUDA_DEVICE_ID`.
+
+When loading CUDA, memex first tries the system loader paths, then any
+configured `cuda_library_paths` / `cudnn_library_paths`, then common CUDA install
+locations and active `venv` / `conda` `site-packages/nvidia/*/lib` directories.
+If your system keeps CUDA or cuDNN in a nonstandard location, set
+`MEMEX_CUDA_LIBRARY_PATHS` and `MEMEX_CUDNN_LIBRARY_PATHS` or the matching config
+keys.
+
 ## Config (optional)
 
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
@@ -241,7 +272,11 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 embeddings = true
 auto_index_on_search = true
 model = "minilm"  # minilm, bge, nomic, gemma, potion
-compute_units = "ane"  # macOS only: ane, gpu, cpu, all
+execution_provider = "auto"  # auto, cpu, coreml, cuda
+cuda_device_id = 0  # optional, when execution_provider = "cuda"
+cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs
+cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional list of cuDNN library dirs
+compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
@@ -255,6 +290,9 @@ codex_resume_cmd = "codex resume {session_id}"
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
+`execution_provider` applies to ONNX-backed models; `potion` uses the model2vec backend.
+`cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
+when `execution_provider = "cuda"`.
 
 Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`.
 
