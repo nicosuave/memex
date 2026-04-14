@@ -26,6 +26,10 @@ in {
         - embeddings (bool)
         - auto_index_on_search (bool)
         - model (string): "minilm", "bge", "nomic", "gemma", "potion"
+        - execution_provider (string): "auto", "cpu", "coreml", "cuda"
+        - cuda_device_id (int): GPU index when using the CUDA execution provider
+        - cuda_library_paths (list of strings): optional CUDA library directories
+        - cudnn_library_paths (list of strings): optional cuDNN library directories
         - scan_cache_ttl (int): seconds
         - index_service_mode (string): "interval" or "continuous"
         - index_service_interval (int): seconds
@@ -41,6 +45,8 @@ in {
       example = {
         embeddings = true;
         model = "minilm";
+        execution_provider = "auto";
+        cuda_device_id = 0;
         auto_index_on_search = true;
       };
     };
