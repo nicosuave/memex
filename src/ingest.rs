@@ -70,7 +70,7 @@ struct WriterContext {
     embed_runtime: EmbedRuntimeConfig,
 }
 
-/// Check if scan cache is fresh; if so, skip indexing entirely.
+/// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.
 /// Returns Ok(None) if skipped due to fresh cache, Ok(Some(report)) if indexing ran.
 pub fn ingest_if_stale(
     paths: &Paths,
@@ -81,7 +81,7 @@ pub fn ingest_if_stale(
     let cache_path = paths.state.join("scan_cache.json");
     let cache = ScanCache::load(&cache_path)?;
 
-    if cache.is_fresh(ttl_seconds) {
+    if can_skip_fresh_scan(&cache, paths, options, ttl_seconds) {
         return Ok(None);
     }
 
@@ -281,6 +281,16 @@ pub fn ingest_all(
 
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
+    if tasks.is_empty() && can_skip_noop_index(paths, options) {
+        update_scan_cache(paths, files_scanned, total_bytes);
+        return Ok(IngestReport {
+            records_added: 0,
+            records_embedded: 0,
+            files_scanned,
+            files_skipped,
+        });
+    }
+
     let progress = Arc::new(Progress::new(totals, file_totals, options.embeddings));
 
     let (tx_record, rx_record) = unbounded::<Record>();
@@ -349,11 +359,7 @@ pub fn ingest_all(
     state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
     state.save(&state_path)?;
 
-    // Update scan cache with current scan results
-    let cache_path = paths.state.join("scan_cache.json");
-    let mut cache = ScanCache::load(&cache_path).unwrap_or_default();
-    cache.update(files_scanned, total_bytes);
-    let _ = cache.save(&cache_path);
+    update_scan_cache(paths, files_scanned, total_bytes);
 
     Ok(IngestReport {
         records_added,
@@ -361,6 +367,36 @@ pub fn ingest_all(
         files_scanned,
         files_skipped,
     })
+}
+
+fn update_scan_cache(paths: &Paths, files_scanned: usize, total_bytes: u64) {
+    let cache_path = paths.state.join("scan_cache.json");
+    let mut cache = ScanCache::load(&cache_path).unwrap_or_default();
+    cache.update(files_scanned, total_bytes);
+    let _ = cache.save(&cache_path);
+}
+
+fn can_skip_fresh_scan(
+    cache: &ScanCache,
+    paths: &Paths,
+    options: &IngestOptions,
+    ttl_seconds: u64,
+) -> bool {
+    cache.is_fresh(ttl_seconds) && can_skip_noop_index(paths, options)
+}
+
+fn can_skip_noop_index(paths: &Paths, options: &IngestOptions) -> bool {
+    if !options.embeddings {
+        return true;
+    }
+    let Some(dimensions) = options.model.known_dimensions() else {
+        return false;
+    };
+    crate::vector::VectorIndex::is_model_compatible(
+        &paths.vectors,
+        options.model.as_str(),
+        dimensions,
+    )
 }
 
 fn writer_loop(
@@ -446,21 +482,21 @@ fn writer_loop(
 
     writer.commit()?;
     if embeddings {
-        let needs_vector_backfill = vector_index
-            .as_ref()
-            .is_some_and(crate::vector::VectorIndex::needs_backfill);
-        if do_backfill_embeddings || needs_vector_backfill {
-            embedded_count += backfill_embeddings(
-                &index,
+        if !embed_buffer.is_empty() {
+            embedded_count += flush_embeddings(
+                &mut embed_buffer,
                 embedder.as_mut().unwrap(),
                 vector_index.as_mut().unwrap(),
                 &progress,
             )?;
         }
 
-        if !embed_buffer.is_empty() {
-            embedded_count += flush_embeddings(
-                &mut embed_buffer,
+        let needs_vector_backfill = vector_index
+            .as_ref()
+            .is_some_and(crate::vector::VectorIndex::needs_backfill);
+        if do_backfill_embeddings || needs_vector_backfill {
+            embedded_count += backfill_embeddings(
+                &index,
                 embedder.as_mut().unwrap(),
                 vector_index.as_mut().unwrap(),
                 &progress,
@@ -1395,7 +1431,43 @@ fn is_embedding_role(role: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Paths;
+    use crate::embed::{EmbedRuntimeConfig, ModelChoice};
+    use crate::vector::VectorIndex;
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
+        IngestOptions {
+            claude_source: PathBuf::from("/does/not/exist"),
+            include_agents: false,
+            include_codex: false,
+            include_opencode: false,
+            embeddings,
+            backfill_embeddings: false,
+            model,
+            embed_runtime: EmbedRuntimeConfig::default(),
+        }
+    }
+
+    fn save_vector_store(paths: &Paths, model: &str, dimensions: usize) {
+        let mut vector = VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model))
+            .expect("open vector store");
+        vector.add(1, &vec![0.0; dimensions]).expect("add vector");
+        vector.save().unwrap();
+    }
+
+    fn fresh_scan_cache() -> ScanCache {
+        let last_scan_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        ScanCache {
+            last_scan_ts,
+            file_count: 0,
+            total_bytes: 0,
+        }
+    }
 
     #[test]
     fn collect_codex_session_files_includes_archived_sessions() {
@@ -1420,5 +1492,119 @@ mod tests {
         files.sort();
 
         assert_eq!(files, vec![archived, live]);
+    }
+
+    #[test]
+    fn can_skip_noop_index_when_embeddings_are_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let options = ingest_options(false, ModelChoice::BGESmall);
+
+        assert!(can_skip_noop_index(&paths, &options));
+    }
+
+    #[test]
+    fn can_skip_fresh_scan_when_embeddings_are_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let cache = fresh_scan_cache();
+
+        assert!(can_skip_fresh_scan(&cache, &paths, &options, 60));
+    }
+
+    #[test]
+    fn can_skip_fresh_scan_with_compatible_vectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+        let options = ingest_options(true, ModelChoice::BGESmall);
+        let cache = fresh_scan_cache();
+
+        assert!(can_skip_fresh_scan(&cache, &paths, &options, 60));
+    }
+
+    #[test]
+    fn cannot_skip_fresh_scan_when_vectors_are_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let options = ingest_options(true, ModelChoice::BGESmall);
+        let cache = fresh_scan_cache();
+
+        assert!(!can_skip_fresh_scan(&cache, &paths, &options, 60));
+    }
+
+    #[test]
+    fn cannot_skip_fresh_scan_with_incompatible_vectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "minilm", 384);
+        let options = ingest_options(true, ModelChoice::BGESmall);
+        let cache = fresh_scan_cache();
+
+        assert!(!can_skip_fresh_scan(&cache, &paths, &options, 60));
+    }
+
+    #[test]
+    fn cannot_skip_fresh_scan_when_cache_is_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let cache = ScanCache {
+            last_scan_ts: 0,
+            file_count: 0,
+            total_bytes: 0,
+        };
+
+        assert!(!can_skip_fresh_scan(&cache, &paths, &options, 60));
+    }
+
+    #[test]
+    fn can_skip_noop_index_with_compatible_vectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+        let options = ingest_options(true, ModelChoice::BGESmall);
+
+        assert!(can_skip_noop_index(&paths, &options));
+    }
+
+    #[test]
+    fn cannot_skip_noop_index_when_vectors_are_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let options = ingest_options(true, ModelChoice::BGESmall);
+
+        assert!(!can_skip_noop_index(&paths, &options));
+    }
+
+    #[test]
+    fn cannot_skip_noop_index_with_incompatible_vectors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "minilm", 384);
+        let options = ingest_options(true, ModelChoice::BGESmall);
+
+        assert!(!can_skip_noop_index(&paths, &options));
+    }
+
+    #[test]
+    fn cannot_skip_noop_index_with_wrong_vector_dimensions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 768);
+        let options = ingest_options(true, ModelChoice::BGESmall);
+
+        assert!(!can_skip_noop_index(&paths, &options));
+    }
+
+    #[test]
+    fn cannot_skip_noop_index_when_model_dimensions_are_dynamic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "potion", 256);
+        let options = ingest_options(true, ModelChoice::Potion);
+
+        assert!(!can_skip_noop_index(&paths, &options));
     }
 }

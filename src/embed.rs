@@ -106,6 +106,10 @@ impl ModelChoice {
             ModelChoice::Potion => "potion",
         }
     }
+
+    pub fn known_dimensions(self) -> Option<usize> {
+        self.fastembed_config().map(|(_, dimensions)| dimensions)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
