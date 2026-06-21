@@ -493,10 +493,6 @@ fn run_index(
     }
     paths.ensure_dirs()?;
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let vector_exists = paths.vectors.join("meta.json").exists()
-        && paths.vectors.join("vectors.f32").exists()
-        && paths.vectors.join("doc_ids.u64").exists();
-    let backfill_embeddings = embeddings && !vector_exists && index.doc_count()? > 0;
 
     let opts = IngestOptions {
         claude_source: source.unwrap_or_else(default_claude_source),
@@ -504,7 +500,7 @@ fn run_index(
         include_codex: codex,
         include_opencode: opencode,
         embeddings,
-        backfill_embeddings,
+        backfill_embeddings: false,
         model: model_choice,
         embed_runtime,
     };
@@ -539,7 +535,8 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut embedder = EmbedderHandle::with_model_and_runtime(model_choice, &embed_runtime)?;
-    let mut vector = VectorIndex::open_or_create(&paths.vectors, embedder.dims)?;
+    let mut vector =
+        VectorIndex::open_or_create(&paths.vectors, embedder.dims, Some(model_choice.as_str()))?;
 
     let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 4], [0; 4], true));
     progress.set_embed_ready();
@@ -657,17 +654,13 @@ fn run_search(
     if auto_index_on_search {
         paths.ensure_dirs()?;
         let index = SearchIndex::open_or_create(&paths.index)?;
-        let vector_exists = paths.vectors.join("meta.json").exists()
-            && paths.vectors.join("vectors.f32").exists()
-            && paths.vectors.join("doc_ids.u64").exists();
-        let backfill_embeddings = embeddings_default && !vector_exists && index.doc_count()? > 0;
         let opts = IngestOptions {
             claude_source: default_claude_source(),
             include_agents: false,
             include_codex: true,
             include_opencode: true,
             embeddings: embeddings_default,
-            backfill_embeddings,
+            backfill_embeddings: false,
             model: model_choice,
             embed_runtime: embed_runtime.clone(),
         };
@@ -1108,32 +1101,31 @@ fn run_stats(root: Option<PathBuf>) -> Result<()> {
 }
 
 fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
-    let meta_path = vectors_dir.join("meta.json");
-    let vectors_path = vectors_dir.join("vectors.f32");
-    let ids_path = vectors_dir.join("doc_ids.u64");
-    if !meta_path.exists() || !vectors_path.exists() || !ids_path.exists() {
-        println!("vectors: none");
-        return Ok(());
-    }
-    #[derive(serde::Deserialize)]
-    struct Meta {
-        dimensions: usize,
-    }
-    let meta_str = std::fs::read_to_string(&meta_path)?;
-    let meta: Meta = serde_json::from_str(&meta_str)?;
-    let ids_bytes = std::fs::metadata(&ids_path)?.len();
-    let vec_bytes = std::fs::metadata(&vectors_path)?.len();
-    let ids = ids_bytes / 8;
-    let vecs = if meta.dimensions == 0 {
-        0
-    } else {
-        (vec_bytes / 4) / meta.dimensions as u64
-    };
-    println!(
-        "vectors: {} (dims {}, ids {}, vectors.f32 {}, doc_ids.u64 {})",
-        vecs, meta.dimensions, ids, vec_bytes, ids_bytes
-    );
+    println!("{}", vector_stats_line(vectors_dir)?);
     Ok(())
+}
+
+fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
+    let vector = match VectorIndex::open(vectors_dir) {
+        Ok(vector) => vector,
+        Err(_) => {
+            return Ok("vectors: none".to_string());
+        }
+    };
+    let index_path = vectors_dir.join("usearch.index");
+    let ids_path = vectors_dir.join("doc_ids.bin");
+    let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+    let ids_bytes = std::fs::metadata(&ids_path).map(|m| m.len()).unwrap_or(0);
+    let model = vector.model().unwrap_or("unknown");
+    Ok(format!(
+        "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
+        vector.len(),
+        vector.dimensions(),
+        model,
+        vector.doc_id_count(),
+        index_bytes,
+        ids_bytes
+    ))
 }
 
 fn run_setup(force: bool) -> Result<()> {
@@ -2535,4 +2527,38 @@ fn parse_version_parts(value: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     Some((parts[0], parts[1], parts[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::VectorIndex;
+    use tempfile::TempDir;
+
+    fn make_vector(dims: usize) -> Vec<f32> {
+        (0..dims).map(|i| (i as f32).sin()).collect()
+    }
+
+    #[test]
+    fn vector_stats_line_reports_current_usearch_store() {
+        let tmp = TempDir::new().unwrap();
+        let mut index = VectorIndex::open_or_create(tmp.path(), 64, Some("bge")).unwrap();
+        index.add(42, &make_vector(64)).unwrap();
+        index.save().unwrap();
+
+        let line = vector_stats_line(tmp.path()).unwrap();
+
+        assert!(line.starts_with("vectors: 1 (dims 64, model bge, ids 1,"));
+        assert!(line.contains("usearch.index"));
+        assert!(line.contains("doc_ids.bin"));
+        assert!(!line.contains("vectors.f32"));
+        assert!(!line.contains("doc_ids.u64"));
+    }
+
+    #[test]
+    fn vector_stats_line_reports_none_without_vector_store() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(vector_stats_line(tmp.path()).unwrap(), "vectors: none");
+    }
 }

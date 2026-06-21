@@ -394,6 +394,7 @@ fn writer_loop(
         vector_index = Some(crate::vector::VectorIndex::open_or_create(
             &vector_dir,
             dims,
+            Some(model.as_str()),
         )?);
         embedder = Some(handle);
         progress.set_embed_ready();
@@ -445,7 +446,10 @@ fn writer_loop(
 
     writer.commit()?;
     if embeddings {
-        if do_backfill_embeddings {
+        let needs_vector_backfill = vector_index
+            .as_ref()
+            .is_some_and(crate::vector::VectorIndex::needs_backfill);
+        if do_backfill_embeddings || needs_vector_backfill {
             embedded_count += backfill_embeddings(
                 &index,
                 embedder.as_mut().unwrap(),

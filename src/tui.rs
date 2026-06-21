@@ -429,18 +429,13 @@ impl App {
                 let index = SearchIndex::open_or_create(&paths.index)?;
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
-                let vector_exists = paths.vectors.join("meta.json").exists()
-                    && paths.vectors.join("vectors.f32").exists()
-                    && paths.vectors.join("doc_ids.u64").exists();
-                let backfill_embeddings =
-                    embeddings_default && !vector_exists && index.doc_count()? > 0;
                 let opts = IngestOptions {
                     claude_source: default_claude_source(),
                     include_agents: false,
                     include_codex: true,
                     include_opencode: true,
                     embeddings: embeddings_default,
-                    backfill_embeddings,
+                    backfill_embeddings: false,
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                 };
