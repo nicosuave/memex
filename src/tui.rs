@@ -352,7 +352,12 @@ pub fn run(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
+    let index = if config.auto_index_on_search_default() {
+        paths.ensure_dirs()?;
+        SearchIndex::open_or_create_for_ingest(&paths.index)?
+    } else {
+        SearchIndex::open_or_create(&paths.index)?
+    };
     let (index_tx, index_rx) = std::sync::mpsc::channel();
     let (search_tx, search_rx) = std::sync::mpsc::channel();
 
@@ -438,7 +443,7 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(IndexUpdate::Started);
             let result = (|| -> Result<Option<crate::ingest::IngestReport>> {
-                let index = SearchIndex::open_or_create(&paths.index)?;
+                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
                 let opts = IngestOptions {

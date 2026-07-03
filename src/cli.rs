@@ -521,7 +521,7 @@ fn run_index(
         std::fs::remove_dir_all(&paths.root)?;
     }
     paths.ensure_dirs()?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
+    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
 
     let opts = IngestOptions {
         claude_source: source.unwrap_or_else(default_claude_source),
@@ -692,7 +692,7 @@ fn run_search(
     let scan_cache_ttl = config.scan_cache_ttl();
     if auto_index_on_search {
         paths.ensure_dirs()?;
-        let index = SearchIndex::open_or_create(&paths.index)?;
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
         let opts = IngestOptions {
             claude_source: default_claude_source(),
             include_agents: false,

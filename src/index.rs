@@ -57,25 +57,33 @@ pub struct QueryOptions {
 
 impl SearchIndex {
     pub fn open_or_create(dir: &Path) -> Result<Self> {
+        Self::open_or_create_with_policy(dir, StaleSchemaPolicy::Error)
+    }
+
+    pub fn open_or_create_for_ingest(dir: &Path) -> Result<Self> {
+        Self::open_or_create_with_policy(dir, StaleSchemaPolicy::Recreate)
+    }
+
+    fn open_or_create_with_policy(
+        dir: &Path,
+        stale_schema_policy: StaleSchemaPolicy,
+    ) -> Result<Self> {
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {
             let index = Index::open_in_dir(dir)?;
             if !schema_is_current(&index.schema()) {
-                drop(index);
-                std::fs::remove_dir_all(dir)?;
-                std::fs::create_dir_all(dir)?;
-                let schema = build_schema()?;
-                let index = Index::create_in_dir(dir, schema.clone())?;
-                let fields = load_fields(schema)?;
-                return Ok(Self { index, fields });
+                return match stale_schema_policy {
+                    StaleSchemaPolicy::Error => Err(stale_schema_error(dir)),
+                    StaleSchemaPolicy::Recreate => {
+                        drop(index);
+                        recreate_index_dir(dir)
+                    }
+                };
             }
             let fields = load_fields(index.schema())?;
             Ok(Self { index, fields })
         } else {
-            let schema = build_schema()?;
-            let index = Index::create_in_dir(dir, schema.clone())?;
-            let fields = load_fields(schema)?;
-            Ok(Self { index, fields })
+            create_index_in_dir(dir)
         }
     }
 
@@ -236,6 +244,32 @@ impl SearchIndex {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StaleSchemaPolicy {
+    Error,
+    Recreate,
+}
+
+fn stale_schema_error(dir: &Path) -> anyhow::Error {
+    anyhow!(
+        "index schema at {} is stale; run `memex index` or `memex reindex` to rebuild it",
+        dir.display()
+    )
+}
+
+fn recreate_index_dir(dir: &Path) -> Result<SearchIndex> {
+    std::fs::remove_dir_all(dir)?;
+    std::fs::create_dir_all(dir)?;
+    create_index_in_dir(dir)
+}
+
+fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
+    let schema = build_schema()?;
+    let index = Index::create_in_dir(dir, schema.clone())?;
+    let fields = load_fields(schema)?;
+    Ok(SearchIndex { index, fields })
 }
 
 fn build_schema() -> Result<Schema> {
@@ -450,5 +484,58 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
 fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<String>) {
     if let Some(value) = value {
         doc.add_text(field, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_stale_schema_index(dir: &Path) {
+        let mut builder = SchemaBuilder::default();
+        builder.add_u64_field("doc_id", INDEXED | STORED);
+        builder.add_u64_field("ts", FAST | STORED | INDEXED);
+        builder.add_text_field("project", STRING | STORED);
+        builder.add_text_field("session_id", STRING | STORED);
+        builder.add_u64_field("turn_id", FAST | STORED);
+        builder.add_text_field("role", STRING | STORED);
+        builder.add_text_field("source", STRING | STORED);
+        builder.add_text_field("text", TEXT | STORED);
+        builder.add_text_field("tool_name", STRING | STORED);
+        builder.add_text_field("tool_input", TEXT | STORED);
+        builder.add_text_field("tool_output", TEXT | STORED);
+        builder.add_text_field("source_path", STRING | STORED);
+
+        let index = Index::create_in_dir(dir, builder.build()).expect("create stale index");
+        drop(index);
+        std::fs::write(dir.join("sentinel"), "keep").expect("write sentinel");
+    }
+
+    #[test]
+    fn read_only_open_preserves_stale_schema_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        create_stale_schema_index(tmp.path());
+
+        let err = match SearchIndex::open_or_create(tmp.path()) {
+            Ok(_) => panic!("stale index unexpectedly opened"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("index schema"));
+        assert!(tmp.path().join("meta.json").exists());
+        assert!(tmp.path().join("sentinel").exists());
+    }
+
+    #[test]
+    fn ingest_open_recreates_stale_schema_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        create_stale_schema_index(tmp.path());
+
+        let index =
+            SearchIndex::open_or_create_for_ingest(tmp.path()).expect("recreate stale index");
+
+        assert_eq!(index.doc_count().expect("doc count"), 0);
+        assert!(tmp.path().join("meta.json").exists());
+        assert!(!tmp.path().join("sentinel").exists());
     }
 }
