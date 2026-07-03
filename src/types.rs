@@ -9,6 +9,7 @@ pub enum SourceKind {
     CodexHistory,
     Opencode,
     Cursor,
+    Pi,
 }
 
 impl SourceKind {
@@ -19,6 +20,7 @@ impl SourceKind {
             SourceKind::CodexHistory => 2,
             SourceKind::Opencode => 3,
             SourceKind::Cursor => 4,
+            SourceKind::Pi => 5,
         }
     }
 
@@ -28,6 +30,7 @@ impl SourceKind {
             SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
+            SourceKind::Pi => "pi",
         }
     }
 
@@ -49,8 +52,25 @@ impl SourceKind {
             || path.contains("agent-transcripts")
         {
             SourceKind::Cursor
+        } else if path.contains(".pi/agent/sessions")
+            || path.contains(".pi\\agent\\sessions")
+            || path.contains("pi/agent/sessions")
+            || path.contains("pi\\agent\\sessions")
+        {
+            SourceKind::Pi
         } else {
             SourceKind::Claude
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "claude" => Some(SourceKind::Claude),
+            "codex" => Some(SourceKind::CodexSession),
+            "opencode" => Some(SourceKind::Opencode),
+            "cursor" => Some(SourceKind::Cursor),
+            "pi" => Some(SourceKind::Pi),
+            _ => None,
         }
     }
 }
@@ -62,6 +82,7 @@ pub enum SourceFilter {
     Codex,
     Opencode,
     Cursor,
+    Pi,
 }
 
 impl SourceFilter {
@@ -73,6 +94,7 @@ impl SourceFilter {
             }
             SourceFilter::Opencode => source == SourceKind::Opencode,
             SourceFilter::Cursor => source == SourceKind::Cursor,
+            SourceFilter::Pi => source == SourceKind::Pi,
         }
     }
 
@@ -82,6 +104,7 @@ impl SourceFilter {
             SourceFilter::Codex => "codex",
             SourceFilter::Opencode => "opencode",
             SourceFilter::Cursor => "cursor",
+            SourceFilter::Pi => "pi",
         }
     }
 }
@@ -132,5 +155,15 @@ mod tests {
 
         assert_eq!(SourceKind::from_path(unix_path), SourceKind::Cursor);
         assert_eq!(SourceKind::from_path(windows_path), SourceKind::Cursor);
+    }
+
+    #[test]
+    fn from_path_recognizes_pi_sessions() {
+        let unix_path = "/tmp/.pi/agent/sessions/--Users-nico-Code/20260703_session.jsonl";
+        let windows_path =
+            "C:\\tmp\\.pi\\agent\\sessions\\--Users-nico-Code\\20260703_session.jsonl";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Pi);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Pi);
     }
 }

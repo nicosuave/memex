@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, and OpenCode logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, and Pi Coding Agent logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -107,7 +107,7 @@ Then run setup to install the skills:
 memex setup
 ```
 
-Restart Claude/Codex after setup.
+Restart Claude, Codex, OpenCode, or Pi after setup.
 
 ## Quickstart
 
@@ -170,7 +170,7 @@ If you built from source, run setup to install:
 memex setup
 ```
 
-This detects which tools are installed (Claude/Codex) and presents an interactive menu to select which to configure.
+This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents an interactive menu to select which to configure.
 ## Search modes
 
 | Need | Command |
@@ -185,7 +185,7 @@ This detects which tools are installed (Claude/Codex) and presents an interactiv
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex`
+- `--source claude|codex|opencode|pi`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -286,6 +286,8 @@ index_service_systemd_dir = "~/.config/systemd/user"  # Linux only
 claude_resume_cmd = "claude --resume {session_id}"
 codex_resume_cmd = "codex resume {session_id}"
 cursor_resume_cmd = "cursor-agent --resume {session_id}"
+opencode_resume_cmd = "opencode resume {session_id}"
+pi_resume_cmd = "pi --session {source_path_shell}"
 ```
 
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
@@ -295,6 +297,6 @@ Service logs and the plist live under `~/.memex` by default (macOS). On Linux, s
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.
 
-Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`.
+Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`.
 
 The skill definitions are bundled in `skills/`.

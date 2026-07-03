@@ -309,7 +309,11 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
         |field: Field| -> u64 { doc.get_first(field).and_then(|v| v.as_u64()).unwrap_or(0) };
 
     let source_path = get_str(fields.source_path).unwrap_or_default();
-    let source = crate::types::SourceKind::from_path(&source_path);
+    let source = fields
+        .source
+        .and_then(&get_str)
+        .and_then(|label| crate::types::SourceKind::from_label(&label))
+        .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
     Record {
         source,
         doc_id: get_u64(fields.doc_id),

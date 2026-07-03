@@ -33,6 +33,7 @@ pub struct IngestOptions {
     pub include_codex: bool,
     pub include_opencode: bool,
     pub include_cursor: bool,
+    pub include_pi: bool,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
@@ -326,6 +327,49 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_pi {
+        let pi_files = collect_pi_files()?;
+        for path in pi_files {
+            let meta = path.metadata()?;
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            files_scanned += 1;
+            total_bytes += size;
+            let key = path.to_string_lossy().to_string();
+            let prev = state.files.get(&key);
+            let (offset, turn_id, delete_first, skip) = match prev {
+                None => (0, 0, false, false),
+                Some(prev) => {
+                    if size < prev.size || mtime < prev.mtime {
+                        (0, 0, true, false)
+                    } else if size == prev.size && mtime == prev.mtime {
+                        (prev.offset, prev.turn_id, false, true)
+                    } else {
+                        (prev.offset, prev.turn_id, false, false)
+                    }
+                }
+            };
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(FileTask {
+                path,
+                source: SourceKind::Pi,
+                offset,
+                turn_id,
+                size,
+                mtime,
+                delete_first,
+            });
+        }
+    }
+
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
@@ -384,6 +428,7 @@ pub fn ingest_all(
             SourceKind::Cursor => {
                 parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
+            SourceKind::Pi => parse_pi_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?,
         }
         Ok(())
     })?;
@@ -504,7 +549,7 @@ fn writer_loop(
     let mut vector_index = None;
     let mut embedder: Option<EmbedderHandle> = None;
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
-    let mut index_pending: [u64; 5] = [0, 0, 0, 0, 0];
+    let mut index_pending = [0u64; 6];
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
         let dims = handle.dims;
@@ -556,7 +601,8 @@ fn writer_loop(
                 1 => SourceKind::CodexSession,
                 2 => SourceKind::CodexHistory,
                 3 => SourceKind::Opencode,
-                _ => SourceKind::Cursor,
+                4 => SourceKind::Cursor,
+                _ => SourceKind::Pi,
             };
             progress.add_indexed(source, pending);
         }
@@ -724,6 +770,28 @@ fn collect_cursor_files() -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn collect_pi_files() -> Result<Vec<PathBuf>> {
+    collect_pi_files_from_root(&pi_sessions_root())
+}
+
+fn collect_pi_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        files.push(path.to_path_buf());
+    }
+    Ok(files)
+}
+
 fn codex_root() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
@@ -770,6 +838,57 @@ fn cursor_projects_root() -> PathBuf {
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
     home.join(".cursor").join("projects")
+}
+
+fn pi_agent_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        return PathBuf::from(root);
+    }
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".pi").join("agent")
+}
+
+fn pi_sessions_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+        return PathBuf::from(root);
+    }
+    let agent_root = pi_agent_root();
+    if let Some(root) = pi_configured_session_root(&agent_root) {
+        return root;
+    }
+    agent_root.join("sessions")
+}
+
+fn pi_configured_session_root(agent_root: &Path) -> Option<PathBuf> {
+    let settings_path = agent_root.join("settings.json");
+    let contents = std::fs::read_to_string(settings_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let session_dir = value.get("sessionDir")?.as_str()?.trim();
+    if session_dir.is_empty() {
+        return None;
+    }
+    Some(resolve_pi_settings_path(session_dir, agent_root))
+}
+
+fn resolve_pi_settings_path(raw: &str, base: &Path) -> PathBuf {
+    if raw == "~" {
+        return directories::BaseDirs::new()
+            .map(|b| b.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return directories::BaseDirs::new()
+            .map(|b| b.home_dir().join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw));
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
 
 fn parse_claude_file(
@@ -1531,6 +1650,347 @@ fn parse_cursor_file(
     Ok(())
 }
 
+fn parse_pi_file(
+    task: &FileTask,
+    tx_record: &Sender<Record>,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let file = File::open(&task.path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let mut start = task.offset as usize;
+    let mut turn_id = task.turn_id;
+
+    let source_path = task.path.to_string_lossy().to_string();
+    let mut session_id =
+        session_id_from_filename(&task.path).unwrap_or_else(|| source_path.clone());
+    let mut project = project_from_pi_session_path(&task.path);
+    let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+
+    let mut buf = Vec::new();
+    if start > 0 && !mmap.is_empty() {
+        let rel = memchr(b'\n', &mmap).unwrap_or(mmap.len());
+        let line = &mmap[..rel];
+        if !line.is_empty() {
+            buf.extend_from_slice(line);
+            if let Ok(value) = simd_json::to_borrowed_value(&mut buf)
+                && let Some(obj) = value.as_object()
+                && obj.get("type").and_then(|v| v.as_str()) == Some("session")
+            {
+                apply_pi_session_header(obj, &mut session_id, &mut project);
+            }
+            buf.clear();
+        }
+    }
+    let mut parsed_bytes = 0u64;
+    while start < mmap.len() {
+        let slice = &mmap[start..];
+        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..rel];
+        let advanced = rel + 1;
+        start += advanced;
+        parsed_bytes += advanced as u64;
+        if parsed_bytes >= 64 * 1024 {
+            progress.add_parsed_bytes(SourceKind::Pi, parsed_bytes);
+            parsed_bytes = 0;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        buf.clear();
+        buf.extend_from_slice(line);
+        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(parse_iso_millis)
+            .unwrap_or(0);
+
+        if entry_type == "session" {
+            apply_pi_session_header(obj, &mut session_id, &mut project);
+            continue;
+        }
+
+        if entry_type == "compaction" || entry_type == "branch_summary" {
+            let summary = obj
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if summary.is_empty() {
+                continue;
+            }
+            let record = Record {
+                source: SourceKind::Pi,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: "assistant".to_string(),
+                text: format!("{entry_type}: {summary}"),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                source_path: source_path.clone(),
+            };
+            progress.add_produced(SourceKind::Pi, 1);
+            tx_record.send(record)?;
+            turn_id += 1;
+            continue;
+        }
+
+        if entry_type == "custom_message" {
+            let text = pi_content_text(obj.get("content")).trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            let custom_type = obj.get("customType").and_then(|v| v.as_str()).unwrap_or("");
+            let prefix = if custom_type.is_empty() {
+                "custom_message".to_string()
+            } else {
+                format!("custom_message({custom_type})")
+            };
+            let record = Record {
+                source: SourceKind::Pi,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: "assistant".to_string(),
+                text: format!("{prefix}: {text}"),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                source_path: source_path.clone(),
+            };
+            progress.add_produced(SourceKind::Pi, 1);
+            tx_record.send(record)?;
+            turn_id += 1;
+            continue;
+        }
+
+        if entry_type != "message" {
+            continue;
+        }
+        let message = match obj.get("message").and_then(|v| v.as_object()) {
+            Some(m) => m,
+            None => continue,
+        };
+        let timestamp = if timestamp == 0 {
+            message
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(parse_iso_millis)
+                .unwrap_or(0)
+        } else {
+            timestamp
+        };
+        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+        match role {
+            "user" | "assistant" => {
+                let content = message.get("content");
+                if role == "assistant"
+                    && let Some(arr) = content.and_then(|v| v.as_array())
+                {
+                    for block in arr {
+                        let Some(block_obj) = block.as_object() else {
+                            continue;
+                        };
+                        if block_obj.get("type").and_then(|v| v.as_str()) != Some("toolCall") {
+                            continue;
+                        }
+                        let tool_name = block_obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        if let (Some(id), Some(name)) = (
+                            block_obj.get("id").and_then(|v| v.as_str()),
+                            tool_name.clone(),
+                        ) {
+                            tool_id_to_name.insert(id.to_string(), name);
+                        }
+                        let tool_input = block_obj.get("arguments").map(|v| v.to_string());
+                        let record = Record {
+                            source: SourceKind::Pi,
+                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                            ts: timestamp,
+                            project: project.clone(),
+                            session_id: session_id.clone(),
+                            turn_id,
+                            role: "tool_use".to_string(),
+                            text: tool_input.clone().unwrap_or_default(),
+                            tool_name,
+                            tool_input,
+                            tool_output: None,
+                            source_path: source_path.clone(),
+                        };
+                        progress.add_produced(SourceKind::Pi, 1);
+                        tx_record.send(record)?;
+                        turn_id += 1;
+                    }
+                }
+
+                let text = pi_content_text(content).trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Pi,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: role.to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Pi, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "toolResult" => {
+                let tool_call_id = message
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tool_name = message
+                    .get("toolName")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| tool_id_to_name.get(tool_call_id).cloned());
+                let tool_output = Some(pi_content_text(message.get("content")));
+                let text = tool_output.clone().unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Pi,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "tool_result".to_string(),
+                    text,
+                    tool_name,
+                    tool_input: None,
+                    tool_output,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Pi, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "bashExecution" => {
+                if message
+                    .get("excludeFromContext")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let command = message
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = message
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let exit_code = message.get("exitCode").and_then(|v| v.as_i64());
+                let text = pi_bash_text(&command, &output, exit_code);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Pi,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "tool_result".to_string(),
+                    text,
+                    tool_name: Some("Bash".to_string()),
+                    tool_input: if command.is_empty() {
+                        None
+                    } else {
+                        Some(command)
+                    },
+                    tool_output: if output.is_empty() {
+                        None
+                    } else {
+                        Some(output)
+                    },
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Pi, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "custom" | "branchSummary" | "compactionSummary" => {
+                let text = pi_summary_message_text(message, role);
+                if text.is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Pi,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "assistant".to_string(),
+                    text: format!("{role}: {text}"),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Pi, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if parsed_bytes > 0 {
+        progress.add_parsed_bytes(SourceKind::Pi, parsed_bytes);
+    }
+    progress.add_files_done(SourceKind::Pi, 1);
+    let state = FileState {
+        size: task.size,
+        mtime: task.mtime,
+        offset: mmap.len() as u64,
+        turn_id,
+    };
+    tx_update.send(FileUpdate {
+        path: source_path,
+        state,
+        session_id: Some(session_id),
+    })?;
+    Ok(())
+}
+
 fn parse_iso_millis(input: &str) -> Option<u64> {
     DateTime::parse_from_rfc3339(input)
         .ok()
@@ -1554,6 +2014,23 @@ fn project_from_path(path: &str) -> String {
         return name.to_string();
     }
     "codex".to_string()
+}
+
+fn apply_pi_session_header(
+    obj: &simd_json::borrowed::Object,
+    session_id: &mut String,
+    project: &mut String,
+) {
+    if let Some(id) = obj.get("id").and_then(|v| v.as_str())
+        && !id.is_empty()
+    {
+        *session_id = id.to_string();
+    }
+    if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str())
+        && !cwd.is_empty()
+    {
+        *project = project_from_path(cwd);
+    }
 }
 
 fn project_from_cursor_path(path: &Path) -> String {
@@ -1628,9 +2105,116 @@ fn stable_cursor_turn_bucket(value: &str) -> u32 {
     hash % CURSOR_SUBAGENT_TURN_BUCKETS
 }
 
+fn project_from_pi_session_path(path: &Path) -> String {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|name| decode_pi_project_name(pi_session_dir_project_key(name)))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "pi".to_string())
+}
+
+fn pi_session_dir_project_key(name: &str) -> &str {
+    if name.starts_with("--") && name.ends_with("--") && name.len() > 4 {
+        &name[1..name.len() - 1]
+    } else {
+        name
+    }
+}
+
+fn pi_content_text(content: Option<&BorrowedValue>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(text) = item.as_str() {
+                parts.push(text.to_string());
+                continue;
+            }
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                }
+                "thinking" => {
+                    if let Some(text) = obj.get("thinking").and_then(|v| v.as_str()) {
+                        parts.push(format!("Thinking:\n{text}"));
+                    }
+                }
+                "toolCall" => {}
+                _ => {
+                    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                        parts.push(text.to_string());
+                    } else if let Some(text) = obj.get("content").and_then(|v| v.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+        return parts.join("\n");
+    }
+    content.to_string()
+}
+
+fn pi_summary_message_text(message: &simd_json::borrowed::Object, role: &str) -> String {
+    let summary = if role == "branchSummary" || role == "compactionSummary" {
+        message.get("summary").and_then(|v| v.as_str())
+    } else {
+        None
+    };
+    summary
+        .map(str::to_string)
+        .unwrap_or_else(|| pi_content_text(message.get("content")))
+        .trim()
+        .to_string()
+}
+
+fn pi_bash_text(command: &str, output: &str, exit_code: Option<i64>) -> String {
+    let mut parts = Vec::new();
+    if !command.is_empty() {
+        parts.push(format!("$ {command}"));
+    }
+    if !output.is_empty() {
+        parts.push(output.to_string());
+    }
+    if let Some(code) = exit_code {
+        parts.push(format!("exit code: {code}"));
+    }
+    parts.join("\n")
+}
+
+fn decode_pi_project_name(folder_name: &str) -> String {
+    let decoded = decode_project_name(folder_name);
+    decoded
+        .rsplit('-')
+        .find(|part| !part.is_empty())
+        .unwrap_or(&decoded)
+        .to_string()
+}
+
 fn decode_project_name(folder_name: &str) -> String {
     let prefixes_to_strip = ["-home-", "-mnt-c-Users-", "-mnt-c-users-", "-Users-"];
     let mut name = folder_name;
+    if name.len() > 10 {
+        let bytes = name.as_bytes();
+        if bytes[0] == b'-'
+            && bytes[2] == b'-'
+            && bytes[3] == b'-'
+            && bytes[1].is_ascii_alphabetic()
+            && name[4..].to_lowercase().starts_with("users-")
+        {
+            name = &name[10..];
+        }
+    }
     for prefix in prefixes_to_strip {
         if name.to_lowercase().starts_with(&prefix.to_lowercase()) {
             name = &name[prefix.len()..];
@@ -1746,8 +2330,8 @@ fn flush_embeddings(
     Ok(count)
 }
 
-fn compute_totals(tasks: &[FileTask]) -> [u64; 5] {
-    let mut totals = [0u64; 5];
+fn compute_totals(tasks: &[FileTask]) -> [u64; 6] {
+    let mut totals = [0u64; 6];
     for task in tasks {
         let remaining = task.size.saturating_sub(task.offset);
         totals[task.source.idx()] += remaining;
@@ -1755,8 +2339,8 @@ fn compute_totals(tasks: &[FileTask]) -> [u64; 5] {
     totals
 }
 
-fn compute_file_totals(tasks: &[FileTask]) -> [u64; 5] {
-    let mut totals = [0u64; 5];
+fn compute_file_totals(tasks: &[FileTask]) -> [u64; 6] {
+    let mut totals = [0u64; 6];
     for task in tasks {
         totals[task.source.idx()] += 1;
     }
@@ -1784,6 +2368,8 @@ mod tests {
     use super::*;
     use crate::config::Paths;
     use crate::embed::{EmbedRuntimeConfig, ModelChoice};
+    use crate::index::SearchIndex;
+    use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1795,6 +2381,7 @@ mod tests {
             include_codex: false,
             include_opencode: false,
             include_cursor: false,
+            include_pi: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -2102,5 +2689,215 @@ mod tests {
         let options = ingest_options(true, ModelChoice::Potion);
 
         assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+    }
+    #[test]
+    fn collect_pi_files_recurses_under_sessions_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = tmp.path().join("sessions");
+        let project_root = sessions_root.join("--Users-nico-Code-memex--");
+        fs::create_dir_all(&project_root).expect("create pi session dir");
+
+        let session =
+            project_root.join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        let ignored = project_root.join("notes.json");
+        fs::write(&session, "{}\n").expect("write pi session");
+        fs::write(&ignored, "{}\n").expect("write ignored");
+
+        let files = collect_pi_files_from_root(&sessions_root).expect("collect pi files");
+
+        assert_eq!(files, vec![session]);
+    }
+
+    #[test]
+    fn pi_sessions_root_honors_session_dir_override() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let custom_sessions = tmp.path().join("custom-sessions");
+        let _env = EnvVarGuard::set_os(&[
+            (
+                "PI_CODING_AGENT_SESSION_DIR",
+                Some(custom_sessions.as_os_str()),
+            ),
+            ("PI_CODING_AGENT_DIR", None),
+        ]);
+
+        assert_eq!(pi_sessions_root(), custom_sessions);
+    }
+
+    #[test]
+    fn pi_sessions_root_honors_settings_session_dir() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pi_root = tmp.path().join("pi-agent");
+        fs::create_dir_all(&pi_root).expect("create pi root");
+        fs::write(
+            pi_root.join("settings.json"),
+            r#"{ "sessionDir": ".pi/sessions" }"#,
+        )
+        .expect("write settings");
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str())),
+        ]);
+
+        assert_eq!(pi_sessions_root(), pi_root.join(".pi/sessions"));
+    }
+
+    #[test]
+    fn pi_session_path_fallback_preserves_project_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home_path = tmp
+            .path()
+            .join("sessions")
+            .join("--home-alice-code-memex--")
+            .join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        let users_path = tmp
+            .path()
+            .join("sessions")
+            .join("--Users-nico-Code-memex--")
+            .join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        let windows_path = tmp
+            .path()
+            .join("sessions")
+            .join("--C--Users-alice-Code-memex--")
+            .join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        let nested_path = tmp
+            .path()
+            .join("sessions")
+            .join("--home-alice-code-acme-memex--")
+            .join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+
+        assert_eq!(project_from_pi_session_path(&home_path), "memex");
+        assert_eq!(project_from_pi_session_path(&users_path), "memex");
+        assert_eq!(project_from_pi_session_path(&windows_path), "memex");
+        assert_eq!(project_from_pi_session_path(&nested_path), "memex");
+    }
+
+    #[test]
+    fn ingest_pi_session_records_supported_message_shapes() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pi_root = tmp.path().join("pi-agent");
+        let sessions_root = pi_root.join("sessions").join("--Users-nico-Code-memex--");
+        fs::create_dir_all(&sessions_root).expect("create pi sessions");
+        let session_file =
+            sessions_root.join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"session","version":3,"id":"11111111-1111-1111-1111-111111111111","timestamp":"2026-07-03T01:02:03Z","cwd":"/Users/nico/Code/memex"}
+{"type":"message","id":"u1","timestamp":"2026-07-03T01:02:04Z","message":{"role":"user","content":[{"type":"text","text":"hello pi"}]}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"considering options"},{"type":"text","text":"I will run a command"},{"type":"toolCall","id":"tc1","name":"Read","arguments":{"file_path":"README.md"}}]}}
+{"type":"message","id":"tr1","parentId":"a1","timestamp":"2026-07-03T01:02:06Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"Read","content":[{"type":"text","text":"README contents"}],"isError":false}}
+{"type":"message","id":"b1","parentId":"tr1","timestamp":"2026-07-03T01:02:07Z","message":{"role":"bashExecution","command":"cargo test","output":"ok","exitCode":0,"cancelled":false,"truncated":false}}
+{"type":"message","id":"bh1","parentId":"b1","timestamp":"2026-07-03T01:02:07Z","message":{"role":"bashExecution","command":"echo secret","output":"secret output","exitCode":0,"excludeFromContext":true}}
+{"type":"compaction","id":"c1","parentId":"b1","timestamp":"2026-07-03T01:02:08Z","summary":"compacted top-level summary","firstKeptEntryId":"tr1","tokensBefore":50000}
+{"type":"branch_summary","id":"br1","parentId":"u1","timestamp":"2026-07-03T01:02:09Z","fromId":"c1","summary":"branch top-level summary"}
+{"type":"custom_message","id":"cm1","parentId":"br1","timestamp":"2026-07-03T01:02:10Z","customType":"memex","content":[{"type":"text","text":"extension context"}],"display":true}
+{"type":"message","id":"mcs1","parentId":"cm1","timestamp":"2026-07-03T01:02:11Z","message":{"role":"compactionSummary","content":"summary text"}}
+{"type":"message","id":"mbs1","parentId":"mcs1","timestamp":"2026-07-03T01:02:12Z","message":{"role":"branchSummary","summary":"message summary text"}}
+"#,
+        )
+        .expect("write pi fixture");
+        let _env = EnvVarGuard::set_os(&[("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str()))]);
+
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let options = IngestOptions {
+            claude_source: tmp.path().join("missing-claude"),
+            include_agents: false,
+            include_codex: false,
+            include_opencode: false,
+            include_cursor: false,
+            include_pi: true,
+            embeddings: false,
+            backfill_embeddings: false,
+            model: ModelChoice::default(),
+            embed_runtime: EmbedRuntimeConfig::default(),
+        };
+
+        let report = ingest_all(&paths, &index, &options).expect("ingest");
+        assert_eq!(report.records_added, 10);
+
+        let mut records = index
+            .records_by_session_id("11111111-1111-1111-1111-111111111111")
+            .expect("records by session");
+        records.sort_by_key(|record| record.turn_id);
+
+        assert_eq!(records.len(), 10);
+        assert!(records.iter().all(|record| record.source == SourceKind::Pi));
+        assert!(records.iter().all(|record| record.project == "memex"));
+        let source_path = session_file.to_string_lossy().to_string();
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == source_path)
+        );
+        assert_eq!(records[0].role, "user");
+        assert_eq!(records[0].text, "hello pi");
+        assert_eq!(records[1].role, "tool_use");
+        assert_eq!(records[1].tool_name.as_deref(), Some("Read"));
+        assert!(records[1].text.contains("README.md"));
+        assert_eq!(records[2].role, "assistant");
+        assert!(records[2].text.contains("I will run a command"));
+        assert!(records[2].text.contains("Thinking:"));
+        assert_eq!(records[3].role, "tool_result");
+        assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+        assert_eq!(records[3].text, "README contents");
+        assert_eq!(records[4].role, "tool_result");
+        assert_eq!(records[4].tool_name.as_deref(), Some("Bash"));
+        assert!(records[4].text.contains("$ cargo test"));
+        assert!(records[4].text.contains("exit code: 0"));
+        assert_eq!(records[5].role, "assistant");
+        assert_eq!(records[5].text, "compaction: compacted top-level summary");
+        assert_eq!(records[6].role, "assistant");
+        assert_eq!(records[6].text, "branch_summary: branch top-level summary");
+        assert_eq!(records[7].role, "assistant");
+        assert_eq!(records[7].text, "custom_message(memex): extension context");
+        assert_eq!(records[8].role, "assistant");
+        assert_eq!(records[8].text, "compactionSummary: summary text");
+        assert_eq!(records[9].role, "assistant");
+        assert_eq!(records[9].text, "branchSummary: message summary text");
+        assert!(!records.iter().any(|record| record.text.contains("secret")));
+    }
+
+    #[test]
+    fn ingest_pi_incremental_records_keep_header_project() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = tmp
+            .path()
+            .join("sessions")
+            .join("--home-alice-code-my-project--");
+        fs::create_dir_all(&sessions_root).expect("create pi sessions");
+        let session_file =
+            sessions_root.join("20260703T010203Z_11111111-1111-1111-1111-111111111111.jsonl");
+        let existing = r#"{"type":"session","version":3,"id":"22222222-2222-2222-2222-222222222222","timestamp":"2026-07-03T01:02:03Z","cwd":"/home/alice/code/my-project"}
+{"type":"message","id":"u1","timestamp":"2026-07-03T01:02:04Z","message":{"role":"user","content":"first"}}
+"#;
+        let appended = r#"{"type":"message","id":"a1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","content":"second"}}
+"#;
+        fs::write(&session_file, format!("{existing}{appended}")).expect("write pi fixture");
+
+        let (tx_record, rx_record) = unbounded();
+        let (tx_update, _rx_update) = unbounded();
+        let task = FileTask {
+            path: session_file,
+            source: SourceKind::Pi,
+            offset: existing.len() as u64,
+            turn_id: 1,
+            size: (existing.len() + appended.len()) as u64,
+            mtime: 0,
+            delete_first: false,
+        };
+        let progress = Arc::new(Progress::new([0; 6], [0; 6], false));
+        let next_doc_id = AtomicU64::new(1);
+
+        parse_pi_file(&task, &tx_record, &tx_update, &next_doc_id, &progress).expect("parse pi");
+        drop(tx_record);
+        let records: Vec<_> = rx_record.try_iter().collect();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].project, "my-project");
+        assert_eq!(records[0].text, "second");
     }
 }

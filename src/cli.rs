@@ -21,10 +21,10 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, and Opencode",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, and Pi",
     after_help = "\
 QUICK START:
-    memex index                     # Index your Claude/Codex/Cursor/Opencode history
+    memex index                     # Index your agent history
     memex search \"error handling\"   # Search for keywords
     memex tui                       # Browse sessions interactively
 
@@ -47,12 +47,24 @@ struct IndexArgs {
     /// Index Codex sessions from ~/.codex [default: true]
     #[arg(long, default_value_t = true)]
     codex: bool,
+    /// Skip indexing Codex sessions
+    #[arg(long = "no-codex", default_value_t = false)]
+    no_codex: bool,
     /// Index Opencode sessions from ~/.local/share/opencode [default: true]
     #[arg(long, default_value_t = true)]
     opencode: bool,
+    /// Skip indexing Opencode sessions
+    #[arg(long = "no-opencode", default_value_t = false)]
+    no_opencode: bool,
     /// Index Cursor agent transcripts from ~/.cursor/projects [default: true]
     #[arg(long = "no-cursor", action = clap::ArgAction::SetFalse, default_value_t = true)]
     cursor: bool,
+    /// Index Pi sessions from ~/.pi/agent/sessions or $PI_CODING_AGENT_DIR/sessions [default: true]
+    #[arg(long, default_value_t = true)]
+    pi: bool,
+    /// Skip indexing Pi sessions
+    #[arg(long = "no-pi", default_value_t = false)]
+    no_pi: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long)]
     embeddings: bool,
@@ -70,7 +82,7 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, and Opencode conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, and Pi conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -134,7 +146,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, or opencode
+        /// Filter by source: claude, codex, cursor, opencode, or pi
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -222,7 +234,7 @@ OUTPUT FIELDS (--fields):
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Install the memex-search skill for Claude, Codex, and/or Opencode
+    /// Install the memex-search skill for Claude, Codex, Opencode, and/or Pi
     Setup {
         /// Overwrite existing skills/prompts (useful after memex update)
         #[arg(short, long)]
@@ -457,9 +469,10 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
     run_index(
         index.source.clone(),
         index.include_agents,
-        index.codex,
-        index.opencode,
+        index.codex && !index.no_codex,
+        index.opencode && !index.no_opencode,
         index.cursor,
+        index.pi && !index.no_pi,
         index.embeddings,
         index.no_embeddings,
         index.model.clone(),
@@ -475,6 +488,7 @@ fn run_index(
     codex: bool,
     opencode: bool,
     cursor: bool,
+    pi: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
     model: Option<String>,
@@ -505,6 +519,7 @@ fn run_index(
         include_codex: codex,
         include_opencode: opencode,
         include_cursor: cursor,
+        include_pi: pi,
         embeddings,
         backfill_embeddings: false,
         model: model_choice,
@@ -544,10 +559,10 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let mut vector =
         VectorIndex::open_or_create(&paths.vectors, embedder.dims, Some(model_choice.as_str()))?;
 
-    let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 5], [0; 5], true));
+    let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 6], [0; 6], true));
     progress.set_embed_ready();
 
-    let mut embedded_counts = [0u64; 5];
+    let mut embedded_counts = [0u64; 6];
     let mut embedded_total = 0u64;
     let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
 
@@ -555,7 +570,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
                        embedder: &mut EmbedderHandle,
                        vector: &mut VectorIndex,
                        progress: &crate::progress::Progress,
-                       embedded_counts: &mut [u64; 5],
+                       embedded_counts: &mut [u64; 6],
                        embedded_total: &mut u64| {
         if batch.is_empty() {
             return Ok(());
@@ -614,13 +629,14 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {})",
+        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {})",
         embedded_total,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
         embedded_counts[crate::types::SourceKind::CodexSession.idx()],
         embedded_counts[crate::types::SourceKind::CodexHistory.idx()],
         embedded_counts[crate::types::SourceKind::Opencode.idx()],
         embedded_counts[crate::types::SourceKind::Cursor.idx()],
+        embedded_counts[crate::types::SourceKind::Pi.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -667,6 +683,7 @@ fn run_search(
             include_codex: true,
             include_opencode: true,
             include_cursor: true,
+            include_pi: true,
             embeddings: embeddings_default,
             backfill_embeddings: false,
             model: model_choice,
@@ -1143,9 +1160,13 @@ fn run_setup(force: bool) -> Result<()> {
     let claude_path = find_in_path("claude");
     let codex_path = find_in_path("codex");
     let opencode_path = find_in_path("opencode");
+    let pi_path = find_in_path("pi");
 
-    if claude_path.is_none() && codex_path.is_none() && opencode_path.is_none() {
-        return Err(anyhow!("Neither claude, codex, nor opencode found in PATH"));
+    if claude_path.is_none() && codex_path.is_none() && opencode_path.is_none() && pi_path.is_none()
+    {
+        return Err(anyhow!(
+            "Neither claude, codex, opencode, nor pi found in PATH"
+        ));
     }
 
     // Show what will be installed
@@ -1159,6 +1180,9 @@ fn run_setup(force: bool) -> Result<()> {
     }
     if opencode_path.is_some() {
         println!("  Opencode: memex-search skill");
+    }
+    if pi_path.is_some() {
+        println!("  Pi: memex-search skill");
     }
     if force {
         println!();
@@ -1180,6 +1204,10 @@ fn run_setup(force: bool) -> Result<()> {
     }
     if let Some(path) = &opencode_path {
         items.push(("opencode", format!("Opencode ({})", path.display())));
+        defaults.push(true);
+    }
+    if let Some(path) = &pi_path {
+        items.push(("pi", format!("Pi ({})", path.display())));
         defaults.push(true);
     }
 
@@ -1212,6 +1240,7 @@ fn run_setup(force: bool) -> Result<()> {
         // Gen 2: flat-file skill paths (now directory-based)
         home.join(".codex/skills/memex-search.md"),
         home.join(".local/share/opencode/skills/memex-search.md"),
+        pi_agent_root().join("skills/memex-search.md"),
     ];
     for path in &stale_paths {
         if path.is_dir() {
@@ -1233,6 +1262,7 @@ fn run_setup(force: bool) -> Result<()> {
     let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
     let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
     let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
+    let pi_skill = include_str!("../skills/pi/memex-search/SKILL.md");
 
     for index in selected {
         let (tool, _) = &items[index];
@@ -1325,12 +1355,31 @@ fn run_setup(force: bool) -> Result<()> {
                     println!("{verb} Opencode skill at {}.", dest.display());
                 }
             }
+            "pi" => {
+                let dest_dir = pi_agent_root().join("skills").join("memex-search");
+                let dest = dest_dir.join("SKILL.md");
+                if dest.exists() && !force {
+                    println!(
+                        "Skipping Pi skill (already installed at {}). Use --force to overwrite.",
+                        dest.display()
+                    );
+                } else {
+                    std::fs::create_dir_all(&dest_dir)?;
+                    std::fs::write(&dest, pi_skill)?;
+                    let verb = if dest.exists() {
+                        "Updated"
+                    } else {
+                        "Installed"
+                    };
+                    println!("{verb} Pi skill at {}.", dest.display());
+                }
+            }
             _ => {}
         }
     }
 
     println!();
-    println!("Done! Restart Claude Code, Codex, or Opencode to pick up changes.");
+    println!("Done! Restart Claude Code, Codex, Opencode, or Pi to pick up changes.");
 
     Ok(())
 }
@@ -1360,6 +1409,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::CodexSession | crate::types::SourceKind::CodexHistory => "codex",
         crate::types::SourceKind::Opencode => "opencode",
         crate::types::SourceKind::Cursor => "cursor",
+        crate::types::SourceKind::Pi => "pi",
     };
     let source_path = &record.source_path;
 
@@ -1398,6 +1448,16 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn pi_agent_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        return PathBuf::from(root);
+    }
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".pi").join("agent")
 }
 
 #[cfg(unix)]
@@ -1536,7 +1596,7 @@ fn run_index_service_enable_launchd(
     } else {
         (Some(interval), false)
     };
-    let env_vars = launchd_environment_variables(paths)?;
+    let env_vars = service_environment_variables(Some(paths))?;
 
     let contents = build_launchd_plist(
         &label,
@@ -1619,7 +1679,9 @@ fn run_index_service_enable_systemd(
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
 
-    let service_contents = build_systemd_service(&exe.to_string_lossy(), program_args, continuous);
+    let env_vars = service_environment_variables(None)?;
+    let service_contents =
+        build_systemd_service(&exe.to_string_lossy(), program_args, continuous, &env_vars);
     std::fs::write(&service_path, service_contents)?;
     println!("wrote systemd service: {}", service_path.display());
 
@@ -1885,14 +1947,17 @@ fn build_index_command_args(
     if index.include_agents {
         args.push("--include-agents".to_string());
     }
-    if !index.codex {
+    if !index.codex || index.no_codex {
         args.push("--no-codex".to_string());
     }
-    if !index.opencode {
+    if !index.opencode || index.no_opencode {
         args.push("--no-opencode".to_string());
     }
     if !index.cursor {
         args.push("--no-cursor".to_string());
+    }
+    if !index.pi || index.no_pi {
+        args.push("--no-pi".to_string());
     }
     if index.embeddings {
         args.push("--embeddings".to_string());
@@ -1981,7 +2046,7 @@ fn build_launchd_plist(
     out
 }
 
-fn launchd_environment_variables(paths: &Paths) -> Result<Vec<(String, String)>> {
+fn service_environment_variables(paths: Option<&Paths>) -> Result<Vec<(String, String)>> {
     let mut vars = Vec::new();
     if let Some(base) = directories::BaseDirs::new() {
         vars.push((
@@ -1995,11 +2060,21 @@ fn launchd_environment_variables(paths: &Paths) -> Result<Vec<(String, String)>>
         .unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".to_string());
     vars.push(("PATH".to_string(), path));
 
-    let embed_cache = paths.root.join("embed-cache");
-    std::fs::create_dir_all(&embed_cache)?;
-    let embed_cache = embed_cache.to_string_lossy().to_string();
-    vars.push(("FASTEMBED_CACHE_DIR".to_string(), embed_cache.clone()));
-    vars.push(("HF_HOME".to_string(), embed_cache));
+    if let Some(paths) = paths {
+        let embed_cache = paths.root.join("embed-cache");
+        std::fs::create_dir_all(&embed_cache)?;
+        let embed_cache = embed_cache.to_string_lossy().to_string();
+        vars.push(("FASTEMBED_CACHE_DIR".to_string(), embed_cache.clone()));
+        vars.push(("HF_HOME".to_string(), embed_cache));
+    }
+
+    for key in ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"] {
+        if let Some(value) = std::env::var_os(key)
+            && !value.is_empty()
+        {
+            vars.push((key.to_string(), value.to_string_lossy().to_string()));
+        }
+    }
 
     Ok(vars)
 }
@@ -2043,7 +2118,12 @@ fn default_systemd_user_dir() -> PathBuf {
     }
 }
 
-fn build_systemd_service(exe_path: &str, program_args: &[String], continuous: bool) -> String {
+fn build_systemd_service(
+    exe_path: &str,
+    program_args: &[String],
+    continuous: bool,
+    env_vars: &[(String, String)],
+) -> String {
     let exec_start = if program_args.is_empty() {
         exe_path.to_string()
     } else {
@@ -2055,6 +2135,13 @@ fn build_systemd_service(exe_path: &str, program_args: &[String], continuous: bo
     out.push_str("Description=Memex Index Service\n");
     out.push('\n');
     out.push_str("[Service]\n");
+    for (key, value) in env_vars {
+        out.push_str(&format!(
+            "Environment=\"{}={}\"\n",
+            systemd_escape_env_value(key),
+            systemd_escape_env_value(value)
+        ));
+    }
     out.push_str("Type=");
     if continuous {
         out.push_str("simple\n");
@@ -2070,6 +2157,13 @@ fn build_systemd_service(exe_path: &str, program_args: &[String], continuous: bo
         out.push_str("WantedBy=default.target\n");
     }
     out
+}
+
+fn systemd_escape_env_value(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
 }
 
 fn build_systemd_timer(interval: u64) -> String {
@@ -2542,6 +2636,7 @@ fn parse_version_parts(value: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
 
@@ -2570,5 +2665,58 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         assert_eq!(vector_stats_line(tmp.path()).unwrap(), "vectors: none");
+    }
+
+    #[test]
+    fn index_args_accept_negative_source_flags() {
+        let cli = Cli::try_parse_from(["memex", "index", "--no-codex", "--no-opencode", "--no-pi"])
+            .unwrap();
+
+        let Commands::Index { index, .. } = cli.command else {
+            panic!("expected index command");
+        };
+        assert!(index.no_codex);
+        assert!(index.no_opencode);
+        assert!(index.no_pi);
+    }
+
+    #[test]
+    fn service_environment_variables_include_pi_overrides() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_DIR", Some("/tmp/pi agent".as_ref())),
+            (
+                "PI_CODING_AGENT_SESSION_DIR",
+                Some("/tmp/pi sessions".as_ref()),
+            ),
+        ]);
+
+        let vars = service_environment_variables(None).unwrap();
+
+        assert!(
+            vars.iter()
+                .any(|(key, value)| { key == "PI_CODING_AGENT_DIR" && value == "/tmp/pi agent" })
+        );
+        assert!(vars.iter().any(|(key, value)| {
+            key == "PI_CODING_AGENT_SESSION_DIR" && value == "/tmp/pi sessions"
+        }));
+    }
+
+    #[test]
+    fn systemd_service_includes_environment_variables() {
+        let service = build_systemd_service(
+            "/usr/bin/memex",
+            &["index".to_string(), "--no-pi".to_string()],
+            false,
+            &[(
+                "PI_CODING_AGENT_SESSION_DIR".to_string(),
+                "/tmp/pi \"sessions\" 100%".to_string(),
+            )],
+        );
+
+        assert!(service.contains(
+            "Environment=\"PI_CODING_AGENT_SESSION_DIR=/tmp/pi \\\"sessions\\\" 100%%\"\n"
+        ));
+        assert!(service.contains("ExecStart=/usr/bin/memex index --no-pi\n"));
     }
 }
