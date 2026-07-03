@@ -287,7 +287,8 @@ claude_resume_cmd = "claude --resume {session_id}"
 codex_resume_cmd = "codex resume {session_id}"
 cursor_resume_cmd = "cursor-agent --resume {session_id}"
 opencode_resume_cmd = "opencode resume {session_id}"
-pi_resume_cmd = "pi --session {source_path_shell}"
+pi_resume_cmd
+copilot_resume_cmd = "pi --session {source_path_shell}"
 ```
 
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.

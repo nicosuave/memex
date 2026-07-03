@@ -104,6 +104,7 @@ enum SourceChoice {
     Opencode,
     Cursor,
     Pi,
+    Copilot,
 }
 
 impl SourceChoice {
@@ -114,7 +115,8 @@ impl SourceChoice {
             SourceChoice::Codex => SourceChoice::Opencode,
             SourceChoice::Opencode => SourceChoice::Cursor,
             SourceChoice::Cursor => SourceChoice::Pi,
-            SourceChoice::Pi => SourceChoice::All,
+            SourceChoice::Pi => SourceChoice::Copilot,
+            SourceChoice::Copilot => SourceChoice::All,
         }
     }
 
@@ -126,6 +128,7 @@ impl SourceChoice {
             SourceChoice::Opencode => Some(SourceFilter::Opencode),
             SourceChoice::Cursor => Some(SourceFilter::Cursor),
             SourceChoice::Pi => Some(SourceFilter::Pi),
+            SourceChoice::Copilot => Some(SourceFilter::Copilot),
         }
     }
 
@@ -137,6 +140,7 @@ impl SourceChoice {
             SourceChoice::Opencode => "opencode",
             SourceChoice::Cursor => "cursor",
             SourceChoice::Pi => "pi",
+            SourceChoice::Copilot => "copilot",
         }
     }
 }
@@ -444,6 +448,7 @@ impl App {
                     include_opencode: true,
                     include_cursor: true,
                     include_pi: true,
+                    include_copilot: true,
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
                     model: model_choice,
@@ -714,6 +719,11 @@ impl App {
                 .pi_resume_cmd
                 .clone()
                 .or_else(|| default_resume_template("pi")),
+            SourceKind::Copilot => self
+                .config
+                .copilot_resume_cmd
+                .clone()
+                .or_else(|| default_resume_template("copilot")),
         };
         let Some(template) = template else {
             self.set_status("resume command not configured in config.toml");
@@ -748,6 +758,7 @@ impl App {
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
+            SourceKind::Copilot => "copilot",
         };
         let source_path = session.source_path.clone();
 
@@ -1962,6 +1973,11 @@ fn parent_dir(path: &str) -> String {
 }
 
 fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
+    if session.source == SourceKind::Copilot
+        && let Some(cwd) = resolve_copilot_workspace_cwd(session)
+    {
+        return Some(cwd);
+    }
     let file = std::fs::File::open(&session.source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;
@@ -2153,4 +2169,49 @@ fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize)
     }
     let row = (pos.y - area.y) as usize;
     if row < len { Some(row) } else { None }
+}
+
+#[derive(Default)]
+struct CopilotWorkspaceCwd {
+    cwd: Option<String>,
+    git_root: Option<String>,
+}
+
+fn resolve_copilot_workspace_cwd(session: &SessionSummary) -> Option<String> {
+    let workspace_path = std::path::Path::new(&session.source_path)
+        .parent()?
+        .join("workspace.yaml");
+    let contents = std::fs::read_to_string(workspace_path).ok()?;
+    let workspace = parse_copilot_workspace_cwd(&contents);
+    workspace.cwd.or(workspace.git_root)
+}
+
+fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
+    let mut workspace = CopilotWorkspaceCwd::default();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || line.chars().next().is_some_and(|c| c.is_whitespace())
+        {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "cwd" => workspace.cwd = Some(value),
+            "gitRoot" | "git_root" => workspace.git_root = Some(value),
+            _ => {}
+        }
+    }
+    workspace
 }
