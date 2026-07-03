@@ -55,7 +55,7 @@ const CUDNN_DYLIBS: &[&str] = &[
 ];
 
 /// Supported embedding models
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ModelChoice {
     /// AllMiniLML6V2 - 22M params, 384 dims, very fast
     MiniLM,
@@ -95,6 +95,20 @@ impl ModelChoice {
                 "unknown model '{s}', options: minilm, bge, nomic, gemma, potion"
             )),
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelChoice::MiniLM => "minilm",
+            ModelChoice::BGESmall => "bge",
+            ModelChoice::Nomic => "nomic",
+            ModelChoice::Gemma => "gemma",
+            ModelChoice::Potion => "potion",
+        }
+    }
+
+    pub fn known_dimensions(self) -> Option<usize> {
+        self.fastembed_config().map(|(_, dimensions)| dimensions)
     }
 }
 

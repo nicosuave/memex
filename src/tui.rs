@@ -429,18 +429,13 @@ impl App {
                 let index = SearchIndex::open_or_create(&paths.index)?;
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
-                let vector_exists = paths.vectors.join("meta.json").exists()
-                    && paths.vectors.join("vectors.f32").exists()
-                    && paths.vectors.join("doc_ids.u64").exists();
-                let backfill_embeddings =
-                    embeddings_default && !vector_exists && index.doc_count()? > 0;
                 let opts = IngestOptions {
                     claude_source: default_claude_source(),
                     include_agents: false,
                     include_codex: true,
                     include_opencode: true,
                     embeddings: embeddings_default,
-                    backfill_embeddings,
+                    backfill_embeddings: false,
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                 };
@@ -928,18 +923,16 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                     app.move_project_selection(1);
                 }
             }
-            KeyCode::Char(ch) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match app.focus {
-                        Focus::Query => app.query.push(ch),
-                        Focus::Project => {
-                            app.project.push(ch);
-                            app.update_project_options();
-                        }
-                        Focus::List => {}
-                        Focus::Preview => {}
-                        Focus::Find => {}
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match app.focus {
+                    Focus::Query => app.query.push(ch),
+                    Focus::Project => {
+                        app.project.push(ch);
+                        app.update_project_options();
                     }
+                    Focus::List => {}
+                    Focus::Preview => {}
+                    Focus::Find => {}
                 }
             }
             _ => {}
@@ -960,11 +953,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             KeyCode::Esc => {
                 app.focus = Focus::Preview;
             }
-            KeyCode::Char(ch) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    app.find_query.push(ch);
-                    app.update_find();
-                }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.find_query.push(ch);
+                app.update_find();
             }
             _ => {}
         }
@@ -1472,7 +1463,7 @@ fn sessions_from_recent(
         }
     }
     let mut out: Vec<SessionSummary> = sessions.into_values().collect();
-    out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+    out.sort_by_key(|summary| std::cmp::Reverse(summary.last_ts));
     Ok(out)
 }
 
@@ -1879,10 +1870,7 @@ fn strip_ansi_and_controls(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut count = 0usize;
-    loop {
-        let Some(ch) = chars.next() else {
-            break;
-        };
+    while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
             if matches!(chars.peek(), Some('[')) {
                 chars.next();
