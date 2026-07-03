@@ -41,6 +41,7 @@ in {
         - index_service_stderr (string): stderr log path (macOS)
         - claude_resume_cmd (string)
         - codex_resume_cmd (string)
+        - cursor_resume_cmd (string)
       '';
       example = {
         embeddings = true;

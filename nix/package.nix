@@ -34,7 +34,7 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   meta = {
-    description = "Fast local history search for Claude and Codex logs";
+    description = "Fast local history search for local agent logs";
     homepage = "https://github.com/nicosuave/memex";
     license = lib.licenses.mit;
     mainProgram = "memex";

@@ -8,6 +8,7 @@ pub enum SourceKind {
     CodexSession,
     CodexHistory,
     Opencode,
+    Cursor,
 }
 
 impl SourceKind {
@@ -17,6 +18,7 @@ impl SourceKind {
             SourceKind::CodexSession => 1,
             SourceKind::CodexHistory => 2,
             SourceKind::Opencode => 3,
+            SourceKind::Cursor => 4,
         }
     }
 
@@ -25,6 +27,7 @@ impl SourceKind {
             SourceKind::Claude => "claude",
             SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
             SourceKind::Opencode => "opencode",
+            SourceKind::Cursor => "cursor",
         }
     }
 
@@ -41,6 +44,11 @@ impl SourceKind {
             || path.contains("opencode\\storage\\message")
         {
             SourceKind::Opencode
+        } else if path.contains(".cursor/projects")
+            || path.contains(".cursor\\projects")
+            || path.contains("agent-transcripts")
+        {
+            SourceKind::Cursor
         } else {
             SourceKind::Claude
         }
@@ -53,6 +61,7 @@ pub enum SourceFilter {
     Claude,
     Codex,
     Opencode,
+    Cursor,
 }
 
 impl SourceFilter {
@@ -63,6 +72,7 @@ impl SourceFilter {
                 source == SourceKind::CodexSession || source == SourceKind::CodexHistory
             }
             SourceFilter::Opencode => source == SourceKind::Opencode,
+            SourceFilter::Cursor => source == SourceKind::Cursor,
         }
     }
 
@@ -71,6 +81,7 @@ impl SourceFilter {
             SourceFilter::Claude => "claude",
             SourceFilter::Codex => "codex",
             SourceFilter::Opencode => "opencode",
+            SourceFilter::Cursor => "cursor",
         }
     }
 }
@@ -110,5 +121,16 @@ mod tests {
             SourceKind::from_path(windows_path),
             SourceKind::CodexSession
         );
+    }
+
+    #[test]
+    fn from_path_recognizes_cursor_agent_transcripts() {
+        let unix_path =
+            "/Users/nico/.cursor/projects/Users-nico-Code-app/agent-transcripts/abc/abc.jsonl";
+        let windows_path =
+            "C:\\Users\\nico\\.cursor\\projects\\app\\agent-transcripts\\abc\\abc.jsonl";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Cursor);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Cursor);
     }
 }

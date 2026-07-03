@@ -90,6 +90,8 @@ pub struct UserConfig {
     pub codex_resume_cmd: Option<String>,
     /// Resume command template for Opencode sessions.
     pub opencode_resume_cmd: Option<String>,
+    /// Resume command template for Cursor sessions.
+    pub cursor_resume_cmd: Option<String>,
 }
 
 impl UserConfig {
