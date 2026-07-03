@@ -3,7 +3,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const SOURCE_COUNT: usize = 6;
+pub const SOURCE_COUNT: usize = 7;
 const SOURCES: [SourceKind; SOURCE_COUNT] = [
     SourceKind::Claude,
     SourceKind::CodexSession,
@@ -11,6 +11,7 @@ const SOURCES: [SourceKind; SOURCE_COUNT] = [
     SourceKind::Opencode,
     SourceKind::Cursor,
     SourceKind::Pi,
+    SourceKind::Copilot,
 ];
 
 pub struct Progress {
@@ -251,6 +252,7 @@ fn progress_label(source: SourceKind) -> &'static str {
         SourceKind::Opencode => "opencode",
         SourceKind::Cursor => "cursor",
         SourceKind::Pi => "pi",
+        SourceKind::Copilot => "copilot",
     }
 }
 

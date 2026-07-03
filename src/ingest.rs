@@ -1,7 +1,7 @@
 use crate::config::Paths;
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
-use crate::progress::Progress;
+use crate::progress::{Progress, SOURCE_COUNT};
 use crate::state::{FileState, IngestState, ScanCache};
 use crate::types::{Record, SourceKind};
 use anyhow::{Result, anyhow};
@@ -34,6 +34,7 @@ pub struct IngestOptions {
     pub include_opencode: bool,
     pub include_cursor: bool,
     pub include_pi: bool,
+    pub include_copilot: bool,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
@@ -370,6 +371,49 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_copilot {
+        let copilot_files = collect_copilot_files()?;
+        for path in copilot_files {
+            let meta = path.metadata()?;
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            files_scanned += 1;
+            total_bytes += size;
+            let key = path.to_string_lossy().to_string();
+            let prev = state.files.get(&key);
+            let (offset, turn_id, delete_first, skip) = match prev {
+                None => (0, 0, false, false),
+                Some(prev) => {
+                    if size < prev.size || mtime < prev.mtime {
+                        (0, 0, true, false)
+                    } else if size == prev.size && mtime == prev.mtime {
+                        (prev.offset, prev.turn_id, false, true)
+                    } else {
+                        (prev.offset, prev.turn_id, false, false)
+                    }
+                }
+            };
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(FileTask {
+                path,
+                source: SourceKind::Copilot,
+                offset,
+                turn_id,
+                size,
+                mtime,
+                delete_first,
+            });
+        }
+    }
+
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
@@ -429,6 +473,9 @@ pub fn ingest_all(
                 parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
             SourceKind::Pi => parse_pi_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?,
+            SourceKind::Copilot => {
+                parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)?
+            }
         }
         Ok(())
     })?;
@@ -549,7 +596,7 @@ fn writer_loop(
     let mut vector_index = None;
     let mut embedder: Option<EmbedderHandle> = None;
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
-    let mut index_pending = [0u64; 6];
+    let mut index_pending = [0u64; SOURCE_COUNT];
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
         let dims = handle.dims;
@@ -602,7 +649,8 @@ fn writer_loop(
                 2 => SourceKind::CodexHistory,
                 3 => SourceKind::Opencode,
                 4 => SourceKind::Cursor,
-                _ => SourceKind::Pi,
+                5 => SourceKind::Pi,
+                _ => SourceKind::Copilot,
             };
             progress.add_indexed(source, pending);
         }
@@ -792,6 +840,27 @@ fn collect_pi_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn collect_copilot_files() -> Result<Vec<PathBuf>> {
+    collect_copilot_files_from_root(&copilot_session_root())
+}
+
+fn collect_copilot_files_from_root(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some("events.jsonl") {
+            files.push(path.to_path_buf());
+        }
+    }
+    Ok(files)
+}
+
 fn codex_root() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
@@ -816,6 +885,20 @@ fn opencode_root() -> PathBuf {
         .join("opencode")
         .join("storage")
         .join("message")
+}
+
+fn copilot_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("COPILOT_HOME") {
+        return PathBuf::from(path);
+    }
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".copilot")
+}
+
+fn copilot_session_root() -> PathBuf {
+    copilot_root().join("session-state")
 }
 
 fn opencode_parts_root() -> PathBuf {
@@ -2033,6 +2116,419 @@ fn apply_pi_session_header(
     }
 }
 
+#[derive(Debug, Default)]
+struct CopilotWorkspace {
+    cwd: Option<String>,
+    git_root: Option<String>,
+    repository: Option<String>,
+    branch: Option<String>,
+}
+
+fn parse_copilot_session(
+    task: &FileTask,
+    tx_record: &Sender<Record>,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let file = File::open(&task.path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let mut start = task.offset as usize;
+    let mut turn_id = task.turn_id;
+
+    let source_path = task.path.to_string_lossy().to_string();
+    let mut session_id =
+        session_id_from_copilot_path(&task.path).unwrap_or_else(|| "unknown".to_string());
+    let mut workspace = read_copilot_workspace(&task.path);
+    let mut project = copilot_project(&workspace);
+    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+
+    let mut parsed_bytes = 0u64;
+    while start < mmap.len() {
+        let slice = &mmap[start..];
+        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..rel];
+        let advanced = rel + 1;
+        start += advanced;
+        parsed_bytes += advanced as u64;
+        if parsed_bytes >= 64 * 1024 {
+            progress.add_parsed_bytes(SourceKind::Copilot, parsed_bytes);
+            parsed_bytes = 0;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_slice(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let data = obj
+            .get("data")
+            .or_else(|| obj.get("payload"))
+            .unwrap_or(&serde_json::Value::Null);
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(json_timestamp_millis)
+            .or_else(|| data.get("timestamp").and_then(json_timestamp_millis))
+            .unwrap_or(0);
+
+        match entry_type {
+            "session.start" | "session.resume" => {
+                if let Some(id) = data
+                    .get("sessionId")
+                    .or_else(|| data.get("session_id"))
+                    .and_then(|v| v.as_str())
+                {
+                    session_id = id.to_string();
+                }
+                merge_copilot_workspace(&mut workspace, data.get("context").unwrap_or(data));
+                project = copilot_project(&workspace);
+            }
+            "session.context_changed" => {
+                merge_copilot_workspace(&mut workspace, data);
+                project = copilot_project(&workspace);
+            }
+            "user.message" => {
+                let text = data
+                    .get("content")
+                    .or_else(|| data.get("message"))
+                    .or_else(|| data.get("prompt"))
+                    .and_then(text_from_json)
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Copilot,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "user".to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Copilot, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "assistant.message" => {
+                let text = data
+                    .get("content")
+                    .and_then(text_from_json)
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Copilot,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "assistant".to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Copilot, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "tool.execution_start" | "tool.user_requested" => {
+                let tool_name = data
+                    .get("toolName")
+                    .or_else(|| data.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(call_id) = data.get("toolCallId").and_then(|v| v.as_str())
+                    && let Some(name) = tool_name.clone()
+                {
+                    call_id_to_name.insert(call_id.to_string(), name);
+                }
+                let tool_input = data
+                    .get("arguments")
+                    .map(json_to_text)
+                    .filter(|s| !s.is_empty());
+                let text = tool_input.clone().unwrap_or_default();
+                let record = Record {
+                    source: SourceKind::Copilot,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "tool_use".to_string(),
+                    text,
+                    tool_name,
+                    tool_input,
+                    tool_output: None,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Copilot, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "tool.execution_complete" => {
+                let call_id = data
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tool_name = data
+                    .get("toolName")
+                    .or_else(|| data.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| call_id_to_name.get(call_id).cloned());
+                let tool_output = copilot_tool_output(data);
+                let text = tool_output.clone().unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Copilot,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "tool_result".to_string(),
+                    text,
+                    tool_name,
+                    tool_input: None,
+                    tool_output,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Copilot, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            "session.task_complete" => {
+                let text = data
+                    .get("summary")
+                    .and_then(text_from_json)
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let record = Record {
+                    source: SourceKind::Copilot,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "assistant".to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    source_path: source_path.clone(),
+                };
+                progress.add_produced(SourceKind::Copilot, 1);
+                tx_record.send(record)?;
+                turn_id += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if parsed_bytes > 0 {
+        progress.add_parsed_bytes(SourceKind::Copilot, parsed_bytes);
+    }
+    progress.add_files_done(SourceKind::Copilot, 1);
+    let state = FileState {
+        size: task.size,
+        mtime: task.mtime,
+        offset: mmap.len() as u64,
+        turn_id,
+    };
+    tx_update.send(FileUpdate {
+        path: source_path,
+        state,
+        session_id: Some(session_id),
+    })?;
+    Ok(())
+}
+
+fn read_copilot_workspace(events_path: &Path) -> CopilotWorkspace {
+    let Some(dir) = events_path.parent() else {
+        return CopilotWorkspace::default();
+    };
+    let path = dir.join("workspace.yaml");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return CopilotWorkspace::default();
+    };
+    parse_copilot_workspace_yaml(&contents)
+}
+
+fn parse_copilot_workspace_yaml(contents: &str) -> CopilotWorkspace {
+    let mut workspace = CopilotWorkspace::default();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || line.chars().next().is_some_and(|c| c.is_whitespace())
+        {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "cwd" => workspace.cwd = Some(value),
+            "gitRoot" | "git_root" => workspace.git_root = Some(value),
+            "repository" => workspace.repository = Some(value),
+            "branch" => workspace.branch = Some(value),
+            _ => {}
+        }
+    }
+    workspace
+}
+
+fn merge_copilot_workspace(workspace: &mut CopilotWorkspace, value: &serde_json::Value) {
+    if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+        workspace.cwd = Some(cwd.to_string());
+    }
+    if let Some(git_root) = value
+        .get("gitRoot")
+        .or_else(|| value.get("git_root"))
+        .and_then(|v| v.as_str())
+    {
+        workspace.git_root = Some(git_root.to_string());
+    }
+    if let Some(repository) = value.get("repository").and_then(|v| v.as_str()) {
+        workspace.repository = Some(repository.to_string());
+    }
+    if let Some(branch) = value.get("branch").and_then(|v| v.as_str()) {
+        workspace.branch = Some(branch.to_string());
+    }
+}
+
+fn copilot_project(workspace: &CopilotWorkspace) -> String {
+    if let Some(repo) = workspace.repository.as_deref() {
+        if let Some((_, name)) = repo.rsplit_once('/')
+            && !name.is_empty()
+        {
+            return name.to_string();
+        }
+        if !repo.is_empty() {
+            return repo.to_string();
+        }
+    }
+    if let Some(git_root) = workspace.git_root.as_deref() {
+        return project_from_path(git_root);
+    }
+    if let Some(cwd) = workspace.cwd.as_deref() {
+        return project_from_path(cwd);
+    }
+    "copilot".to_string()
+}
+
+fn session_id_from_copilot_path(path: &Path) -> Option<String> {
+    path.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn json_timestamp_millis(value: &serde_json::Value) -> Option<u64> {
+    if let Some(text) = value.as_str() {
+        if let Some(ts) = parse_iso_millis(text) {
+            return Some(ts);
+        }
+        return text.parse::<u64>().ok();
+    }
+    if let Some(n) = value.as_u64() {
+        return Some(if n < 10_000_000_000 { n * 1000 } else { n });
+    }
+    None
+}
+
+fn text_from_json(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.trim().to_string());
+    }
+    if let Some(arr) = value.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(text) = item.as_str() {
+                parts.push(text);
+                continue;
+            }
+            if let Some(obj) = item.as_object()
+                && let Some(text) = obj
+                    .get("text")
+                    .or_else(|| obj.get("content"))
+                    .and_then(|v| v.as_str())
+            {
+                parts.push(text);
+            }
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("\n").trim().to_string());
+        }
+    }
+    None
+}
+
+fn json_to_text(value: &serde_json::Value) -> String {
+    if let Some(text) = text_from_json(value) {
+        return text;
+    }
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn copilot_tool_output(data: &serde_json::Value) -> Option<String> {
+    if let Some(result) = data.get("result") {
+        for key in ["detailedContent", "content"] {
+            if let Some(text) = result.get(key).and_then(text_from_json)
+                && !text.trim().is_empty()
+            {
+                return Some(text);
+            }
+        }
+        if let Some(contents) = result.get("contents").and_then(|v| v.as_array()) {
+            let mut parts = Vec::new();
+            for item in contents {
+                if let Some(text) = text_from_json(item) {
+                    parts.push(text);
+                }
+            }
+            if !parts.is_empty() {
+                return Some(parts.join("\n"));
+            }
+        }
+    }
+    if let Some(error) = data.get("error") {
+        if let Some(message) = error.get("message").and_then(|v| v.as_str()) {
+            return Some(message.to_string());
+        }
+        return Some(json_to_text(error));
+    }
+    None
+}
+
 fn project_from_cursor_path(path: &Path) -> String {
     let root = cursor_projects_root();
     let Ok(relative) = path.strip_prefix(root) else {
@@ -2330,8 +2826,8 @@ fn flush_embeddings(
     Ok(count)
 }
 
-fn compute_totals(tasks: &[FileTask]) -> [u64; 6] {
-    let mut totals = [0u64; 6];
+fn compute_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
+    let mut totals = [0u64; SOURCE_COUNT];
     for task in tasks {
         let remaining = task.size.saturating_sub(task.offset);
         totals[task.source.idx()] += remaining;
@@ -2339,8 +2835,8 @@ fn compute_totals(tasks: &[FileTask]) -> [u64; 6] {
     totals
 }
 
-fn compute_file_totals(tasks: &[FileTask]) -> [u64; 6] {
-    let mut totals = [0u64; 6];
+fn compute_file_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
+    let mut totals = [0u64; SOURCE_COUNT];
     for task in tasks {
         totals[task.source.idx()] += 1;
     }
@@ -2382,6 +2878,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_copilot: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -2810,6 +3307,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: true,
+            include_copilot: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -2889,7 +3387,7 @@ mod tests {
             mtime: 0,
             delete_first: false,
         };
-        let progress = Arc::new(Progress::new([0; 6], [0; 6], false));
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(1);
 
         parse_pi_file(&task, &tx_record, &tx_update, &next_doc_id, &progress).expect("parse pi");
@@ -2899,5 +3397,140 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].project, "my-project");
         assert_eq!(records[0].text, "second");
+    }
+    #[test]
+    fn collect_copilot_files_finds_session_events() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_dir = tmp
+            .path()
+            .join("session-state")
+            .join("11111111-1111-4111-8111-111111111111");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let events = session_dir.join("events.jsonl");
+        let ignored = session_dir.join("workspace.yaml");
+        fs::write(&events, "{}\n").expect("write events");
+        fs::write(&ignored, "cwd: /tmp/project\n").expect("write workspace");
+
+        let files = collect_copilot_files_from_root(&tmp.path().join("session-state"))
+            .expect("collect copilot sessions");
+
+        assert_eq!(files, vec![events]);
+    }
+
+    #[test]
+    fn parse_copilot_session_extracts_messages_tools_and_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_id = "11111111-1111-4111-8111-111111111111";
+        let session_dir = tmp.path().join("session-state").join(session_id);
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::write(
+            session_dir.join("workspace.yaml"),
+            "cwd: /Users/nico/Code/memex\ngitRoot: /Users/nico/Code/memex\nrepository: nicosuave/memex\nbranch: main\n",
+        )
+        .expect("write workspace");
+        let events = session_dir.join("events.jsonl");
+        fs::write(
+            &events,
+            concat!(
+                "{\"type\":\"session.start\",\"timestamp\":\"2026-06-01T12:00:00Z\",\"data\":{\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"context\":{\"cwd\":\"/Users/nico/Code/memex\",\"repository\":\"nicosuave/memex\"}}}\n",
+                "{\"type\":\"user.message\",\"timestamp\":\"2026-06-01T12:00:01Z\",\"data\":{\"content\":\"Find the parser\"}}\n",
+                "{\"type\":\"assistant.message\",\"timestamp\":\"2026-06-01T12:00:02Z\",\"data\":{\"content\":\"I will inspect ingestion.\"}}\n",
+                "{\"type\":\"tool.execution_start\",\"timestamp\":\"2026-06-01T12:00:03Z\",\"data\":{\"toolCallId\":\"call-1\",\"toolName\":\"grep\",\"arguments\":{\"pattern\":\"parse_copilot\"}}}\n",
+                "{\"type\":\"tool.execution_complete\",\"timestamp\":\"2026-06-01T12:00:04Z\",\"data\":{\"toolCallId\":\"call-1\",\"success\":true,\"result\":{\"content\":\"src/ingest.rs\"}}}\n"
+            ),
+        )
+        .expect("write events");
+        let meta = events.metadata().expect("metadata");
+        let task = FileTask {
+            path: events.clone(),
+            source: SourceKind::Copilot,
+            offset: 0,
+            turn_id: 0,
+            size: meta.len(),
+            mtime: 0,
+            delete_first: false,
+        };
+        let (tx_record, rx_record) = unbounded();
+        let (tx_update, rx_update) = unbounded();
+        let next_doc_id = AtomicU64::new(1);
+        let progress = Arc::new(Progress::new(
+            [0, 0, 0, 0, 0, 0, meta.len()],
+            [0, 0, 0, 0, 0, 0, 1],
+            false,
+        ));
+
+        parse_copilot_session(&task, &tx_record, &tx_update, &next_doc_id, &progress)
+            .expect("parse copilot session");
+        drop(tx_record);
+        drop(tx_update);
+
+        let records: Vec<Record> = rx_record.try_iter().collect();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|r| r.source == SourceKind::Copilot));
+        assert!(records.iter().all(|r| r.project == "memex"));
+        assert!(records.iter().all(|r| r.session_id == session_id));
+        assert_eq!(records[0].role, "user");
+        assert_eq!(records[1].role, "assistant");
+        assert_eq!(records[2].role, "tool_use");
+        assert_eq!(records[2].tool_name.as_deref(), Some("grep"));
+        assert!(records[2].text.contains("parse_copilot"));
+        assert_eq!(records[3].role, "tool_result");
+        assert_eq!(records[3].tool_name.as_deref(), Some("grep"));
+        assert_eq!(records[3].tool_output.as_deref(), Some("src/ingest.rs"));
+
+        let update = rx_update.try_recv().expect("file update");
+        assert_eq!(update.state.offset, meta.len());
+        assert_eq!(update.state.turn_id, 4);
+    }
+
+    #[test]
+    fn writer_loop_accepts_copilot_source_progress() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_dir = tmp.path().join("index");
+        let vector_dir = tmp.path().join("vectors");
+        fs::create_dir_all(&index_dir).expect("create index dir");
+        fs::create_dir_all(&vector_dir).expect("create vector dir");
+        let index = SearchIndex::open_or_create(&index_dir).expect("open index");
+        let (tx_record, rx_record) = unbounded();
+        tx_record
+            .send(Record {
+                source: SourceKind::Copilot,
+                doc_id: 1,
+                ts: 1_780_291_200_000,
+                project: "memex".to_string(),
+                session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                turn_id: 0,
+                role: "user".to_string(),
+                text: "Find the parser".to_string(),
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                source_path: tmp
+                    .path()
+                    .join(
+                        ".copilot/session-state/11111111-1111-4111-8111-111111111111/events.jsonl",
+                    )
+                    .to_string_lossy()
+                    .to_string(),
+            })
+            .expect("send record");
+        drop(tx_record);
+
+        let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+        let ctx = WriterContext {
+            embeddings: false,
+            do_backfill_embeddings: false,
+            vector_dir,
+            progress,
+            model: ModelChoice::default(),
+            embed_runtime: EmbedRuntimeConfig::default(),
+        };
+
+        let (records_added, records_embedded) =
+            writer_loop(index, rx_record, Vec::new(), ctx).expect("write copilot record");
+
+        assert_eq!(records_added, 1);
+        assert_eq!(records_embedded, 0);
     }
 }

@@ -65,6 +65,12 @@ struct IndexArgs {
     /// Skip indexing Pi sessions
     #[arg(long = "no-pi", default_value_t = false)]
     no_pi: bool,
+    /// Index GitHub Copilot CLI sessions from ~/.copilot [default: true]
+    #[arg(long, default_value_t = true)]
+    copilot: bool,
+    /// Skip indexing GitHub Copilot CLI sessions
+    #[arg(long = "no-copilot", default_value_t = false)]
+    no_copilot: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long)]
     embeddings: bool,
@@ -473,6 +479,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.opencode && !index.no_opencode,
         index.cursor,
         index.pi && !index.no_pi,
+        index.copilot && !index.no_copilot,
         index.embeddings,
         index.no_embeddings,
         index.model.clone(),
@@ -489,6 +496,7 @@ fn run_index(
     opencode: bool,
     cursor: bool,
     pi: bool,
+    copilot: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
     model: Option<String>,
@@ -520,6 +528,7 @@ fn run_index(
         include_opencode: opencode,
         include_cursor: cursor,
         include_pi: pi,
+        include_copilot: copilot,
         embeddings,
         backfill_embeddings: false,
         model: model_choice,
@@ -559,10 +568,14 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let mut vector =
         VectorIndex::open_or_create(&paths.vectors, embedder.dims, Some(model_choice.as_str()))?;
 
-    let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 6], [0; 6], true));
+    let progress = std::sync::Arc::new(crate::progress::Progress::new(
+        [0; crate::progress::SOURCE_COUNT],
+        [0; crate::progress::SOURCE_COUNT],
+        true,
+    ));
     progress.set_embed_ready();
 
-    let mut embedded_counts = [0u64; 6];
+    let mut embedded_counts = [0u64; crate::progress::SOURCE_COUNT];
     let mut embedded_total = 0u64;
     let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
 
@@ -570,7 +583,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
                        embedder: &mut EmbedderHandle,
                        vector: &mut VectorIndex,
                        progress: &crate::progress::Progress,
-                       embedded_counts: &mut [u64; 6],
+                       embedded_counts: &mut [u64; crate::progress::SOURCE_COUNT],
                        embedded_total: &mut u64| {
         if batch.is_empty() {
             return Ok(());
@@ -629,7 +642,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {})",
+        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {}, pi {}, copilot {})",
         embedded_total,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
         embedded_counts[crate::types::SourceKind::CodexSession.idx()],
@@ -637,6 +650,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         embedded_counts[crate::types::SourceKind::Opencode.idx()],
         embedded_counts[crate::types::SourceKind::Cursor.idx()],
         embedded_counts[crate::types::SourceKind::Pi.idx()],
+        embedded_counts[crate::types::SourceKind::Copilot.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -684,6 +698,7 @@ fn run_search(
             include_opencode: true,
             include_cursor: true,
             include_pi: true,
+            include_copilot: true,
             embeddings: embeddings_default,
             backfill_embeddings: false,
             model: model_choice,
@@ -1410,6 +1425,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Opencode => "opencode",
         crate::types::SourceKind::Cursor => "cursor",
         crate::types::SourceKind::Pi => "pi",
+        crate::types::SourceKind::Copilot => "copilot",
     };
     let source_path = &record.source_path;
 
@@ -1958,6 +1974,9 @@ fn build_index_command_args(
     }
     if !index.pi || index.no_pi {
         args.push("--no-pi".to_string());
+    }
+    if !index.copilot || index.no_copilot {
+        args.push("--no-copilot".to_string());
     }
     if index.embeddings {
         args.push("--embeddings".to_string());
@@ -2640,6 +2659,35 @@ mod tests {
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
 
+    #[test]
+    fn build_index_command_args_preserves_disabled_sources() {
+        let index = IndexArgs {
+            source: None,
+            include_agents: false,
+            codex: false,
+            opencode: false,
+            cursor: false,
+            pi: false,
+            copilot: false,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_copilot: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+        };
+
+        let args = build_index_command_args(&index, false, 30);
+
+        assert!(args.contains(&"--no-codex".to_string()));
+        assert!(args.contains(&"--no-opencode".to_string()));
+        assert!(args.contains(&"--no-cursor".to_string()));
+        assert!(args.contains(&"--no-pi".to_string()));
+        assert!(args.contains(&"--no-copilot".to_string()));
+    }
+
     fn make_vector(dims: usize) -> Vec<f32> {
         (0..dims).map(|i| (i as f32).sin()).collect()
     }
@@ -2669,8 +2717,15 @@ mod tests {
 
     #[test]
     fn index_args_accept_negative_source_flags() {
-        let cli = Cli::try_parse_from(["memex", "index", "--no-codex", "--no-opencode", "--no-pi"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index",
+            "--no-codex",
+            "--no-opencode",
+            "--no-pi",
+            "--no-copilot",
+        ])
+        .unwrap();
 
         let Commands::Index { index, .. } = cli.command else {
             panic!("expected index command");
@@ -2678,6 +2733,7 @@ mod tests {
         assert!(index.no_codex);
         assert!(index.no_opencode);
         assert!(index.no_pi);
+        assert!(index.no_copilot);
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub enum SourceKind {
     Opencode,
     Cursor,
     Pi,
+    Copilot,
 }
 
 impl SourceKind {
@@ -21,6 +22,7 @@ impl SourceKind {
             SourceKind::Opencode => 3,
             SourceKind::Cursor => 4,
             SourceKind::Pi => 5,
+            SourceKind::Copilot => 6,
         }
     }
 
@@ -31,6 +33,7 @@ impl SourceKind {
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
+            SourceKind::Copilot => "copilot",
         }
     }
 
@@ -58,6 +61,12 @@ impl SourceKind {
             || path.contains("pi\\agent\\sessions")
         {
             SourceKind::Pi
+        } else if path.contains(".copilot/session-state")
+            || path.contains(".copilot\\session-state")
+            || path.contains("/session-state/")
+            || path.contains("\\session-state\\")
+        {
+            SourceKind::Copilot
         } else {
             SourceKind::Claude
         }
@@ -70,6 +79,7 @@ impl SourceKind {
             "opencode" => Some(SourceKind::Opencode),
             "cursor" => Some(SourceKind::Cursor),
             "pi" => Some(SourceKind::Pi),
+            "copilot" => Some(SourceKind::Copilot),
             _ => None,
         }
     }
@@ -83,6 +93,7 @@ pub enum SourceFilter {
     Opencode,
     Cursor,
     Pi,
+    Copilot,
 }
 
 impl SourceFilter {
@@ -95,6 +106,7 @@ impl SourceFilter {
             SourceFilter::Opencode => source == SourceKind::Opencode,
             SourceFilter::Cursor => source == SourceKind::Cursor,
             SourceFilter::Pi => source == SourceKind::Pi,
+            SourceFilter::Copilot => source == SourceKind::Copilot,
         }
     }
 
@@ -105,6 +117,7 @@ impl SourceFilter {
             SourceFilter::Opencode => "opencode",
             SourceFilter::Cursor => "cursor",
             SourceFilter::Pi => "pi",
+            SourceFilter::Copilot => "copilot",
         }
     }
 }

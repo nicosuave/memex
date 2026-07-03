@@ -94,6 +94,8 @@ pub struct UserConfig {
     pub cursor_resume_cmd: Option<String>,
     /// Resume command template for Pi sessions.
     pub pi_resume_cmd: Option<String>,
+    /// Resume command template for GitHub Copilot CLI sessions.
+    pub copilot_resume_cmd: Option<String>,
 }
 
 impl UserConfig {
