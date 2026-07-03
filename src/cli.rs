@@ -3,7 +3,7 @@ use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
 use crate::tui;
-use crate::types::SourceFilter;
+use crate::types::{RecordLinks, SourceFilter};
 use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
 use chrono::SecondsFormat;
@@ -21,7 +21,7 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, and Pi",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, and Copilot",
     after_help = "\
 QUICK START:
     memex index                     # Index your agent history
@@ -88,7 +88,7 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, and Pi conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, Pi, and Copilot conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -136,7 +136,9 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    score, ts, doc_id, project, role, session_id, source_path, text, snippet, matches")]
+    score, ts, doc_id, project, role, session_id, source, source_path, text, snippet, matches
+    event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
+    parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
@@ -152,7 +154,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, or pi
+        /// Filter by source: claude, codex, cursor, opencode, pi, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -985,10 +987,13 @@ struct SearchHit {
     project: String,
     role: String,
     session_id: String,
+    source: String,
     source_path: String,
     text: String,
     snippet: String,
     matches: Vec<MatchSpan>,
+    #[serde(flatten)]
+    links: RecordLinks,
 }
 
 fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOptions) -> Result<()> {
@@ -1047,6 +1052,58 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
             if fields.contains("session_id") {
                 map.insert("session_id".to_string(), Value::from(record.session_id));
             }
+            if fields.contains("source") {
+                map.insert("source".to_string(), Value::from(record.source.label()));
+            }
+            insert_optional_field(&mut map, fields, "event_id", &record.links.event_id);
+            insert_optional_field(
+                &mut map,
+                fields,
+                "parent_event_id",
+                &record.links.parent_event_id,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "logical_parent_event_id",
+                &record.links.logical_parent_event_id,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "parent_session_id",
+                &record.links.parent_session_id,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "thread_source",
+                &record.links.thread_source,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "conversation_kind",
+                &record.links.conversation_kind,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "parent_tool_use_id",
+                &record.links.parent_tool_use_id,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "source_tool_use_id",
+                &record.links.source_tool_use_id,
+            );
+            insert_optional_field(
+                &mut map,
+                fields,
+                "source_tool_assistant_uuid",
+                &record.links.source_tool_assistant_uuid,
+            );
             if fields.contains("source_path") {
                 map.insert("source_path".to_string(), Value::from(record.source_path));
             }
@@ -1068,10 +1125,12 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
                 project: record.project,
                 role: record.role,
                 session_id: record.session_id,
+                source: record.source.label().to_string(),
                 source_path: record.source_path,
                 text,
                 snippet,
                 matches,
+                links: record.links,
             })?
         };
         if render.json_array {
@@ -1085,6 +1144,19 @@ fn render_results(results: Vec<(f32, crate::types::Record)>, render: &RenderOpti
         println!("{}", serde_json::to_string(&output)?);
     }
     Ok(())
+}
+
+fn insert_optional_field(
+    map: &mut serde_json::Map<String, Value>,
+    fields: &HashSet<String>,
+    name: &str,
+    value: &Option<String>,
+) {
+    if fields.contains(name)
+        && let Some(value) = value
+    {
+        map.insert(name.to_string(), Value::from(value.clone()));
+    }
 }
 
 fn run_session(session_id: String, verbose: bool, root: Option<PathBuf>) -> Result<()> {

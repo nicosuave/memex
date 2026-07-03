@@ -46,12 +46,16 @@ Output is JSONL (JSON Lines). Each line is a valid JSON object.
 - `doc_id`: Unique record ID.
 - `session_id`: Conversation thread ID.
 - `ts`: ISO 8601 timestamp.
-- `role`: `user`, `assistant`, `system`.
+- `source`: Agent source name.
+- `source_path`: Transcript path.
+- `role`: `user`, `assistant`, `tool_use`, or `tool_result`.
 - `text`: Content payload.
 - `score`: Search relevance (float).
+- `event_id`, `parent_session_id`, `conversation_kind`: Fork/tree metadata when available.
 
 **Interpretation:**
 
 - **Filtering:** Discard results below a relevance threshold (e.g., `score < 0.5`) unless specific.
 - **Ordering:** Sort by `ts` for timeline reconstruction.
 - **Grouping:** Aggregate by `session_id` to view conversation turns.
+- **Forks:** Use `parent_session_id` to connect forked Opencode sessions back to the parent thread.

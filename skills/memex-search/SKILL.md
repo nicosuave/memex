@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Search, filter, and retrieve Claude/Codex/OpenCode/Pi history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
+description: Search, filter, and retrieve Claude/Codex/Cursor/OpenCode/Pi/Copilot history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
 allowed-tools: Bash(memex:*)
 ---
 
@@ -27,6 +27,7 @@ Use this skill to index local history and retrieve results in a structured, LLM-
   - `--codex/--no-codex` to include or skip Codex logs
   - `--opencode/--no-opencode` to include or skip OpenCode logs
   - `--pi/--no-pi` to include or skip Pi logs
+  - `--copilot/--no-copilot` to include or skip GitHub Copilot CLI logs
   - `--model <minilm|bge|nomic|gemma|potion>` to select embedding model
   - `--root <path>` to change data root (default: `~/.memex`)
 
@@ -39,11 +40,12 @@ memex search "query" --limit 20
 ```
 
 Each JSON line includes:
-- `doc_id`, `ts` (ISO), `session_id`, `project`, `role`, `source_path`
+- `doc_id`, `ts` (ISO), `session_id`, `project`, `role`, `source`, `source_path`
 - `text` (full record text)
 - `snippet` (trimmed single-line summary)
 - `matches` (offsets + before/after context)
 - `score` (ranked score)
+- tree/linkage fields when available: `event_id`, `parent_event_id`, `logical_parent_event_id`, `parent_session_id`, `thread_source`, `conversation_kind`, `parent_tool_use_id`, `source_tool_use_id`, `source_tool_assistant_uuid`
 
 ### Mode decision table
 
@@ -59,7 +61,7 @@ Each JSON line includes:
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>` (search inside a transcript)
-- `--source claude|codex|opencode|pi`
+- `--source claude|codex|cursor|opencode|pi|copilot`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -74,7 +76,7 @@ Each JSON line includes:
 
 - JSONL default (one JSON per line)
 - `--json-array` for a single JSON array
-- `--fields score,ts,doc_id,session_id,snippet` to reduce output
+- `--fields score,ts,doc_id,session_id,snippet,event_id,parent_event_id` to reduce output
 - `-v/--verbose` for human output
 
 ### Background index service (macOS launchd)

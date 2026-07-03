@@ -3,7 +3,7 @@ use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::progress::{Progress, SOURCE_COUNT};
 use crate::state::{FileState, IngestState, ScanCache};
-use crate::types::{Record, SourceKind};
+use crate::types::{Record, RecordLinks, SourceKind};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -102,6 +102,13 @@ pub fn ingest_all(
 ) -> Result<IngestReport> {
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
+    if index.doc_count()? == 0 && !state.files.is_empty() {
+        state = IngestState::default();
+        if paths.vectors.exists() {
+            std::fs::remove_dir_all(&paths.vectors)?;
+            std::fs::create_dir_all(&paths.vectors)?;
+        }
+    }
     let next_doc_id = Arc::new(AtomicU64::new(state.next_doc_id));
 
     let mut tasks = Vec::new();
@@ -525,6 +532,9 @@ fn can_skip_fresh_scan(
     options: &IngestOptions,
     ttl_seconds: u64,
 ) -> Result<bool> {
+    if index.doc_count()? == 0 {
+        return Ok(false);
+    }
     if !cache.is_fresh(ttl_seconds) {
         return Ok(false);
     }
@@ -642,16 +652,9 @@ fn writer_loop(
 
     // Flush any remaining index progress
     for (idx, &pending) in index_pending.iter().enumerate() {
-        if pending > 0 {
-            let source = match idx {
-                0 => SourceKind::Claude,
-                1 => SourceKind::CodexSession,
-                2 => SourceKind::CodexHistory,
-                3 => SourceKind::Opencode,
-                4 => SourceKind::Cursor,
-                5 => SourceKind::Pi,
-                _ => SourceKind::Copilot,
-            };
+        if pending > 0
+            && let Some(source) = SourceKind::from_idx(idx)
+        {
             progress.add_indexed(source, pending);
         }
     }
@@ -912,6 +915,63 @@ fn opencode_parts_root() -> PathBuf {
         .join("part")
 }
 
+fn opencode_session_links(session_id: &str) -> SessionLinks {
+    opencode_session_links_from_root(&opencode_storage_root().join("session"), session_id)
+}
+
+fn opencode_session_links_from_root(root: &Path, session_id: &str) -> SessionLinks {
+    if !root.exists() {
+        return SessionLinks {
+            conversation_kind: Some("main".to_string()),
+            ..SessionLinks::default()
+        };
+    }
+    let needle = format!("{session_id}.json");
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name().to_str() != Some(needle.as_str()) {
+            continue;
+        }
+        let Ok(file) = File::open(entry.path()) else {
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(reader) else {
+            continue;
+        };
+        let parent_session_id = value
+            .get("parentID")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        return SessionLinks {
+            conversation_kind: Some(if parent_session_id.is_some() {
+                "fork".to_string()
+            } else {
+                "main".to_string()
+            }),
+            thread_source: parent_session_id.as_ref().map(|_| "fork".to_string()),
+            parent_session_id,
+        };
+    }
+    SessionLinks {
+        conversation_kind: Some("main".to_string()),
+        ..SessionLinks::default()
+    }
+}
+
+fn opencode_storage_root() -> PathBuf {
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+}
+
 fn codex_history_path() -> PathBuf {
     codex_root().join("history.jsonl")
 }
@@ -974,6 +1034,130 @@ fn resolve_pi_settings_path(raw: &str, base: &Path) -> PathBuf {
     }
 }
 
+#[derive(Clone, Default)]
+struct SessionLinks {
+    parent_session_id: Option<String>,
+    thread_source: Option<String>,
+    conversation_kind: Option<String>,
+}
+
+impl SessionLinks {
+    fn record_links(&self) -> RecordLinks {
+        RecordLinks {
+            parent_session_id: self.parent_session_id.clone(),
+            thread_source: self.thread_source.clone(),
+            conversation_kind: self.conversation_kind.clone(),
+            ..RecordLinks::default()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CodexSessionMeta {
+    session_id: String,
+    project: String,
+    links: SessionLinks,
+}
+
+fn codex_session_meta_from_path(path: &Path) -> CodexSessionMeta {
+    CodexSessionMeta {
+        session_id: session_id_from_filename(path).unwrap_or_else(|| "unknown".to_string()),
+        project: "codex".to_string(),
+        links: SessionLinks {
+            conversation_kind: Some("main".to_string()),
+            ..SessionLinks::default()
+        },
+    }
+}
+
+fn read_codex_session_meta_until(path: &Path, limit: u64) -> Result<CodexSessionMeta> {
+    let mut meta = codex_session_meta_from_path(path);
+    if limit == 0 {
+        return Ok(meta);
+    }
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let mut start = 0usize;
+    let limit = (limit as usize).min(mmap.len());
+    let mut buf = Vec::new();
+    while start < limit {
+        let slice = &mmap[start..limit];
+        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..rel];
+        start += rel + 1;
+        if line.is_empty() {
+            continue;
+        }
+        buf.clear();
+        buf.extend_from_slice(line);
+        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
+            && let Some(payload) = value.get("payload").and_then(|v| v.as_object())
+        {
+            apply_codex_session_meta(payload, &mut meta);
+        }
+    }
+    Ok(meta)
+}
+
+fn apply_codex_session_meta(payload: &simd_json::borrowed::Object, meta: &mut CodexSessionMeta) {
+    if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+        meta.session_id = id.to_string();
+    }
+    if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
+        meta.project = project_from_path(cwd);
+    }
+
+    let forked_from_id = payload
+        .get("forked_from_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let parent_thread_id = payload
+        .get("source")
+        .and_then(|v| v.as_object())
+        .and_then(|source| source.get("subagent"))
+        .and_then(|v| v.as_object())
+        .and_then(|subagent| subagent.get("thread_spawn"))
+        .and_then(|v| v.as_object())
+        .and_then(|spawn| spawn.get("parent_thread_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let thread_source = payload
+        .get("thread_source")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| parent_thread_id.as_ref().map(|_| "subagent".to_string()))
+        .or_else(|| forked_from_id.as_ref().map(|_| "fork".to_string()));
+
+    meta.links.parent_session_id = forked_from_id.clone().or(parent_thread_id);
+    meta.links.thread_source = thread_source.clone();
+    meta.links.conversation_kind = Some(if thread_source.as_deref() == Some("subagent") {
+        "subagent".to_string()
+    } else if forked_from_id.is_some() {
+        "fork".to_string()
+    } else {
+        "main".to_string()
+    });
+}
+
+fn opt_str(obj: &simd_json::borrowed::Object, key: &str) -> Option<String> {
+    obj.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn pi_base_links(obj: &simd_json::borrowed::Object, conversation_kind: &str) -> RecordLinks {
+    RecordLinks {
+        event_id: opt_str(obj, "id"),
+        parent_event_id: opt_str(obj, "parentId"),
+        logical_parent_event_id: opt_str(obj, "fromId"),
+        thread_source: (conversation_kind != "main").then(|| conversation_kind.to_string()),
+        conversation_kind: Some(conversation_kind.to_string()),
+        ..RecordLinks::default()
+    }
+}
+
 fn parse_claude_file(
     task: &FileTask,
     tx_record: &Sender<Record>,
@@ -993,6 +1177,11 @@ fn parse_claude_file(
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
+    let is_agent_file = session_id.starts_with("agent-")
+        || task
+            .path
+            .components()
+            .any(|component| component.as_os_str().to_str() == Some("subagents"));
     let source_path = task.path.to_string_lossy().to_string();
     let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
 
@@ -1026,6 +1215,37 @@ fn parse_claude_file(
         if entry_type != "user" && entry_type != "assistant" {
             continue;
         }
+        let entry_uuid = opt_str(obj, "uuid");
+        let entry_parent_uuid = opt_str(obj, "parentUuid");
+        let is_sidechain = obj
+            .get("isSidechain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let conversation_kind = if is_agent_file {
+            "subagent"
+        } else if is_sidechain {
+            "sidechain"
+        } else {
+            "main"
+        };
+        let thread_source = if is_agent_file {
+            Some("subagent".to_string())
+        } else if is_sidechain {
+            Some("sidechain".to_string())
+        } else {
+            None
+        };
+        let entry_links = RecordLinks {
+            event_id: entry_uuid.clone(),
+            parent_event_id: entry_parent_uuid,
+            logical_parent_event_id: opt_str(obj, "logicalParentUuid"),
+            parent_session_id: is_agent_file.then(|| opt_str(obj, "sessionId")).flatten(),
+            thread_source,
+            conversation_kind: Some(conversation_kind.to_string()),
+            parent_tool_use_id: opt_str(obj, "parentToolUseID"),
+            source_tool_use_id: opt_str(obj, "sourceToolUseID"),
+            source_tool_assistant_uuid: opt_str(obj, "sourceToolAssistantUUID"),
+        };
         let timestamp = obj
             .get("timestamp")
             .and_then(|v| v.as_str())
@@ -1064,6 +1284,11 @@ fn parse_claude_file(
                         }
                         let tool_input = block_obj.get("input").map(|v| v.to_string());
                         let text = tool_input.clone().unwrap_or_default();
+                        let mut links = entry_links.clone();
+                        if let Some(tool_id) = block_obj.get("id").and_then(|v| v.as_str()) {
+                            links.event_id = Some(tool_id.to_string());
+                            links.parent_event_id = entry_uuid.clone();
+                        }
                         let record = Record {
                             source: SourceKind::Claude,
                             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1076,6 +1301,7 @@ fn parse_claude_file(
                             tool_name,
                             tool_input,
                             tool_output: None,
+                            links,
                             source_path: source_path.clone(),
                         };
                         progress.add_produced(SourceKind::Claude, 1);
@@ -1108,6 +1334,18 @@ fn parse_claude_file(
                         .and_then(|v| v.as_str())
                         .and_then(|id| tool_id_to_name.get(id))
                         .cloned();
+                    let tool_use_id = block_obj
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let mut links = entry_links.clone();
+                    if let Some(tool_use_id) = &tool_use_id {
+                        links.event_id = entry_uuid
+                            .as_ref()
+                            .map(|uuid| format!("{uuid}:tool_result:{tool_use_id}"));
+                        links.parent_event_id = Some(tool_use_id.clone());
+                        links.parent_tool_use_id = Some(tool_use_id.clone());
+                    }
                     let record = Record {
                         source: SourceKind::Claude,
                         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1120,6 +1358,7 @@ fn parse_claude_file(
                         tool_name,
                         tool_input: None,
                         tool_output,
+                        links,
                         source_path: source_path.clone(),
                     };
                     progress.add_produced(SourceKind::Claude, 1);
@@ -1143,6 +1382,7 @@ fn parse_claude_file(
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                links: entry_links,
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::Claude, 1);
@@ -1182,9 +1422,7 @@ fn parse_codex_session(
     let mut turn_id = task.turn_id;
 
     let source_path = task.path.to_string_lossy().to_string();
-    let mut session_id =
-        session_id_from_filename(&task.path).unwrap_or_else(|| "unknown".to_string());
-    let mut project = "codex".to_string();
+    let mut meta = read_codex_session_meta_until(&task.path, task.offset)?;
     let mut call_id_to_name: HashMap<String, String> = HashMap::new();
 
     let mut buf = Vec::new();
@@ -1221,12 +1459,7 @@ fn parse_codex_session(
             .unwrap_or(0);
         if entry_type == "session_meta" {
             if let Some(payload) = obj.get("payload").and_then(|v| v.as_object()) {
-                if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
-                    session_id = id.to_string();
-                }
-                if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
-                    project = project_from_path(cwd);
-                }
+                apply_codex_session_meta(payload, &mut meta);
             }
             continue;
         }
@@ -1238,6 +1471,8 @@ fn parse_codex_session(
             None => continue,
         };
         let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mut base_links = meta.links.record_links();
+        base_links.event_id = opt_str(payload, "id");
         if payload_type == "message" {
             let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
             let content = payload.get("content");
@@ -1266,14 +1501,15 @@ fn parse_codex_session(
                 source: SourceKind::CodexSession,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
+                project: meta.project.clone(),
+                session_id: meta.session_id.clone(),
                 turn_id,
                 role: role.to_string(),
                 text,
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                links: base_links,
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::CodexSession, 1);
@@ -1294,18 +1530,23 @@ fn parse_codex_session(
                 call_id_to_name.insert(call_id.to_string(), name);
             }
             let text = tool_input.clone().unwrap_or_default();
+            let mut links = base_links;
+            if let Some(call_id) = payload.get("call_id").and_then(|v| v.as_str()) {
+                links.event_id = Some(call_id.to_string());
+            }
             let record = Record {
                 source: SourceKind::CodexSession,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
+                project: meta.project.clone(),
+                session_id: meta.session_id.clone(),
                 turn_id,
                 role: "tool_use".to_string(),
                 text,
                 tool_name,
                 tool_input,
                 tool_output: None,
+                links,
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::CodexSession, 1);
@@ -1325,18 +1566,24 @@ fn parse_codex_session(
             if text.is_empty() {
                 continue;
             }
+            let mut links = base_links;
+            if !call_id.is_empty() {
+                links.parent_event_id = Some(call_id.to_string());
+                links.parent_tool_use_id = Some(call_id.to_string());
+            }
             let record = Record {
                 source: SourceKind::CodexSession,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
-                project: project.clone(),
-                session_id: session_id.clone(),
+                project: meta.project.clone(),
+                session_id: meta.session_id.clone(),
                 turn_id,
                 role: "tool_result".to_string(),
                 text,
                 tool_name,
                 tool_input: None,
                 tool_output,
+                links,
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::CodexSession, 1);
@@ -1358,7 +1605,7 @@ fn parse_codex_session(
     tx_update.send(FileUpdate {
         path: source_path,
         state,
-        session_id: Some(session_id),
+        session_id: Some(meta.session_id),
     })?;
     Ok(())
 }
@@ -1429,6 +1676,10 @@ fn parse_codex_history(
             tool_name: None,
             tool_input: None,
             tool_output: None,
+            links: RecordLinks {
+                conversation_kind: Some("main".to_string()),
+                ..RecordLinks::default()
+            },
             source_path: source_path.clone(),
         };
         progress.add_produced(SourceKind::CodexHistory, 1);
@@ -1468,6 +1719,7 @@ fn parse_opencode_file(
         .unwrap_or("unknown")
         .to_string();
     let project = "opencode".to_string();
+    let session_links = opencode_session_links(&session_id);
 
     let mut messages = Vec::new();
     for entry in std::fs::read_dir(session_dir)? {
@@ -1537,6 +1789,8 @@ fn parse_opencode_file(
         }
 
         let text = text_parts.join("\n");
+        let mut links = session_links.record_links();
+        links.event_id = Some(msg_id.clone());
         let record = Record {
             source: SourceKind::Opencode,
             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1549,6 +1803,7 @@ fn parse_opencode_file(
             tool_name: None,
             tool_input: None,
             tool_output: None,
+            links,
             source_path: session_dir.to_string_lossy().to_string(),
         };
         progress.add_produced(SourceKind::Opencode, 1);
@@ -1655,6 +1910,7 @@ fn parse_cursor_file(
                             tool_name,
                             tool_input,
                             tool_output: None,
+                            links: cursor_record_links(&task.path, &session_id, turn_id),
                             source_path: source_path.clone(),
                         };
                         progress.add_produced(SourceKind::Cursor, 1);
@@ -1683,6 +1939,7 @@ fn parse_cursor_file(
                             tool_name: None,
                             tool_input: None,
                             tool_output,
+                            links: cursor_record_links(&task.path, &session_id, turn_id),
                             source_path: source_path.clone(),
                         };
                         progress.add_produced(SourceKind::Cursor, 1);
@@ -1707,6 +1964,7 @@ fn parse_cursor_file(
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                links: cursor_record_links(&task.path, &session_id, turn_id),
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::Cursor, 1);
@@ -1797,6 +2055,12 @@ fn parse_pi_file(
             .and_then(|v| v.as_str())
             .and_then(parse_iso_millis)
             .unwrap_or(0);
+        let conversation_kind = match entry_type {
+            "branch_summary" => "branch",
+            "compaction" => "compaction",
+            _ => "main",
+        };
+        let mut base_links = pi_base_links(obj, conversation_kind);
 
         if entry_type == "session" {
             apply_pi_session_header(obj, &mut session_id, &mut project);
@@ -1824,6 +2088,7 @@ fn parse_pi_file(
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                links: base_links,
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::Pi, 1);
@@ -1855,6 +2120,7 @@ fn parse_pi_file(
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                links: base_links,
                 source_path: source_path.clone(),
             };
             progress.add_produced(SourceKind::Pi, 1);
@@ -1880,6 +2146,19 @@ fn parse_pi_file(
             timestamp
         };
         let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if conversation_kind == "main" {
+            match role {
+                "branchSummary" => {
+                    base_links.thread_source = Some("branch".to_string());
+                    base_links.conversation_kind = Some("branch".to_string());
+                }
+                "compactionSummary" => {
+                    base_links.thread_source = Some("compaction".to_string());
+                    base_links.conversation_kind = Some("compaction".to_string());
+                }
+                _ => {}
+            }
+        }
 
         match role {
             "user" | "assistant" => {
@@ -1905,6 +2184,11 @@ fn parse_pi_file(
                             tool_id_to_name.insert(id.to_string(), name);
                         }
                         let tool_input = block_obj.get("arguments").map(|v| v.to_string());
+                        let mut links = base_links.clone();
+                        if let Some(tool_call_id) = block_obj.get("id").and_then(|v| v.as_str()) {
+                            links.event_id = Some(tool_call_id.to_string());
+                            links.parent_event_id = base_links.event_id.clone();
+                        }
                         let record = Record {
                             source: SourceKind::Pi,
                             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1917,6 +2201,7 @@ fn parse_pi_file(
                             tool_name,
                             tool_input,
                             tool_output: None,
+                            links,
                             source_path: source_path.clone(),
                         };
                         progress.add_produced(SourceKind::Pi, 1);
@@ -1941,6 +2226,7 @@ fn parse_pi_file(
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
+                    links: base_links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Pi, 1);
@@ -1962,6 +2248,10 @@ fn parse_pi_file(
                 if text.trim().is_empty() {
                     continue;
                 }
+                let mut links = base_links;
+                if !tool_call_id.is_empty() {
+                    links.parent_tool_use_id = Some(tool_call_id.to_string());
+                }
                 let record = Record {
                     source: SourceKind::Pi,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1974,6 +2264,7 @@ fn parse_pi_file(
                     tool_name,
                     tool_input: None,
                     tool_output,
+                    links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Pi, 1);
@@ -2023,6 +2314,7 @@ fn parse_pi_file(
                     } else {
                         Some(output)
                     },
+                    links: base_links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Pi, 1);
@@ -2046,6 +2338,7 @@ fn parse_pi_file(
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
+                    links: base_links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Pi, 1);
@@ -2202,6 +2495,7 @@ fn parse_copilot_session(
                 if text.trim().is_empty() {
                     continue;
                 }
+                let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -2214,6 +2508,7 @@ fn parse_copilot_session(
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
+                    links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Copilot, 1);
@@ -2228,6 +2523,7 @@ fn parse_copilot_session(
                 if text.trim().is_empty() {
                     continue;
                 }
+                let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -2240,6 +2536,7 @@ fn parse_copilot_session(
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
+                    links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Copilot, 1);
@@ -2262,6 +2559,10 @@ fn parse_copilot_session(
                     .map(json_to_text)
                     .filter(|s| !s.is_empty());
                 let text = tool_input.clone().unwrap_or_default();
+                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
+                if let Some(call_id) = data.get("toolCallId").and_then(|v| v.as_str()) {
+                    links.event_id = Some(call_id.to_string());
+                }
                 let record = Record {
                     source: SourceKind::Copilot,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -2274,6 +2575,7 @@ fn parse_copilot_session(
                     tool_name,
                     tool_input,
                     tool_output: None,
+                    links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Copilot, 1);
@@ -2296,6 +2598,11 @@ fn parse_copilot_session(
                 if text.trim().is_empty() {
                     continue;
                 }
+                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
+                if !call_id.is_empty() {
+                    links.parent_event_id = Some(call_id.to_string());
+                    links.parent_tool_use_id = Some(call_id.to_string());
+                }
                 let record = Record {
                     source: SourceKind::Copilot,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -2308,6 +2615,7 @@ fn parse_copilot_session(
                     tool_name,
                     tool_input: None,
                     tool_output,
+                    links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Copilot, 1);
@@ -2322,6 +2630,7 @@ fn parse_copilot_session(
                 if text.trim().is_empty() {
                     continue;
                 }
+                let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -2334,6 +2643,7 @@ fn parse_copilot_session(
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
+                    links,
                     source_path: source_path.clone(),
                 };
                 progress.add_produced(SourceKind::Copilot, 1);
@@ -2450,6 +2760,86 @@ fn session_id_from_copilot_path(path: &Path) -> Option<String> {
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn copilot_record_links(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    data: &serde_json::Value,
+    session_id: &str,
+    turn_id: u32,
+) -> RecordLinks {
+    let parent_session_id = copilot_string_field(data, obj, COPILOT_PARENT_SESSION_KEYS);
+    let explicit_thread_source =
+        copilot_string_field(data, obj, &["threadSource", "thread_source", "source"]);
+    let thread_source = explicit_thread_source.or_else(|| {
+        parent_session_id
+            .as_ref()
+            .filter(|parent| parent.as_str() != session_id)
+            .map(|_| "fork".to_string())
+    });
+    let conversation_kind = match thread_source.as_deref() {
+        Some("subagent") => "subagent",
+        Some("sidechain") => "sidechain",
+        Some("branch") => "branch",
+        Some("fork") => "fork",
+        _ => "main",
+    };
+
+    RecordLinks {
+        event_id: copilot_string_field(data, obj, COPILOT_EVENT_KEYS)
+            .or_else(|| Some(format!("{session_id}:{turn_id}"))),
+        parent_event_id: copilot_string_field(data, obj, COPILOT_PARENT_EVENT_KEYS),
+        logical_parent_event_id: copilot_string_field(data, obj, COPILOT_LOGICAL_PARENT_KEYS),
+        parent_session_id,
+        thread_source,
+        conversation_kind: Some(conversation_kind.to_string()),
+        ..RecordLinks::default()
+    }
+}
+
+const COPILOT_EVENT_KEYS: &[&str] = &[
+    "id",
+    "eventId",
+    "event_id",
+    "messageId",
+    "message_id",
+    "requestId",
+    "request_id",
+    "responseId",
+    "response_id",
+];
+const COPILOT_PARENT_EVENT_KEYS: &[&str] = &[
+    "parentId",
+    "parent_id",
+    "parentMessageId",
+    "parent_message_id",
+    "parentEventId",
+    "parent_event_id",
+];
+const COPILOT_LOGICAL_PARENT_KEYS: &[&str] = &["fromId", "from_id", "rootId", "root_id"];
+const COPILOT_PARENT_SESSION_KEYS: &[&str] = &[
+    "parentSessionId",
+    "parent_session_id",
+    "forkedFromSessionId",
+    "forked_from_session_id",
+];
+
+fn copilot_string_field(
+    data: &serde_json::Value,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    for key in keys {
+        if let Some(value) = data
+            .get(*key)
+            .or_else(|| obj.get(*key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn json_timestamp_millis(value: &serde_json::Value) -> Option<u64> {
@@ -2590,6 +2980,30 @@ fn cursor_subagent_turn_base(path: &Path) -> Option<u32> {
         .filter(|s| !s.is_empty())?;
     let bucket = stable_cursor_turn_bucket(agent_id);
     Some(CURSOR_SUBAGENT_TURN_BASE + bucket.saturating_mul(CURSOR_SUBAGENT_TURN_STRIDE))
+}
+
+fn cursor_is_subagent_transcript(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_str() == Some("subagents"))
+}
+
+fn cursor_transcript_id(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn cursor_record_links(path: &Path, session_id: &str, turn_id: u32) -> RecordLinks {
+    let is_subagent = cursor_is_subagent_transcript(path);
+    RecordLinks {
+        event_id: Some(format!("{}:{turn_id}", cursor_transcript_id(path))),
+        parent_session_id: is_subagent.then(|| session_id.to_string()),
+        thread_source: is_subagent.then(|| "subagent".to_string()),
+        conversation_kind: Some(if is_subagent { "subagent" } else { "main" }.to_string()),
+        ..RecordLinks::default()
+    }
 }
 
 fn stable_cursor_turn_bucket(value: &str) -> u32 {
@@ -2921,6 +3335,7 @@ mod tests {
             tool_name: None,
             tool_input: None,
             tool_output: None,
+            links: RecordLinks::default(),
             source_path: format!("source-{doc_id}.jsonl"),
         }
     }
@@ -3004,6 +3419,161 @@ mod tests {
     }
 
     #[test]
+    fn cursor_record_links_mark_subagent_parent_session() {
+        let path = Path::new(
+            "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
+             11111111-1111-1111-1111-111111111111/subagents/\
+             22222222-2222-2222-2222-222222222222.jsonl",
+        );
+
+        let links = cursor_record_links(path, "11111111-1111-1111-1111-111111111111", 42);
+
+        assert_eq!(
+            links.event_id.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222:42")
+        );
+        assert_eq!(
+            links.parent_session_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(links.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(links.conversation_kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn opencode_session_links_preserve_parent_id() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).expect("create opencode project");
+        fs::write(
+            project.join("ses_child.json"),
+            r#"{"id":"ses_child","parentID":"ses_parent","projectID":"global"}"#,
+        )
+        .expect("write opencode session");
+
+        let links = opencode_session_links_from_root(tmp.path(), "ses_child");
+
+        assert_eq!(links.parent_session_id.as_deref(), Some("ses_parent"));
+        assert_eq!(links.thread_source.as_deref(), Some("fork"));
+        assert_eq!(links.conversation_kind.as_deref(), Some("fork"));
+    }
+
+    #[test]
+    fn codex_session_meta_preserves_fork_and_subagent_links() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join("rollout-2026-05-22T13-17-11-019e5155-b507-7d83-8c3d-9ecee5f93f12.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-05-22T20:17:12.595Z","type":"session_meta","payload":{"id":"019e5155-b507-7d83-8c3d-9ecee5f93f12","forked_from_id":"019e5117-c673-7660-b218-af0489416e0f","cwd":"/tmp/project","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019e5117-c673-7660-b218-af0489416e0f","depth":1}}},"thread_source":"subagent"}}"#
+                .to_string()
+                + "\n",
+        )
+        .expect("write codex session");
+
+        let meta = read_codex_session_meta_until(&path, fs::metadata(&path).unwrap().len())
+            .expect("read codex meta");
+
+        assert_eq!(meta.session_id, "019e5155-b507-7d83-8c3d-9ecee5f93f12");
+        assert_eq!(meta.project, "project");
+        assert_eq!(
+            meta.links.parent_session_id.as_deref(),
+            Some("019e5117-c673-7660-b218-af0489416e0f")
+        );
+        assert_eq!(meta.links.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(meta.links.conversation_kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn ingest_claude_records_preserve_sidechain_and_tool_links() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let claude_root = tmp.path().join("claude-projects");
+        let project_root = claude_root.join("-Users-nico-Code-memex");
+        fs::create_dir_all(&project_root).expect("create claude project");
+        let session_file = project_root.join("sess-claude.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"sess-claude","isSidechain":false,"timestamp":"2026-03-11T01:23:43.844Z","message":{"content":"question"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","logicalParentUuid":"u0","sessionId":"sess-claude","isSidechain":true,"sourceToolUseID":"source-tool","sourceToolAssistantUUID":"source-assistant","timestamp":"2026-03-11T01:23:44.844Z","message":{"content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"tool-claude","name":"Read","input":{"file_path":"Cargo.toml"}}]}}
+{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"sess-claude","isSidechain":true,"timestamp":"2026-03-11T01:23:45.844Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-claude","content":"ok"}]}}
+"#,
+        )
+        .expect("write claude fixture");
+
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let options = IngestOptions {
+            claude_source: claude_root,
+            include_agents: false,
+            include_codex: false,
+            include_opencode: false,
+            include_cursor: false,
+            include_pi: false,
+            include_copilot: false,
+            embeddings: false,
+            backfill_embeddings: false,
+            model: ModelChoice::default(),
+            embed_runtime: EmbedRuntimeConfig::default(),
+        };
+
+        let report = ingest_all(&paths, &index, &options).expect("ingest");
+        assert_eq!(report.records_added, 4);
+
+        let mut records = index
+            .records_by_session_id("sess-claude")
+            .expect("records by session");
+        records.sort_by_key(|record| record.turn_id);
+
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].role, "user");
+        assert_eq!(records[0].links.event_id.as_deref(), Some("u1"));
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+        assert_eq!(records[1].role, "tool_use");
+        assert_eq!(records[1].links.event_id.as_deref(), Some("tool-claude"));
+        assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
+        assert_eq!(
+            records[1].links.logical_parent_event_id.as_deref(),
+            Some("u0")
+        );
+        assert_eq!(
+            records[1].links.source_tool_use_id.as_deref(),
+            Some("source-tool")
+        );
+        assert_eq!(
+            records[1].links.source_tool_assistant_uuid.as_deref(),
+            Some("source-assistant")
+        );
+        assert_eq!(records[1].links.thread_source.as_deref(), Some("sidechain"));
+        assert_eq!(
+            records[1].links.conversation_kind.as_deref(),
+            Some("sidechain")
+        );
+        assert_eq!(records[2].role, "assistant");
+        assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
+        assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
+        assert_eq!(records[2].links.thread_source.as_deref(), Some("sidechain"));
+        assert_eq!(
+            records[2].links.conversation_kind.as_deref(),
+            Some("sidechain")
+        );
+        assert_eq!(records[3].role, "tool_result");
+        assert_eq!(
+            records[3].links.event_id.as_deref(),
+            Some("r1:tool_result:tool-claude")
+        );
+        assert_eq!(
+            records[3].links.parent_event_id.as_deref(),
+            Some("tool-claude")
+        );
+        assert_eq!(
+            records[3].links.parent_tool_use_id.as_deref(),
+            Some("tool-claude")
+        );
+    }
+
+    #[test]
     fn collect_codex_session_files_includes_archived_sessions() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sessions_root = tmp.path().join("sessions");
@@ -3042,7 +3612,7 @@ mod tests {
     fn can_skip_fresh_scan_when_embeddings_are_disabled() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        let index = open_search_index(&paths);
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(false, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
 
@@ -3054,7 +3624,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
         save_vector_store(&paths, "bge", 384);
-        let index = open_search_index(&paths);
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(true, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
 
@@ -3333,29 +3903,66 @@ mod tests {
         );
         assert_eq!(records[0].role, "user");
         assert_eq!(records[0].text, "hello pi");
+        assert_eq!(records[0].links.event_id.as_deref(), Some("u1"));
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
         assert_eq!(records[1].role, "tool_use");
         assert_eq!(records[1].tool_name.as_deref(), Some("Read"));
         assert!(records[1].text.contains("README.md"));
+        assert_eq!(records[1].links.event_id.as_deref(), Some("tc1"));
+        assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].role, "assistant");
         assert!(records[2].text.contains("I will run a command"));
         assert!(records[2].text.contains("Thinking:"));
+        assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
+        assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
         assert_eq!(records[3].role, "tool_result");
         assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
         assert_eq!(records[3].text, "README contents");
+        assert_eq!(records[3].links.event_id.as_deref(), Some("tr1"));
+        assert_eq!(records[3].links.parent_event_id.as_deref(), Some("a1"));
+        assert_eq!(records[3].links.parent_tool_use_id.as_deref(), Some("tc1"));
         assert_eq!(records[4].role, "tool_result");
         assert_eq!(records[4].tool_name.as_deref(), Some("Bash"));
         assert!(records[4].text.contains("$ cargo test"));
         assert!(records[4].text.contains("exit code: 0"));
         assert_eq!(records[5].role, "assistant");
+        assert_eq!(records[5].links.event_id.as_deref(), Some("c1"));
+        assert_eq!(
+            records[5].links.thread_source.as_deref(),
+            Some("compaction")
+        );
+        assert_eq!(
+            records[5].links.conversation_kind.as_deref(),
+            Some("compaction")
+        );
         assert_eq!(records[5].text, "compaction: compacted top-level summary");
         assert_eq!(records[6].role, "assistant");
         assert_eq!(records[6].text, "branch_summary: branch top-level summary");
+        assert_eq!(records[6].links.event_id.as_deref(), Some("br1"));
+        assert_eq!(records[6].links.parent_event_id.as_deref(), Some("u1"));
+        assert_eq!(
+            records[6].links.logical_parent_event_id.as_deref(),
+            Some("c1")
+        );
+        assert_eq!(records[6].links.thread_source.as_deref(), Some("branch"));
+        assert_eq!(
+            records[6].links.conversation_kind.as_deref(),
+            Some("branch")
+        );
         assert_eq!(records[7].role, "assistant");
         assert_eq!(records[7].text, "custom_message(memex): extension context");
         assert_eq!(records[8].role, "assistant");
         assert_eq!(records[8].text, "compactionSummary: summary text");
+        assert_eq!(
+            records[8].links.conversation_kind.as_deref(),
+            Some("compaction")
+        );
         assert_eq!(records[9].role, "assistant");
         assert_eq!(records[9].text, "branchSummary: message summary text");
+        assert_eq!(
+            records[9].links.conversation_kind.as_deref(),
+            Some("branch")
+        );
         assert!(!records.iter().any(|record| record.text.contains("secret")));
     }
 
@@ -3471,13 +4078,28 @@ mod tests {
         assert!(records.iter().all(|r| r.project == "memex"));
         assert!(records.iter().all(|r| r.session_id == session_id));
         assert_eq!(records[0].role, "user");
+        assert_eq!(
+            records[0].links.event_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111:0")
+        );
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
         assert_eq!(records[1].role, "assistant");
+        assert_eq!(
+            records[1].links.event_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111:1")
+        );
         assert_eq!(records[2].role, "tool_use");
         assert_eq!(records[2].tool_name.as_deref(), Some("grep"));
         assert!(records[2].text.contains("parse_copilot"));
+        assert_eq!(records[2].links.event_id.as_deref(), Some("call-1"));
         assert_eq!(records[3].role, "tool_result");
         assert_eq!(records[3].tool_name.as_deref(), Some("grep"));
         assert_eq!(records[3].tool_output.as_deref(), Some("src/ingest.rs"));
+        assert_eq!(records[3].links.parent_event_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            records[3].links.parent_tool_use_id.as_deref(),
+            Some("call-1")
+        );
 
         let update = rx_update.try_recv().expect("file update");
         assert_eq!(update.state.offset, meta.len());
@@ -3506,6 +4128,7 @@ mod tests {
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
+                links: RecordLinks::default(),
                 source_path: tmp
                     .path()
                     .join(

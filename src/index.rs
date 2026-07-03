@@ -1,6 +1,7 @@
-use crate::types::Record;
+use crate::types::{Record, RecordLinks};
 use anyhow::{Result, anyhow};
 use std::ops::Bound;
+use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
@@ -23,6 +24,15 @@ pub struct IndexFields {
     pub tool_name: Field,
     pub tool_input: Field,
     pub tool_output: Field,
+    pub event_id: Field,
+    pub parent_event_id: Field,
+    pub logical_parent_event_id: Field,
+    pub parent_session_id: Field,
+    pub thread_source: Field,
+    pub conversation_kind: Field,
+    pub parent_tool_use_id: Field,
+    pub source_tool_use_id: Field,
+    pub source_tool_assistant_uuid: Field,
     pub source_path: Field,
 }
 
@@ -46,10 +56,19 @@ pub struct QueryOptions {
 }
 
 impl SearchIndex {
-    pub fn open_or_create(dir: &std::path::Path) -> Result<Self> {
+    pub fn open_or_create(dir: &Path) -> Result<Self> {
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {
             let index = Index::open_in_dir(dir)?;
+            if !schema_is_current(&index.schema()) {
+                drop(index);
+                std::fs::remove_dir_all(dir)?;
+                std::fs::create_dir_all(dir)?;
+                let schema = build_schema()?;
+                let index = Index::create_in_dir(dir, schema.clone())?;
+                let fields = load_fields(schema)?;
+                return Ok(Self { index, fields });
+            }
             let fields = load_fields(index.schema())?;
             Ok(Self { index, fields })
         } else {
@@ -94,6 +113,47 @@ impl SearchIndex {
         if let Some(tool_output) = &record.tool_output {
             doc.add_text(self.fields.tool_output, tool_output);
         }
+        add_optional_text(&mut doc, self.fields.event_id, &record.links.event_id);
+        add_optional_text(
+            &mut doc,
+            self.fields.parent_event_id,
+            &record.links.parent_event_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.logical_parent_event_id,
+            &record.links.logical_parent_event_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.parent_session_id,
+            &record.links.parent_session_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.thread_source,
+            &record.links.thread_source,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.conversation_kind,
+            &record.links.conversation_kind,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.parent_tool_use_id,
+            &record.links.parent_tool_use_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.source_tool_use_id,
+            &record.links.source_tool_use_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.source_tool_assistant_uuid,
+            &record.links.source_tool_assistant_uuid,
+        );
         doc.add_text(self.fields.source_path, &record.source_path);
         writer.add_document(doc)?;
         Ok(())
@@ -200,9 +260,46 @@ fn build_schema() -> Result<Schema> {
     builder.add_text_field("tool_name", STRING | STORED);
     builder.add_text_field("tool_input", TEXT | STORED);
     builder.add_text_field("tool_output", TEXT | STORED);
+    builder.add_text_field("event_id", STRING | STORED);
+    builder.add_text_field("parent_event_id", STRING | STORED);
+    builder.add_text_field("logical_parent_event_id", STRING | STORED);
+    builder.add_text_field("parent_session_id", STRING | STORED);
+    builder.add_text_field("thread_source", STRING | STORED);
+    builder.add_text_field("conversation_kind", STRING | STORED);
+    builder.add_text_field("parent_tool_use_id", STRING | STORED);
+    builder.add_text_field("source_tool_use_id", STRING | STORED);
+    builder.add_text_field("source_tool_assistant_uuid", STRING | STORED);
     builder.add_text_field("source_path", STRING | STORED);
 
     Ok(builder.build())
+}
+
+fn schema_is_current(schema: &Schema) -> bool {
+    [
+        "doc_id",
+        "ts",
+        "project",
+        "session_id",
+        "turn_id",
+        "role",
+        "source",
+        "text",
+        "tool_name",
+        "tool_input",
+        "tool_output",
+        "event_id",
+        "parent_event_id",
+        "logical_parent_event_id",
+        "parent_session_id",
+        "thread_source",
+        "conversation_kind",
+        "parent_tool_use_id",
+        "source_tool_use_id",
+        "source_tool_assistant_uuid",
+        "source_path",
+    ]
+    .into_iter()
+    .all(|field| schema.get_field(field).is_ok())
 }
 
 fn load_fields(schema: Schema) -> Result<IndexFields> {
@@ -223,6 +320,15 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
         tool_name: get("tool_name")?,
         tool_input: get("tool_input")?,
         tool_output: get("tool_output")?,
+        event_id: get("event_id")?,
+        parent_event_id: get("parent_event_id")?,
+        logical_parent_event_id: get("logical_parent_event_id")?,
+        parent_session_id: get("parent_session_id")?,
+        thread_source: get("thread_source")?,
+        conversation_kind: get("conversation_kind")?,
+        parent_tool_use_id: get("parent_tool_use_id")?,
+        source_tool_use_id: get("source_tool_use_id")?,
+        source_tool_assistant_uuid: get("source_tool_assistant_uuid")?,
         source_path: get("source_path")?,
     })
 }
@@ -326,6 +432,23 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
         tool_name: get_str(fields.tool_name),
         tool_input: get_str(fields.tool_input),
         tool_output: get_str(fields.tool_output),
+        links: RecordLinks {
+            event_id: get_str(fields.event_id),
+            parent_event_id: get_str(fields.parent_event_id),
+            logical_parent_event_id: get_str(fields.logical_parent_event_id),
+            parent_session_id: get_str(fields.parent_session_id),
+            thread_source: get_str(fields.thread_source),
+            conversation_kind: get_str(fields.conversation_kind),
+            parent_tool_use_id: get_str(fields.parent_tool_use_id),
+            source_tool_use_id: get_str(fields.source_tool_use_id),
+            source_tool_assistant_uuid: get_str(fields.source_tool_assistant_uuid),
+        },
         source_path,
+    }
+}
+
+fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<String>) {
+    if let Some(value) = value {
+        doc.add_text(field, value);
     }
 }
