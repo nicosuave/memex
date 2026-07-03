@@ -35,7 +35,7 @@ impl VectorIndex {
         if index_path.exists() {
             let existing = Index::new(&IndexOptions::default())?;
             existing.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
-            let existing_meta = load_metadata(&meta_path).ok();
+            let existing_meta = load_metadata_if_exists(&meta_path)?;
             let model_mismatch = match (&existing_meta, &model) {
                 (Some(meta), Some(model)) => meta.model.as_deref() != Some(model),
                 (None, Some(_)) => true,
@@ -99,7 +99,7 @@ impl VectorIndex {
         } else {
             HashSet::new()
         };
-        let model = load_metadata(&meta_path).ok().and_then(|meta| meta.model);
+        let model = load_metadata_if_exists(&meta_path)?.and_then(|meta| meta.model);
 
         Ok(Self {
             dims: index.dimensions(),
@@ -109,13 +109,6 @@ impl VectorIndex {
             doc_id_set,
             needs_backfill: false,
         })
-    }
-
-    pub fn is_model_compatible(dir: &Path, model: &str, dimensions: usize) -> bool {
-        match Self::open(dir) {
-            Ok(index) => index.model() == Some(model) && index.dimensions() == dimensions,
-            Err(_) => false,
-        }
     }
 
     pub fn add(&mut self, doc_id: u64, embedding: &[f32]) -> Result<()> {
@@ -188,6 +181,10 @@ impl VectorIndex {
         self.index.size()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.index.size() == 0
+    }
+
     pub fn doc_id_count(&self) -> usize {
         self.doc_id_set.len()
     }
@@ -209,6 +206,13 @@ impl VectorIndex {
 fn load_metadata(path: &Path) -> Result<VectorMetadata> {
     let data = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&data)?)
+}
+
+fn load_metadata_if_exists(path: &Path) -> Result<Option<VectorMetadata>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(load_metadata(path)?))
 }
 
 fn save_metadata(path: &Path, metadata: &VectorMetadata) -> Result<()> {
@@ -430,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_compatibility_checks_metadata() {
+    fn test_corrupt_model_metadata_errors() {
         let tmp = TempDir::new().unwrap();
 
         {
@@ -439,9 +443,25 @@ mod tests {
             idx.save().unwrap();
         }
 
-        assert!(VectorIndex::is_model_compatible(tmp.path(), "alpha", 64));
-        assert!(!VectorIndex::is_model_compatible(tmp.path(), "beta", 64));
-        assert!(!VectorIndex::is_model_compatible(tmp.path(), "alpha", 128));
+        fs::write(tmp.path().join("meta.json"), "{").unwrap();
+
+        assert!(VectorIndex::open(tmp.path()).is_err());
+        assert!(VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).is_err());
+    }
+
+    #[test]
+    fn test_open_exposes_model_metadata_for_compatibility_checks() {
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).unwrap();
+            idx.add(1, &make_vector(64, 1.0)).unwrap();
+            idx.save().unwrap();
+        }
+
+        let idx = VectorIndex::open(tmp.path()).unwrap();
+        assert_eq!(idx.model(), Some("alpha"));
+        assert_eq!(idx.dimensions(), 64);
     }
 
     #[test]

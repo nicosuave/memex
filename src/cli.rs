@@ -1106,12 +1106,10 @@ fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
 }
 
 fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
-    let vector = match VectorIndex::open(vectors_dir) {
-        Ok(vector) => vector,
-        Err(_) => {
-            return Ok("vectors: none".to_string());
-        }
-    };
+    if !vectors_dir.join("usearch.index").exists() {
+        return Ok("vectors: none".to_string());
+    }
+    let vector = VectorIndex::open(vectors_dir)?;
     let index_path = vectors_dir.join("usearch.index");
     let ids_path = vectors_dir.join("doc_ids.bin");
     let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
@@ -2200,7 +2198,7 @@ fn apply_post_processing(
             results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         }
         SortBy::Ts => {
-            results.sort_by(|a, b| b.1.ts.cmp(&a.1.ts));
+            results.sort_by_key(|result| std::cmp::Reverse(result.1.ts));
         }
     }
 
