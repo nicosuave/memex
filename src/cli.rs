@@ -21,10 +21,10 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude and Codex",
+    about = "Fast local history search for Claude, Codex, Cursor, and Opencode",
     after_help = "\
 QUICK START:
-    memex index                     # Index your Claude/Codex history
+    memex index                     # Index your Claude/Codex/Cursor/Opencode history
     memex search \"error handling\"   # Search for keywords
     memex tui                       # Browse sessions interactively
 
@@ -50,6 +50,9 @@ struct IndexArgs {
     /// Index Opencode sessions from ~/.local/share/opencode [default: true]
     #[arg(long, default_value_t = true)]
     opencode: bool,
+    /// Index Cursor agent transcripts from ~/.cursor/projects [default: true]
+    #[arg(long = "no-cursor", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    cursor: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long)]
     embeddings: bool,
@@ -67,10 +70,10 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude and Codex conversation history
+    /// Index Claude, Codex, Cursor, and Opencode conversation history
     #[command(after_help = "\
 EXAMPLES:
-    memex index                         # Index all Claude and Codex history
+    memex index                         # Index all supported local history
     memex index --embeddings            # Also generate embeddings for semantic search
     memex index --include-agents        # Include Claude Code subagent conversations
     memex index --source ~/custom/path  # Use custom Claude projects directory")]
@@ -131,7 +134,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude or codex
+        /// Filter by source: claude, codex, cursor, or opencode
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -456,6 +459,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.include_agents,
         index.codex,
         index.opencode,
+        index.cursor,
         index.embeddings,
         index.no_embeddings,
         index.model.clone(),
@@ -470,6 +474,7 @@ fn run_index(
     include_agents: bool,
     codex: bool,
     opencode: bool,
+    cursor: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
     model: Option<String>,
@@ -499,6 +504,7 @@ fn run_index(
         include_agents,
         include_codex: codex,
         include_opencode: opencode,
+        include_cursor: cursor,
         embeddings,
         backfill_embeddings: false,
         model: model_choice,
@@ -538,10 +544,10 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let mut vector =
         VectorIndex::open_or_create(&paths.vectors, embedder.dims, Some(model_choice.as_str()))?;
 
-    let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 4], [0; 4], true));
+    let progress = std::sync::Arc::new(crate::progress::Progress::new([0; 5], [0; 5], true));
     progress.set_embed_ready();
 
-    let mut embedded_counts = [0u64; 4];
+    let mut embedded_counts = [0u64; 5];
     let mut embedded_total = 0u64;
     let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
 
@@ -549,7 +555,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
                        embedder: &mut EmbedderHandle,
                        vector: &mut VectorIndex,
                        progress: &crate::progress::Progress,
-                       embedded_counts: &mut [u64; 4],
+                       embedded_counts: &mut [u64; 5],
                        embedded_total: &mut u64| {
         if batch.is_empty() {
             return Ok(());
@@ -608,12 +614,13 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, history {}, opencode {})",
+        "embedded {} vectors (claude {}, codex {}, history {}, opencode {}, cursor {})",
         embedded_total,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
         embedded_counts[crate::types::SourceKind::CodexSession.idx()],
         embedded_counts[crate::types::SourceKind::CodexHistory.idx()],
         embedded_counts[crate::types::SourceKind::Opencode.idx()],
+        embedded_counts[crate::types::SourceKind::Cursor.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -659,6 +666,7 @@ fn run_search(
             include_agents: false,
             include_codex: true,
             include_opencode: true,
+            include_cursor: true,
             embeddings: embeddings_default,
             backfill_embeddings: false,
             model: model_choice,
@@ -1351,6 +1359,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Claude => "claude",
         crate::types::SourceKind::CodexSession | crate::types::SourceKind::CodexHistory => "codex",
         crate::types::SourceKind::Opencode => "opencode",
+        crate::types::SourceKind::Cursor => "cursor",
     };
     let source_path = &record.source_path;
 
@@ -1881,6 +1890,9 @@ fn build_index_command_args(
     }
     if !index.opencode {
         args.push("--no-opencode".to_string());
+    }
+    if !index.cursor {
+        args.push("--no-cursor".to_string());
     }
     if index.embeddings {
         args.push("--embeddings".to_string());

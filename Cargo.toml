@@ -3,7 +3,7 @@ name = "memex"
 version = "0.3.1"
 edition = "2024"
 build = "build.rs"
-description = "CLI tool for indexing and searching Claude Code conversation history"
+description = "CLI tool for indexing and searching local agent conversation history"
 license = "MIT"
 repository = "https://github.com/nicosuave/memex"
 

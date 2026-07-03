@@ -22,6 +22,9 @@ use walkdir::WalkDir;
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
 const INDEX_PROGRESS_BATCH: u64 = 1;
+const CURSOR_SUBAGENT_TURN_BASE: u32 = 1_000_000_000;
+const CURSOR_SUBAGENT_TURN_STRIDE: u32 = 50_000;
+const CURSOR_SUBAGENT_TURN_BUCKETS: u32 = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
@@ -29,6 +32,7 @@ pub struct IngestOptions {
     pub include_agents: bool,
     pub include_codex: bool,
     pub include_opencode: bool,
+    pub include_cursor: bool,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
@@ -279,6 +283,49 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_cursor {
+        let cursor_files = collect_cursor_files()?;
+        for path in cursor_files {
+            let meta = path.metadata()?;
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            files_scanned += 1;
+            total_bytes += size;
+            let key = path.to_string_lossy().to_string();
+            let prev = state.files.get(&key);
+            let (offset, turn_id, delete_first, skip) = match prev {
+                None => (0, 0, false, false),
+                Some(prev) => {
+                    if size < prev.size || mtime < prev.mtime {
+                        (0, 0, true, false)
+                    } else if size == prev.size && mtime == prev.mtime {
+                        (prev.offset, prev.turn_id, false, true)
+                    } else {
+                        (prev.offset, prev.turn_id, false, false)
+                    }
+                }
+            };
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(FileTask {
+                path,
+                source: SourceKind::Cursor,
+                offset,
+                turn_id,
+                size,
+                mtime,
+                delete_first,
+            });
+        }
+    }
+
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
@@ -333,6 +380,9 @@ pub fn ingest_all(
             )?,
             SourceKind::Opencode => {
                 parse_opencode_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
+            }
+            SourceKind::Cursor => {
+                parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
         }
         Ok(())
@@ -454,7 +504,7 @@ fn writer_loop(
     let mut vector_index = None;
     let mut embedder: Option<EmbedderHandle> = None;
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
-    let mut index_pending: [u64; 4] = [0, 0, 0, 0];
+    let mut index_pending: [u64; 5] = [0, 0, 0, 0, 0];
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
         let dims = handle.dims;
@@ -505,7 +555,8 @@ fn writer_loop(
                 0 => SourceKind::Claude,
                 1 => SourceKind::CodexSession,
                 2 => SourceKind::CodexHistory,
-                _ => SourceKind::Opencode,
+                3 => SourceKind::Opencode,
+                _ => SourceKind::Cursor,
             };
             progress.add_indexed(source, pending);
         }
@@ -648,6 +699,31 @@ fn collect_opencode_files() -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn collect_cursor_files() -> Result<Vec<PathBuf>> {
+    let root = cursor_projects_root();
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        if path_str.contains("/agent-transcripts/") || path_str.contains("\\agent-transcripts\\") {
+            files.push(path.to_path_buf());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn codex_root() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
@@ -687,6 +763,13 @@ fn opencode_parts_root() -> PathBuf {
 
 fn codex_history_path() -> PathBuf {
     codex_root().join("history.jsonl")
+}
+
+fn cursor_projects_root() -> PathBuf {
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".cursor").join("projects")
 }
 
 fn parse_claude_file(
@@ -1286,6 +1369,168 @@ fn parse_opencode_file(
     Ok(())
 }
 
+fn parse_cursor_file(
+    task: &FileTask,
+    tx_record: &Sender<Record>,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let file = File::open(&task.path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let mut start = task.offset as usize;
+    let mut turn_id = cursor_initial_turn_id(&task.path, task.turn_id);
+
+    let source_path = task.path.to_string_lossy().to_string();
+    let session_id = cursor_session_id_from_path(&task.path);
+    let project = project_from_cursor_path(&task.path);
+    let timestamp = task.mtime.max(0) as u64 * 1000;
+
+    let mut buf = Vec::new();
+    let mut parsed_bytes = 0u64;
+    while start < mmap.len() {
+        let slice = &mmap[start..];
+        let rel = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..rel];
+        let advanced = rel + 1;
+        start += advanced;
+        parsed_bytes += advanced as u64;
+        if parsed_bytes >= 64 * 1024 {
+            progress.add_parsed_bytes(SourceKind::Cursor, parsed_bytes);
+            parsed_bytes = 0;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        buf.clear();
+        buf.extend_from_slice(line);
+        let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let message = match obj.get("message").and_then(|v| v.as_object()) {
+            Some(m) => m,
+            None => continue,
+        };
+        let mut text_parts = Vec::new();
+        if let Some(content) = message.get("content") {
+            if let Some(text) = content.as_str() {
+                text_parts.push(text);
+            } else if let Some(arr) = content.as_array() {
+                for block in arr {
+                    let Some(block_obj) = block.as_object() else {
+                        continue;
+                    };
+                    let block_type = block_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if block_type == "text" {
+                        if let Some(text) = block_obj.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(text);
+                        }
+                    } else if block_type == "tool_use" {
+                        let tool_name = block_obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let tool_input = block_obj.get("input").map(|v| v.to_string());
+                        let text = tool_input.clone().unwrap_or_default();
+                        let record = Record {
+                            source: SourceKind::Cursor,
+                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                            ts: timestamp,
+                            project: project.clone(),
+                            session_id: session_id.clone(),
+                            turn_id,
+                            role: "tool_use".to_string(),
+                            text,
+                            tool_name,
+                            tool_input,
+                            tool_output: None,
+                            source_path: source_path.clone(),
+                        };
+                        progress.add_produced(SourceKind::Cursor, 1);
+                        tx_record.send(record)?;
+                        turn_id += 1;
+                    } else if block_type == "tool_result" {
+                        let tool_output = block_obj.get("content").map(|v| v.to_string());
+                        let mut text = extract_text_from_tool_result(block).unwrap_or_default();
+                        if text.is_empty()
+                            && let Some(content) = block_obj.get("content")
+                        {
+                            text = content.to_string();
+                        }
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let record = Record {
+                            source: SourceKind::Cursor,
+                            doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                            ts: timestamp,
+                            project: project.clone(),
+                            session_id: session_id.clone(),
+                            turn_id,
+                            role: "tool_result".to_string(),
+                            text,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output,
+                            source_path: source_path.clone(),
+                        };
+                        progress.add_produced(SourceKind::Cursor, 1);
+                        tx_record.send(record)?;
+                        turn_id += 1;
+                    }
+                }
+            }
+        }
+
+        let text = text_parts.join("\n").trim().to_string();
+        if !text.is_empty() {
+            let record = Record {
+                source: SourceKind::Cursor,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: role.to_string(),
+                text,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                source_path: source_path.clone(),
+            };
+            progress.add_produced(SourceKind::Cursor, 1);
+            tx_record.send(record)?;
+            turn_id += 1;
+        }
+    }
+
+    if parsed_bytes > 0 {
+        progress.add_parsed_bytes(SourceKind::Cursor, parsed_bytes);
+    }
+    progress.add_files_done(SourceKind::Cursor, 1);
+    let state = FileState {
+        size: task.size,
+        mtime: task.mtime,
+        offset: mmap.len() as u64,
+        turn_id,
+    };
+    tx_update.send(FileUpdate {
+        path: source_path,
+        state,
+        session_id: Some(session_id),
+    })?;
+    Ok(())
+}
+
 fn parse_iso_millis(input: &str) -> Option<u64> {
     DateTime::parse_from_rfc3339(input)
         .ok()
@@ -1309,6 +1554,78 @@ fn project_from_path(path: &str) -> String {
         return name.to_string();
     }
     "codex".to_string()
+}
+
+fn project_from_cursor_path(path: &Path) -> String {
+    let root = cursor_projects_root();
+    let Ok(relative) = path.strip_prefix(root) else {
+        return "cursor".to_string();
+    };
+    let Some(project_folder) = relative
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+    else {
+        return "cursor".to_string();
+    };
+    if project_folder == "empty-window" {
+        return project_folder.to_string();
+    }
+    decode_project_name(project_folder)
+}
+
+fn cursor_session_id_from_path(path: &Path) -> String {
+    let components: Vec<_> = path.components().collect();
+    for (idx, component) in components.iter().enumerate() {
+        if component.as_os_str().to_str() == Some("agent-transcripts")
+            && let Some(session_id) = components
+                .get(idx + 1)
+                .and_then(|c| Path::new(c.as_os_str()).file_stem())
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+        {
+            return session_id.to_string();
+        }
+    }
+
+    session_id_from_filename(path).unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    })
+}
+
+fn cursor_initial_turn_id(path: &Path, cached_turn_id: u32) -> u32 {
+    if cached_turn_id != 0 {
+        return cached_turn_id;
+    }
+    cursor_subagent_turn_base(path).unwrap_or(cached_turn_id)
+}
+
+fn cursor_subagent_turn_base(path: &Path) -> Option<u32> {
+    if !path
+        .components()
+        .any(|component| component.as_os_str().to_str() == Some("subagents"))
+    {
+        return None;
+    }
+
+    let agent_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())?;
+    let bucket = stable_cursor_turn_bucket(agent_id);
+    Some(CURSOR_SUBAGENT_TURN_BASE + bucket.saturating_mul(CURSOR_SUBAGENT_TURN_STRIDE))
+}
+
+fn stable_cursor_turn_bucket(value: &str) -> u32 {
+    let mut hash = 2_166_136_261u32;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    hash % CURSOR_SUBAGENT_TURN_BUCKETS
 }
 
 fn decode_project_name(folder_name: &str) -> String {
@@ -1429,8 +1746,8 @@ fn flush_embeddings(
     Ok(count)
 }
 
-fn compute_totals(tasks: &[FileTask]) -> [u64; 4] {
-    let mut totals = [0u64; 4];
+fn compute_totals(tasks: &[FileTask]) -> [u64; 5] {
+    let mut totals = [0u64; 5];
     for task in tasks {
         let remaining = task.size.saturating_sub(task.offset);
         totals[task.source.idx()] += remaining;
@@ -1438,8 +1755,8 @@ fn compute_totals(tasks: &[FileTask]) -> [u64; 4] {
     totals
 }
 
-fn compute_file_totals(tasks: &[FileTask]) -> [u64; 4] {
-    let mut totals = [0u64; 4];
+fn compute_file_totals(tasks: &[FileTask]) -> [u64; 5] {
+    let mut totals = [0u64; 5];
     for task in tasks {
         totals[task.source.idx()] += 1;
     }
@@ -1477,6 +1794,7 @@ mod tests {
             include_agents: false,
             include_codex: false,
             include_opencode: false,
+            include_cursor: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -1533,6 +1851,72 @@ mod tests {
             file_count: 0,
             total_bytes: 0,
         }
+    }
+
+    #[test]
+    fn cursor_session_id_uses_agent_transcripts_session_directory() {
+        let path = Path::new(
+            "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
+             11111111-1111-1111-1111-111111111111/\
+             11111111-1111-1111-1111-111111111111.jsonl",
+        );
+
+        assert_eq!(
+            cursor_session_id_from_path(path),
+            "11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[test]
+    fn cursor_session_id_strips_direct_transcript_extension() {
+        let path = Path::new(
+            "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
+             11111111-1111-1111-1111-111111111111.jsonl",
+        );
+
+        assert_eq!(
+            cursor_session_id_from_path(path),
+            "11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[test]
+    fn cursor_session_id_uses_parent_session_for_subagent_transcripts() {
+        let path = Path::new(
+            "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
+             11111111-1111-1111-1111-111111111111/subagents/\
+             22222222-2222-2222-2222-222222222222.jsonl",
+        );
+
+        assert_eq!(
+            cursor_session_id_from_path(path),
+            "11111111-1111-1111-1111-111111111111"
+        );
+    }
+
+    #[test]
+    fn cursor_parent_transcripts_start_at_cached_turn_id() {
+        let path = Path::new(
+            "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
+             11111111-1111-1111-1111-111111111111/\
+             11111111-1111-1111-1111-111111111111.jsonl",
+        );
+
+        assert_eq!(cursor_initial_turn_id(path, 0), 0);
+        assert_eq!(cursor_initial_turn_id(path, 42), 42);
+    }
+
+    #[test]
+    fn cursor_subagent_transcripts_use_reserved_turn_range() {
+        let path = Path::new(
+            "/Users/nico/.cursor/projects/-Users-nico-Code-memex/agent-transcripts/\
+             11111111-1111-1111-1111-111111111111/subagents/\
+             22222222-2222-2222-2222-222222222222.jsonl",
+        );
+
+        let initial = cursor_initial_turn_id(path, 0);
+        assert!(initial >= CURSOR_SUBAGENT_TURN_BASE);
+        assert_eq!(cursor_initial_turn_id(path, initial + 3), initial + 3);
     }
 
     #[test]

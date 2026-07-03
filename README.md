@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI & OpenCode logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, and OpenCode logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -285,6 +285,7 @@ index_service_label = "memex-index"  # service name (default: com.memex.index on
 index_service_systemd_dir = "~/.config/systemd/user"  # Linux only
 claude_resume_cmd = "claude --resume {session_id}"
 codex_resume_cmd = "codex resume {session_id}"
+cursor_resume_cmd = "cursor-agent --resume {session_id}"
 ```
 
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.

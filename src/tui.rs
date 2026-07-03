@@ -102,6 +102,7 @@ enum SourceChoice {
     Claude,
     Codex,
     Opencode,
+    Cursor,
 }
 
 impl SourceChoice {
@@ -110,7 +111,8 @@ impl SourceChoice {
             SourceChoice::All => SourceChoice::Claude,
             SourceChoice::Claude => SourceChoice::Codex,
             SourceChoice::Codex => SourceChoice::Opencode,
-            SourceChoice::Opencode => SourceChoice::All,
+            SourceChoice::Opencode => SourceChoice::Cursor,
+            SourceChoice::Cursor => SourceChoice::All,
         }
     }
 
@@ -120,6 +122,7 @@ impl SourceChoice {
             SourceChoice::Claude => Some(SourceFilter::Claude),
             SourceChoice::Codex => Some(SourceFilter::Codex),
             SourceChoice::Opencode => Some(SourceFilter::Opencode),
+            SourceChoice::Cursor => Some(SourceFilter::Cursor),
         }
     }
 
@@ -129,6 +132,7 @@ impl SourceChoice {
             SourceChoice::Claude => "claude",
             SourceChoice::Codex => "codex",
             SourceChoice::Opencode => "opencode",
+            SourceChoice::Cursor => "cursor",
         }
     }
 }
@@ -434,6 +438,7 @@ impl App {
                     include_agents: false,
                     include_codex: true,
                     include_opencode: true,
+                    include_cursor: true,
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
                     model: model_choice,
@@ -694,6 +699,11 @@ impl App {
                 .opencode_resume_cmd
                 .clone()
                 .or_else(|| default_resume_template("opencode")),
+            SourceKind::Cursor => self
+                .config
+                .cursor_resume_cmd
+                .clone()
+                .or_else(|| default_resume_template("cursor")),
         };
         let Some(template) = template else {
             self.set_status("resume command not configured in config.toml");
@@ -726,6 +736,7 @@ impl App {
             SourceKind::Claude => "claude",
             SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
             SourceKind::Opencode => "opencode",
+            SourceKind::Cursor => "cursor",
         };
         let source_path = session.source_path.clone();
 
@@ -1627,6 +1638,9 @@ fn default_resume_template(cmd: &str) -> Option<String> {
         }
         "codex" => find_in_path("codex").map(|_| "codex resume {session_id}".to_string()),
         "opencode" => find_in_path("opencode").map(|_| "opencode resume {session_id}".to_string()),
+        "cursor" => {
+            find_in_path("cursor-agent").map(|_| "cursor-agent --resume {session_id}".to_string())
+        }
         _ => None,
     }
 }
