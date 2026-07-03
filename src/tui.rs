@@ -103,6 +103,7 @@ enum SourceChoice {
     Codex,
     Opencode,
     Cursor,
+    Pi,
 }
 
 impl SourceChoice {
@@ -112,7 +113,8 @@ impl SourceChoice {
             SourceChoice::Claude => SourceChoice::Codex,
             SourceChoice::Codex => SourceChoice::Opencode,
             SourceChoice::Opencode => SourceChoice::Cursor,
-            SourceChoice::Cursor => SourceChoice::All,
+            SourceChoice::Cursor => SourceChoice::Pi,
+            SourceChoice::Pi => SourceChoice::All,
         }
     }
 
@@ -123,6 +125,7 @@ impl SourceChoice {
             SourceChoice::Codex => Some(SourceFilter::Codex),
             SourceChoice::Opencode => Some(SourceFilter::Opencode),
             SourceChoice::Cursor => Some(SourceFilter::Cursor),
+            SourceChoice::Pi => Some(SourceFilter::Pi),
         }
     }
 
@@ -133,6 +136,7 @@ impl SourceChoice {
             SourceChoice::Codex => "codex",
             SourceChoice::Opencode => "opencode",
             SourceChoice::Cursor => "cursor",
+            SourceChoice::Pi => "pi",
         }
     }
 }
@@ -439,6 +443,7 @@ impl App {
                     include_codex: true,
                     include_opencode: true,
                     include_cursor: true,
+                    include_pi: true,
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
                     model: model_choice,
@@ -704,6 +709,11 @@ impl App {
                 .cursor_resume_cmd
                 .clone()
                 .or_else(|| default_resume_template("cursor")),
+            SourceKind::Pi => self
+                .config
+                .pi_resume_cmd
+                .clone()
+                .or_else(|| default_resume_template("pi")),
         };
         let Some(template) = template else {
             self.set_status("resume command not configured in config.toml");
@@ -737,6 +747,7 @@ impl App {
             SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
+            SourceKind::Pi => "pi",
         };
         let source_path = session.source_path.clone();
 
@@ -1626,8 +1637,11 @@ fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -
         .replace("{session_id}", &session.session_id)
         .replace("{project}", &session.project)
         .replace("{source}", session.source.label())
+        .replace("{source_path_shell}", &shell_quote(&session.source_path))
         .replace("{source_path}", &session.source_path)
+        .replace("{source_dir_shell}", &shell_quote(&session.source_dir))
         .replace("{source_dir}", &session.source_dir)
+        .replace("{cwd_shell}", &shell_quote(cwd))
         .replace("{cwd}", cwd)
 }
 
@@ -1641,8 +1655,26 @@ fn default_resume_template(cmd: &str) -> Option<String> {
         "cursor" => {
             find_in_path("cursor-agent").map(|_| "cursor-agent --resume {session_id}".to_string())
         }
+        "pi" => find_in_path("pi").map(|_| "pi --session {source_path_shell}".to_string()),
         _ => None,
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
@@ -1967,6 +1999,18 @@ fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
                 .map(|s| s.to_string());
             if payload_cwd.is_some() {
                 return payload_cwd;
+            }
+        }
+
+        if session.source == SourceKind::Pi
+            && value.get("type").and_then(|v| v.as_str()) == Some("session")
+        {
+            let cwd = value
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if cwd.is_some() {
+                return cwd;
             }
         }
     }

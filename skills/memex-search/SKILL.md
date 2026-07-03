@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Search, filter, and retrieve Claude/Codex history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
+description: Search, filter, and retrieve Claude/Codex/OpenCode/Pi history indexed by the memex CLI. Use when the user wants to index history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output for RAG.
 allowed-tools: Bash(memex:*)
 ---
 
@@ -25,6 +25,8 @@ Use this skill to index local history and retrieve results in a structured, LLM-
   - `--source <path>` for Claude logs
   - `--include-agents` to include agent transcripts
   - `--codex/--no-codex` to include or skip Codex logs
+  - `--opencode/--no-opencode` to include or skip OpenCode logs
+  - `--pi/--no-pi` to include or skip Pi logs
   - `--model <minilm|bge|nomic|gemma|potion>` to select embedding model
   - `--root <path>` to change data root (default: `~/.memex`)
 
@@ -57,7 +59,7 @@ Each JSON line includes:
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>` (search inside a transcript)
-- `--source claude|codex`
+- `--source claude|codex|opencode|pi`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
