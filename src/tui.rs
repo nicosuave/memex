@@ -71,10 +71,10 @@ const FOOTER_HEIGHT: u16 = 2;
 const PROJECT_PANEL_HEIGHT: u16 = 6;
 const SPLIT_GAP: u16 = 1;
 
-const COLOR_BASE: Color = Color::Black;
-const COLOR_PANEL: Color = Color::Black;
-const COLOR_PANEL_ALT: Color = Color::Black;
-const COLOR_TEXT: Color = Color::Rgb(220, 220, 220);
+const COLOR_BASE: Color = Color::Reset;
+const COLOR_PANEL: Color = Color::Reset;
+const COLOR_PANEL_ALT: Color = Color::Reset;
+const COLOR_TEXT: Color = Color::Reset;
 const COLOR_MUTED: Color = Color::Rgb(140, 140, 140);
 const COLOR_ACCENT: Color = Color::Rgb(198, 150, 115);
 const COLOR_SELECTION_BG: Color = Color::Rgb(214, 160, 120);
