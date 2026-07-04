@@ -5,6 +5,7 @@ pub mod index;
 pub mod ingest;
 pub mod progress;
 pub mod state;
+pub mod transfer;
 pub mod tui;
 pub mod types;
 pub mod vector;
