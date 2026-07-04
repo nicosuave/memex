@@ -1852,14 +1852,21 @@ fn cursor_projects_dir() -> Result<PathBuf> {
 }
 
 fn copilot_session_root() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".copilot").join("session-state"))
+    let root = std::env::var_os("COPILOT_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(home_dir()?.join(".copilot"));
+    Ok(root.join("session-state"))
 }
 
 fn pi_sessions_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
         return Ok(PathBuf::from(root));
     }
-    Ok(pi_agent_root()?.join("sessions"))
+    let agent_root = pi_agent_root()?;
+    if let Some(root) = pi_configured_session_root(&agent_root) {
+        return Ok(root);
+    }
+    Ok(agent_root.join("sessions"))
 }
 
 fn memex_transfer_dir() -> Result<PathBuf> {
@@ -1871,6 +1878,36 @@ fn pi_agent_root() -> Result<PathBuf> {
         return Ok(PathBuf::from(root));
     }
     Ok(home_dir()?.join(".pi").join("agent"))
+}
+
+fn pi_configured_session_root(agent_root: &Path) -> Option<PathBuf> {
+    let settings_path = agent_root.join("settings.json");
+    let contents = fs::read_to_string(settings_path).ok()?;
+    let value: Value = serde_json::from_str(&contents).ok()?;
+    let session_dir = value.get("sessionDir")?.as_str()?.trim();
+    if session_dir.is_empty() {
+        return None;
+    }
+    Some(resolve_pi_settings_path(session_dir, agent_root))
+}
+
+fn resolve_pi_settings_path(raw: &str, base: &Path) -> PathBuf {
+    if raw == "~" {
+        return directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw));
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
 
 fn codex_home() -> Result<PathBuf> {
@@ -1889,6 +1926,7 @@ fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, env_lock};
 
     fn msg(role: ConversationRole, text: &str) -> ConversationMessage {
         ConversationMessage {
@@ -2031,6 +2069,35 @@ mod tests {
             cwd_from_opencode_session(&message_dir).as_deref(),
             Some(project.as_path())
         );
+    }
+
+    #[test]
+    fn copilot_session_root_honors_copilot_home() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("copilot-home");
+        let _env = EnvVarGuard::set_os(&[("COPILOT_HOME", Some(home.as_os_str()))]);
+
+        assert_eq!(copilot_session_root().unwrap(), home.join("session-state"));
+    }
+
+    #[test]
+    fn pi_sessions_root_honors_settings_session_dir() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let pi_root = dir.path().join("pi-agent");
+        fs::create_dir_all(&pi_root).unwrap();
+        fs::write(
+            pi_root.join("settings.json"),
+            r#"{ "sessionDir": ".pi/sessions" }"#,
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str())),
+        ]);
+
+        assert_eq!(pi_sessions_root().unwrap(), pi_root.join(".pi/sessions"));
     }
 
     #[test]
