@@ -102,7 +102,7 @@ fn transfer_session_to_codex(
     options: TransferOptions,
 ) -> Result<TransferResult> {
     let conversation = conversation_from_index(index, &options)?;
-    let generated_path = write_claude_import_jsonl(&conversation, options.dry_run)?;
+    let generated_path = write_claude_import_jsonl(&conversation)?;
     let message_count = conversation.messages.len();
 
     if options.dry_run {
@@ -117,7 +117,18 @@ fn transfer_session_to_codex(
         });
     }
 
-    let thread_id = import_generated_session_to_codex(&generated_path, &conversation.cwd)?;
+    let staged_path = stage_codex_import_jsonl(&generated_path)?;
+    let import_result = import_generated_session_to_codex(&staged_path, &conversation.cwd);
+    let cleanup_result = fs::remove_file(&staged_path).with_context(|| {
+        format!(
+            "failed to remove Codex import scratch {}",
+            staged_path.display()
+        )
+    });
+    let thread_id = import_result.and_then(|thread_id| {
+        cleanup_result?;
+        Ok(thread_id)
+    })?;
     let resume_command = format!("codex resume {thread_id}");
     Ok(TransferResult {
         source: conversation.source,
@@ -1188,12 +1199,8 @@ fn import_opencode_session(path: &Path, cwd: &Path) -> Result<()> {
     ))
 }
 
-fn write_claude_import_jsonl(conversation: &Conversation, dry_run: bool) -> Result<PathBuf> {
-    let dir = if dry_run {
-        memex_transfer_dir()?.join("codex")
-    } else {
-        claude_projects_dir()?.join("-memex-transfer")
-    };
+fn write_claude_import_jsonl(conversation: &Conversation) -> Result<PathBuf> {
+    let dir = memex_transfer_dir()?.join("codex");
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create transfer directory {}", dir.display()))?;
     let file_name = format!(
@@ -1236,6 +1243,31 @@ fn write_claude_import_jsonl(conversation: &Conversation, dry_run: bool) -> Resu
         }
         writeln!(file, "{}", serde_json::to_string(&record)?)?;
     }
+    Ok(path)
+}
+
+fn stage_codex_import_jsonl(source_path: &Path) -> Result<PathBuf> {
+    let dir = claude_projects_dir()?.join("-memex-transfer");
+    fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create Codex import scratch directory {}",
+            dir.display()
+        )
+    })?;
+    let file_name = source_path.file_name().ok_or_else(|| {
+        anyhow!(
+            "generated transfer path has no file name: {}",
+            source_path.display()
+        )
+    })?;
+    let path = dir.join(file_name);
+    fs::copy(source_path, &path).with_context(|| {
+        format!(
+            "failed to stage Codex import transcript from {} to {}",
+            source_path.display(),
+            path.display()
+        )
+    })?;
     Ok(path)
 }
 
@@ -1574,15 +1606,6 @@ fn cursor_cwd_from_value(value: &Value) -> Option<PathBuf> {
                     return Some(path);
                 }
             }
-            for key in ["path", "file_path"] {
-                if let Some(path) = obj
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .and_then(existing_dir_or_parent_from_absolute)
-                {
-                    return Some(path);
-                }
-            }
             obj.values().find_map(cursor_cwd_from_value)
         }
         Value::Array(values) => values.iter().find_map(cursor_cwd_from_value),
@@ -1633,19 +1656,6 @@ fn decode_cursor_project_parts(base: PathBuf, parts: &[&str]) -> Option<PathBuf>
 fn existing_dir_from_absolute(value: &str) -> Option<PathBuf> {
     let path = PathBuf::from(value);
     (path.is_absolute() && path.is_dir()).then_some(path)
-}
-
-fn existing_dir_or_parent_from_absolute(value: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return None;
-    }
-    if path.is_dir() {
-        return Some(path);
-    }
-    path.parent()
-        .filter(|parent| parent.is_dir())
-        .map(Path::to_path_buf)
 }
 
 fn cwd_from_opencode_session(message_dir: &Path) -> Option<PathBuf> {
@@ -2033,6 +2043,37 @@ mod tests {
     }
 
     #[test]
+    fn cursor_ignores_nested_file_paths_for_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("my-project");
+        let nested = project.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        let encoded = sanitize_cursor_cwd(&project);
+        let transcript = dir
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join(encoded)
+            .join("agent-transcripts")
+            .join("abc")
+            .join("abc.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            format!(
+                r#"{{"role":"assistant","message":{{"content":[{{"type":"tool_use","input":{{"file_path":{}}}}}]}}}}"#,
+                serde_json::to_string(nested.join("lib.rs").to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cwd_from_cursor_session(&transcript).as_deref(),
+            Some(project.as_path())
+        );
+    }
+
+    #[test]
     fn opencode_resolves_cwd_from_session_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("my-project");
@@ -2055,6 +2096,28 @@ mod tests {
             cwd_from_opencode_session(&message_dir).as_deref(),
             Some(project.as_path())
         );
+    }
+
+    #[test]
+    fn codex_generated_transcript_stays_out_of_claude_projects() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvVarGuard::set_os(&[("HOME", Some(dir.path().as_os_str()))]);
+        let conversation = Conversation {
+            source: SourceKind::Claude,
+            session_id: "claude-session".to_string(),
+            source_path: "/tmp/claude.jsonl".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            title: None,
+            tool_calls: 0,
+            tool_results: 0,
+            messages: vec![msg(ConversationRole::User, "first")],
+        };
+
+        let path = write_claude_import_jsonl(&conversation).unwrap();
+
+        assert!(path.starts_with(dir.path().join(".memex").join("transfers")));
+        assert!(!path.starts_with(dir.path().join(".claude").join("projects")));
     }
 
     #[test]
