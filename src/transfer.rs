@@ -1595,22 +1595,26 @@ fn cwd_from_cursor_transcript(path: &Path) -> Option<PathBuf> {
 }
 
 fn cursor_cwd_from_value(value: &Value) -> Option<PathBuf> {
-    match value {
-        Value::Object(obj) => {
-            for key in ["cwd", "workspace", "target_directory"] {
-                if let Some(path) = obj
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .and_then(existing_dir_from_absolute)
-                {
-                    return Some(path);
-                }
-            }
-            obj.values().find_map(cursor_cwd_from_value)
+    let obj = value.as_object()?;
+    cursor_cwd_from_metadata_object(obj).or_else(|| {
+        ["metadata", "context", "workspaceInfo"]
+            .into_iter()
+            .filter_map(|key| obj.get(key).and_then(Value::as_object))
+            .find_map(cursor_cwd_from_metadata_object)
+    })
+}
+
+fn cursor_cwd_from_metadata_object(obj: &serde_json::Map<String, Value>) -> Option<PathBuf> {
+    for key in ["cwd", "workspace", "target_directory"] {
+        if let Some(path) = obj
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(existing_dir_from_absolute)
+        {
+            return Some(path);
         }
-        Value::Array(values) => values.iter().find_map(cursor_cwd_from_value),
-        _ => None,
     }
+    None
 }
 
 fn cwd_from_cursor_project_path(path: &Path) -> Option<PathBuf> {
@@ -2061,8 +2065,9 @@ mod tests {
         fs::write(
             &transcript,
             format!(
-                r#"{{"role":"assistant","message":{{"content":[{{"type":"tool_use","input":{{"file_path":{}}}}}]}}}}"#,
-                serde_json::to_string(nested.join("lib.rs").to_str().unwrap()).unwrap()
+                r#"{{"role":"assistant","message":{{"content":[{{"type":"tool_use","input":{{"file_path":{},"target_directory":{}}}}}]}}}}"#,
+                serde_json::to_string(nested.join("lib.rs").to_str().unwrap()).unwrap(),
+                serde_json::to_string(nested.to_str().unwrap()).unwrap()
             ),
         )
         .unwrap();
