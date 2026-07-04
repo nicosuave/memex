@@ -280,13 +280,10 @@ REQUIREMENTS:
     #[command(after_help = "\
 EXAMPLES:
     memex transfer abc123
-    memex transfer abc123 --source pi --to codex
-    memex transfer abc123 --source claude --to pi
-    memex transfer abc123 --source codex --to claude
-    memex transfer abc123 --source copilot --to cursor
-    memex transfer abc123 --source cursor --to opencode
-    memex transfer abc123 --source pi --to opencode
+    memex transfer abc123 --to pi
+    memex transfer abc123 --to opencode
     memex transfer abc123 --mode strict --turns 80
+    memex transfer abc123 --source pi --to codex
     memex transfer abc123 --dry-run")]
     Transfer {
         /// Session ID (from search results or TUI)

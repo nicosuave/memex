@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -297,9 +298,11 @@ fn conversation_from_index(index: &SearchIndex, options: &TransferOptions) -> Re
         .ok_or_else(|| anyhow!("session not found: {}", options.session_id))?;
     let source_kind = first.source;
     if records.iter().any(|record| record.source != source_kind) {
+        let sources = ambiguous_source_labels(&records);
         return Err(anyhow!(
-            "session id {} exists in multiple sources; retry with --source",
-            options.session_id
+            "session id {} exists in multiple sources ({}); retry with --source",
+            options.session_id,
+            sources
         ));
     }
 
@@ -336,6 +339,14 @@ fn conversation_from_index(index: &SearchIndex, options: &TransferOptions) -> Re
         tool_results,
         messages,
     })
+}
+
+fn ambiguous_source_labels(records: &[Record]) -> String {
+    let sources = records
+        .iter()
+        .map(|record| record.source.label())
+        .collect::<BTreeSet<_>>();
+    sources.into_iter().collect::<Vec<_>>().join(", ")
 }
 
 fn conversation_messages_from_records(
@@ -1499,8 +1510,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::CodexSession => cwd_from_codex_session(Path::new(&first.source_path)),
         SourceKind::Copilot => cwd_from_copilot_session(Path::new(&first.source_path)),
         SourceKind::Cursor => cwd_from_cursor_session(Path::new(&first.source_path)),
+        SourceKind::Opencode => cwd_from_opencode_session(Path::new(&first.source_path)),
         SourceKind::Pi => cwd_from_pi_session(Path::new(&first.source_path)),
-        SourceKind::CodexHistory | SourceKind::Opencode => None,
+        SourceKind::CodexHistory => None,
     }
     .filter(|path| path.is_dir())
 }
@@ -1549,6 +1561,50 @@ fn cwd_from_pi_session(path: &Path) -> Option<PathBuf> {
 }
 
 fn cwd_from_cursor_session(path: &Path) -> Option<PathBuf> {
+    cwd_from_cursor_transcript(path).or_else(|| cwd_from_cursor_project_path(path))
+}
+
+fn cwd_from_cursor_transcript(path: &Path) -> Option<PathBuf> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        let value: Value = serde_json::from_str(&line).ok()?;
+        if let Some(path) = cursor_cwd_from_value(&value) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn cursor_cwd_from_value(value: &Value) -> Option<PathBuf> {
+    match value {
+        Value::Object(obj) => {
+            for key in ["cwd", "workspace", "target_directory"] {
+                if let Some(path) = obj
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(existing_dir_from_absolute)
+                {
+                    return Some(path);
+                }
+            }
+            for key in ["path", "file_path"] {
+                if let Some(path) = obj
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(existing_dir_or_parent_from_absolute)
+                {
+                    return Some(path);
+                }
+            }
+            obj.values().find_map(cursor_cwd_from_value)
+        }
+        Value::Array(values) => values.iter().find_map(cursor_cwd_from_value),
+        _ => None,
+    }
+}
+
+fn cwd_from_cursor_project_path(path: &Path) -> Option<PathBuf> {
     let mut saw_projects = false;
     for component in path.components() {
         let value = component.as_os_str().to_string_lossy();
@@ -1556,11 +1612,66 @@ fn cwd_from_cursor_session(path: &Path) -> Option<PathBuf> {
             if value.is_empty() || value == "agent-transcripts" {
                 return None;
             }
-            return Some(PathBuf::from(format!("/{}", value.replace('-', "/"))));
+            return decode_cursor_project_component(&value);
         }
         saw_projects = value == "projects";
     }
     None
+}
+
+fn decode_cursor_project_component(value: &str) -> Option<PathBuf> {
+    let parts = value
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    decode_cursor_project_parts(Path::new("/").to_path_buf(), &parts)
+}
+
+fn decode_cursor_project_parts(base: PathBuf, parts: &[&str]) -> Option<PathBuf> {
+    if parts.is_empty() {
+        return base.is_dir().then_some(base);
+    }
+
+    for len in 1..=parts.len() {
+        let candidate = base.join(parts[..len].join("-"));
+        if !candidate.is_dir() {
+            continue;
+        }
+        if let Some(path) = decode_cursor_project_parts(candidate, &parts[len..]) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn existing_dir_from_absolute(value: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(value);
+    (path.is_absolute() && path.is_dir()).then_some(path)
+}
+
+fn existing_dir_or_parent_from_absolute(value: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    if path.is_dir() {
+        return Some(path);
+    }
+    path.parent()
+        .filter(|parent| parent.is_dir())
+        .map(Path::to_path_buf)
+}
+
+fn cwd_from_opencode_session(message_dir: &Path) -> Option<PathBuf> {
+    let session_id = message_dir.file_name()?.to_str()?;
+    let storage_root = message_dir.parent()?.parent()?;
+    let session_path = storage_root
+        .join("session")
+        .join(format!("{session_id}.json"));
+    let file = File::open(session_path).ok()?;
+    let value: Value = serde_json::from_reader(file).ok()?;
+    let directory = value.get("directory").and_then(Value::as_str)?;
+    Some(PathBuf::from(directory))
 }
 
 fn cwd_from_copilot_session(path: &Path) -> Option<PathBuf> {
@@ -1873,6 +1984,52 @@ mod tests {
             ))
             .as_deref(),
             Some(Path::new("/Users/nico/Code/memex"))
+        );
+    }
+
+    #[test]
+    fn cursor_resolves_hyphenated_project_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("my-project");
+        fs::create_dir_all(&project).unwrap();
+        let encoded = sanitize_cursor_cwd(&project);
+        let transcript = dir
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join(encoded)
+            .join("agent-transcripts")
+            .join("abc")
+            .join("abc.jsonl");
+
+        assert_eq!(
+            cwd_from_cursor_session(&transcript).as_deref(),
+            Some(project.as_path())
+        );
+    }
+
+    #[test]
+    fn opencode_resolves_cwd_from_session_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("my-project");
+        fs::create_dir_all(&project).unwrap();
+        let storage = dir.path().join("storage");
+        let message_dir = storage.join("message").join("ses_abc");
+        let session_dir = storage.join("session");
+        fs::create_dir_all(&message_dir).unwrap();
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("ses_abc.json"),
+            format!(
+                r#"{{"id":"ses_abc","directory":{}}}"#,
+                serde_json::to_string(project.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cwd_from_opencode_session(&message_dir).as_deref(),
+            Some(project.as_path())
         );
     }
 
