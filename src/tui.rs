@@ -66,8 +66,8 @@ const OUTER_PAD_Y: u16 = 0;
 const PANEL_PAD_X: u16 = 2;
 const PANEL_PAD_Y: u16 = 1;
 const PANEL_TITLE_HEIGHT: u16 = 1;
-const HEADER_HEIGHT: u16 = 3;
-const FOOTER_HEIGHT: u16 = 2;
+const QUERY_BAR_HEIGHT: u16 = 1;
+const FOOTER_HEIGHT: u16 = 1;
 const PROJECT_PANEL_HEIGHT: u16 = 6;
 const SPLIT_GAP: u16 = 1;
 
@@ -189,7 +189,7 @@ struct App {
     search_rx: std::sync::mpsc::Receiver<SearchUpdate>,
     search_tx: std::sync::mpsc::Sender<SearchUpdate>,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
-    header_area: Rect,
+    querybar_area: Rect,
     body_area: Rect,
     list_area: Rect,
     preview_area: Rect,
@@ -418,7 +418,7 @@ impl App {
             search_tx,
             search_rx,
             update_rx: None,
-            header_area: Rect::default(),
+            querybar_area: Rect::default(),
             body_area: Rect::default(),
             list_area: Rect::default(),
             preview_area: Rect::default(),
@@ -1118,88 +1118,94 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
         OUTER_PAD_Y,
         OUTER_PAD_Y,
     );
+    // The query bar only pops up while a text field is focused, so browsing
+    // stays at a single row of chrome and typing is unmistakably in a box.
+    let editing = matches!(app.focus, Focus::Query | Focus::Project | Focus::Find);
+    let querybar_height = if editing { QUERY_BAR_HEIGHT } else { 0 };
+
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(5),
+            Constraint::Length(querybar_height),
             Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(area);
 
-    app.header_area = root[0];
-    app.body_area = root[1];
+    app.body_area = root[0];
+    app.querybar_area = if editing { root[1] } else { Rect::default() };
 
-    draw_header(frame, app, &theme, root[0]);
-    draw_body(frame, app, &theme, root[1]);
+    draw_body(frame, app, &theme, root[0]);
+    if editing {
+        draw_query_bar(frame, app, &theme, root[1]);
+    }
     draw_footer(frame, app, &theme, root[2]);
 }
 
-fn draw_header(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_query_bar(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
     frame.render_widget(Block::default().style(theme.panel), area);
     let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
 
-    let query_style = if matches!(app.focus, Focus::Query) {
-        theme.focus
-    } else {
-        theme.text
-    };
-    let project_style = if matches!(app.focus, Focus::Project) {
-        theme.focus
-    } else {
-        theme.text
-    };
-    let find_style = if matches!(app.focus, Focus::Find) {
-        theme.focus
-    } else {
-        theme.text
-    };
+    // Active field: bold label, bright value, and a single block-cursor cell so
+    // it reads like a standard terminal input; inactive fields stay muted context.
+    let mut left: Vec<Span> = Vec::new();
+    let mut push_field =
+        |label: &str, value: &str, placeholder: &str, active: bool, first: bool| {
+            if !first {
+                left.push(Span::raw("   "));
+            }
+            left.push(Span::styled(
+                format!("{label} "),
+                if active { theme.focus } else { theme.muted },
+            ));
+            if active {
+                if !value.is_empty() {
+                    left.push(Span::styled(value.to_string(), theme.text_bold));
+                }
+                // A reverse-video space is the conventional block cursor.
+                left.push(Span::styled(" ", theme.selection));
+            } else if value.is_empty() {
+                left.push(Span::styled(placeholder.to_string(), theme.muted));
+            } else {
+                left.push(Span::styled(value.to_string(), theme.text));
+            }
+        };
 
-    let line1 = Line::from(vec![
-        Span::styled("memex", theme.text_bold),
-        Span::raw("  "),
+    push_field(
+        "query",
+        &app.query,
+        "<empty>",
+        matches!(app.focus, Focus::Query),
+        true,
+    );
+    push_field(
+        "project",
+        &app.project,
+        "<any>",
+        matches!(app.focus, Focus::Project),
+        false,
+    );
+    push_field(
+        "find",
+        &app.find_query,
+        "<none>",
+        matches!(app.focus, Focus::Find),
+        false,
+    );
+
+    let right = Line::from(vec![
         Span::styled("source ", theme.muted),
         Span::styled(app.source.label(), theme.accent),
-        Span::raw("  "),
-        Span::styled("mode ", theme.muted),
-        Span::styled(
-            match app.preview_mode {
-                PreviewMode::Matches => "matches",
-                PreviewMode::History => "history",
-            },
-            theme.text,
-        ),
     ]);
+    let right_width = right.width() as u16;
 
-    let query_value = if app.query.is_empty() {
-        Span::styled("<empty>", theme.muted)
-    } else {
-        Span::styled(app.query.as_str(), query_style)
-    };
-    let project_value = if app.project.is_empty() {
-        Span::styled("<any>", theme.muted)
-    } else {
-        Span::styled(app.project.as_str(), project_style)
-    };
-    let find_value = if app.find_query.is_empty() {
-        Span::styled("<none>", theme.muted)
-    } else {
-        Span::styled(app.find_query.as_str(), find_style)
-    };
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(right_width)])
+        .split(inner);
 
-    let line2 = Line::from(vec![
-        Span::styled("query ", theme.muted),
-        query_value,
-        Span::raw("   "),
-        Span::styled("project ", theme.muted),
-        project_value,
-        Span::raw("   "),
-        Span::styled("find ", theme.muted),
-        find_value,
-    ]);
-
-    let paragraph = Paragraph::new(vec![line1, line2]).alignment(Alignment::Left);
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), cols[1]);
 }
 
 fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
@@ -1399,24 +1405,17 @@ fn draw_preview_panel(
 }
 
 fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
-    let status = if app.status.is_empty() {
-        "ready"
-    } else {
-        &app.status
-    };
     frame.render_widget(Block::default().style(theme.panel), area);
     let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
-    let status_line = Line::from(vec![
-        Span::styled("status ", theme.muted),
-        Span::styled(status, theme.text),
-        Span::raw("  "),
-        Span::styled("tools ", theme.muted),
-        Span::styled(if app.show_tools { "on" } else { "off" }, theme.text),
-        Span::raw("  "),
-        Span::styled("focus ", theme.muted),
-        Span::styled(format!("{:?}", app.focus).to_lowercase(), theme.text),
-    ]);
-    let shortcuts_line = Line::from(vec![
+
+    // Shortcuts on the left. The right side rests on the preview mode and only
+    // surfaces an activity indicator while something is actually happening.
+    let tools_hint = if app.show_tools {
+        " tools:on  "
+    } else {
+        " tools:off  "
+    };
+    let shortcuts = Line::from(vec![
         Span::styled("tab", theme.accent),
         Span::styled(" focus  ", theme.muted),
         Span::styled("/", theme.accent),
@@ -1425,10 +1424,12 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         Span::styled(" find  ", theme.muted),
         Span::styled("p", theme.accent),
         Span::styled(" project  ", theme.muted),
+        Span::styled("s", theme.accent),
+        Span::styled(" source  ", theme.muted),
         Span::styled("m", theme.accent),
         Span::styled(" mode  ", theme.muted),
         Span::styled("t", theme.accent),
-        Span::styled(" tools  ", theme.muted),
+        Span::styled(tools_hint, theme.muted),
         Span::styled("r", theme.accent),
         Span::styled(" resume  ", theme.muted),
         Span::styled("S", theme.accent),
@@ -1436,8 +1437,29 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         Span::styled("esc", theme.accent),
         Span::styled(" quit", theme.muted),
     ]);
-    let paragraph = Paragraph::new(vec![status_line, shortcuts_line]);
-    frame.render_widget(paragraph, inner);
+
+    let mode = match app.preview_mode {
+        PreviewMode::Matches => "matches",
+        PreviewMode::History => "history",
+    };
+    let mut right_spans = Vec::new();
+    if !app.status.is_empty() {
+        right_spans.push(Span::styled("\u{25cf} ", theme.accent));
+        right_spans.push(Span::styled(app.status.as_str(), theme.text));
+        right_spans.push(Span::raw("   "));
+    }
+    right_spans.push(Span::styled("mode ", theme.muted));
+    right_spans.push(Span::styled(mode, theme.text));
+    let right = Line::from(right_spans);
+    let right_width = right.width() as u16;
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(right_width)])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(shortcuts), cols[0]);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), cols[1]);
 }
 
 fn sessions_from_query(
@@ -2081,7 +2103,7 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 {
                     app.project_selected = idx;
                 }
-            } else if app.header_area.contains(pos) {
+            } else if app.querybar_area.contains(pos) {
                 app.focus = Focus::Query;
             }
         }
