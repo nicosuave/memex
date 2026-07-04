@@ -14,6 +14,8 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
+    pub const COUNT: usize = 7;
+
     pub fn idx(self) -> usize {
         match self {
             SourceKind::Claude => 0,
@@ -23,6 +25,19 @@ impl SourceKind {
             SourceKind::Cursor => 4,
             SourceKind::Pi => 5,
             SourceKind::Copilot => 6,
+        }
+    }
+
+    pub fn from_idx(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(SourceKind::Claude),
+            1 => Some(SourceKind::CodexSession),
+            2 => Some(SourceKind::CodexHistory),
+            3 => Some(SourceKind::Opencode),
+            4 => Some(SourceKind::Cursor),
+            5 => Some(SourceKind::Pi),
+            6 => Some(SourceKind::Copilot),
+            _ => None,
         }
     }
 
@@ -122,6 +137,28 @@ impl SourceFilter {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecordLinks {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_parent_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_tool_use_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_tool_assistant_uuid: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     #[serde(skip)]
@@ -139,6 +176,8 @@ pub struct Record {
     pub tool_input: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<String>,
+    #[serde(flatten)]
+    pub links: RecordLinks,
     pub source_path: String,
 }
 
@@ -178,5 +217,15 @@ mod tests {
 
         assert_eq!(SourceKind::from_path(unix_path), SourceKind::Pi);
         assert_eq!(SourceKind::from_path(windows_path), SourceKind::Pi);
+    }
+
+    #[test]
+    fn from_path_recognizes_copilot_sessions() {
+        let unix_path =
+            "/Users/nico/.copilot/session-state/11111111-1111-4111-8111-111111111111/events.jsonl";
+        let windows_path = "C:\\Users\\nico\\.copilot\\session-state\\11111111-1111-4111-8111-111111111111\\events.jsonl";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Copilot);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Copilot);
     }
 }

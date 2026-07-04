@@ -3,7 +3,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub const SOURCE_COUNT: usize = 7;
+pub const SOURCE_COUNT: usize = SourceKind::COUNT;
 const SOURCES: [SourceKind; SOURCE_COUNT] = [
     SourceKind::Claude,
     SourceKind::CodexSession,

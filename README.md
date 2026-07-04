@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, and Pi Coding Agent logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -185,7 +185,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|opencode|pi`
+- `--source claude|codex|cursor|opencode|pi|copilot`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -194,6 +194,12 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--unique-session`
 - `--fields score,ts,doc_id,session_id,snippet`
 - `--json-array`
+
+JSON output also includes `source` and, when available, tree/linkage metadata:
+`event_id`, `parent_event_id`, `logical_parent_event_id`,
+`parent_session_id`, `thread_source`, `conversation_kind`,
+`parent_tool_use_id`, `source_tool_use_id`, and
+`source_tool_assistant_uuid`.
 
 ## Background index service
 
@@ -287,8 +293,8 @@ claude_resume_cmd = "claude --resume {session_id}"
 codex_resume_cmd = "codex resume {session_id}"
 cursor_resume_cmd = "cursor-agent --resume {session_id}"
 opencode_resume_cmd = "opencode resume {session_id}"
-pi_resume_cmd
-copilot_resume_cmd = "pi --session {source_path_shell}"
+pi_resume_cmd = "pi --session {source_path_shell}"
+# copilot_resume_cmd = "your-copilot-resume-command {session_id}"
 ```
 
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.

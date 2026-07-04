@@ -107,7 +107,7 @@ Use `memex search` to find patterns. Key options:
 - `--top-n-per-session N` - limit N results per session
 - `--limit N` - max total results
 - `--project NAME` - filter by project
-- `--source claude|codex|opencode|pi` - filter by source
+- `--source claude|codex|cursor|opencode|pi|copilot` - filter by source
 - `--since TIMESTAMP` - RFC3339 (2024-01-15T00:00:00Z) or unix seconds
 - `--fields score,ts,session_id,snippet` - select output fields
 

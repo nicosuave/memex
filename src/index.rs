@@ -1,6 +1,7 @@
-use crate::types::Record;
+use crate::types::{Record, RecordLinks};
 use anyhow::{Result, anyhow};
 use std::ops::Bound;
+use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
@@ -23,6 +24,15 @@ pub struct IndexFields {
     pub tool_name: Field,
     pub tool_input: Field,
     pub tool_output: Field,
+    pub event_id: Field,
+    pub parent_event_id: Field,
+    pub logical_parent_event_id: Field,
+    pub parent_session_id: Field,
+    pub thread_source: Field,
+    pub conversation_kind: Field,
+    pub parent_tool_use_id: Field,
+    pub source_tool_use_id: Field,
+    pub source_tool_assistant_uuid: Field,
     pub source_path: Field,
 }
 
@@ -46,17 +56,34 @@ pub struct QueryOptions {
 }
 
 impl SearchIndex {
-    pub fn open_or_create(dir: &std::path::Path) -> Result<Self> {
+    pub fn open_or_create(dir: &Path) -> Result<Self> {
+        Self::open_or_create_with_policy(dir, StaleSchemaPolicy::Error)
+    }
+
+    pub fn open_or_create_for_ingest(dir: &Path) -> Result<Self> {
+        Self::open_or_create_with_policy(dir, StaleSchemaPolicy::Recreate)
+    }
+
+    fn open_or_create_with_policy(
+        dir: &Path,
+        stale_schema_policy: StaleSchemaPolicy,
+    ) -> Result<Self> {
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {
             let index = Index::open_in_dir(dir)?;
+            if !schema_is_current(&index.schema()) {
+                return match stale_schema_policy {
+                    StaleSchemaPolicy::Error => Err(stale_schema_error(dir)),
+                    StaleSchemaPolicy::Recreate => {
+                        drop(index);
+                        recreate_index_dir(dir)
+                    }
+                };
+            }
             let fields = load_fields(index.schema())?;
             Ok(Self { index, fields })
         } else {
-            let schema = build_schema()?;
-            let index = Index::create_in_dir(dir, schema.clone())?;
-            let fields = load_fields(schema)?;
-            Ok(Self { index, fields })
+            create_index_in_dir(dir)
         }
     }
 
@@ -94,6 +121,47 @@ impl SearchIndex {
         if let Some(tool_output) = &record.tool_output {
             doc.add_text(self.fields.tool_output, tool_output);
         }
+        add_optional_text(&mut doc, self.fields.event_id, &record.links.event_id);
+        add_optional_text(
+            &mut doc,
+            self.fields.parent_event_id,
+            &record.links.parent_event_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.logical_parent_event_id,
+            &record.links.logical_parent_event_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.parent_session_id,
+            &record.links.parent_session_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.thread_source,
+            &record.links.thread_source,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.conversation_kind,
+            &record.links.conversation_kind,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.parent_tool_use_id,
+            &record.links.parent_tool_use_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.source_tool_use_id,
+            &record.links.source_tool_use_id,
+        );
+        add_optional_text(
+            &mut doc,
+            self.fields.source_tool_assistant_uuid,
+            &record.links.source_tool_assistant_uuid,
+        );
         doc.add_text(self.fields.source_path, &record.source_path);
         writer.add_document(doc)?;
         Ok(())
@@ -178,6 +246,32 @@ impl SearchIndex {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum StaleSchemaPolicy {
+    Error,
+    Recreate,
+}
+
+fn stale_schema_error(dir: &Path) -> anyhow::Error {
+    anyhow!(
+        "index schema at {} is stale; run `memex index` or `memex reindex` to rebuild it",
+        dir.display()
+    )
+}
+
+fn recreate_index_dir(dir: &Path) -> Result<SearchIndex> {
+    std::fs::remove_dir_all(dir)?;
+    std::fs::create_dir_all(dir)?;
+    create_index_in_dir(dir)
+}
+
+fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
+    let schema = build_schema()?;
+    let index = Index::create_in_dir(dir, schema.clone())?;
+    let fields = load_fields(schema)?;
+    Ok(SearchIndex { index, fields })
+}
+
 fn build_schema() -> Result<Schema> {
     let mut builder = SchemaBuilder::default();
 
@@ -200,9 +294,46 @@ fn build_schema() -> Result<Schema> {
     builder.add_text_field("tool_name", STRING | STORED);
     builder.add_text_field("tool_input", TEXT | STORED);
     builder.add_text_field("tool_output", TEXT | STORED);
+    builder.add_text_field("event_id", STRING | STORED);
+    builder.add_text_field("parent_event_id", STRING | STORED);
+    builder.add_text_field("logical_parent_event_id", STRING | STORED);
+    builder.add_text_field("parent_session_id", STRING | STORED);
+    builder.add_text_field("thread_source", STRING | STORED);
+    builder.add_text_field("conversation_kind", STRING | STORED);
+    builder.add_text_field("parent_tool_use_id", STRING | STORED);
+    builder.add_text_field("source_tool_use_id", STRING | STORED);
+    builder.add_text_field("source_tool_assistant_uuid", STRING | STORED);
     builder.add_text_field("source_path", STRING | STORED);
 
     Ok(builder.build())
+}
+
+fn schema_is_current(schema: &Schema) -> bool {
+    [
+        "doc_id",
+        "ts",
+        "project",
+        "session_id",
+        "turn_id",
+        "role",
+        "source",
+        "text",
+        "tool_name",
+        "tool_input",
+        "tool_output",
+        "event_id",
+        "parent_event_id",
+        "logical_parent_event_id",
+        "parent_session_id",
+        "thread_source",
+        "conversation_kind",
+        "parent_tool_use_id",
+        "source_tool_use_id",
+        "source_tool_assistant_uuid",
+        "source_path",
+    ]
+    .into_iter()
+    .all(|field| schema.get_field(field).is_ok())
 }
 
 fn load_fields(schema: Schema) -> Result<IndexFields> {
@@ -223,6 +354,15 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
         tool_name: get("tool_name")?,
         tool_input: get("tool_input")?,
         tool_output: get("tool_output")?,
+        event_id: get("event_id")?,
+        parent_event_id: get("parent_event_id")?,
+        logical_parent_event_id: get("logical_parent_event_id")?,
+        parent_session_id: get("parent_session_id")?,
+        thread_source: get("thread_source")?,
+        conversation_kind: get("conversation_kind")?,
+        parent_tool_use_id: get("parent_tool_use_id")?,
+        source_tool_use_id: get("source_tool_use_id")?,
+        source_tool_assistant_uuid: get("source_tool_assistant_uuid")?,
         source_path: get("source_path")?,
     })
 }
@@ -326,6 +466,76 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
         tool_name: get_str(fields.tool_name),
         tool_input: get_str(fields.tool_input),
         tool_output: get_str(fields.tool_output),
+        links: RecordLinks {
+            event_id: get_str(fields.event_id),
+            parent_event_id: get_str(fields.parent_event_id),
+            logical_parent_event_id: get_str(fields.logical_parent_event_id),
+            parent_session_id: get_str(fields.parent_session_id),
+            thread_source: get_str(fields.thread_source),
+            conversation_kind: get_str(fields.conversation_kind),
+            parent_tool_use_id: get_str(fields.parent_tool_use_id),
+            source_tool_use_id: get_str(fields.source_tool_use_id),
+            source_tool_assistant_uuid: get_str(fields.source_tool_assistant_uuid),
+        },
         source_path,
+    }
+}
+
+fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<String>) {
+    if let Some(value) = value {
+        doc.add_text(field, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_stale_schema_index(dir: &Path) {
+        let mut builder = SchemaBuilder::default();
+        builder.add_u64_field("doc_id", INDEXED | STORED);
+        builder.add_u64_field("ts", FAST | STORED | INDEXED);
+        builder.add_text_field("project", STRING | STORED);
+        builder.add_text_field("session_id", STRING | STORED);
+        builder.add_u64_field("turn_id", FAST | STORED);
+        builder.add_text_field("role", STRING | STORED);
+        builder.add_text_field("source", STRING | STORED);
+        builder.add_text_field("text", TEXT | STORED);
+        builder.add_text_field("tool_name", STRING | STORED);
+        builder.add_text_field("tool_input", TEXT | STORED);
+        builder.add_text_field("tool_output", TEXT | STORED);
+        builder.add_text_field("source_path", STRING | STORED);
+
+        let index = Index::create_in_dir(dir, builder.build()).expect("create stale index");
+        drop(index);
+        std::fs::write(dir.join("sentinel"), "keep").expect("write sentinel");
+    }
+
+    #[test]
+    fn read_only_open_preserves_stale_schema_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        create_stale_schema_index(tmp.path());
+
+        let err = match SearchIndex::open_or_create(tmp.path()) {
+            Ok(_) => panic!("stale index unexpectedly opened"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("index schema"));
+        assert!(tmp.path().join("meta.json").exists());
+        assert!(tmp.path().join("sentinel").exists());
+    }
+
+    #[test]
+    fn ingest_open_recreates_stale_schema_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        create_stale_schema_index(tmp.path());
+
+        let index =
+            SearchIndex::open_or_create_for_ingest(tmp.path()).expect("recreate stale index");
+
+        assert_eq!(index.doc_count().expect("doc count"), 0);
+        assert!(tmp.path().join("meta.json").exists());
+        assert!(!tmp.path().join("sentinel").exists());
     }
 }

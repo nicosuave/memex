@@ -44,12 +44,16 @@ Output is JSONL (JSON Lines). Each line is a valid JSON object.
 - `doc_id`: Unique record ID.
 - `session_id`: Conversation thread ID.
 - `ts`: ISO 8601 timestamp.
+- `source`: Agent source name.
+- `source_path`: Transcript path.
 - `role`: `user`, `assistant`, `tool_use`, or `tool_result`.
 - `text`: Content payload.
 - `score`: Search relevance (float).
+- `event_id`, `parent_event_id`, `logical_parent_event_id`, `conversation_kind`: Branch/tree metadata when available.
 
 **Interpretation:**
 
 - **Filtering:** Discard results below a relevance threshold unless the query is specific.
 - **Ordering:** Sort by `ts` for timeline reconstruction.
 - **Grouping:** Aggregate by `session_id` to view conversation turns.
+- **Branches:** Use `parent_event_id` and `logical_parent_event_id` to reconstruct Pi branch points.
