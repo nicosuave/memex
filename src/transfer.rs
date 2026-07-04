@@ -248,7 +248,7 @@ fn transfer_session_to_pi(
     let max_turns = requested_turns
         .unwrap_or(PI_DEFAULT_TURNS)
         .min(PI_MAX_TURNS);
-    let selected_messages = take_last_messages(conversation.messages.clone(), max_turns);
+    let selected_messages = take_last_user_turns(conversation.messages.clone(), max_turns);
     if selected_messages.is_empty() {
         return Err(anyhow!(
             "session has no importable messages after Pi turn limit: {}",
@@ -546,20 +546,6 @@ fn take_last_user_turns(
         }
     }
     messages.into_iter().skip(start).collect()
-}
-
-fn take_last_messages(
-    messages: Vec<ConversationMessage>,
-    max_messages: usize,
-) -> Vec<ConversationMessage> {
-    if max_messages == 0 {
-        return Vec::new();
-    }
-    let len = messages.len();
-    messages
-        .into_iter()
-        .skip(len.saturating_sub(max_messages))
-        .collect()
 }
 
 fn tool_note(kind: &str, tool_name: Option<&str>, text: &str) -> String {
