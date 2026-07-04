@@ -1448,6 +1448,13 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::styled(app.status.as_str(), theme.text));
         right_spans.push(Span::raw("   "));
     }
+    // Keep an active source filter visible while browsing, when the query bar
+    // (the other source readout) is hidden. Omit it when unfiltered.
+    if app.source != SourceChoice::All {
+        right_spans.push(Span::styled("source ", theme.muted));
+        right_spans.push(Span::styled(app.source.label(), theme.accent));
+        right_spans.push(Span::raw("   "));
+    }
     right_spans.push(Span::styled("mode ", theme.muted));
     right_spans.push(Span::styled(mode, theme.text));
     let right = Line::from(right_spans);
