@@ -421,6 +421,12 @@ pub fn ingest_all(
         }
     }
 
+    let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
+        opencode_session_links_by_id()
+    } else {
+        HashMap::new()
+    };
+
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
@@ -473,9 +479,14 @@ pub fn ingest_all(
                 &session_ids,
                 &progress,
             )?,
-            SourceKind::Opencode => {
-                parse_opencode_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
-            }
+            SourceKind::Opencode => parse_opencode_file(
+                task,
+                &tx_record,
+                &tx_update,
+                &next_doc_id,
+                &progress,
+                &opencode_session_links,
+            )?,
             SourceKind::Cursor => {
                 parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)?
             }
@@ -915,25 +926,39 @@ fn opencode_parts_root() -> PathBuf {
         .join("part")
 }
 
-fn opencode_session_links(session_id: &str) -> SessionLinks {
-    opencode_session_links_from_root(&opencode_storage_root().join("session"), session_id)
+fn opencode_default_session_links() -> SessionLinks {
+    SessionLinks {
+        conversation_kind: Some("main".to_string()),
+        ..SessionLinks::default()
+    }
 }
 
-fn opencode_session_links_from_root(root: &Path, session_id: &str) -> SessionLinks {
+fn opencode_session_links_by_id() -> HashMap<String, SessionLinks> {
+    opencode_session_links_by_id_from_root(&opencode_storage_root().join("session"))
+}
+
+fn opencode_session_links_by_id_from_root(root: &Path) -> HashMap<String, SessionLinks> {
+    let mut links_by_id = HashMap::new();
     if !root.exists() {
-        return SessionLinks {
-            conversation_kind: Some("main".to_string()),
-            ..SessionLinks::default()
-        };
+        return links_by_id;
     }
-    let needle = format!("{session_id}.json");
+
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry.file_name().to_str() != Some(needle.as_str()) {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        let Some(session_id) = entry
+            .path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
         let Ok(file) = File::open(entry.path()) else {
             continue;
         };
@@ -941,24 +966,34 @@ fn opencode_session_links_from_root(root: &Path, session_id: &str) -> SessionLin
         let Ok(value) = serde_json::from_reader::<_, serde_json::Value>(reader) else {
             continue;
         };
-        let parent_session_id = value
-            .get("parentID")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        return SessionLinks {
-            conversation_kind: Some(if parent_session_id.is_some() {
-                "fork".to_string()
-            } else {
-                "main".to_string()
-            }),
-            thread_source: parent_session_id.as_ref().map(|_| "fork".to_string()),
-            parent_session_id,
-        };
+
+        links_by_id.insert(session_id, opencode_session_links_from_value(&value));
     }
+
+    links_by_id
+}
+
+#[cfg(test)]
+fn opencode_session_links_from_root(root: &Path, session_id: &str) -> SessionLinks {
+    opencode_session_links_by_id_from_root(root)
+        .remove(session_id)
+        .unwrap_or_else(opencode_default_session_links)
+}
+
+fn opencode_session_links_from_value(value: &serde_json::Value) -> SessionLinks {
+    let parent_session_id = value
+        .get("parentID")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     SessionLinks {
-        conversation_kind: Some("main".to_string()),
-        ..SessionLinks::default()
+        conversation_kind: Some(if parent_session_id.is_some() {
+            "fork".to_string()
+        } else {
+            "main".to_string()
+        }),
+        thread_source: parent_session_id.as_ref().map(|_| "fork".to_string()),
+        parent_session_id,
     }
 }
 
@@ -1711,6 +1746,7 @@ fn parse_opencode_file(
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
+    opencode_session_links: &HashMap<String, SessionLinks>,
 ) -> Result<()> {
     let session_dir = &task.path;
     let session_id = session_dir
@@ -1719,7 +1755,10 @@ fn parse_opencode_file(
         .unwrap_or("unknown")
         .to_string();
     let project = "opencode".to_string();
-    let session_links = opencode_session_links(&session_id);
+    let session_links = opencode_session_links
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_else(opencode_default_session_links);
 
     let mut messages = Vec::new();
     for entry in std::fs::read_dir(session_dir)? {
@@ -3456,6 +3495,35 @@ mod tests {
         assert_eq!(links.parent_session_id.as_deref(), Some("ses_parent"));
         assert_eq!(links.thread_source.as_deref(), Some("fork"));
         assert_eq!(links.conversation_kind.as_deref(), Some("fork"));
+    }
+
+    #[test]
+    fn opencode_session_links_by_id_caches_metadata_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).expect("create opencode project");
+        fs::write(
+            project.join("ses_child.json"),
+            r#"{"id":"ses_child","parentID":"ses_parent","projectID":"global"}"#,
+        )
+        .expect("write child session");
+        fs::write(
+            project.join("ses_main.json"),
+            r#"{"id":"ses_main","projectID":"global"}"#,
+        )
+        .expect("write main session");
+
+        let links_by_id = opencode_session_links_by_id_from_root(tmp.path());
+        let child_links = links_by_id.get("ses_child").expect("child links");
+        let main_links = links_by_id.get("ses_main").expect("main links");
+
+        assert_eq!(links_by_id.len(), 2);
+        assert_eq!(child_links.parent_session_id.as_deref(), Some("ses_parent"));
+        assert_eq!(child_links.thread_source.as_deref(), Some("fork"));
+        assert_eq!(child_links.conversation_kind.as_deref(), Some("fork"));
+        assert_eq!(main_links.parent_session_id, None);
+        assert_eq!(main_links.thread_source, None);
+        assert_eq!(main_links.conversation_kind.as_deref(), Some("main"));
     }
 
     #[test]
