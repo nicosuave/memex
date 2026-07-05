@@ -46,6 +46,7 @@ enum IndexUpdate {
 enum SearchUpdate {
     Started,
     Results(Vec<SessionSummary>),
+    Timeline(ProjectTimeline),
     Projects {
         projects: Vec<String>,
         source: SourceChoice,
@@ -60,6 +61,7 @@ const PREVIEW_LINE_MAX_CHARS: usize = 320;
 const CONTEXT_AROUND_MATCH: usize = 1;
 const RECENT_SESSIONS_LIMIT: usize = 200;
 const RECENT_RECORDS_MULTIPLIER: usize = 50;
+const PROJECT_TIMELINE_RECORD_LIMIT: usize = 50_000;
 
 const OUTER_PAD_X: u16 = 0;
 const OUTER_PAD_Y: u16 = 0;
@@ -124,10 +126,12 @@ enum LayoutMode {
     Split,
     List,
     Detail,
+    Timeline,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum SourceChoice {
+    #[default]
     All,
     Claude,
     Codex,
@@ -188,6 +192,22 @@ struct SessionSummary {
     source_dir: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProjectTimeline {
+    rows: Vec<ProjectTimelineRow>,
+    min_ts: u64,
+    max_ts: u64,
+    source: SourceChoice,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectTimelineRow {
+    project: String,
+    sessions: usize,
+    last_ts: u64,
+    session_ts: Vec<u64>,
+}
+
 struct App {
     paths: Paths,
     config: UserConfig,
@@ -202,6 +222,8 @@ struct App {
     project_source: SourceChoice,
     results: Vec<SessionSummary>,
     selected: ListState,
+    timeline: ProjectTimeline,
+    timeline_scroll: usize,
     layout_mode: LayoutMode,
     quick_popup: bool,
     quick_scroll: usize,
@@ -435,6 +457,8 @@ impl App {
             project_source: SourceChoice::All,
             results: Vec::new(),
             selected: ListState::default(),
+            timeline: ProjectTimeline::default(),
+            timeline_scroll: 0,
             layout_mode: LayoutMode::Split,
             quick_popup: false,
             quick_scroll: 0,
@@ -642,6 +666,27 @@ impl App {
         });
     }
 
+    fn kickoff_timeline_load(&mut self) {
+        let source = self.source;
+        let paths = self.paths.clone();
+        let tx = self.search_tx.clone();
+        self.set_status("loading timeline...");
+        std::thread::spawn(move || {
+            let result = (|| -> Result<ProjectTimeline> {
+                let index = SearchIndex::open_or_create(&paths.index)?;
+                build_project_timeline(&index, source)
+            })();
+            match result {
+                Ok(timeline) => {
+                    let _ = tx.send(SearchUpdate::Timeline(timeline));
+                }
+                Err(err) => {
+                    let _ = tx.send(SearchUpdate::Error(err.to_string()));
+                }
+            }
+        });
+    }
+
     fn update_project_options(&mut self) {
         let filter = self.project.trim().to_lowercase();
         let mut options = Vec::new();
@@ -718,6 +763,7 @@ impl App {
                 Focus::List | Focus::Preview => Focus::Find,
                 Focus::Find => Focus::Query,
             },
+            LayoutMode::Timeline => Focus::List,
             LayoutMode::Detail => match self.focus {
                 Focus::Preview => Focus::Find,
                 Focus::Find | Focus::Query | Focus::Project | Focus::List => Focus::Preview,
@@ -734,6 +780,7 @@ impl App {
                 Focus::List | Focus::Preview => Focus::Project,
                 Focus::Find => Focus::List,
             },
+            LayoutMode::Timeline => Focus::List,
             LayoutMode::Detail => match self.focus {
                 Focus::Preview | Focus::Query | Focus::Project | Focus::List => Focus::Find,
                 Focus::Find => Focus::Preview,
@@ -769,6 +816,21 @@ impl App {
         self.quick_scroll = next;
     }
 
+    fn scroll_timeline(&mut self, delta: isize) {
+        if self.timeline.rows.is_empty() {
+            self.timeline_scroll = 0;
+            return;
+        }
+        let view_height = self.list_area.height as usize;
+        let max_scroll = if view_height == 0 {
+            self.timeline.rows.len().saturating_sub(1)
+        } else {
+            self.timeline.rows.len().saturating_sub(view_height)
+        };
+        let next = (self.timeline_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
+        self.timeline_scroll = next;
+    }
+
     fn toggle_layout_mode(&mut self) {
         self.layout_mode = match self.layout_mode {
             LayoutMode::Split => {
@@ -777,7 +839,16 @@ impl App {
                 self.quick_lines.clear();
                 LayoutMode::List
             }
-            LayoutMode::List | LayoutMode::Detail => LayoutMode::Split,
+            LayoutMode::List => {
+                self.focus = Focus::List;
+                self.quick_popup = false;
+                self.quick_lines.clear();
+                if self.timeline.rows.is_empty() || self.timeline.source != self.source {
+                    self.kickoff_timeline_load();
+                }
+                LayoutMode::Timeline
+            }
+            LayoutMode::Timeline | LayoutMode::Detail => LayoutMode::Split,
         };
     }
 
@@ -1010,6 +1081,11 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                     app.set_status(format!("{} sessions", app.results.len()));
                     app.update_detail();
                 }
+                SearchUpdate::Timeline(timeline) => {
+                    app.timeline = timeline;
+                    app.timeline_scroll = 0;
+                    app.set_status(format!("{} projects", app.timeline.rows.len()));
+                }
                 SearchUpdate::Projects { projects, source } => {
                     app.all_projects = projects;
                     app.project_source = source;
@@ -1206,24 +1282,32 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.focus_prev();
         }
         KeyCode::Up => {
-            if matches!(app.focus, Focus::List) {
+            if app.layout_mode == LayoutMode::Timeline {
+                app.scroll_timeline(-1);
+            } else if matches!(app.focus, Focus::List) {
                 app.move_selection(-1);
             }
         }
         KeyCode::Down => {
-            if matches!(app.focus, Focus::List) {
+            if app.layout_mode == LayoutMode::Timeline {
+                app.scroll_timeline(1);
+            } else if matches!(app.focus, Focus::List) {
                 app.move_selection(1);
             }
         }
         KeyCode::Char('j') => {
-            if matches!(app.focus, Focus::Preview) {
+            if app.layout_mode == LayoutMode::Timeline {
+                app.scroll_timeline(1);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(1);
             } else {
                 app.move_selection(1);
             }
         }
         KeyCode::Char('k') => {
-            if matches!(app.focus, Focus::Preview) {
+            if app.layout_mode == LayoutMode::Timeline {
+                app.scroll_timeline(-1);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(-1);
             } else {
                 app.move_selection(-1);
@@ -1239,7 +1323,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             }
         }
         KeyCode::Char('l') => {
-            if matches!(app.focus, Focus::List) {
+            if app.layout_mode != LayoutMode::Timeline && matches!(app.focus, Focus::List) {
                 if app.layout_mode == LayoutMode::List {
                     app.enter_full_history();
                 } else {
@@ -1248,7 +1332,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             }
         }
         KeyCode::Enter => {
-            if matches!(app.focus, Focus::List) {
+            if app.layout_mode != LayoutMode::Timeline && matches!(app.focus, Focus::List) {
                 if app.layout_mode == LayoutMode::List {
                     app.enter_full_history();
                 } else {
@@ -1257,12 +1341,16 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             }
         }
         KeyCode::PageDown => {
-            if matches!(app.focus, Focus::Preview) {
+            if app.layout_mode == LayoutMode::Timeline {
+                app.scroll_timeline(8);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(8);
             }
         }
         KeyCode::PageUp => {
-            if matches!(app.focus, Focus::Preview) {
+            if app.layout_mode == LayoutMode::Timeline {
+                app.scroll_timeline(-8);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(-8);
             }
         }
@@ -1270,6 +1358,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.source = app.source.cycle();
             app.set_status("searching...");
             terminal.draw(|f| draw_ui(f, app))?;
+            if app.layout_mode == LayoutMode::Timeline {
+                app.kickoff_timeline_load();
+            }
             app.refresh_results();
         }
         KeyCode::Char('m') => {
@@ -1433,6 +1524,14 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         return;
     }
 
+    if app.layout_mode == LayoutMode::Timeline {
+        app.preview_area = Rect::default();
+        app.project_area = None;
+        app.dragging = false;
+        app.list_area = draw_timeline_panel(frame, app, theme, area);
+        return;
+    }
+
     if app.layout_mode == LayoutMode::List {
         app.preview_area = Rect::default();
         app.dragging = false;
@@ -1497,6 +1596,90 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     let list_content = draw_sessions_panel(frame, app, theme, sessions_area);
     app.list_area = list_content;
     app.preview_area = draw_preview_panel(frame, app, theme, chunks[2]);
+}
+
+fn draw_timeline_panel(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+) -> Rect {
+    frame.render_widget(Block::default().style(theme.panel), area);
+    let inner = panel_inner(area);
+    let header = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: PANEL_TITLE_HEIGHT.min(inner.height),
+    };
+    let content = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(PANEL_TITLE_HEIGHT),
+        width: inner.width,
+        height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
+    };
+
+    let range = timeline_range_label(app.timeline.min_ts, app.timeline.max_ts);
+    let title = Line::from(vec![
+        Span::styled("Project timeline", theme.focus),
+        Span::raw(" "),
+        Span::styled(app.timeline.source.label(), theme.accent),
+        Span::raw(" "),
+        Span::styled(range, theme.muted),
+    ]);
+    frame.render_widget(Paragraph::new(title), header);
+
+    if app.timeline.rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("no project sessions", theme.muted))),
+            content,
+        );
+        return content;
+    }
+
+    let project_width = timeline_project_width(&app.timeline.rows, content.width);
+    let meta_width = 15u16.min(content.width.saturating_sub(project_width));
+    let chart_width = content
+        .width
+        .saturating_sub(project_width)
+        .saturating_sub(meta_width)
+        .saturating_sub(2);
+    let visible_rows = content.height as usize;
+    let max_scroll = app.timeline.rows.len().saturating_sub(visible_rows);
+    app.timeline_scroll = app.timeline_scroll.min(max_scroll);
+
+    let items: Vec<ListItem> = app
+        .timeline
+        .rows
+        .iter()
+        .skip(app.timeline_scroll)
+        .take(visible_rows)
+        .map(|row| {
+            let project = fit_text(&row.project, project_width as usize);
+            let chart = timeline_chart(
+                &row.session_ts,
+                app.timeline.min_ts,
+                app.timeline.max_ts,
+                chart_width as usize,
+            );
+            let last = format_relative_ts(row.last_ts);
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{project:<width$}", width = project_width as usize),
+                    theme.text,
+                ),
+                Span::raw(" "),
+                Span::styled(chart, theme.accent),
+                Span::raw(" "),
+                Span::styled(format!("{:>4}", row.sessions), theme.accent),
+                Span::raw(" "),
+                Span::styled(format!("{last:>4}"), theme.muted),
+            ]))
+        })
+        .collect();
+
+    frame.render_widget(List::new(items).style(theme.text), content);
+    content
 }
 
 fn draw_sessions_panel(
@@ -1725,6 +1908,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         LayoutMode::Split => "split",
         LayoutMode::List => "list",
         LayoutMode::Detail => "detail",
+        LayoutMode::Timeline => "timeline",
     };
     let mut right_spans = Vec::new();
     if !app.status.is_empty() {
@@ -1776,6 +1960,19 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
                 },
                 theme.muted,
             ),
+        ]);
+    }
+
+    if app.layout_mode == LayoutMode::Timeline {
+        return Line::from(vec![
+            Span::styled("j/k", theme.accent),
+            Span::styled(" scroll  ", theme.muted),
+            Span::styled("s", theme.accent),
+            Span::styled(" source  ", theme.muted),
+            Span::styled("v", theme.accent),
+            Span::styled(" split  ", theme.muted),
+            Span::styled("/", theme.accent),
+            Span::styled(" query", theme.muted),
         ]);
     }
 
@@ -2553,6 +2750,162 @@ fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result
     Ok(projects)
 }
 
+fn build_project_timeline(index: &SearchIndex, source: SourceChoice) -> Result<ProjectTimeline> {
+    let mut sessions: HashMap<String, (String, u64)> = HashMap::new();
+    let records = index.recent_records(PROJECT_TIMELINE_RECORD_LIMIT)?;
+    for record in records {
+        if let Some(source_filter) = source.as_filter()
+            && !source_filter.matches(record.source)
+        {
+            continue;
+        }
+        let project = if record.project.is_empty() {
+            "(none)".to_string()
+        } else {
+            record.project
+        };
+        let key = format!(
+            "{}\u{1f}{}",
+            record.source.storage_label(),
+            record.session_id
+        );
+        let entry = sessions.entry(key).or_insert((project.clone(), record.ts));
+        if record.ts >= entry.1 {
+            *entry = (project, record.ts);
+        }
+    }
+
+    let mut projects: HashMap<String, Vec<u64>> = HashMap::new();
+    for (project, ts) in sessions.into_values() {
+        projects.entry(project).or_default().push(ts);
+    }
+
+    let mut min_ts = u64::MAX;
+    let mut max_ts = 0u64;
+    let mut rows: Vec<ProjectTimelineRow> = projects
+        .into_iter()
+        .map(|(project, mut session_ts)| {
+            session_ts.sort_unstable();
+            let last_ts = session_ts.last().copied().unwrap_or(0);
+            let first_ts = session_ts.first().copied().unwrap_or(0);
+            if first_ts > 0 {
+                min_ts = min_ts.min(first_ts);
+            }
+            max_ts = max_ts.max(last_ts);
+            ProjectTimelineRow {
+                project,
+                sessions: session_ts.len(),
+                last_ts,
+                session_ts,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.sessions
+            .cmp(&a.sessions)
+            .then_with(|| b.last_ts.cmp(&a.last_ts))
+            .then_with(|| a.project.cmp(&b.project))
+    });
+    if rows.is_empty() {
+        min_ts = 0;
+        max_ts = 0;
+    }
+    Ok(ProjectTimeline {
+        rows,
+        min_ts,
+        max_ts,
+        source,
+    })
+}
+
+fn timeline_project_width(rows: &[ProjectTimelineRow], total_width: u16) -> u16 {
+    if total_width <= 24 {
+        return total_width.saturating_div(3).max(8);
+    }
+    let max_project = rows
+        .iter()
+        .map(|row| row.project.chars().count())
+        .max()
+        .unwrap_or(8);
+    let cap = total_width.saturating_div(3).clamp(12, 32) as usize;
+    max_project.clamp(12, cap) as u16
+}
+
+fn timeline_range_label(min_ts: u64, max_ts: u64) -> String {
+    if min_ts == 0 || max_ts == 0 {
+        return String::new();
+    }
+    format!(
+        "{}..{}",
+        format_short_date(min_ts),
+        format_short_date(max_ts)
+    )
+}
+
+fn format_short_date(ts: u64) -> String {
+    let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts as i64) else {
+        return "-".to_string();
+    };
+    dt.format("%Y-%m-%d").to_string()
+}
+
+fn fit_text(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx + 1 >= width {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn timeline_chart(timestamps: &[u64], min_ts: u64, max_ts: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if timestamps.is_empty() || min_ts == 0 || max_ts == 0 {
+        return " ".repeat(width);
+    }
+
+    let samples = width.saturating_mul(2);
+    let mut buckets = vec![0usize; samples];
+    let span = max_ts.saturating_sub(min_ts).max(1) as u128;
+    for ts in timestamps {
+        let offset = ts.saturating_sub(min_ts) as u128;
+        let idx = ((offset * samples as u128) / (span + 1)).min(samples.saturating_sub(1) as u128);
+        buckets[idx as usize] += 1;
+    }
+    let max_bucket = buckets.iter().copied().max().unwrap_or(0);
+    let mut out = String::with_capacity(width);
+    for pair in buckets.chunks(2) {
+        let left = timeline_level(pair.first().copied().unwrap_or(0), max_bucket);
+        let right = timeline_level(pair.get(1).copied().unwrap_or(0), max_bucket);
+        out.push(timeline_glyph(left, right));
+    }
+    out
+}
+
+fn timeline_level(value: usize, max_value: usize) -> usize {
+    if value == 0 || max_value == 0 {
+        return 0;
+    }
+    ((value * 4).div_ceil(max_value)).clamp(1, 4)
+}
+
+fn timeline_glyph(left: usize, right: usize) -> char {
+    if left == 0 && right == 0 {
+        return ' ';
+    }
+    const LEFT_MASKS: [u32; 5] = [0, 0x40, 0x44, 0x46, 0x47];
+    const RIGHT_MASKS: [u32; 5] = [0, 0x80, 0xA0, 0xB0, 0xB8];
+    char::from_u32(0x2800 + LEFT_MASKS[left.min(4)] + RIGHT_MASKS[right.min(4)]).unwrap_or(' ')
+}
+
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -2565,7 +2918,9 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
             if app.list_area.contains(pos) {
                 app.focus = Focus::List;
-                if let Some(idx) = list_index_from_mouse(pos, app.list_area, app.results.len()) {
+                if app.layout_mode != LayoutMode::Timeline
+                    && let Some(idx) = list_index_from_mouse(pos, app.list_area, app.results.len())
+                {
                     app.selected.select(Some(idx));
                     app.last_detail_session = None;
                     app.update_detail();
@@ -2600,7 +2955,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 app.scroll_detail(1);
             } else if app.list_area.contains(pos) {
                 app.focus = Focus::List;
-                app.move_selection(1);
+                if app.layout_mode == LayoutMode::Timeline {
+                    app.scroll_timeline(1);
+                } else {
+                    app.move_selection(1);
+                }
             }
         }
         MouseEventKind::ScrollUp => {
@@ -2610,7 +2969,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 app.scroll_detail(-1);
             } else if app.list_area.contains(pos) {
                 app.focus = Focus::List;
-                app.move_selection(-1);
+                if app.layout_mode == LayoutMode::Timeline {
+                    app.scroll_timeline(-1);
+                } else {
+                    app.move_selection(-1);
+                }
             }
         }
         _ => {}
@@ -2840,6 +3203,7 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
+    use tempfile::TempDir;
 
     fn record(role: &str, text: &str) -> Record {
         Record {
@@ -2857,6 +3221,42 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    fn timeline_record(
+        doc_id: u64,
+        source: SourceKind,
+        project: &str,
+        session_id: &str,
+        ts: u64,
+    ) -> Record {
+        Record {
+            source,
+            doc_id,
+            ts,
+            project: project.to_string(),
+            session_id: session_id.to_string(),
+            turn_id: doc_id as u32,
+            role: "user".to_string(),
+            text: format!("message {doc_id}"),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks::default(),
+            source_path: format!("source-{doc_id}.jsonl"),
+        }
+    }
+
+    fn save_timeline_records(tmp: &TempDir, records: &[Record]) -> SearchIndex {
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let index = SearchIndex::open_or_create(&index_dir).unwrap();
+        let mut writer = index.writer().unwrap();
+        for record in records {
+            index.add_record(&mut writer, record).unwrap();
+        }
+        writer.commit().unwrap();
+        index
     }
 
     #[test]
@@ -2886,5 +3286,61 @@ mod tests {
         let record = record("tool_use", text);
 
         assert_eq!(record_preview_text(&record), text);
+    }
+
+    #[test]
+    fn project_timeline_counts_sessions_per_project() {
+        let tmp = TempDir::new().unwrap();
+        let index = save_timeline_records(
+            &tmp,
+            &[
+                timeline_record(1, SourceKind::Claude, "alpha", "s1", 1_000),
+                timeline_record(2, SourceKind::Claude, "alpha", "s1", 2_000),
+                timeline_record(3, SourceKind::Claude, "beta", "s2", 3_000),
+                timeline_record(4, SourceKind::CodexSession, "alpha", "s3", 4_000),
+            ],
+        );
+
+        let timeline = build_project_timeline(&index, SourceChoice::All).unwrap();
+
+        assert_eq!(timeline.rows.len(), 2);
+        assert_eq!(timeline.min_ts, 2_000);
+        assert_eq!(timeline.max_ts, 4_000);
+        let alpha = timeline
+            .rows
+            .iter()
+            .find(|row| row.project == "alpha")
+            .unwrap();
+        assert_eq!(alpha.sessions, 2);
+        assert_eq!(alpha.session_ts, vec![2_000, 4_000]);
+    }
+
+    #[test]
+    fn project_timeline_honors_source_filter() {
+        let tmp = TempDir::new().unwrap();
+        let index = save_timeline_records(
+            &tmp,
+            &[
+                timeline_record(1, SourceKind::Claude, "alpha", "s1", 1_000),
+                timeline_record(2, SourceKind::CodexSession, "beta", "s2", 2_000),
+                timeline_record(3, SourceKind::CodexHistory, "gamma", "s3", 3_000),
+            ],
+        );
+
+        let timeline = build_project_timeline(&index, SourceChoice::Codex).unwrap();
+
+        assert_eq!(timeline.rows.len(), 2);
+        assert!(timeline.rows.iter().any(|row| row.project == "beta"));
+        assert!(timeline.rows.iter().any(|row| row.project == "gamma"));
+    }
+
+    #[test]
+    fn timeline_chart_renders_fixed_width_activity() {
+        let chart = timeline_chart(&[1_000, 2_000, 4_000], 1_000, 4_000, 6);
+
+        assert_eq!(chart.chars().count(), 6);
+        assert!(!chart.trim().is_empty());
+        assert_eq!(timeline_level(1, 1), 4);
+        assert_eq!(timeline_glyph(0, 0), ' ');
     }
 }
