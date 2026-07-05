@@ -2,6 +2,10 @@ use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
+use crate::transfer::{
+    TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
+    transfer_session,
+};
 use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
 use crate::vector::VectorIndex;
@@ -272,6 +276,77 @@ REQUIREMENTS:
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Transfer an indexed session into another agent backend
+    #[command(after_help = "\
+EXAMPLES:
+    memex transfer abc123
+    memex transfer abc123 --to pi
+    memex transfer abc123 --to opencode
+    memex transfer abc123 --mode strict --turns 80
+    memex transfer abc123 --source pi --to codex
+    memex transfer abc123 --dry-run")]
+    Transfer {
+        /// Session ID (from search results or TUI)
+        session_id: String,
+        /// Filter by source when a session id appears in multiple backends
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Target backend to import into
+        #[arg(long, value_enum, default_value = "codex")]
+        to: TransferTarget,
+        /// Compact imports text turns; strict includes tool activity as text notes
+        #[arg(long, value_enum, default_value = "compact")]
+        mode: TransferMode,
+        /// Limit imported turns (Pi defaults to 60 and caps at 400)
+        #[arg(long)]
+        turns: Option<usize>,
+        /// Generate the intermediate transcript without importing into the target
+        #[arg(long)]
+        dry_run: bool,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum TransferTarget {
+    Codex,
+    Claude,
+    Copilot,
+    Cursor,
+    Opencode,
+    Pi,
+}
+
+impl From<TransferTarget> for CoreTransferTarget {
+    fn from(value: TransferTarget) -> Self {
+        match value {
+            TransferTarget::Codex => CoreTransferTarget::Codex,
+            TransferTarget::Claude => CoreTransferTarget::Claude,
+            TransferTarget::Copilot => CoreTransferTarget::Copilot,
+            TransferTarget::Cursor => CoreTransferTarget::Cursor,
+            TransferTarget::Opencode => CoreTransferTarget::Opencode,
+            TransferTarget::Pi => CoreTransferTarget::Pi,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum TransferMode {
+    Compact,
+    Strict,
+}
+
+impl From<TransferMode> for CoreTransferMode {
+    fn from(value: TransferMode) -> Self {
+        match value {
+            TransferMode::Compact => CoreTransferMode::Compact,
+            TransferMode::Strict => CoreTransferMode::Strict,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -460,6 +535,17 @@ pub fn run() -> Result<()> {
             root,
         } => {
             run_share(session_id, title, root)?;
+        }
+        Commands::Transfer {
+            session_id,
+            source,
+            to,
+            mode,
+            turns,
+            dry_run,
+            root,
+        } => {
+            run_transfer(session_id, source, to, mode, turns, dry_run, root)?;
         }
     }
     Ok(())
@@ -1524,6 +1610,43 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     }
 
     println!("{url}");
+    Ok(())
+}
+
+fn run_transfer(
+    session_id: String,
+    source: Option<SourceFilter>,
+    to: TransferTarget,
+    mode: TransferMode,
+    turns: Option<usize>,
+    dry_run: bool,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let index = SearchIndex::open_or_create(&paths.index)?;
+    let result = transfer_session(
+        &index,
+        TransferOptions {
+            session_id,
+            source,
+            target: to.into(),
+            mode: mode.into(),
+            turns,
+            dry_run,
+        },
+    )?;
+
+    println!("generated: {}", result.generated_path.display());
+    println!("source: {}", result.source.label());
+    println!("session: {}", result.session_id);
+    println!("messages: {}", result.message_count);
+    println!("source_path: {}", result.source_path);
+    if let Some(thread_id) = result.thread_id {
+        println!("codex_thread: {thread_id}");
+    }
+    if let Some(resume) = result.resume_command {
+        println!("resume: {resume}");
+    }
     Ok(())
 }
 

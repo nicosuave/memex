@@ -2012,6 +2012,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "simd-json",
  "tantivy",
  "tempfile",

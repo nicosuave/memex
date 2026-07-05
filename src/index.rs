@@ -110,7 +110,7 @@ impl SearchIndex {
         doc.add_text(self.fields.role, &record.role);
         doc.add_text(self.fields.text, &record.text);
         if let Some(field) = self.fields.source {
-            doc.add_text(field, record.source.label());
+            doc.add_text(field, record.source.storage_label());
         }
         if let Some(tool_name) = &record.tool_name {
             doc.add_text(self.fields.tool_name, tool_name);
@@ -409,11 +409,20 @@ fn build_query(
     if let Some(source) = options.source
         && let Some(field) = fields.source
     {
-        let term = Term::from_field_text(field, source.as_str());
-        clauses.push((
-            Occur::Must,
-            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-        ));
+        let source_terms = source
+            .storage_labels()
+            .iter()
+            .map(|label| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(field, label),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        clauses.push((Occur::Must, Box::new(BooleanQuery::new(source_terms))));
     }
 
     if let Some(session_id) = &options.session_id {
