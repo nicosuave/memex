@@ -14,7 +14,16 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
-    pub const COUNT: usize = 7;
+    pub const ALL: [SourceKind; 7] = [
+        SourceKind::Claude,
+        SourceKind::CodexSession,
+        SourceKind::CodexHistory,
+        SourceKind::Opencode,
+        SourceKind::Cursor,
+        SourceKind::Pi,
+        SourceKind::Copilot,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
 
     pub fn idx(self) -> usize {
         match self {
@@ -45,6 +54,18 @@ impl SourceKind {
         match self {
             SourceKind::Claude => "claude",
             SourceKind::CodexSession | SourceKind::CodexHistory => "codex",
+            SourceKind::Opencode => "opencode",
+            SourceKind::Cursor => "cursor",
+            SourceKind::Pi => "pi",
+            SourceKind::Copilot => "copilot",
+        }
+    }
+
+    pub fn storage_label(self) -> &'static str {
+        match self {
+            SourceKind::Claude => "claude",
+            SourceKind::CodexSession => "codex-session",
+            SourceKind::CodexHistory => "codex-history",
             SourceKind::Opencode => "opencode",
             SourceKind::Cursor => "cursor",
             SourceKind::Pi => "pi",
@@ -90,7 +111,8 @@ impl SourceKind {
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "claude" => Some(SourceKind::Claude),
-            "codex" => Some(SourceKind::CodexSession),
+            "codex" | "codex-session" => Some(SourceKind::CodexSession),
+            "codex-history" => Some(SourceKind::CodexHistory),
             "opencode" => Some(SourceKind::Opencode),
             "cursor" => Some(SourceKind::Cursor),
             "pi" => Some(SourceKind::Pi),
@@ -122,6 +144,17 @@ impl SourceFilter {
             SourceFilter::Cursor => source == SourceKind::Cursor,
             SourceFilter::Pi => source == SourceKind::Pi,
             SourceFilter::Copilot => source == SourceKind::Copilot,
+        }
+    }
+
+    pub fn storage_labels(self) -> &'static [&'static str] {
+        match self {
+            SourceFilter::Claude => &["claude"],
+            SourceFilter::Codex => &["codex", "codex-session", "codex-history"],
+            SourceFilter::Opencode => &["opencode"],
+            SourceFilter::Cursor => &["cursor"],
+            SourceFilter::Pi => &["pi"],
+            SourceFilter::Copilot => &["copilot"],
         }
     }
 
@@ -184,6 +217,19 @@ pub struct Record {
 #[cfg(test)]
 mod tests {
     use super::SourceKind;
+    use std::collections::HashSet;
+
+    #[test]
+    fn source_indices_and_storage_labels_are_unique() {
+        assert_eq!(SourceKind::COUNT, SourceKind::ALL.len());
+        let mut indices = HashSet::new();
+        let mut labels = HashSet::new();
+        for source in SourceKind::ALL {
+            assert!(indices.insert(source.idx()));
+            assert!(labels.insert(source.storage_label()));
+            assert_eq!(SourceKind::from_label(source.storage_label()), Some(source));
+        }
+    }
 
     #[test]
     fn from_path_recognizes_archived_codex_sessions() {

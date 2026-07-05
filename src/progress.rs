@@ -4,15 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub const SOURCE_COUNT: usize = SourceKind::COUNT;
-const SOURCES: [SourceKind; SOURCE_COUNT] = [
-    SourceKind::Claude,
-    SourceKind::CodexSession,
-    SourceKind::CodexHistory,
-    SourceKind::Opencode,
-    SourceKind::Cursor,
-    SourceKind::Pi,
-    SourceKind::Copilot,
-];
+const SOURCES: [SourceKind; SOURCE_COUNT] = SourceKind::ALL;
 
 pub struct Progress {
     #[allow(dead_code)] // Kept alive to coordinate progress bars.
