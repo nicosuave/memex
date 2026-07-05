@@ -1645,7 +1645,7 @@ fn decode_cursor_project_parts(base: PathBuf, parts: &[&str]) -> Option<PathBuf>
         return base.is_dir().then_some(base);
     }
 
-    for len in 1..=parts.len() {
+    for len in (1..=parts.len()).rev() {
         let candidate = base.join(parts[..len].join("-"));
         if !candidate.is_dir() {
             continue;
@@ -2016,12 +2016,28 @@ mod tests {
             sanitize_cursor_cwd(Path::new("/Users/nico/Code/memex")),
             "Users-nico-Code-memex"
         );
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir
+            .path()
+            .join("Users")
+            .join("nico")
+            .join("Code")
+            .join("memex");
+        fs::create_dir_all(&project).unwrap();
+        let encoded = sanitize_cursor_cwd(&project);
+        let transcript = dir
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join(encoded)
+            .join("agent-transcripts")
+            .join("abc")
+            .join("abc.jsonl");
+
         assert_eq!(
-            cwd_from_cursor_session(Path::new(
-                "/Users/nico/.cursor/projects/Users-nico-Code-memex/agent-transcripts/abc/abc.jsonl"
-            ))
-            .as_deref(),
-            Some(Path::new("/Users/nico/Code/memex"))
+            cwd_from_cursor_session(&transcript).as_deref(),
+            Some(project.as_path())
         );
     }
 
@@ -2029,7 +2045,9 @@ mod tests {
     fn cursor_resolves_hyphenated_project_paths() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("my-project");
+        let split_project = dir.path().join("my").join("project");
         fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&split_project).unwrap();
         let encoded = sanitize_cursor_cwd(&project);
         let transcript = dir
             .path()
