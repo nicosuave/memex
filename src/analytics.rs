@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectGrouping {
@@ -103,6 +103,19 @@ impl AnalyticsStore {
             CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
             "#,
         )?;
+        let previous_schema_version: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse().ok());
+        if previous_schema_version != Some(SCHEMA_VERSION) {
+            self.conn
+                .execute("DELETE FROM meta WHERE key = 'analytics_complete'", [])?;
+        }
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -419,12 +432,16 @@ fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     );
+    let path_repo_project = claude_worktree_repo_project(cwd);
     let repo_project = common_dir
         .as_deref()
         .and_then(common_dir_project_name)
-        .or_else(|| root.as_deref().and_then(path_file_name));
+        .or_else(|| root.as_deref().and_then(path_file_name))
+        .or_else(|| path_repo_project.clone());
 
-    let status = if repo_project.is_some() {
+    let status = if repo_project.is_some() && root.is_none() && common_dir.is_none() {
+        "path-fallback"
+    } else if repo_project.is_some() {
         "ok"
     } else if root.is_some() || common_dir.is_some() {
         "git-partial"
@@ -439,6 +456,21 @@ fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
         repo_project,
         status,
     }
+}
+
+fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
+    for ancestor in Path::new(cwd).ancestors() {
+        if ancestor.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
+            continue;
+        }
+        let claude_dir = ancestor.parent()?;
+        if claude_dir.file_name().and_then(|n| n.to_str()) != Some(".claude") {
+            continue;
+        }
+        let repo_dir = claude_dir.parent()?;
+        return path_file_name(repo_dir.to_string_lossy().as_ref());
+    }
+    None
 }
 
 fn git_rev_parse(cwd: &str, args: &[&str]) -> Option<String> {
@@ -760,6 +792,27 @@ mod tests {
     }
 
     #[test]
+    fn analytics_schema_version_change_marks_incomplete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        {
+            let conn = Connection::open(&db).expect("open sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '1');
+                INSERT INTO meta(key, value) VALUES('analytics_complete', '1');
+                "#,
+            )
+            .expect("seed meta");
+        }
+
+        let store = AnalyticsStore::open(&db).expect("open store");
+
+        assert!(!store.complete().expect("complete"));
+    }
+
+    #[test]
     fn repository_grouping_uses_git_common_dir_project() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("memex");
@@ -801,5 +854,50 @@ mod tests {
             .expect("query");
         assert_eq!(rows[0].project, "memex-claude-worktrees-feature");
         assert_eq!(rows[0].display_project, "memex");
+    }
+
+    #[test]
+    fn claude_worktree_path_falls_back_to_parent_repo() {
+        assert_eq!(
+            claude_worktree_repo_project(
+                "/Users/nico/Code/atm-backend/.claude/worktrees/exciting-morse-e2914f"
+            )
+            .as_deref(),
+            Some("atm-backend")
+        );
+        assert_eq!(
+            claude_worktree_repo_project("/Users/nico/Code/atm-backend"),
+            None
+        );
+    }
+
+    #[test]
+    fn repository_grouping_uses_claude_worktree_path_without_local_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            "{\"cwd\":\"/Users/nico/Code/atm-backend/.claude/worktrees/exciting-morse-e2914f\"}\n",
+        )
+        .expect("write transcript");
+
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(
+            &db,
+            [record(
+                "ssh-d4309b74-100f-407e-b64d-31c7160044cd",
+                "s1",
+                &transcript,
+                10,
+            )],
+        )
+        .expect("rebuild");
+
+        let store = AnalyticsStore::open(&db).expect("open store");
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Repository, None)
+            .expect("query");
+        assert_eq!(rows[0].project, "ssh-d4309b74-100f-407e-b64d-31c7160044cd");
+        assert_eq!(rows[0].display_project, "atm-backend");
     }
 }

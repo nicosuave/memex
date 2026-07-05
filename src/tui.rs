@@ -184,6 +184,35 @@ impl TimelineRange {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineDensityMode {
+    Compact,
+    Tall,
+}
+
+impl TimelineDensityMode {
+    fn toggle(self) -> Self {
+        match self {
+            TimelineDensityMode::Compact => TimelineDensityMode::Tall,
+            TimelineDensityMode::Tall => TimelineDensityMode::Compact,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TimelineDensityMode::Compact => "1-row",
+            TimelineDensityMode::Tall => "2-row",
+        }
+    }
+
+    fn row_height(self) -> u16 {
+        match self {
+            TimelineDensityMode::Compact => 1,
+            TimelineDensityMode::Tall => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectDisplayMode {
     Flat,
     NestedWorktrees,
@@ -300,6 +329,7 @@ struct App {
     project_display: ProjectDisplayMode,
     session_project_cache: HashMap<String, String>,
     timeline_range: TimelineRange,
+    timeline_density: TimelineDensityMode,
     timeline_rows: Vec<ProjectTimelineRow>,
     timeline_scroll: usize,
     timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode)>,
@@ -539,6 +569,7 @@ impl App {
             project_display: ProjectDisplayMode::NestedWorktrees,
             session_project_cache: HashMap::new(),
             timeline_range: TimelineRange::All,
+            timeline_density: TimelineDensityMode::Compact,
             timeline_rows: Vec::new(),
             timeline_scroll: 0,
             timeline_loaded: None,
@@ -970,16 +1001,30 @@ impl App {
         }
     }
 
+    fn toggle_timeline_density(&mut self) {
+        self.timeline_density = self.timeline_density.toggle();
+        self.set_status(format!("density: {}", self.timeline_density.label()));
+        if matches!(self.layout_mode, LayoutMode::Timeline) {
+            self.scroll_timeline(0);
+        }
+    }
+
     fn scroll_timeline(&mut self, delta: isize) {
         if self.timeline_rows.is_empty() {
             self.timeline_scroll = 0;
             return;
         }
         let view_height = self.list_area.height as usize;
-        let max_scroll = if view_height == 0 {
+        let row_height = self.timeline_density.row_height().max(1) as usize;
+        let view_rows = if view_height == 0 {
+            0
+        } else {
+            (view_height / row_height).max(1)
+        };
+        let max_scroll = if view_rows == 0 {
             self.timeline_rows.len().saturating_sub(1)
         } else {
-            self.timeline_rows.len().saturating_sub(view_height)
+            self.timeline_rows.len().saturating_sub(view_rows)
         };
         self.timeline_scroll =
             (self.timeline_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
@@ -1510,6 +1555,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         KeyCode::Char(']') => {
             app.cycle_timeline_range(1);
         }
+        KeyCode::Char('d') if matches!(app.layout_mode, LayoutMode::Timeline) => {
+            app.toggle_timeline_density();
+        }
         KeyCode::Char('g') => {
             app.toggle_project_display();
         }
@@ -1880,7 +1928,15 @@ fn draw_project_timeline(
         width: content.width,
         height: content.height,
     };
-    let rows_visible = rows_area.height as usize;
+    let row_height = app
+        .timeline_density
+        .row_height()
+        .min(rows_area.height.max(1));
+    let rows_visible = if rows_area.height == 0 {
+        0
+    } else {
+        (rows_area.height / row_height).max(1) as usize
+    };
     let start = app.timeline_scroll.min(app.timeline_rows.len());
     let end = if rows_visible == 0 {
         start
@@ -1898,7 +1954,6 @@ fn draw_project_timeline(
         Constraint::Length(count_width),
         Constraint::Length(1),
         Constraint::Length(last_width),
-        Constraint::Min(0),
     ];
     let range = timeline_bounds(&app.timeline_rows, app.timeline_range);
     let density_max = timeline_density_max(&app.timeline_rows[start..end], range, chart_width);
@@ -1906,29 +1961,57 @@ fn draw_project_timeline(
     for (line_idx, row) in app.timeline_rows[start..end].iter().enumerate() {
         let row_area = Rect {
             x: rows_area.x,
-            y: rows_area.y.saturating_add(line_idx as u16),
+            y: rows_area
+                .y
+                .saturating_add((line_idx as u16).saturating_mul(row_height)),
             width: rows_area.width,
-            height: 1,
+            height: row_height,
         };
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(row_widths)
             .split(row_area);
+        let label_area = Rect {
+            height: 1,
+            ..cols[0]
+        };
+        let count_area = Rect {
+            height: 1,
+            ..cols[3]
+        };
+        let last_area = Rect {
+            height: 1,
+            ..cols[5]
+        };
         frame.render_widget(
-            Paragraph::new(truncate_middle(&row.project, cols[0].width as usize)).style(theme.text),
-            cols[0],
+            Paragraph::new(truncate_middle(&row.project, label_area.width as usize))
+                .style(theme.text),
+            label_area,
         );
-        let chart = timeline_chart(&row.session_ts, range, cols[1].width as usize, density_max);
-        frame.render_widget(Paragraph::new(chart).style(theme.muted), cols[1]);
+        let chart_lines = timeline_chart_lines(
+            &row.session_ts,
+            range,
+            cols[1].width as usize,
+            density_max,
+            row_height as usize,
+        );
+        for (chart_idx, chart) in chart_lines.into_iter().enumerate() {
+            let chart_area = Rect {
+                y: cols[1].y.saturating_add(chart_idx as u16),
+                height: 1,
+                ..cols[1]
+            };
+            frame.render_widget(Paragraph::new(chart).style(theme.muted), chart_area);
+        }
         frame.render_widget(
             Paragraph::new(row.session_count.to_string())
                 .style(theme.accent)
                 .alignment(Alignment::Right),
-            cols[3],
+            count_area,
         );
         frame.render_widget(
             Paragraph::new(format_relative_ts(row.last_ts)).style(theme.accent),
-            cols[5],
+            last_area,
         );
     }
     content
@@ -2102,18 +2185,18 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     }
     // Keep an active source filter visible while browsing, when the query bar
     // (the other source readout) is hidden. Omit it when unfiltered.
-    if app.source != SourceChoice::All {
+    if app.source != SourceChoice::All && app.layout_mode != LayoutMode::Timeline {
         right_spans.push(Span::styled("source ", theme.muted));
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
     if app.layout_mode == LayoutMode::Timeline {
-        if app.source == SourceChoice::All {
-            right_spans.push(Span::styled("source ", theme.muted));
-            right_spans.push(Span::styled(app.source.label(), theme.accent));
-            right_spans.push(Span::raw("   "));
-        }
-        right_spans.push(Span::styled("range ", theme.muted));
+        right_spans.push(Span::styled("source", theme.muted));
+        right_spans.push(Span::styled("(s) ", theme.accent));
+        right_spans.push(Span::styled(app.source.label(), theme.accent));
+        right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("range", theme.muted));
+        right_spans.push(Span::styled("([]) ", theme.accent));
         right_spans.push(Span::styled(app.timeline_range.label(), theme.text));
         right_spans.push(Span::raw("   "));
         right_spans.push(Span::styled("dates ", theme.muted));
@@ -2122,11 +2205,21 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
             theme.text,
         ));
         right_spans.push(Span::raw("   "));
-        right_spans.push(Span::styled("group ", theme.muted));
+        right_spans.push(Span::styled("group", theme.muted));
+        right_spans.push(Span::styled("(g) ", theme.accent));
         right_spans.push(Span::styled(app.project_display.label(), theme.text));
         right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("density", theme.muted));
+        right_spans.push(Span::styled("(d) ", theme.accent));
+        right_spans.push(Span::styled(app.timeline_density.label(), theme.text));
+        right_spans.push(Span::raw("   "));
     }
-    right_spans.push(Span::styled("view ", theme.muted));
+    right_spans.push(Span::styled("view", theme.muted));
+    if app.layout_mode == LayoutMode::Timeline {
+        right_spans.push(Span::styled("(v) ", theme.accent));
+    } else {
+        right_spans.push(Span::raw(" "));
+    }
     right_spans.push(Span::styled(view, theme.text));
     if app.layout_mode != LayoutMode::Timeline {
         right_spans.push(Span::raw("   "));
@@ -2215,15 +2308,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
     if app.layout_mode == LayoutMode::Timeline {
         return Line::from(vec![
             Span::styled("j/k", theme.accent),
-            Span::styled(" scroll  ", theme.muted),
-            Span::styled("[/]", theme.accent),
-            Span::styled(" range  ", theme.muted),
-            Span::styled("s", theme.accent),
-            Span::styled(" source  ", theme.muted),
-            Span::styled("g", theme.accent),
-            Span::styled(" grouping  ", theme.muted),
-            Span::styled("v", theme.accent),
-            Span::styled(" split", theme.muted),
+            Span::styled(" scroll", theme.muted),
         ]);
     }
 
@@ -2436,6 +2521,9 @@ fn build_project_timeline(
     let rows = store.query_sessions(source, range.since_ms(now), None, display.grouping(), None)?;
     let mut projects: HashMap<String, ProjectTimelineRow> = HashMap::new();
     for row in rows {
+        if row.last_at == 0 {
+            continue;
+        }
         let project_name = if row.display_project.is_empty() {
             row.project
         } else {
@@ -2816,12 +2904,14 @@ fn timeline_bounds(rows: &[ProjectTimelineRow], range: TimelineRange) -> (u64, u
         .iter()
         .flat_map(|row| row.session_ts.iter())
         .copied()
+        .filter(|ts| *ts > 0)
         .min()
         .unwrap_or(now);
     let max_seen = rows
         .iter()
         .flat_map(|row| row.session_ts.iter())
         .copied()
+        .filter(|ts| *ts > 0)
         .max()
         .unwrap_or(now);
     match range.since_ms(now) {
@@ -2866,14 +2956,12 @@ fn timeline_chart_width(
     count_width: u16,
     last_width: u16,
 ) -> usize {
-    const MAX_TIMELINE_CHART_WIDTH: usize = 56;
     let gutter_width = 2u16;
-    let available = total_width
+    total_width
         .saturating_sub(project_width)
         .saturating_sub(gutter_width)
         .saturating_sub(count_width)
-        .saturating_sub(last_width) as usize;
-    available.min(MAX_TIMELINE_CHART_WIDTH)
+        .saturating_sub(last_width) as usize
 }
 
 fn timeline_density_max(rows: &[ProjectTimelineRow], bounds: (u64, u64), width: usize) -> usize {
@@ -2901,26 +2989,48 @@ fn timeline_bucket_counts(session_ts: &[u64], bounds: (u64, u64), width: usize) 
     buckets
 }
 
-fn timeline_chart(
+fn timeline_chart_lines(
     session_ts: &[u64],
     bounds: (u64, u64),
     width: usize,
     density_max: usize,
-) -> String {
-    timeline_bucket_counts(session_ts, bounds, width)
-        .into_iter()
-        .map(|count| timeline_glyph(count, density_max))
-        .collect()
+    height: usize,
+) -> Vec<String> {
+    let buckets = timeline_bucket_counts(session_ts, bounds, width);
+    if height <= 1 {
+        return vec![
+            buckets
+                .into_iter()
+                .map(|count| timeline_glyph(count, density_max))
+                .collect(),
+        ];
+    }
+
+    let mut lines = vec![String::with_capacity(width), String::with_capacity(width)];
+    for count in buckets {
+        let level = timeline_density_level(count, density_max, 8);
+        lines[0].push(timeline_level_glyph(level.saturating_sub(4)));
+        lines[1].push(timeline_level_glyph(level.min(4)));
+    }
+    lines
+}
+
+fn timeline_density_level(count: usize, max: usize, levels: usize) -> usize {
+    if count == 0 || max == 0 || levels == 0 {
+        return 0;
+    }
+    if max == 1 {
+        return 1;
+    }
+    ((count * levels).saturating_add(max - 1)) / max
 }
 
 fn timeline_glyph(count: usize, max: usize) -> char {
-    if count == 0 || max == 0 {
-        return ' ';
-    }
-    if max == 1 {
-        return '⠁';
-    }
-    match ((count * 4).saturating_add(max - 1)) / max {
+    timeline_level_glyph(timeline_density_level(count, max, 4))
+}
+
+fn timeline_level_glyph(level: usize) -> char {
+    match level {
         0 => ' ',
         1 => '⠁',
         2 => '⠃',
@@ -3317,6 +3427,9 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
             if app.list_area.contains(pos) {
                 app.focus = Focus::List;
+                if app.layout_mode == LayoutMode::Timeline {
+                    return;
+                }
                 if let Some(idx) = list_index_from_mouse(pos, app.list_area, app.results.len()) {
                     app.selected.select(Some(idx));
                     app.last_detail_session = None;
@@ -3352,7 +3465,16 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 app.scroll_detail(1);
             } else if app.list_area.contains(pos) {
                 app.focus = Focus::List;
-                app.move_selection(1);
+                if app.layout_mode == LayoutMode::Timeline {
+                    app.scroll_timeline(1);
+                } else {
+                    app.move_selection(1);
+                }
+            } else if let Some(project_area) = app.project_area
+                && project_area.contains(pos)
+            {
+                app.focus = Focus::Project;
+                app.move_project_selection(1);
             }
         }
         MouseEventKind::ScrollUp => {
@@ -3362,7 +3484,16 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                 app.scroll_detail(-1);
             } else if app.list_area.contains(pos) {
                 app.focus = Focus::List;
-                app.move_selection(-1);
+                if app.layout_mode == LayoutMode::Timeline {
+                    app.scroll_timeline(-1);
+                } else {
+                    app.move_selection(-1);
+                }
+            } else if let Some(project_area) = app.project_area
+                && project_area.contains(pos)
+            {
+                app.focus = Focus::Project;
+                app.move_project_selection(-1);
             }
         }
         _ => {}
@@ -3649,12 +3780,37 @@ mod tests {
 
     #[test]
     fn timeline_chart_uses_shared_density_scale() {
-        let dense = timeline_chart(&[10, 10, 10, 50], (0, 100), 5, 3);
-        let sparse = timeline_chart(&[50], (0, 100), 5, 3);
+        let dense = timeline_chart_lines(&[10, 10, 10, 50], (0, 100), 5, 3, 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let sparse = timeline_chart_lines(&[50], (0, 100), 5, 3, 1)
+            .into_iter()
+            .next()
+            .unwrap();
 
         assert!(dense.contains('⣿'));
         assert!(sparse.contains('⠃'));
         assert!(!sparse.contains('⣿'));
+    }
+
+    #[test]
+    fn timeline_chart_lines_tall_uses_two_density_rows() {
+        let lines = timeline_chart_lines(&[10, 10, 10, 10, 10, 50], (0, 100), 2, 5, 2);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().next(), Some('⣿'));
+        assert_eq!(lines[1].chars().next(), Some('⣿'));
+        assert_eq!(lines[0].chars().nth(1), Some(' '));
+        assert_eq!(lines[1].chars().nth(1), Some('⠃'));
+    }
+
+    #[test]
+    fn timeline_chart_lines_compact_uses_one_density_row() {
+        let lines = timeline_chart_lines(&[10, 50], (0, 100), 2, 1, 1);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), 2);
     }
 
     #[test]
@@ -3665,8 +3821,21 @@ mod tests {
 
     #[test]
     fn timeline_chart_width_reserves_numeric_gutters() {
-        assert_eq!(timeline_chart_width(100, 20, 5, 4), 56);
+        assert_eq!(timeline_chart_width(100, 20, 5, 4), 69);
         assert_eq!(timeline_chart_width(40, 20, 5, 4), 9);
+    }
+
+    #[test]
+    fn timeline_bounds_ignore_zero_timestamps() {
+        let rows = vec![
+            timeline_row_with_ts("bad", 1, vec![0]),
+            timeline_row_with_ts("good", 1, vec![1_700_000_000_000]),
+        ];
+
+        let (start, end) = timeline_bounds(&rows, TimelineRange::All);
+
+        assert_eq!(start, 1_700_000_000_000);
+        assert_eq!(end, 1_700_000_000_001);
     }
 
     #[test]
@@ -3696,11 +3865,19 @@ mod tests {
     }
 
     fn timeline_row(project: &str, session_count: usize) -> ProjectTimelineRow {
+        timeline_row_with_ts(project, session_count, Vec::new())
+    }
+
+    fn timeline_row_with_ts(
+        project: &str,
+        session_count: usize,
+        session_ts: Vec<u64>,
+    ) -> ProjectTimelineRow {
         ProjectTimelineRow {
             project: project.to_string(),
             session_count,
             last_ts: 0,
-            session_ts: Vec::new(),
+            session_ts,
         }
     }
 
