@@ -205,6 +205,7 @@ struct App {
     layout_mode: LayoutMode,
     quick_popup: bool,
     quick_scroll: usize,
+    quick_lines: Vec<PreviewLine>,
     preview_mode: PreviewMode,
     show_tools: bool,
     find_query: String,
@@ -437,6 +438,7 @@ impl App {
             layout_mode: LayoutMode::Split,
             quick_popup: false,
             quick_scroll: 0,
+            quick_lines: Vec::new(),
             preview_mode: PreviewMode::Matches,
             show_tools: false,
             find_query: String::new(),
@@ -754,14 +756,14 @@ impl App {
     }
 
     fn scroll_quick_popup(&mut self, delta: isize) {
-        if self.detail_lines.is_empty() {
+        if self.quick_lines.is_empty() {
             return;
         }
         let view_height = quick_popup_content_height(self.body_area) as usize;
         let max_scroll = if view_height == 0 {
-            self.detail_lines.len().saturating_sub(1)
+            self.quick_lines.len().saturating_sub(1)
         } else {
-            self.detail_lines.len().saturating_sub(view_height)
+            self.quick_lines.len().saturating_sub(view_height)
         };
         let next = (self.quick_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.quick_scroll = next;
@@ -772,6 +774,7 @@ impl App {
             LayoutMode::Split => {
                 self.focus = Focus::List;
                 self.quick_popup = false;
+                self.quick_lines.clear();
                 LayoutMode::List
             }
             LayoutMode::List | LayoutMode::Detail => LayoutMode::Split,
@@ -779,21 +782,54 @@ impl App {
     }
 
     fn toggle_quick_popup(&mut self) {
-        self.preview_mode = PreviewMode::Matches;
-        self.update_detail();
+        if self.quick_popup {
+            self.quick_popup = false;
+            self.quick_scroll = 0;
+            self.quick_lines.clear();
+            return;
+        }
+        self.update_quick_lines();
         self.quick_popup = !self.quick_popup;
         self.quick_scroll = 0;
+    }
+
+    fn update_quick_lines(&mut self) {
+        let Some(idx) = self.selected.selected() else {
+            self.quick_lines = vec![PreviewLine::Text("no session selected".to_string())];
+            return;
+        };
+        let Some(session) = self.results.get(idx) else {
+            self.quick_lines = vec![PreviewLine::Text("no session selected".to_string())];
+            return;
+        };
+        let active_query = if self.find_query.trim().is_empty() {
+            self.query.trim()
+        } else {
+            self.find_query.trim()
+        };
+        self.quick_lines = match build_detail_lines(
+            &self.index,
+            session,
+            PreviewMode::Matches,
+            active_query,
+            self.show_tools,
+        ) {
+            Ok(lines) => lines,
+            Err(err) => vec![PreviewLine::Text(format!("detail error: {err}"))],
+        };
     }
 
     fn enter_preview(&mut self) {
         self.layout_mode = LayoutMode::Split;
         self.quick_popup = false;
+        self.quick_lines.clear();
         self.focus = Focus::Preview;
     }
 
     fn enter_full_history(&mut self) {
         self.layout_mode = LayoutMode::Detail;
         self.quick_popup = false;
+        self.quick_lines.clear();
         self.preview_mode = PreviewMode::History;
         self.focus = Focus::Preview;
         self.last_detail_session = None;
@@ -803,6 +839,7 @@ impl App {
     fn return_to_list(&mut self) {
         self.layout_mode = LayoutMode::List;
         self.quick_popup = false;
+        self.quick_lines.clear();
         self.focus = Focus::List;
     }
 
@@ -967,6 +1004,7 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                     }
                     app.quick_popup = false;
                     app.quick_scroll = 0;
+                    app.quick_lines.clear();
                     app.last_detail_session = None;
                     app.detail_scroll = 0;
                     app.set_status(format!("{} sessions", app.results.len()));
@@ -1658,13 +1696,13 @@ fn draw_quick_popup(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, ar
     frame.render_widget(Paragraph::new(title), header);
 
     let view_height = content.height as usize;
-    let start = app.quick_scroll.min(app.detail_lines.len());
+    let start = app.quick_scroll.min(app.quick_lines.len());
     let end = if view_height == 0 {
         start
     } else {
-        (start + view_height).min(app.detail_lines.len())
+        (start + view_height).min(app.quick_lines.len())
     };
-    let visible_lines: Vec<Line> = app.detail_lines[start..end]
+    let visible_lines: Vec<Line> = app.quick_lines[start..end]
         .iter()
         .map(|line| render_preview_line(line, theme))
         .collect();
