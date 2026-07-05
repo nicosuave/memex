@@ -279,7 +279,7 @@ fn transfer_session_to_pi(
     let resume_command = if options.dry_run {
         None
     } else {
-        Some(format!("pi --session {}", generated_path.display()))
+        Some(pi_resume_command(&generated_path))
     };
     Ok(TransferResult {
         source: conversation.source,
@@ -1849,6 +1849,13 @@ fn claude_resume_command(session_id: &str, cwd: &Path) -> String {
     )
 }
 
+fn pi_resume_command(session_path: &Path) -> String {
+    format!(
+        "pi --session {}",
+        shell_quote(&session_path.to_string_lossy())
+    )
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -2022,6 +2029,14 @@ mod tests {
         assert_eq!(
             sanitize_pi_cwd(Path::new("C:\\Users\\nico\\Code\\memex")),
             "--C:-Users-nico-Code-memex--"
+        );
+    }
+
+    #[test]
+    fn pi_resume_command_quotes_session_path() {
+        assert_eq!(
+            pi_resume_command(Path::new("/tmp/My Project/session file.jsonl")),
+            "pi --session '/tmp/My Project/session file.jsonl'"
         );
     }
 
