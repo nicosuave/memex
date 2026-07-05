@@ -15,6 +15,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 #[cfg(not(unix))]
@@ -2338,7 +2340,7 @@ fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool)
     let preview_text = record_preview_text(record);
     let text = if preview_text.len() > MAX_MESSAGE_CHARS {
         let trimmed = summarize(&preview_text, MAX_MESSAGE_CHARS);
-        format!("{trimmed} …")
+        Cow::Owned(format!("{trimmed} …"))
     } else {
         preview_text
     };
@@ -2357,22 +2359,113 @@ fn sanitize_preview_lines(text: &str) -> Vec<String> {
     text.split('\n').map(strip_ansi_and_controls).collect()
 }
 
-fn record_preview_text(record: &Record) -> String {
+fn record_preview_text(record: &Record) -> Cow<'_, str> {
     if is_tool_role(&record.role)
         && let Some(pretty) = pretty_json_text(&record.text)
     {
-        return pretty;
+        return Cow::Owned(pretty);
     }
-    record.text.clone()
+    Cow::Borrowed(&record.text)
 }
 
 fn pretty_json_text(text: &str) -> Option<String> {
+    if text.len() > MAX_MESSAGE_CHARS {
+        return None;
+    }
     let trimmed = text.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    serde_json::to_string_pretty(&value).ok()
+    if !is_valid_json(trimmed) {
+        return None;
+    }
+    Some(format_json_preserving_order(trimmed))
+}
+
+fn is_valid_json(text: &str) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    serde::de::IgnoredAny::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
+}
+
+fn format_json_preserving_order(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut indent = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                out.push(ch);
+                indent += 1;
+                if !next_significant_char(&chars, idx + 1)
+                    .is_some_and(|next| is_matching_close(ch, next))
+                {
+                    push_json_indent(&mut out, indent);
+                }
+            }
+            '}' | ']' => {
+                indent = indent.saturating_sub(1);
+                if !last_significant_char(&out).is_some_and(|last| is_matching_open(last, ch)) {
+                    push_json_indent(&mut out, indent);
+                }
+                out.push(ch);
+            }
+            ',' => {
+                out.push(ch);
+                push_json_indent(&mut out, indent);
+            }
+            ':' => out.push_str(": "),
+            ch if ch.is_whitespace() => {}
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
+fn next_significant_char(chars: &[char], start: usize) -> Option<char> {
+    chars
+        .iter()
+        .skip(start)
+        .copied()
+        .find(|ch| !ch.is_whitespace())
+}
+
+fn last_significant_char(text: &str) -> Option<char> {
+    text.chars().rev().find(|ch| !ch.is_whitespace())
+}
+
+fn is_matching_close(open: char, close: char) -> bool {
+    matches!((open, close), ('{', '}') | ('[', ']'))
+}
+
+fn is_matching_open(open: char, close: char) -> bool {
+    is_matching_close(open, close)
+}
+
+fn push_json_indent(out: &mut String, indent: usize) {
+    out.push('\n');
+    for _ in 0..indent {
+        out.push_str("  ");
+    }
 }
 
 fn role_color(role: &str) -> Color {
@@ -2873,11 +2966,36 @@ mod tests {
     }
 
     #[test]
+    fn record_preview_text_preserves_tool_json_key_order() {
+        let record = record("tool_use", r#"{"z":1,"a":2,"nested":{"b":3,"a":4}}"#);
+
+        assert_eq!(
+            record_preview_text(&record),
+            "{\n  \"z\": 1,\n  \"a\": 2,\n  \"nested\": {\n    \"b\": 3,\n    \"a\": 4\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn record_preview_text_ignores_json_punctuation_inside_strings() {
+        let record = record(
+            "tool_use",
+            r#"{"cmd":"printf '{x: [1,2]}'","args":["a,b","c:d"]}"#,
+        );
+
+        assert_eq!(
+            record_preview_text(&record),
+            "{\n  \"cmd\": \"printf '{x: [1,2]}'\",\n  \"args\": [\n    \"a,b\",\n    \"c:d\"\n  ]\n}"
+        );
+    }
+
+    #[test]
     fn record_preview_text_leaves_non_tool_json_unchanged() {
         let text = r#"{"content":"not a tool call"}"#;
         let record = record("assistant", text);
+        let preview = record_preview_text(&record);
 
-        assert_eq!(record_preview_text(&record), text);
+        assert!(matches!(preview, Cow::Borrowed(_)));
+        assert_eq!(preview, text);
     }
 
     #[test]
@@ -2886,5 +3004,15 @@ mod tests {
         let record = record("tool_use", text);
 
         assert_eq!(record_preview_text(&record), text);
+    }
+
+    #[test]
+    fn record_preview_text_leaves_large_tool_json_unchanged() {
+        let text = format!(r#"{{"payload":"{}"}}"#, "x".repeat(MAX_MESSAGE_CHARS));
+        let record = record("tool_result", &text);
+        let preview = record_preview_text(&record);
+
+        assert!(matches!(preview, Cow::Borrowed(_)));
+        assert_eq!(preview, text);
     }
 }
