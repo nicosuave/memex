@@ -1285,7 +1285,7 @@ fn draw_sessions_panel(
         app.results
             .iter()
             .map(|session| {
-                let ts = format_ts(session.last_ts);
+                let ts = format_relative_ts(session.last_ts);
                 let line = Line::from(vec![
                     Span::styled(format!("{:>4}", session.hit_count), theme.accent),
                     Span::raw(" "),
@@ -1293,7 +1293,7 @@ fn draw_sessions_panel(
                     Span::raw(" "),
                     Span::styled(session.source.label(), theme.muted),
                     Span::raw(" "),
-                    Span::styled(ts, theme.muted),
+                    Span::styled(format!("{ts:>4}"), theme.accent),
                     Span::raw(" "),
                     Span::styled(session.session_id.as_str(), theme.text),
                 ]);
@@ -1835,6 +1835,42 @@ fn format_ts(ts: u64) -> String {
         return "-".to_string();
     };
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn format_relative_ts(ts: u64) -> String {
+    let now = chrono::Utc::now().timestamp_millis();
+    let now = u64::try_from(now).unwrap_or(0);
+    format_relative_ts_at(ts, now)
+}
+
+fn format_relative_ts_at(ts: u64, now: u64) -> String {
+    if ts == 0 {
+        return "-".to_string();
+    }
+    if ts >= now {
+        return "now".to_string();
+    }
+
+    let age_secs = (now - ts) / 1000;
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = MINUTE * 60;
+    const DAY: u64 = HOUR * 24;
+    const MONTH: u64 = DAY * 30;
+    const YEAR: u64 = DAY * 365;
+
+    if age_secs < MINUTE {
+        "now".to_string()
+    } else if age_secs < HOUR {
+        format!("{}m", age_secs / MINUTE)
+    } else if age_secs < DAY {
+        format!("{}h", age_secs / HOUR)
+    } else if age_secs < MONTH {
+        format!("{}d", age_secs / DAY)
+    } else if age_secs < YEAR {
+        format!("{}mo", age_secs / MONTH)
+    } else {
+        format!("{}y", age_secs / YEAR)
+    }
 }
 
 fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
