@@ -2,6 +2,7 @@ use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
+use crate::state::ScanCache;
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
     transfer_session,
@@ -19,7 +20,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
@@ -240,8 +241,11 @@ OUTPUT FIELDS (--fields):
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Show index statistics (document count, vector count, storage paths)
+    /// Show index statistics, vector state, and indexing config
     Stats {
+        /// Output stats as JSON
+        #[arg(long)]
+        json: bool,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -520,8 +524,8 @@ pub fn run() -> Result<()> {
         } => {
             run_show(doc_id, verbose, root)?;
         }
-        Commands::Stats { root } => {
-            run_stats(root)?;
+        Commands::Stats { json, root } => {
+            run_stats(json, root)?;
         }
         Commands::Setup { force } => {
             run_setup(force)?;
@@ -1289,39 +1293,171 @@ fn run_show(doc_id: u64, verbose: bool, root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn run_stats(root: Option<PathBuf>) -> Result<()> {
+#[derive(Serialize)]
+struct StatsReport {
+    index: String,
+    documents: usize,
+    vectors: VectorStats,
+    auto_index_on_search: bool,
+    scan_cache_ttl_seconds: u64,
+    scan_cache: ScanCacheStats,
+    embeddings: bool,
+    model: String,
+    execution_provider: String,
+    compute_units: Option<String>,
+    sources: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct VectorStats {
+    exists: bool,
+    count: usize,
+    dimensions: Option<usize>,
+    model: Option<String>,
+    doc_ids: Option<usize>,
+    index_bytes: Option<u64>,
+    ids_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ScanCacheStats {
+    last_scan_ts: Option<u64>,
+    last_scan: Option<String>,
+    age_seconds: Option<u64>,
+    fresh: bool,
+    file_count: usize,
+    total_bytes: u64,
+}
+
+fn run_stats(json: bool, root: Option<PathBuf>) -> Result<()> {
+    let report = build_stats_report(root)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_stats_report(&report);
+    }
+    Ok(())
+}
+
+fn build_stats_report(root: Option<PathBuf>) -> Result<StatsReport> {
     let paths = Paths::new(root)?;
+    paths.ensure_dirs()?;
+    let config = UserConfig::load(&paths)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
-    println!("index: {}", paths.index.display());
-    println!("documents: {}", index.doc_count()?);
-    print_vector_stats(&paths.vectors)?;
-    Ok(())
+    let runtime = config.resolve_embed_runtime()?;
+    let scan_cache_ttl_seconds = config.scan_cache_ttl();
+    Ok(StatsReport {
+        index: paths.index.display().to_string(),
+        documents: index.doc_count()?,
+        vectors: read_vector_stats(&paths.vectors)?,
+        auto_index_on_search: config.auto_index_on_search_default(),
+        scan_cache_ttl_seconds,
+        scan_cache: read_scan_cache_stats(&paths, scan_cache_ttl_seconds)?,
+        embeddings: config.embeddings_default(),
+        model: config.resolve_model(None)?.as_str().to_string(),
+        execution_provider: runtime.execution_provider.as_str().to_string(),
+        compute_units: runtime.compute_units,
+        sources: vec!["claude", "codex", "cursor", "opencode", "pi", "copilot"],
+    })
 }
 
-fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
-    println!("{}", vector_stats_line(vectors_dir)?);
-    Ok(())
+fn print_stats_report(report: &StatsReport) {
+    println!("index: {}", report.index);
+    println!("documents: {}", report.documents);
+    println!("{}", vector_stats_line(&report.vectors));
+    println!();
+    println!("indexing:");
+    println!(
+        "  auto-index-on-search: {}",
+        enabled_label(report.auto_index_on_search)
+    );
+    println!("  scan-cache-ttl: {}s", report.scan_cache_ttl_seconds);
+    let last_scan = report.scan_cache.last_scan.as_deref().unwrap_or("never");
+    let freshness = if report.scan_cache.fresh {
+        "fresh"
+    } else {
+        "stale"
+    };
+    println!("  last-scan: {last_scan} ({freshness})");
+    println!("  scanned-files: {}", report.scan_cache.file_count);
+    println!("  scanned-bytes: {}", report.scan_cache.total_bytes);
+    println!();
+    println!("embeddings:");
+    println!("  enabled: {}", enabled_label(report.embeddings));
+    println!("  model: {}", report.model);
+    println!("  execution-provider: {}", report.execution_provider);
+    if let Some(compute_units) = &report.compute_units {
+        println!("  compute-units: {compute_units}");
+    }
+    println!();
+    println!("sources:");
+    for source in &report.sources {
+        println!("  - {source}");
+    }
 }
 
-fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
+fn read_vector_stats(vectors_dir: &std::path::Path) -> Result<VectorStats> {
     if !vectors_dir.join("usearch.index").exists() {
-        return Ok("vectors: none".to_string());
+        return Ok(VectorStats {
+            exists: false,
+            count: 0,
+            dimensions: None,
+            model: None,
+            doc_ids: None,
+            index_bytes: None,
+            ids_bytes: None,
+        });
     }
     let vector = VectorIndex::open(vectors_dir)?;
     let index_path = vectors_dir.join("usearch.index");
     let ids_path = vectors_dir.join("doc_ids.bin");
     let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
     let ids_bytes = std::fs::metadata(&ids_path).map(|m| m.len()).unwrap_or(0);
-    let model = vector.model().unwrap_or("unknown");
-    Ok(format!(
+    Ok(VectorStats {
+        exists: true,
+        count: vector.len(),
+        dimensions: Some(vector.dimensions()),
+        model: vector.model().map(str::to_string),
+        doc_ids: Some(vector.doc_id_count()),
+        index_bytes: Some(index_bytes),
+        ids_bytes: Some(ids_bytes),
+    })
+}
+
+fn vector_stats_line(stats: &VectorStats) -> String {
+    if !stats.exists {
+        return "vectors: none".to_string();
+    }
+    format!(
         "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
-        vector.len(),
-        vector.dimensions(),
-        model,
-        vector.doc_id_count(),
-        index_bytes,
-        ids_bytes
-    ))
+        stats.count,
+        stats.dimensions.unwrap_or(0),
+        stats.model.as_deref().unwrap_or("unknown"),
+        stats.doc_ids.unwrap_or(0),
+        stats.index_bytes.unwrap_or(0),
+        stats.ids_bytes.unwrap_or(0)
+    )
+}
+
+fn read_scan_cache_stats(paths: &Paths, ttl_seconds: u64) -> Result<ScanCacheStats> {
+    let cache = ScanCache::load(&paths.state.join("scan_cache.json"))?;
+    let last_scan_ts = (cache.last_scan_ts != 0).then_some(cache.last_scan_ts);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Ok(ScanCacheStats {
+        last_scan_ts,
+        last_scan: last_scan_ts.map(|ts| format_ts(ts.saturating_mul(1000))),
+        age_seconds: last_scan_ts.map(|ts| now.saturating_sub(ts)),
+        fresh: last_scan_ts.is_some() && cache.is_fresh(ttl_seconds),
+        file_count: cache.file_count,
+        total_bytes: cache.total_bytes,
+    })
+}
+
+fn enabled_label(value: bool) -> &'static str {
+    if value { "enabled" } else { "disabled" }
 }
 
 fn run_setup(force: bool) -> Result<()> {
@@ -2894,7 +3030,8 @@ mod tests {
         index.add(42, &make_vector(64)).unwrap();
         index.save().unwrap();
 
-        let line = vector_stats_line(tmp.path()).unwrap();
+        let stats = read_vector_stats(tmp.path()).unwrap();
+        let line = vector_stats_line(&stats);
 
         assert!(line.starts_with("vectors: 1 (dims 64, model bge, ids 1,"));
         assert!(line.contains("usearch.index"));
@@ -2907,7 +3044,8 @@ mod tests {
     fn vector_stats_line_reports_none_without_vector_store() {
         let tmp = TempDir::new().unwrap();
 
-        assert_eq!(vector_stats_line(tmp.path()).unwrap(), "vectors: none");
+        let stats = read_vector_stats(tmp.path()).unwrap();
+        assert_eq!(vector_stats_line(&stats), "vectors: none");
     }
 
     #[test]
