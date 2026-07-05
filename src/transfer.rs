@@ -1100,7 +1100,7 @@ fn build_opencode_import_export(conversation: &Conversation, target_session_id: 
             "agent": OPENCODE_DEFAULT_AGENT,
             "model": {
                 "providerID": OPENCODE_DEFAULT_PROVIDER,
-                "modelID": OPENCODE_DEFAULT_MODEL,
+                "id": OPENCODE_DEFAULT_MODEL,
             },
             "metadata": {
                 "source": conversation.source.label(),
@@ -1123,7 +1123,7 @@ fn opencode_user_message_info(session_id: &str, message_id: &str, timestamp_ms: 
         "agent": OPENCODE_DEFAULT_AGENT,
         "model": {
             "providerID": OPENCODE_DEFAULT_PROVIDER,
-            "modelID": OPENCODE_DEFAULT_MODEL,
+            "id": OPENCODE_DEFAULT_MODEL,
         },
     })
 }
@@ -2345,12 +2345,20 @@ mod tests {
         assert_eq!(export["info"]["id"], "ses_abc");
         assert_eq!(export["info"]["title"], "Build this");
         assert_eq!(export["info"]["directory"], "/tmp/project");
+        assert_eq!(
+            export["info"]["model"]["providerID"],
+            OPENCODE_DEFAULT_PROVIDER
+        );
+        assert_eq!(export["info"]["model"]["id"], OPENCODE_DEFAULT_MODEL);
+        assert!(export["info"]["model"].get("modelID").is_none());
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["info"]["role"], "user");
+        assert_eq!(messages[0]["info"]["model"]["id"], OPENCODE_DEFAULT_MODEL);
         assert_eq!(messages[0]["parts"][0]["type"], "text");
         assert_eq!(messages[0]["parts"][0]["text"], "first");
         assert_eq!(messages[1]["info"]["role"], "assistant");
         assert_eq!(messages[1]["info"]["parentID"], messages[0]["info"]["id"]);
+        assert_eq!(messages[1]["info"]["modelID"], OPENCODE_DEFAULT_MODEL);
         assert_eq!(messages[1]["info"]["path"]["cwd"], "/tmp/project");
         assert_eq!(messages[1]["info"]["tokens"]["cache"]["read"], 0);
         assert_eq!(
