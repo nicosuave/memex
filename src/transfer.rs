@@ -153,7 +153,10 @@ fn transfer_session_to_claude(
     let resume_command = if options.dry_run {
         None
     } else {
-        Some(format!("claude --resume {target_session_id}"))
+        Some(claude_resume_command(
+            &target_session_id,
+            conversation.cwd.as_path(),
+        ))
     };
 
     Ok(TransferResult {
@@ -1839,6 +1842,30 @@ fn yaml_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn claude_resume_command(session_id: &str, cwd: &Path) -> String {
+    format!(
+        "cd {} && claude --resume {session_id}",
+        shell_quote(&cwd.to_string_lossy())
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn now_millis() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
 }
@@ -2007,6 +2034,14 @@ mod tests {
         assert_eq!(
             sanitize_claude_cwd(Path::new("C:\\Users\\nico\\Code\\memex")),
             "-C:-Users-nico-Code-memex"
+        );
+    }
+
+    #[test]
+    fn claude_resume_command_changes_to_project_cwd() {
+        assert_eq!(
+            claude_resume_command("target-session", Path::new("/tmp/project with 'quote'")),
+            "cd '/tmp/project with '\\''quote'\\''' && claude --resume target-session"
         );
     }
 
