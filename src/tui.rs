@@ -64,6 +64,7 @@ const RECENT_RECORDS_MULTIPLIER: usize = 50;
 const OUTER_PAD_X: u16 = 0;
 const OUTER_PAD_Y: u16 = 0;
 const PANEL_PAD_X: u16 = 2;
+const PANEL_SPLIT_PAD_X: u16 = 1;
 const PANEL_PAD_Y: u16 = 1;
 const PANEL_TITLE_HEIGHT: u16 = 1;
 const QUERY_BAR_HEIGHT: u16 = 1;
@@ -1226,8 +1227,7 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         .split(area);
 
     if SPLIT_GAP > 0 {
-        let divider_style = Style::default().bg(COLOR_DIVIDER);
-        frame.render_widget(Block::default().style(divider_style), chunks[1]);
+        draw_split_divider(frame, chunks[1]);
     }
 
     let mut project_area = None;
@@ -1260,7 +1260,7 @@ fn draw_sessions_panel(
     area: Rect,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel), area);
-    let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
+    let inner = inset(area, PANEL_PAD_X, PANEL_SPLIT_PAD_X, 0, 0);
     let header = Rect {
         x: inner.x,
         y: inner.y,
@@ -1318,7 +1318,7 @@ fn draw_project_panel(
     area: Rect,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel_alt), area);
-    let inner = panel_inner(area);
+    let inner = panel_inner_before_split(area);
     let header = Rect {
         x: inner.x,
         y: inner.y,
@@ -1367,7 +1367,7 @@ fn draw_preview_panel(
     area: Rect,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel_alt), area);
-    let inner = panel_inner(area);
+    let inner = panel_inner_after_split(area);
     let header = Rect {
         x: inner.x,
         y: inner.y,
@@ -2190,9 +2190,7 @@ fn near_divider(x: u16, body: Rect, left_width: u16) -> bool {
         .x
         .saturating_add(left_width)
         .saturating_add(SPLIT_GAP / 2);
-    let min_x = divider_x.saturating_sub(1);
-    let max_x = divider_x.saturating_add(1);
-    x >= min_x && x <= max_x
+    x == divider_x
 }
 
 fn resize_split(x: u16, app: &mut App) {
@@ -2223,8 +2221,40 @@ fn inset(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
     }
 }
 
-fn panel_inner(area: Rect) -> Rect {
-    inset(area, PANEL_PAD_X, PANEL_PAD_X, PANEL_PAD_Y, PANEL_PAD_Y)
+fn panel_inner_before_split(area: Rect) -> Rect {
+    inset(
+        area,
+        PANEL_PAD_X,
+        PANEL_SPLIT_PAD_X,
+        PANEL_PAD_Y,
+        PANEL_PAD_Y,
+    )
+}
+
+fn panel_inner_after_split(area: Rect) -> Rect {
+    inset(
+        area,
+        PANEL_SPLIT_PAD_X,
+        PANEL_PAD_X,
+        PANEL_PAD_Y,
+        PANEL_PAD_Y,
+    )
+}
+
+fn draw_split_divider(frame: &mut ratatui::Frame, area: Rect) {
+    let style = Style::default().fg(COLOR_DIVIDER);
+    for y in area.y..area.y.saturating_add(area.height) {
+        let row = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(ratatui::symbols::line::VERTICAL).style(style),
+            row,
+        );
+    }
 }
 
 fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize) -> Option<usize> {
