@@ -1,3 +1,4 @@
+use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_path};
 use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
@@ -51,6 +52,12 @@ enum SearchUpdate {
     Projects {
         projects: Vec<String>,
         source: SourceChoice,
+    },
+    Timeline {
+        rows: Vec<ProjectTimelineRow>,
+        source: SourceChoice,
+        range: TimelineRange,
+        grouping: ProjectDisplayMode,
     },
     Error(String),
 }
@@ -125,7 +132,84 @@ enum PreviewMode {
 enum LayoutMode {
     Split,
     List,
+    Timeline,
     Detail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelineRange {
+    Day,
+    Week,
+    Month,
+    All,
+}
+
+impl TimelineRange {
+    fn next(self) -> Self {
+        match self {
+            TimelineRange::Day => TimelineRange::Week,
+            TimelineRange::Week => TimelineRange::Month,
+            TimelineRange::Month => TimelineRange::All,
+            TimelineRange::All => TimelineRange::Day,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            TimelineRange::Day => TimelineRange::All,
+            TimelineRange::Week => TimelineRange::Day,
+            TimelineRange::Month => TimelineRange::Week,
+            TimelineRange::All => TimelineRange::Month,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            TimelineRange::Day => "last 24h",
+            TimelineRange::Week => "last 7d",
+            TimelineRange::Month => "last 30d",
+            TimelineRange::All => "all history",
+        }
+    }
+
+    fn since_ms(self, now_ms: u64) -> Option<u64> {
+        let day = 24 * 60 * 60 * 1000;
+        match self {
+            TimelineRange::Day => Some(now_ms.saturating_sub(day)),
+            TimelineRange::Week => Some(now_ms.saturating_sub(7 * day)),
+            TimelineRange::Month => Some(now_ms.saturating_sub(30 * day)),
+            TimelineRange::All => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectDisplayMode {
+    Flat,
+    NestedWorktrees,
+}
+
+impl ProjectDisplayMode {
+    fn toggle(self) -> Self {
+        match self {
+            ProjectDisplayMode::Flat => ProjectDisplayMode::NestedWorktrees,
+            ProjectDisplayMode::NestedWorktrees => ProjectDisplayMode::Flat,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ProjectDisplayMode::Flat => "flat",
+            ProjectDisplayMode::NestedWorktrees => "repo",
+        }
+    }
+
+    fn grouping(self) -> ProjectGrouping {
+        match self {
+            ProjectDisplayMode::Flat => ProjectGrouping::Flat,
+            ProjectDisplayMode::NestedWorktrees => ProjectGrouping::Repository,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -190,6 +274,14 @@ struct SessionSummary {
     source_dir: String,
 }
 
+#[derive(Clone, Debug)]
+struct ProjectTimelineRow {
+    project: String,
+    session_count: usize,
+    last_ts: u64,
+    session_ts: Vec<u64>,
+}
+
 struct App {
     paths: Paths,
     config: UserConfig,
@@ -205,6 +297,12 @@ struct App {
     results: Vec<SessionSummary>,
     selected: ListState,
     layout_mode: LayoutMode,
+    project_display: ProjectDisplayMode,
+    session_project_cache: HashMap<String, String>,
+    timeline_range: TimelineRange,
+    timeline_rows: Vec<ProjectTimelineRow>,
+    timeline_scroll: usize,
+    timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode)>,
     quick_popup: bool,
     quick_scroll: usize,
     quick_lines: Vec<PreviewLine>,
@@ -438,6 +536,12 @@ impl App {
             results: Vec::new(),
             selected: ListState::default(),
             layout_mode: LayoutMode::Split,
+            project_display: ProjectDisplayMode::NestedWorktrees,
+            session_project_cache: HashMap::new(),
+            timeline_range: TimelineRange::All,
+            timeline_rows: Vec::new(),
+            timeline_scroll: 0,
+            timeline_loaded: None,
             quick_popup: false,
             quick_scroll: 0,
             quick_lines: Vec::new(),
@@ -592,21 +696,41 @@ impl App {
         let source = self.source;
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
+        let grouping = self.project_display.grouping();
         self.set_status("searching...");
         std::thread::spawn(move || {
             let _ = tx.send(SearchUpdate::Started);
             let result = (|| -> Result<(Vec<SessionSummary>, Option<Vec<String>>)> {
-                let index = SearchIndex::open_or_create(&paths.index)?;
                 let sessions = if query.is_empty() {
-                    sessions_from_recent(&index, source.as_filter(), project_opt.as_deref())?
+                    sessions_from_analytics(
+                        &paths,
+                        source.as_filter(),
+                        project_opt.as_deref(),
+                        grouping,
+                    )
+                    .or_else(|_| {
+                        let index = SearchIndex::open_or_create(&paths.index)?;
+                        sessions_from_recent(&index, source.as_filter(), project_opt.as_deref())
+                    })?
                 } else {
-                    sessions_from_query(
+                    let index = SearchIndex::open_or_create(&paths.index)?;
+                    let tantivy_project = if grouping == ProjectGrouping::Flat {
+                        project_opt.as_deref()
+                    } else {
+                        None
+                    };
+                    let mut sessions = sessions_from_query(
                         &index,
                         &query,
                         source.as_filter(),
-                        project_opt.as_deref(),
+                        tantivy_project,
                         RESULT_LIMIT,
-                    )?
+                    )?;
+                    enrich_session_projects(&paths, &mut sessions, grouping);
+                    if let Some(project) = project_opt.as_deref() {
+                        sessions.retain(|session| session.project == project);
+                    }
+                    sessions
                 };
                 Ok((sessions, None))
             })();
@@ -628,14 +752,42 @@ impl App {
         let source = self.source;
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
+        let grouping = self.project_display.grouping();
         std::thread::spawn(move || {
-            let result = (|| -> Result<Vec<String>> {
-                let index = SearchIndex::open_or_create(&paths.index)?;
-                collect_projects(&index, source.as_filter())
-            })();
+            let result = collect_projects_from_analytics(&paths, source.as_filter(), grouping)
+                .or_else(|_| {
+                    let index = SearchIndex::open_or_create(&paths.index)?;
+                    collect_projects(&index, source.as_filter())
+                });
             match result {
                 Ok(projects) => {
                     let _ = tx.send(SearchUpdate::Projects { projects, source });
+                }
+                Err(err) => {
+                    let _ = tx.send(SearchUpdate::Error(err.to_string()));
+                }
+            }
+        });
+    }
+
+    fn kickoff_timeline_load(&mut self) {
+        let source = self.source;
+        let range = self.timeline_range;
+        let grouping = self.project_display;
+        let paths = self.paths.clone();
+        let tx = self.search_tx.clone();
+        self.timeline_loaded = Some((source, range, grouping));
+        self.set_status("loading timeline...");
+        std::thread::spawn(move || {
+            let result = build_project_timeline(&paths, source.as_filter(), range, grouping);
+            match result {
+                Ok(rows) => {
+                    let _ = tx.send(SearchUpdate::Timeline {
+                        rows,
+                        source,
+                        range,
+                        grouping,
+                    });
                 }
                 Err(err) => {
                     let _ = tx.send(SearchUpdate::Error(err.to_string()));
@@ -720,6 +872,7 @@ impl App {
                 Focus::List | Focus::Preview => Focus::Find,
                 Focus::Find => Focus::Query,
             },
+            LayoutMode::Timeline => Focus::List,
             LayoutMode::Detail => match self.focus {
                 Focus::Preview => Focus::Find,
                 Focus::Find | Focus::Query | Focus::Project | Focus::List => Focus::Preview,
@@ -736,6 +889,7 @@ impl App {
                 Focus::List | Focus::Preview => Focus::Project,
                 Focus::Find => Focus::List,
             },
+            LayoutMode::Timeline => Focus::List,
             LayoutMode::Detail => match self.focus {
                 Focus::Preview | Focus::Query | Focus::Project | Focus::List => Focus::Find,
                 Focus::Find => Focus::Preview,
@@ -779,8 +933,56 @@ impl App {
                 self.quick_lines.clear();
                 LayoutMode::List
             }
-            LayoutMode::List | LayoutMode::Detail => LayoutMode::Split,
+            LayoutMode::List => {
+                self.focus = Focus::List;
+                self.quick_popup = false;
+                self.quick_lines.clear();
+                self.kickoff_timeline_load();
+                LayoutMode::Timeline
+            }
+            LayoutMode::Timeline | LayoutMode::Detail => LayoutMode::Split,
         };
+    }
+
+    fn toggle_project_display(&mut self) {
+        self.project_display = self.project_display.toggle();
+        self.session_project_cache.clear();
+        self.set_status(format!("projects: {}", self.project_display.label()));
+        if matches!(self.layout_mode, LayoutMode::Timeline) {
+            self.kickoff_timeline_load();
+        } else {
+            self.refresh_results();
+            if self.project_source == self.source {
+                self.kickoff_project_load();
+            }
+        }
+    }
+
+    fn cycle_timeline_range(&mut self, delta: isize) {
+        self.timeline_range = if delta < 0 {
+            self.timeline_range.prev()
+        } else {
+            self.timeline_range.next()
+        };
+        if matches!(self.layout_mode, LayoutMode::Timeline) {
+            self.timeline_scroll = 0;
+            self.kickoff_timeline_load();
+        }
+    }
+
+    fn scroll_timeline(&mut self, delta: isize) {
+        if self.timeline_rows.is_empty() {
+            self.timeline_scroll = 0;
+            return;
+        }
+        let view_height = self.list_area.height as usize;
+        let max_scroll = if view_height == 0 {
+            self.timeline_rows.len().saturating_sub(1)
+        } else {
+            self.timeline_rows.len().saturating_sub(view_height)
+        };
+        self.timeline_scroll =
+            (self.timeline_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
     }
 
     fn toggle_quick_popup(&mut self) {
@@ -1017,6 +1219,18 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                     app.project_source = source;
                     app.update_project_options();
                 }
+                SearchUpdate::Timeline {
+                    rows,
+                    source,
+                    range,
+                    grouping,
+                } => {
+                    if app.timeline_loaded == Some((source, range, grouping)) {
+                        app.timeline_rows = rows;
+                        app.timeline_scroll = 0;
+                        app.set_status(format!("{} projects", app.timeline_rows.len()));
+                    }
+                }
                 SearchUpdate::Error(msg) => app.set_status(format!("search error: {msg}")),
             }
             dirty = true;
@@ -1208,24 +1422,32 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.focus_prev();
         }
         KeyCode::Up => {
-            if matches!(app.focus, Focus::List) {
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.scroll_timeline(-1);
+            } else if matches!(app.focus, Focus::List) {
                 app.move_selection(-1);
             }
         }
         KeyCode::Down => {
-            if matches!(app.focus, Focus::List) {
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.scroll_timeline(1);
+            } else if matches!(app.focus, Focus::List) {
                 app.move_selection(1);
             }
         }
         KeyCode::Char('j') => {
-            if matches!(app.focus, Focus::Preview) {
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.scroll_timeline(1);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(1);
             } else {
                 app.move_selection(1);
             }
         }
         KeyCode::Char('k') => {
-            if matches!(app.focus, Focus::Preview) {
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.scroll_timeline(-1);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(-1);
             } else {
                 app.move_selection(-1);
@@ -1259,12 +1481,16 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             }
         }
         KeyCode::PageDown => {
-            if matches!(app.focus, Focus::Preview) {
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.scroll_timeline(8);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(8);
             }
         }
         KeyCode::PageUp => {
-            if matches!(app.focus, Focus::Preview) {
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.scroll_timeline(-8);
+            } else if matches!(app.focus, Focus::Preview) {
                 app.scroll_detail(-8);
             }
         }
@@ -1272,7 +1498,20 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.source = app.source.cycle();
             app.set_status("searching...");
             terminal.draw(|f| draw_ui(f, app))?;
-            app.refresh_results();
+            if matches!(app.layout_mode, LayoutMode::Timeline) {
+                app.kickoff_timeline_load();
+            } else {
+                app.refresh_results();
+            }
+        }
+        KeyCode::Char('[') => {
+            app.cycle_timeline_range(-1);
+        }
+        KeyCode::Char(']') => {
+            app.cycle_timeline_range(1);
+        }
+        KeyCode::Char('g') => {
+            app.toggle_project_display();
         }
         KeyCode::Char('m') => {
             app.toggle_preview_mode();
@@ -1458,6 +1697,14 @@ fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         return;
     }
 
+    if app.layout_mode == LayoutMode::Timeline {
+        app.preview_area = Rect::default();
+        app.project_area = None;
+        app.dragging = false;
+        app.list_area = draw_project_timeline(frame, app, theme, area);
+        return;
+    }
+
     let min_left = 20u16;
     let min_right = 24u16;
     let total = area.width.max(min_left + min_right + SPLIT_GAP);
@@ -1540,24 +1787,25 @@ fn draw_sessions_panel(
             theme.muted,
         )))]
     } else {
-        app.results
-            .iter()
-            .map(|session| {
-                let ts = format_relative_ts(session.last_ts);
-                let line = Line::from(vec![
-                    Span::styled(format!("{:>4}", session.hit_count), theme.accent),
-                    Span::raw(" "),
-                    Span::styled(session.project.as_str(), theme.text),
-                    Span::raw(" "),
-                    Span::styled(session.source.label(), theme.muted),
-                    Span::raw(" "),
-                    Span::styled(format!("{ts:>4}"), theme.accent),
-                    Span::raw(" "),
-                    Span::styled(session.session_id.as_str(), theme.text),
-                ]);
-                ListItem::new(line)
-            })
-            .collect()
+        let sessions = app.results.clone();
+        let mut items = Vec::with_capacity(sessions.len());
+        for session in &sessions {
+            let ts = format_relative_ts(session.last_ts);
+            let project = display_project_for_session(app, session);
+            let line = Line::from(vec![
+                Span::styled(format!("{:>4}", session.hit_count), theme.accent),
+                Span::raw(" "),
+                Span::styled(project, theme.text),
+                Span::raw(" "),
+                Span::styled(session.source.label(), theme.muted),
+                Span::raw(" "),
+                Span::styled(format!("{ts:>4}"), theme.accent),
+                Span::raw(" "),
+                Span::styled(session.session_id.clone(), theme.text),
+            ]);
+            items.push(ListItem::new(line));
+        }
+        items
     };
 
     let list = List::new(list_items)
@@ -1566,6 +1814,123 @@ fn draw_sessions_panel(
         .highlight_symbol("");
 
     frame.render_stateful_widget(list, content, &mut app.selected);
+    content
+}
+
+fn display_project_for_session(app: &mut App, session: &SessionSummary) -> String {
+    if app.project_display == ProjectDisplayMode::Flat {
+        return session.project.clone();
+    }
+    let key = format!(
+        "{}\0{}\0{}",
+        session.source.storage_label(),
+        session.session_id,
+        session.source_path
+    );
+    if let Some(project) = app.session_project_cache.get(&key) {
+        return project.clone();
+    }
+    let project = AnalyticsStore::open(analytics_path(&app.paths.state))
+        .ok()
+        .and_then(|store| {
+            store
+                .project_for_session(
+                    session.source,
+                    &session.session_id,
+                    &session.source_path,
+                    app.project_display.grouping(),
+                )
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| session.project.clone());
+    app.session_project_cache.insert(key, project.clone());
+    project
+}
+
+fn draw_project_timeline(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+) -> Rect {
+    frame.render_widget(Block::default().style(theme.panel), area);
+    let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, PANEL_PAD_Y, PANEL_PAD_Y);
+    let content = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height,
+    };
+
+    if app.timeline_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no sessions in this window",
+                theme.muted,
+            ))),
+            content,
+        );
+        return content;
+    }
+
+    let rows_area = Rect {
+        x: content.x,
+        y: content.y,
+        width: content.width,
+        height: content.height,
+    };
+    let rows_visible = rows_area.height as usize;
+    let start = app.timeline_scroll.min(app.timeline_rows.len());
+    let end = if rows_visible == 0 {
+        start
+    } else {
+        (start + rows_visible).min(app.timeline_rows.len())
+    };
+    let project_width = timeline_project_width(&app.timeline_rows[start..end], content.width);
+    let count_width = 5u16;
+    let last_width = 4u16;
+    let chart_width = timeline_chart_width(content.width, project_width, count_width, last_width);
+    let row_widths = [
+        Constraint::Length(project_width),
+        Constraint::Length(chart_width as u16),
+        Constraint::Length(1),
+        Constraint::Length(count_width),
+        Constraint::Length(1),
+        Constraint::Length(last_width),
+        Constraint::Min(0),
+    ];
+    let range = timeline_bounds(&app.timeline_rows, app.timeline_range);
+    let density_max = timeline_density_max(&app.timeline_rows[start..end], range, chart_width);
+
+    for (line_idx, row) in app.timeline_rows[start..end].iter().enumerate() {
+        let row_area = Rect {
+            x: rows_area.x,
+            y: rows_area.y.saturating_add(line_idx as u16),
+            width: rows_area.width,
+            height: 1,
+        };
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(row_widths)
+            .split(row_area);
+        frame.render_widget(
+            Paragraph::new(truncate_middle(&row.project, cols[0].width as usize)).style(theme.text),
+            cols[0],
+        );
+        let chart = timeline_chart(&row.session_ts, range, cols[1].width as usize, density_max);
+        frame.render_widget(Paragraph::new(chart).style(theme.muted), cols[1]);
+        frame.render_widget(
+            Paragraph::new(row.session_count.to_string())
+                .style(theme.accent)
+                .alignment(Alignment::Right),
+            cols[3],
+        );
+        frame.render_widget(
+            Paragraph::new(format_relative_ts(row.last_ts)).style(theme.accent),
+            cols[5],
+        );
+    }
     content
 }
 
@@ -1726,6 +2091,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     let view = match app.layout_mode {
         LayoutMode::Split => "split",
         LayoutMode::List => "list",
+        LayoutMode::Timeline => "timeline",
         LayoutMode::Detail => "detail",
     };
     let mut right_spans = Vec::new();
@@ -1741,11 +2107,32 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
+    if app.layout_mode == LayoutMode::Timeline {
+        if app.source == SourceChoice::All {
+            right_spans.push(Span::styled("source ", theme.muted));
+            right_spans.push(Span::styled(app.source.label(), theme.accent));
+            right_spans.push(Span::raw("   "));
+        }
+        right_spans.push(Span::styled("range ", theme.muted));
+        right_spans.push(Span::styled(app.timeline_range.label(), theme.text));
+        right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("dates ", theme.muted));
+        right_spans.push(Span::styled(
+            timeline_date_range(&app.timeline_rows, app.timeline_range),
+            theme.text,
+        ));
+        right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("group ", theme.muted));
+        right_spans.push(Span::styled(app.project_display.label(), theme.text));
+        right_spans.push(Span::raw("   "));
+    }
     right_spans.push(Span::styled("view ", theme.muted));
     right_spans.push(Span::styled(view, theme.text));
-    right_spans.push(Span::raw("   "));
-    right_spans.push(Span::styled("mode ", theme.muted));
-    right_spans.push(Span::styled(mode, theme.text));
+    if app.layout_mode != LayoutMode::Timeline {
+        right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("mode ", theme.muted));
+        right_spans.push(Span::styled(mode, theme.text));
+    }
     let right = Line::from(right_spans);
     let right_width = right.width() as u16;
     let shortcut_width = inner.width.saturating_sub(right_width);
@@ -1822,6 +2209,21 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" list  ", theme.muted),
             Span::styled("r", theme.accent),
             Span::styled(" resume", theme.muted),
+        ]);
+    }
+
+    if app.layout_mode == LayoutMode::Timeline {
+        return Line::from(vec![
+            Span::styled("j/k", theme.accent),
+            Span::styled(" scroll  ", theme.muted),
+            Span::styled("[/]", theme.accent),
+            Span::styled(" range  ", theme.muted),
+            Span::styled("s", theme.accent),
+            Span::styled(" source  ", theme.muted),
+            Span::styled("g", theme.accent),
+            Span::styled(" grouping  ", theme.muted),
+            Span::styled("v", theme.accent),
+            Span::styled(" split", theme.muted),
         ]);
     }
 
@@ -1947,6 +2349,120 @@ fn sessions_from_recent(
     }
     let mut out: Vec<SessionSummary> = sessions.into_values().collect();
     out.sort_by_key(|summary| std::cmp::Reverse(summary.last_ts));
+    Ok(out)
+}
+
+fn sessions_from_analytics(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    project: Option<&str>,
+    grouping: ProjectGrouping,
+) -> Result<Vec<SessionSummary>> {
+    let store = AnalyticsStore::open(analytics_path(&paths.state))?;
+    let rows =
+        store.query_sessions(source, None, project, grouping, Some(RECENT_SESSIONS_LIMIT))?;
+    if rows.is_empty() {
+        anyhow::bail!("no analytics sessions");
+    }
+    Ok(rows.into_iter().map(session_summary_from_row).collect())
+}
+
+fn session_summary_from_row(row: SessionRow) -> SessionSummary {
+    SessionSummary {
+        session_id: row.session_id,
+        project: row.display_project,
+        source: row.source,
+        last_ts: row.last_at,
+        hit_count: row.message_count.max(1) as usize,
+        top_score: 0.0,
+        snippet: String::new(),
+        source_dir: row.cwd.unwrap_or_else(|| parent_dir(&row.source_path)),
+        source_path: row.source_path,
+    }
+}
+
+fn enrich_session_projects(
+    paths: &Paths,
+    sessions: &mut [SessionSummary],
+    grouping: ProjectGrouping,
+) {
+    if grouping == ProjectGrouping::Flat {
+        return;
+    }
+    let Ok(store) = AnalyticsStore::open(analytics_path(&paths.state)) else {
+        return;
+    };
+    for session in sessions {
+        if let Ok(Some(project)) = store.project_for_session(
+            session.source,
+            &session.session_id,
+            &session.source_path,
+            grouping,
+        ) {
+            session.project = project;
+        }
+    }
+}
+
+fn collect_projects_from_analytics(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    grouping: ProjectGrouping,
+) -> Result<Vec<String>> {
+    let store = AnalyticsStore::open(analytics_path(&paths.state))?;
+    let rows = store.query_sessions(source, None, None, grouping, None)?;
+    if rows.is_empty() {
+        anyhow::bail!("no analytics projects");
+    }
+    let mut set = HashSet::new();
+    for row in rows {
+        if !row.display_project.is_empty() {
+            set.insert(row.display_project);
+        }
+    }
+    let mut projects: Vec<String> = set.into_iter().collect();
+    projects.sort();
+    Ok(projects)
+}
+
+fn build_project_timeline(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    range: TimelineRange,
+    display: ProjectDisplayMode,
+) -> Result<Vec<ProjectTimelineRow>> {
+    let store = AnalyticsStore::open(analytics_path(&paths.state))?;
+    let now = now_ms();
+    let rows = store.query_sessions(source, range.since_ms(now), None, display.grouping(), None)?;
+    let mut projects: HashMap<String, ProjectTimelineRow> = HashMap::new();
+    for row in rows {
+        let project_name = if row.display_project.is_empty() {
+            row.project
+        } else {
+            row.display_project
+        };
+        let entry = projects
+            .entry(project_name.clone())
+            .or_insert_with(|| ProjectTimelineRow {
+                project: project_name,
+                session_count: 0,
+                last_ts: 0,
+                session_ts: Vec::new(),
+            });
+        entry.session_count += 1;
+        entry.last_ts = entry.last_ts.max(row.last_at);
+        entry.session_ts.push(row.last_at);
+    }
+    let mut out: Vec<ProjectTimelineRow> = projects.into_values().collect();
+    for row in &mut out {
+        row.session_ts.sort_unstable();
+    }
+    out.sort_by(|a, b| {
+        b.session_count
+            .cmp(&a.session_count)
+            .then_with(|| b.last_ts.cmp(&a.last_ts))
+            .then_with(|| a.project.cmp(&b.project))
+    });
     Ok(out)
 }
 
@@ -2287,6 +2803,149 @@ fn format_relative_ts_at(ts: u64, now: u64) -> String {
     } else {
         format!("{}y", age_secs / YEAR)
     }
+}
+
+fn now_ms() -> u64 {
+    let now = chrono::Utc::now().timestamp_millis();
+    u64::try_from(now).unwrap_or(0)
+}
+
+fn timeline_bounds(rows: &[ProjectTimelineRow], range: TimelineRange) -> (u64, u64) {
+    let now = now_ms();
+    let min_seen = rows
+        .iter()
+        .flat_map(|row| row.session_ts.iter())
+        .copied()
+        .min()
+        .unwrap_or(now);
+    let max_seen = rows
+        .iter()
+        .flat_map(|row| row.session_ts.iter())
+        .copied()
+        .max()
+        .unwrap_or(now);
+    match range.since_ms(now) {
+        Some(since) => (since, now.max(since.saturating_add(1))),
+        None => (min_seen, max_seen.max(min_seen.saturating_add(1))),
+    }
+}
+
+fn timeline_date_range(rows: &[ProjectTimelineRow], range: TimelineRange) -> String {
+    let (start, end) = timeline_bounds(rows, range);
+    format!("{}..{}", format_day(start), format_day(end))
+}
+
+fn format_day(ts: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts as i64)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn timeline_project_width(rows: &[ProjectTimelineRow], total_width: u16) -> u16 {
+    let max_sessions = rows.iter().map(|row| row.session_count).max().unwrap_or(0);
+    let significant_sessions = (max_sessions / 20).max(3);
+    let mut widths: Vec<usize> = rows
+        .iter()
+        .filter(|row| row.session_count >= significant_sessions)
+        .map(|row| row.project.chars().count().saturating_add(1))
+        .collect();
+    if widths.is_empty() {
+        widths = rows
+            .iter()
+            .map(|row| row.project.chars().count().saturating_add(1))
+            .collect();
+    }
+    let width = widths.iter().max().copied().unwrap_or(12);
+    let max_project = total_width.saturating_sub(24).clamp(12, 32);
+    (width as u16).clamp(12, max_project)
+}
+
+fn timeline_chart_width(
+    total_width: u16,
+    project_width: u16,
+    count_width: u16,
+    last_width: u16,
+) -> usize {
+    const MAX_TIMELINE_CHART_WIDTH: usize = 56;
+    let gutter_width = 2u16;
+    let available = total_width
+        .saturating_sub(project_width)
+        .saturating_sub(gutter_width)
+        .saturating_sub(count_width)
+        .saturating_sub(last_width) as usize;
+    available.min(MAX_TIMELINE_CHART_WIDTH)
+}
+
+fn timeline_density_max(rows: &[ProjectTimelineRow], bounds: (u64, u64), width: usize) -> usize {
+    rows.iter()
+        .flat_map(|row| timeline_bucket_counts(&row.session_ts, bounds, width))
+        .max()
+        .unwrap_or(0)
+}
+
+fn timeline_bucket_counts(session_ts: &[u64], bounds: (u64, u64), width: usize) -> Vec<usize> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut buckets = vec![0usize; width];
+    let span = bounds.1.saturating_sub(bounds.0).max(1);
+    for &ts in session_ts {
+        let clamped = ts.clamp(bounds.0, bounds.1);
+        let offset = clamped.saturating_sub(bounds.0);
+        let mut idx = ((offset as u128 * width as u128) / span as u128) as usize;
+        if idx >= width {
+            idx = width - 1;
+        }
+        buckets[idx] += 1;
+    }
+    buckets
+}
+
+fn timeline_chart(
+    session_ts: &[u64],
+    bounds: (u64, u64),
+    width: usize,
+    density_max: usize,
+) -> String {
+    timeline_bucket_counts(session_ts, bounds, width)
+        .into_iter()
+        .map(|count| timeline_glyph(count, density_max))
+        .collect()
+}
+
+fn timeline_glyph(count: usize, max: usize) -> char {
+    if count == 0 || max == 0 {
+        return ' ';
+    }
+    if max == 1 {
+        return '⠁';
+    }
+    match ((count * 4).saturating_add(max - 1)) / max {
+        0 => ' ',
+        1 => '⠁',
+        2 => '⠃',
+        3 => '⠇',
+        _ => '⣿',
+    }
+}
+
+fn truncate_middle(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep.saturating_sub(head);
+    let mut out = String::new();
+    out.extend(value.chars().take(head));
+    out.push('…');
+    let tail_chars: Vec<char> = value.chars().rev().take(tail).collect();
+    out.extend(tail_chars.into_iter().rev());
+    out
 }
 
 fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
@@ -2986,6 +3645,63 @@ mod tests {
             record_preview_text(&record),
             "{\n  \"cmd\": \"printf '{x: [1,2]}'\",\n  \"args\": [\n    \"a,b\",\n    \"c:d\"\n  ]\n}"
         );
+    }
+
+    #[test]
+    fn timeline_chart_uses_shared_density_scale() {
+        let dense = timeline_chart(&[10, 10, 10, 50], (0, 100), 5, 3);
+        let sparse = timeline_chart(&[50], (0, 100), 5, 3);
+
+        assert!(dense.contains('⣿'));
+        assert!(sparse.contains('⠃'));
+        assert!(!sparse.contains('⣿'));
+    }
+
+    #[test]
+    fn timeline_default_range_is_all_history() {
+        assert_eq!(TimelineRange::All.label(), "all history");
+        assert_eq!(TimelineRange::All.since_ms(123), None);
+    }
+
+    #[test]
+    fn timeline_chart_width_reserves_numeric_gutters() {
+        assert_eq!(timeline_chart_width(100, 20, 5, 4), 56);
+        assert_eq!(timeline_chart_width(40, 20, 5, 4), 9);
+    }
+
+    #[test]
+    fn timeline_project_width_ignores_low_count_long_names() {
+        let rows = vec![
+            timeline_row("mdnb", 925),
+            timeline_row("sidequery-backend", 413),
+            timeline_row("nico-duckdb-iceberg", 51),
+            timeline_row(
+                "generated-harness-directory-name-that-should-not-set-width",
+                1,
+            ),
+        ];
+
+        assert_eq!(timeline_project_width(&rows, 120), 20);
+    }
+
+    #[test]
+    fn timeline_project_width_keeps_significant_long_names() {
+        let rows = vec![
+            timeline_row("mdnb", 925),
+            timeline_row("sidequery-backend", 413),
+            timeline_row("important-long-project-name", 300),
+        ];
+
+        assert_eq!(timeline_project_width(&rows, 120), 28);
+    }
+
+    fn timeline_row(project: &str, session_count: usize) -> ProjectTimelineRow {
+        ProjectTimelineRow {
+            project: project.to_string(),
+            session_count,
+            last_ts: 0,
+            session_ts: Vec::new(),
+        }
     }
 
     #[test]

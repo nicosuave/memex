@@ -1,3 +1,4 @@
+use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
@@ -242,6 +243,13 @@ OUTPUT FIELDS (--fields):
     },
     /// Show index statistics (document count, vector count, storage paths)
     Stats {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Rebuild the SQLite analytics cache from the existing Tantivy index
+    #[command(hide = true)]
+    AnalyticsBackfill {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -522,6 +530,9 @@ pub fn run() -> Result<()> {
         }
         Commands::Stats { root } => {
             run_stats(root)?;
+        }
+        Commands::AnalyticsBackfill { root } => {
+            run_analytics_backfill(root)?;
         }
         Commands::Setup { force } => {
             run_setup(force)?;
@@ -1295,6 +1306,19 @@ fn run_stats(root: Option<PathBuf>) -> Result<()> {
     println!("index: {}", paths.index.display());
     println!("documents: {}", index.doc_count()?);
     print_vector_stats(&paths.vectors)?;
+    Ok(())
+}
+
+fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
+    let paths = Paths::new(root)?;
+    paths.ensure_dirs()?;
+    let index = SearchIndex::open_or_create(&paths.index)?;
+    let db = analytics_path(&paths.state);
+    backfill_from_index(&db, &index)?;
+    let store = AnalyticsStore::open(&db)?;
+    println!("analytics: {}", db.display());
+    println!("documents: {}", index.doc_count()?);
+    println!("sessions: {}", store.session_count()?);
     Ok(())
 }
 

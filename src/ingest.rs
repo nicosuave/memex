@@ -1,3 +1,4 @@
+use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index};
 use crate::config::Paths;
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
@@ -71,6 +72,7 @@ struct WriterContext {
     embeddings: bool,
     do_backfill_embeddings: bool,
     vector_dir: PathBuf,
+    analytics_path: PathBuf,
     progress: Arc<Progress>,
     model: ModelChoice,
     embed_runtime: EmbedRuntimeConfig,
@@ -429,7 +431,13 @@ pub fn ingest_all(
 
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
+    let analytics_db = analytics_path(&paths.state);
+    let analytics_needs_backfill =
+        !AnalyticsStore::is_complete(&analytics_db) && index.doc_count()? > 0;
     if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
+        if analytics_needs_backfill {
+            backfill_from_index(&analytics_db, index)?;
+        }
         update_scan_cache(paths, files_scanned, total_bytes);
         return Ok(IngestReport {
             records_added: 0,
@@ -455,6 +463,7 @@ pub fn ingest_all(
         embeddings: options.embeddings,
         do_backfill_embeddings: options.backfill_embeddings,
         vector_dir: paths.vectors.clone(),
+        analytics_path: analytics_db.clone(),
         progress: progress.clone(),
         model: options.model,
         embed_runtime: options.embed_runtime.clone(),
@@ -506,6 +515,11 @@ pub fn ingest_all(
         .map_err(|_| anyhow!("writer thread panicked"))?;
     progress.finish();
     let (records_added, records_embedded) = writer_result?;
+    if analytics_needs_backfill {
+        backfill_from_index(&analytics_db, index)?;
+    } else {
+        AnalyticsStore::open(&analytics_db)?.mark_complete()?;
+    }
 
     let mut updated_files = HashMap::new();
     while let Ok(update) = rx_update.recv() {
@@ -547,6 +561,9 @@ fn can_skip_fresh_scan(
         return Ok(false);
     }
     if !cache.is_fresh(ttl_seconds) {
+        return Ok(false);
+    }
+    if !AnalyticsStore::is_complete(analytics_path(&paths.state)) && index.doc_count()? > 0 {
         return Ok(false);
     }
     can_skip_noop_index(paths, index, options)
@@ -603,13 +620,16 @@ fn writer_loop(
         embeddings,
         do_backfill_embeddings,
         vector_dir,
+        analytics_path,
         progress,
         model,
         embed_runtime,
     } = ctx;
     let mut writer = index.writer()?;
+    let mut analytics = AnalyticsWriter::open(&analytics_path)?;
     for path in delete_paths {
         index.delete_by_source_path(&mut writer, &path);
+        analytics.delete_source_path(&path)?;
     }
 
     let mut count = 0usize;
@@ -631,6 +651,7 @@ fn writer_loop(
     }
 
     for mut record in rx.iter() {
+        analytics.record(&record)?;
         index.add_record(&mut writer, &record)?;
         let source_idx = record.source.idx();
         index_pending[source_idx] += 1;
@@ -670,6 +691,7 @@ fn writer_loop(
         }
     }
 
+    analytics.flush()?;
     writer.commit()?;
     if embeddings {
         if !embed_buffer.is_empty() {
@@ -3361,6 +3383,13 @@ mod tests {
         index
     }
 
+    fn mark_analytics_complete(paths: &Paths) {
+        AnalyticsStore::open(analytics_path(&paths.state))
+            .expect("open analytics")
+            .mark_complete()
+            .expect("mark analytics complete");
+    }
+
     fn record(doc_id: u64, role: &str, text: &str) -> Record {
         Record {
             source: SourceKind::Claude,
@@ -3683,6 +3712,7 @@ mod tests {
         let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(false, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
+        mark_analytics_complete(&paths);
 
         assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
     }
@@ -3695,6 +3725,7 @@ mod tests {
         let index = save_search_records(&paths, &[record(1, "user", "hello")]);
         let options = ingest_options(true, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
+        mark_analytics_complete(&paths);
 
         assert!(can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
     }
@@ -4213,6 +4244,7 @@ mod tests {
             embeddings: false,
             do_backfill_embeddings: false,
             vector_dir,
+            analytics_path: tmp.path().join("state").join("analytics.sqlite"),
             progress,
             model: ModelChoice::default(),
             embed_runtime: EmbedRuntimeConfig::default(),
