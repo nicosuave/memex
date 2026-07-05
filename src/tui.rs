@@ -14,7 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 #[cfg(not(unix))]
@@ -91,10 +91,39 @@ enum Focus {
     Find,
 }
 
+impl Focus {
+    fn next(self) -> Self {
+        match self {
+            Focus::Query => Focus::Project,
+            Focus::Project => Focus::List,
+            Focus::List => Focus::Preview,
+            Focus::Preview => Focus::Find,
+            Focus::Find => Focus::Query,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Focus::Query => Focus::Find,
+            Focus::Project => Focus::Query,
+            Focus::List => Focus::Project,
+            Focus::Preview => Focus::List,
+            Focus::Find => Focus::Preview,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PreviewMode {
     Matches,
     History,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LayoutMode {
+    Split,
+    List,
+    Detail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -173,6 +202,10 @@ struct App {
     project_source: SourceChoice,
     results: Vec<SessionSummary>,
     selected: ListState,
+    layout_mode: LayoutMode,
+    quick_popup: bool,
+    quick_scroll: usize,
+    quick_lines: Vec<PreviewLine>,
     preview_mode: PreviewMode,
     show_tools: bool,
     find_query: String,
@@ -402,6 +435,10 @@ impl App {
             project_source: SourceChoice::All,
             results: Vec::new(),
             selected: ListState::default(),
+            layout_mode: LayoutMode::Split,
+            quick_popup: false,
+            quick_scroll: 0,
+            quick_lines: Vec::new(),
             preview_mode: PreviewMode::Matches,
             show_tools: false,
             find_query: String::new(),
@@ -643,6 +680,7 @@ impl App {
         let idx = self.selected.selected().unwrap_or(0) as isize + delta;
         let next = idx.clamp(0, (self.results.len() - 1) as isize) as usize;
         self.selected.select(Some(next));
+        self.quick_scroll = 0;
         self.update_detail();
     }
 
@@ -671,6 +709,38 @@ impl App {
         self.update_detail();
     }
 
+    fn focus_next(&mut self) {
+        self.focus = match self.layout_mode {
+            LayoutMode::Split => self.focus.next(),
+            LayoutMode::List => match self.focus {
+                Focus::Query => Focus::Project,
+                Focus::Project => Focus::List,
+                Focus::List | Focus::Preview => Focus::Find,
+                Focus::Find => Focus::Query,
+            },
+            LayoutMode::Detail => match self.focus {
+                Focus::Preview => Focus::Find,
+                Focus::Find | Focus::Query | Focus::Project | Focus::List => Focus::Preview,
+            },
+        };
+    }
+
+    fn focus_prev(&mut self) {
+        self.focus = match self.layout_mode {
+            LayoutMode::Split => self.focus.prev(),
+            LayoutMode::List => match self.focus {
+                Focus::Query => Focus::Find,
+                Focus::Project => Focus::Query,
+                Focus::List | Focus::Preview => Focus::Project,
+                Focus::Find => Focus::List,
+            },
+            LayoutMode::Detail => match self.focus {
+                Focus::Preview | Focus::Query | Focus::Project | Focus::List => Focus::Find,
+                Focus::Find => Focus::Preview,
+            },
+        };
+    }
+
     fn scroll_detail(&mut self, delta: isize) {
         if self.detail_lines.is_empty() {
             return;
@@ -683,6 +753,94 @@ impl App {
         };
         let next = (self.detail_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
         self.detail_scroll = next;
+    }
+
+    fn scroll_quick_popup(&mut self, delta: isize) {
+        if self.quick_lines.is_empty() {
+            return;
+        }
+        let view_height = quick_popup_content_height(self.body_area) as usize;
+        let max_scroll = if view_height == 0 {
+            self.quick_lines.len().saturating_sub(1)
+        } else {
+            self.quick_lines.len().saturating_sub(view_height)
+        };
+        let next = (self.quick_scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
+        self.quick_scroll = next;
+    }
+
+    fn toggle_layout_mode(&mut self) {
+        self.layout_mode = match self.layout_mode {
+            LayoutMode::Split => {
+                self.focus = Focus::List;
+                self.quick_popup = false;
+                self.quick_lines.clear();
+                LayoutMode::List
+            }
+            LayoutMode::List | LayoutMode::Detail => LayoutMode::Split,
+        };
+    }
+
+    fn toggle_quick_popup(&mut self) {
+        if self.quick_popup {
+            self.quick_popup = false;
+            self.quick_scroll = 0;
+            self.quick_lines.clear();
+            return;
+        }
+        self.update_quick_lines();
+        self.quick_popup = !self.quick_popup;
+        self.quick_scroll = 0;
+    }
+
+    fn update_quick_lines(&mut self) {
+        let Some(idx) = self.selected.selected() else {
+            self.quick_lines = vec![PreviewLine::Text("no session selected".to_string())];
+            return;
+        };
+        let Some(session) = self.results.get(idx) else {
+            self.quick_lines = vec![PreviewLine::Text("no session selected".to_string())];
+            return;
+        };
+        let active_query = if self.find_query.trim().is_empty() {
+            self.query.trim()
+        } else {
+            self.find_query.trim()
+        };
+        self.quick_lines = match build_detail_lines(
+            &self.index,
+            session,
+            PreviewMode::Matches,
+            active_query,
+            self.show_tools,
+        ) {
+            Ok(lines) => lines,
+            Err(err) => vec![PreviewLine::Text(format!("detail error: {err}"))],
+        };
+    }
+
+    fn enter_preview(&mut self) {
+        self.layout_mode = LayoutMode::Split;
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        self.focus = Focus::Preview;
+    }
+
+    fn enter_full_history(&mut self) {
+        self.layout_mode = LayoutMode::Detail;
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        self.preview_mode = PreviewMode::History;
+        self.focus = Focus::Preview;
+        self.last_detail_session = None;
+        self.update_detail();
+    }
+
+    fn return_to_list(&mut self) {
+        self.layout_mode = LayoutMode::List;
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        self.focus = Focus::List;
     }
 
     fn update_find(&mut self) {
@@ -844,6 +1002,9 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                     } else {
                         app.selected.select(Some(0));
                     }
+                    app.quick_popup = false;
+                    app.quick_scroll = 0;
+                    app.quick_lines.clear();
                     app.last_detail_session = None;
                     app.detail_scroll = 0;
                     app.set_status(format!("{} sessions", app.results.len()));
@@ -890,18 +1051,6 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
-    if matches!(key.code, KeyCode::Esc) {
-        if matches!(app.focus, Focus::List) {
-            return Ok(true);
-        }
-        if matches!(app.focus, Focus::Find) {
-            app.focus = Focus::Preview;
-        } else {
-            app.focus = Focus::List;
-        }
-        return Ok(false);
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             key.code,
@@ -911,23 +1060,53 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         return Ok(true);
     }
 
+    if app.quick_popup {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char(' ') => {
+                app.quick_popup = false;
+            }
+            KeyCode::Enter | KeyCode::Char('l') => {
+                app.enter_full_history();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.scroll_quick_popup(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.scroll_quick_popup(1);
+            }
+            KeyCode::PageUp => {
+                app.scroll_quick_popup(-8);
+            }
+            KeyCode::PageDown => {
+                app.scroll_quick_popup(8);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if matches!(key.code, KeyCode::Esc) {
+        if app.layout_mode == LayoutMode::Detail && !matches!(app.focus, Focus::Find) {
+            app.return_to_list();
+        } else if matches!(app.focus, Focus::Find) {
+            app.focus = if app.layout_mode == LayoutMode::List {
+                Focus::List
+            } else {
+                Focus::Preview
+            };
+        } else {
+            app.focus = Focus::List;
+        }
+        return Ok(false);
+    }
+
     if matches!(app.focus, Focus::Query | Focus::Project) {
         match key.code {
             KeyCode::Tab => {
-                app.focus = match app.focus {
-                    Focus::Query => Focus::Project,
-                    Focus::Project => Focus::List,
-                    Focus::List => Focus::Preview,
-                    Focus::Preview | Focus::Find => Focus::Query,
-                };
+                app.focus_next();
             }
             KeyCode::BackTab => {
-                app.focus = match app.focus {
-                    Focus::Query => Focus::Preview,
-                    Focus::Project => Focus::Query,
-                    Focus::List => Focus::Project,
-                    Focus::Preview | Focus::Find => Focus::List,
-                };
+                app.focus_prev();
             }
             KeyCode::Enter => {
                 if matches!(app.focus, Focus::Project)
@@ -938,7 +1117,11 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.set_status("searching...");
                 terminal.draw(|f| draw_ui(f, app))?;
                 app.refresh_results();
-                app.focus = Focus::List;
+                app.focus = if app.layout_mode == LayoutMode::Detail {
+                    Focus::Preview
+                } else {
+                    Focus::List
+                };
             }
             KeyCode::Backspace => match app.focus {
                 Focus::Query => {
@@ -981,16 +1164,30 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
 
     if matches!(app.focus, Focus::Find) {
         match key.code {
+            KeyCode::Tab => {
+                app.focus_next();
+            }
+            KeyCode::BackTab => {
+                app.focus_prev();
+            }
             KeyCode::Enter => {
                 app.update_find();
-                app.focus = Focus::Preview;
+                app.focus = if app.layout_mode == LayoutMode::List {
+                    Focus::List
+                } else {
+                    Focus::Preview
+                };
             }
             KeyCode::Backspace => {
                 app.find_query.pop();
                 app.update_find();
             }
             KeyCode::Esc => {
-                app.focus = Focus::Preview;
+                app.focus = if app.layout_mode == LayoutMode::List {
+                    Focus::List
+                } else {
+                    Focus::Preview
+                };
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.find_query.push(ch);
@@ -1003,20 +1200,10 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
 
     match key.code {
         KeyCode::Tab => {
-            app.focus = match app.focus {
-                Focus::Query => Focus::Project,
-                Focus::Project => Focus::List,
-                Focus::List => Focus::Preview,
-                Focus::Preview | Focus::Find => Focus::Query,
-            };
+            app.focus_next();
         }
         KeyCode::BackTab => {
-            app.focus = match app.focus {
-                Focus::Query => Focus::Preview,
-                Focus::Project => Focus::Query,
-                Focus::List => Focus::Project,
-                Focus::Preview | Focus::Find => Focus::List,
-            };
+            app.focus_prev();
         }
         KeyCode::Up => {
             if matches!(app.focus, Focus::List) {
@@ -1044,12 +1231,29 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         }
         KeyCode::Char('h') => {
             if matches!(app.focus, Focus::Preview) {
-                app.focus = Focus::List;
+                if app.layout_mode == LayoutMode::Detail {
+                    app.return_to_list();
+                } else {
+                    app.focus = Focus::List;
+                }
             }
         }
         KeyCode::Char('l') => {
             if matches!(app.focus, Focus::List) {
-                app.focus = Focus::Preview;
+                if app.layout_mode == LayoutMode::List {
+                    app.enter_full_history();
+                } else {
+                    app.enter_preview();
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if matches!(app.focus, Focus::List) {
+                if app.layout_mode == LayoutMode::List {
+                    app.enter_full_history();
+                } else {
+                    app.enter_preview();
+                }
             }
         }
         KeyCode::PageDown => {
@@ -1070,6 +1274,14 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         }
         KeyCode::Char('m') => {
             app.toggle_preview_mode();
+        }
+        KeyCode::Char('v') => {
+            app.toggle_layout_mode();
+        }
+        KeyCode::Char(' ') => {
+            if app.layout_mode == LayoutMode::List && matches!(app.focus, Focus::List) {
+                app.toggle_quick_popup();
+            }
         }
         KeyCode::Char('t') => {
             app.toggle_tools();
@@ -1141,6 +1353,9 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
         draw_query_bar(frame, app, &theme, root[1]);
     }
     draw_footer(frame, app, &theme, root[2]);
+    if app.quick_popup {
+        draw_quick_popup(frame, app, &theme, app.body_area);
+    }
 }
 
 fn draw_query_bar(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
@@ -1210,6 +1425,37 @@ fn draw_query_bar(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Re
 }
 
 fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
+    if app.layout_mode == LayoutMode::Detail {
+        app.list_area = Rect::default();
+        app.project_area = None;
+        app.dragging = false;
+        app.preview_area = draw_preview_panel(frame, app, theme, area);
+        return;
+    }
+
+    if app.layout_mode == LayoutMode::List {
+        app.preview_area = Rect::default();
+        app.dragging = false;
+        let mut project_area = None;
+        let mut sessions_area = area;
+        if matches!(app.focus, Focus::Project) {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(PROJECT_PANEL_HEIGHT), Constraint::Min(5)])
+                .split(area);
+            project_area = Some(chunks[0]);
+            sessions_area = chunks[1];
+        }
+        if let Some(project_area) = project_area {
+            let content_area = draw_project_panel(frame, app, theme, project_area);
+            app.project_area = Some(content_area);
+        } else {
+            app.project_area = None;
+        }
+        app.list_area = draw_sessions_panel(frame, app, theme, sessions_area);
+        return;
+    }
+
     let min_left = 20u16;
     let min_right = 24u16;
     let total = area.width.max(min_left + min_right + SPLIT_GAP);
@@ -1260,7 +1506,12 @@ fn draw_sessions_panel(
     area: Rect,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel), area);
-    let inner = inset(area, PANEL_PAD_X, PANEL_SPLIT_PAD_X, 0, 0);
+    let right_pad = if app.layout_mode == LayoutMode::Split {
+        PANEL_SPLIT_PAD_X
+    } else {
+        PANEL_PAD_X
+    };
+    let inner = inset(area, PANEL_PAD_X, right_pad, 0, 0);
     let header = Rect {
         x: inner.x,
         y: inner.y,
@@ -1273,7 +1524,12 @@ fn draw_sessions_panel(
         width: inner.width,
         height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
     };
-    let title = Paragraph::new(Line::from(Span::styled("Sessions", theme.text_bold)));
+    let title_style = if matches!(app.focus, Focus::List) {
+        theme.focus
+    } else {
+        theme.text_bold
+    };
+    let title = Paragraph::new(Line::from(Span::styled("Sessions", title_style)));
     frame.render_widget(title, header);
 
     let list_items: Vec<ListItem> = if app.results.is_empty() {
@@ -1318,7 +1574,7 @@ fn draw_project_panel(
     area: Rect,
 ) -> Rect {
     frame.render_widget(Block::default().style(theme.panel_alt), area);
-    let inner = panel_inner_before_split(area);
+    let inner = panel_inner_before_split(area, app.layout_mode == LayoutMode::Split);
     let header = Rect {
         x: inner.x,
         y: inner.y,
@@ -1331,7 +1587,12 @@ fn draw_project_panel(
         width: inner.width,
         height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
     };
-    let title = Paragraph::new(Line::from(Span::styled("Projects", theme.text_bold)));
+    let title_style = if matches!(app.focus, Focus::Project) {
+        theme.focus
+    } else {
+        theme.text_bold
+    };
+    let title = Paragraph::new(Line::from(Span::styled("Projects", title_style)));
     frame.render_widget(title, header);
 
     let project_items: Vec<ListItem> = if app.project_options.is_empty() {
@@ -1384,7 +1645,12 @@ fn draw_preview_panel(
         PreviewMode::Matches => "Preview · Matches",
         PreviewMode::History => "Preview · History",
     };
-    let title = Paragraph::new(Line::from(Span::styled(detail_title, theme.text_bold)));
+    let title_style = if matches!(app.focus, Focus::Preview | Focus::Find) {
+        theme.focus
+    } else {
+        theme.text_bold
+    };
+    let title = Paragraph::new(Line::from(Span::styled(detail_title, title_style)));
     frame.render_widget(title, header);
     let view_height = content.height as usize;
     let start = app.detail_scroll.min(app.detail_lines.len());
@@ -1404,43 +1670,61 @@ fn draw_preview_panel(
     content
 }
 
+fn draw_quick_popup(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) -> Rect {
+    let popup = quick_popup_area(area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(theme.panel_alt), popup);
+
+    let inner = panel_inner(popup);
+    let header = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: PANEL_TITLE_HEIGHT.min(inner.height),
+    };
+    let content = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(PANEL_TITLE_HEIGHT),
+        width: inner.width,
+        height: inner.height.saturating_sub(PANEL_TITLE_HEIGHT),
+    };
+
+    let title = Line::from(vec![
+        Span::styled("Quick matches", theme.text_bold),
+        Span::styled("  enter history  esc close", theme.muted),
+    ]);
+    frame.render_widget(Paragraph::new(title), header);
+
+    let view_height = content.height as usize;
+    let start = app.quick_scroll.min(app.quick_lines.len());
+    let end = if view_height == 0 {
+        start
+    } else {
+        (start + view_height).min(app.quick_lines.len())
+    };
+    let visible_lines: Vec<Line> = app.quick_lines[start..end]
+        .iter()
+        .map(|line| render_preview_line(line, theme))
+        .collect();
+    let detail = Paragraph::new(visible_lines)
+        .style(theme.text)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(detail, content);
+    content
+}
+
 fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
     frame.render_widget(Block::default().style(theme.panel), area);
     let inner = inset(area, PANEL_PAD_X, PANEL_PAD_X, 0, 0);
 
-    // Shortcuts on the left. The right side rests on the preview mode and only
-    // surfaces an activity indicator while something is actually happening.
-    let tools_hint = if app.show_tools {
-        " tools:on  "
-    } else {
-        " tools:off  "
-    };
-    let shortcuts = Line::from(vec![
-        Span::styled("tab", theme.accent),
-        Span::styled(" focus  ", theme.muted),
-        Span::styled("/", theme.accent),
-        Span::styled(" query  ", theme.muted),
-        Span::styled("f", theme.accent),
-        Span::styled(" find  ", theme.muted),
-        Span::styled("p", theme.accent),
-        Span::styled(" project  ", theme.muted),
-        Span::styled("s", theme.accent),
-        Span::styled(" source  ", theme.muted),
-        Span::styled("m", theme.accent),
-        Span::styled(" mode  ", theme.muted),
-        Span::styled("t", theme.accent),
-        Span::styled(tools_hint, theme.muted),
-        Span::styled("r", theme.accent),
-        Span::styled(" resume  ", theme.muted),
-        Span::styled("S", theme.accent),
-        Span::styled(" share  ", theme.muted),
-        Span::styled("esc", theme.accent),
-        Span::styled(" quit", theme.muted),
-    ]);
-
     let mode = match app.preview_mode {
         PreviewMode::Matches => "matches",
         PreviewMode::History => "history",
+    };
+    let view = match app.layout_mode {
+        LayoutMode::Split => "split",
+        LayoutMode::List => "list",
+        LayoutMode::Detail => "detail",
     };
     let mut right_spans = Vec::new();
     if !app.status.is_empty() {
@@ -1455,10 +1739,15 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
+    right_spans.push(Span::styled("view ", theme.muted));
+    right_spans.push(Span::styled(view, theme.text));
+    right_spans.push(Span::raw("   "));
     right_spans.push(Span::styled("mode ", theme.muted));
     right_spans.push(Span::styled(mode, theme.text));
     let right = Line::from(right_spans);
     let right_width = right.width() as u16;
+    let shortcut_width = inner.width.saturating_sub(right_width);
+    let shortcuts = footer_shortcuts(app, theme, shortcut_width);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -1467,6 +1756,131 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
 
     frame.render_widget(Paragraph::new(shortcuts), cols[0]);
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), cols[1]);
+}
+
+fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
+    if app.layout_mode == LayoutMode::Detail {
+        return Line::from(vec![
+            Span::styled("h", theme.accent),
+            Span::styled(" list  ", theme.muted),
+            Span::styled("j/k", theme.accent),
+            Span::styled(" scroll  ", theme.muted),
+            Span::styled("f", theme.accent),
+            Span::styled(" find  ", theme.muted),
+            Span::styled("t", theme.accent),
+            Span::styled(
+                if app.show_tools {
+                    " tools:on"
+                } else {
+                    " tools:off"
+                },
+                theme.muted,
+            ),
+        ]);
+    }
+
+    let tools_hint = if app.show_tools {
+        " tools:on  "
+    } else {
+        " tools:off  "
+    };
+
+    if app.layout_mode == LayoutMode::Split {
+        if width >= 110 {
+            return Line::from(vec![
+                Span::styled("tab", theme.accent),
+                Span::styled(" focus  ", theme.muted),
+                Span::styled("/", theme.accent),
+                Span::styled(" query  ", theme.muted),
+                Span::styled("f", theme.accent),
+                Span::styled(" find  ", theme.muted),
+                Span::styled("p", theme.accent),
+                Span::styled(" project  ", theme.muted),
+                Span::styled("s", theme.accent),
+                Span::styled(" source  ", theme.muted),
+                Span::styled("m", theme.accent),
+                Span::styled(" mode  ", theme.muted),
+                Span::styled("v", theme.accent),
+                Span::styled(" list  ", theme.muted),
+                Span::styled("t", theme.accent),
+                Span::styled(tools_hint, theme.muted),
+                Span::styled("r", theme.accent),
+                Span::styled(" resume  ", theme.muted),
+                Span::styled("S", theme.accent),
+                Span::styled(" share", theme.muted),
+            ]);
+        }
+
+        return Line::from(vec![
+            Span::styled("tab", theme.accent),
+            Span::styled(" focus  ", theme.muted),
+            Span::styled("/", theme.accent),
+            Span::styled(" query  ", theme.muted),
+            Span::styled("v", theme.accent),
+            Span::styled(" list  ", theme.muted),
+            Span::styled("r", theme.accent),
+            Span::styled(" resume", theme.muted),
+        ]);
+    }
+
+    if width >= 130 {
+        return Line::from(vec![
+            Span::styled("tab", theme.accent),
+            Span::styled(" focus  ", theme.muted),
+            Span::styled("/", theme.accent),
+            Span::styled(" query  ", theme.muted),
+            Span::styled("f", theme.accent),
+            Span::styled(" find  ", theme.muted),
+            Span::styled("p", theme.accent),
+            Span::styled(" project  ", theme.muted),
+            Span::styled("s", theme.accent),
+            Span::styled(" source  ", theme.muted),
+            Span::styled("m", theme.accent),
+            Span::styled(" mode  ", theme.muted),
+            Span::styled("v", theme.accent),
+            Span::styled(" view  ", theme.muted),
+            Span::styled("space", theme.accent),
+            Span::styled(" peek  ", theme.muted),
+            Span::styled("enter", theme.accent),
+            Span::styled(" history  ", theme.muted),
+            Span::styled("t", theme.accent),
+            Span::styled(tools_hint, theme.muted),
+            Span::styled("r", theme.accent),
+            Span::styled(" resume  ", theme.muted),
+            Span::styled("S", theme.accent),
+            Span::styled(" share", theme.muted),
+        ]);
+    }
+
+    if width >= 90 {
+        return Line::from(vec![
+            Span::styled("tab", theme.accent),
+            Span::styled(" focus  ", theme.muted),
+            Span::styled("/", theme.accent),
+            Span::styled(" query  ", theme.muted),
+            Span::styled("v", theme.accent),
+            Span::styled(" view  ", theme.muted),
+            Span::styled("space", theme.accent),
+            Span::styled(" peek  ", theme.muted),
+            Span::styled("enter", theme.accent),
+            Span::styled(" history  ", theme.muted),
+            Span::styled("r", theme.accent),
+            Span::styled(" resume", theme.muted),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("tab", theme.accent),
+        Span::styled(" focus  ", theme.muted),
+        Span::styled("/", theme.accent),
+        Span::styled(" query  ", theme.muted),
+        Span::styled("v", theme.accent),
+        Span::styled(" view  ", theme.muted),
+        Span::styled("sp", theme.accent),
+        Span::styled(" peek  ", theme.muted),
+        Span::styled("enter", theme.accent),
+        Span::styled(" history", theme.muted),
+    ])
 }
 
 fn sessions_from_query(
@@ -1921,11 +2335,12 @@ fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool)
         ts,
         highlight,
     });
-    let text = if record.text.len() > MAX_MESSAGE_CHARS {
-        let trimmed = summarize(&record.text, MAX_MESSAGE_CHARS);
+    let preview_text = record_preview_text(record);
+    let text = if preview_text.len() > MAX_MESSAGE_CHARS {
+        let trimmed = summarize(&preview_text, MAX_MESSAGE_CHARS);
         format!("{trimmed} …")
     } else {
-        record.text.clone()
+        preview_text
     };
     let sanitized = sanitize_preview_lines(&text);
     if sanitized.is_empty() {
@@ -1940,6 +2355,24 @@ fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool)
 
 fn sanitize_preview_lines(text: &str) -> Vec<String> {
     text.split('\n').map(strip_ansi_and_controls).collect()
+}
+
+fn record_preview_text(record: &Record) -> String {
+    if is_tool_role(&record.role)
+        && let Some(pretty) = pretty_json_text(&record.text)
+    {
+        return pretty;
+    }
+    record.text.clone()
+}
+
+fn pretty_json_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    serde_json::to_string_pretty(&value).ok()
 }
 
 fn role_color(role: &str) -> Color {
@@ -2123,7 +2556,9 @@ fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result
 fn handle_mouse(mouse: MouseEvent, app: &mut App) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if near_divider(mouse.column, app.body_area, app.left_width.unwrap_or(0)) {
+            if app.layout_mode == LayoutMode::Split
+                && near_divider(mouse.column, app.body_area, app.left_width.unwrap_or(0))
+            {
                 app.dragging = true;
                 return;
             }
@@ -2147,11 +2582,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
                     app.project_selected = idx;
                 }
             } else if app.querybar_area.contains(pos) {
-                app.focus = Focus::Query;
+                app.focus = query_bar_focus_from_mouse(app, mouse.column);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if app.dragging {
+            if app.dragging && app.layout_mode == LayoutMode::Split {
                 resize_split(mouse.column, app);
             }
         }
@@ -2221,14 +2656,99 @@ fn inset(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
     }
 }
 
-fn panel_inner_before_split(area: Rect) -> Rect {
-    inset(
-        area,
-        PANEL_PAD_X,
-        PANEL_SPLIT_PAD_X,
-        PANEL_PAD_Y,
-        PANEL_PAD_Y,
-    )
+fn query_bar_focus_from_mouse(app: &App, x: u16) -> Focus {
+    let mut field_x = app.querybar_area.x.saturating_add(PANEL_PAD_X);
+    for (focus, width) in [
+        (
+            Focus::Query,
+            query_bar_field_width(
+                "query",
+                &app.query,
+                "<empty>",
+                matches!(app.focus, Focus::Query),
+            ),
+        ),
+        (
+            Focus::Project,
+            query_bar_field_width(
+                "project",
+                &app.project,
+                "<any>",
+                matches!(app.focus, Focus::Project),
+            ),
+        ),
+        (
+            Focus::Find,
+            query_bar_field_width(
+                "find",
+                &app.find_query,
+                "<none>",
+                matches!(app.focus, Focus::Find),
+            ),
+        ),
+    ] {
+        let field_end = field_x.saturating_add(width);
+        if x >= field_x && x < field_end {
+            return focus;
+        }
+        field_x = field_end.saturating_add(3);
+    }
+    Focus::Query
+}
+
+fn query_bar_field_width(label: &str, value: &str, placeholder: &str, active: bool) -> u16 {
+    let value_width = if active {
+        value.chars().count().saturating_add(1)
+    } else if value.is_empty() {
+        placeholder.chars().count()
+    } else {
+        value.chars().count()
+    };
+    label
+        .chars()
+        .count()
+        .saturating_add(1)
+        .saturating_add(value_width)
+        .try_into()
+        .unwrap_or(u16::MAX)
+}
+
+fn panel_inner(area: Rect) -> Rect {
+    inset(area, PANEL_PAD_X, PANEL_PAD_X, PANEL_PAD_Y, PANEL_PAD_Y)
+}
+
+fn quick_popup_area(area: Rect) -> Rect {
+    let width = area
+        .width
+        .saturating_mul(4)
+        .saturating_div(5)
+        .clamp(40, 100);
+    let height = area
+        .height
+        .saturating_mul(3)
+        .saturating_div(5)
+        .clamp(10, 30);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}
+
+fn quick_popup_content_height(area: Rect) -> u16 {
+    let popup = quick_popup_area(area);
+    let inner = panel_inner(popup);
+    inner.height.saturating_sub(PANEL_TITLE_HEIGHT)
+}
+
+fn panel_inner_before_split(area: Rect, compact: bool) -> Rect {
+    let right_pad = if compact {
+        PANEL_SPLIT_PAD_X
+    } else {
+        PANEL_PAD_X
+    };
+    inset(area, PANEL_PAD_X, right_pad, PANEL_PAD_Y, PANEL_PAD_Y)
 }
 
 fn panel_inner_after_split(area: Rect) -> Rect {
@@ -2314,4 +2834,57 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
         }
     }
     workspace
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{RecordLinks, SourceKind};
+
+    fn record(role: &str, text: &str) -> Record {
+        Record {
+            source: SourceKind::CodexSession,
+            doc_id: 1,
+            ts: 0,
+            project: "project".to_string(),
+            session_id: "session".to_string(),
+            turn_id: 1,
+            role: role.to_string(),
+            text: text.to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks::default(),
+            source_path: "source.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn record_preview_text_pretty_prints_tool_json() {
+        let record = record(
+            "tool_use",
+            r#"{"cmd":"pwd && rg --files","workdir":"/tmp/app","yield_time_ms":1000}"#,
+        );
+
+        assert_eq!(
+            record_preview_text(&record),
+            "{\n  \"cmd\": \"pwd && rg --files\",\n  \"workdir\": \"/tmp/app\",\n  \"yield_time_ms\": 1000\n}"
+        );
+    }
+
+    #[test]
+    fn record_preview_text_leaves_non_tool_json_unchanged() {
+        let text = r#"{"content":"not a tool call"}"#;
+        let record = record("assistant", text);
+
+        assert_eq!(record_preview_text(&record), text);
+    }
+
+    #[test]
+    fn record_preview_text_leaves_invalid_tool_json_unchanged() {
+        let text = r#"{"cmd":"unterminated"#;
+        let record = record("tool_use", text);
+
+        assert_eq!(record_preview_text(&record), text);
+    }
 }
