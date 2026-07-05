@@ -779,6 +779,7 @@ impl App {
     }
 
     fn toggle_quick_popup(&mut self) {
+        self.preview_mode = PreviewMode::Matches;
         self.update_detail();
         self.quick_popup = !self.quick_popup;
         self.quick_scroll = 0;
