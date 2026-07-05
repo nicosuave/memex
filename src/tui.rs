@@ -992,6 +992,15 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('d')
+        )
+    {
+        return Ok(true);
+    }
+
     if app.quick_popup {
         match key.code {
             KeyCode::Esc | KeyCode::Char(' ') => {
@@ -1018,9 +1027,6 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
     }
 
     if matches!(key.code, KeyCode::Esc) {
-        if matches!(app.focus, Focus::List) {
-            return Ok(true);
-        }
         if matches!(app.focus, Focus::Find) {
             app.focus = if app.layout_mode == LayoutMode::List {
                 Focus::List
@@ -1031,15 +1037,6 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.focus = Focus::List;
         }
         return Ok(false);
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(
-            key.code,
-            KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('d')
-        )
-    {
-        return Ok(true);
     }
 
     if matches!(app.focus, Focus::Query | Focus::Project) {
@@ -1707,9 +1704,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled("r", theme.accent),
             Span::styled(" resume  ", theme.muted),
             Span::styled("S", theme.accent),
-            Span::styled(" share  ", theme.muted),
-            Span::styled("esc", theme.accent),
-            Span::styled(" quit", theme.muted),
+            Span::styled(" share", theme.muted),
         ]);
     }
 
@@ -1726,9 +1721,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled("enter", theme.accent),
             Span::styled(" full  ", theme.muted),
             Span::styled("r", theme.accent),
-            Span::styled(" resume  ", theme.muted),
-            Span::styled("esc", theme.accent),
-            Span::styled(" quit", theme.muted),
+            Span::styled(" resume", theme.muted),
         ]);
     }
 
@@ -1742,9 +1735,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
         Span::styled("sp", theme.accent),
         Span::styled(" peek  ", theme.muted),
         Span::styled("enter", theme.accent),
-        Span::styled(" full  ", theme.muted),
-        Span::styled("esc", theme.accent),
-        Span::styled(" quit", theme.muted),
+        Span::styled(" full", theme.muted),
     ])
 }
 
