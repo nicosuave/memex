@@ -123,6 +123,7 @@ enum PreviewMode {
 enum LayoutMode {
     Split,
     List,
+    Detail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -707,30 +708,38 @@ impl App {
     }
 
     fn focus_next(&mut self) {
-        self.focus = if self.layout_mode == LayoutMode::List {
-            match self.focus {
+        self.focus = match self.layout_mode {
+            LayoutMode::Split => self.focus.next(),
+            LayoutMode::List => match self.focus {
                 Focus::Query => Focus::Project,
                 Focus::Project => Focus::List,
-                Focus::List => Focus::Find,
+                Focus::List | Focus::Preview => Focus::Find,
+                Focus::Find => Focus::Query,
+            },
+            LayoutMode::Detail => match self.focus {
                 Focus::Preview => Focus::Find,
                 Focus::Find => Focus::Query,
-            }
-        } else {
-            self.focus.next()
+                Focus::Query => Focus::Preview,
+                Focus::Project | Focus::List => Focus::Preview,
+            },
         };
     }
 
     fn focus_prev(&mut self) {
-        self.focus = if self.layout_mode == LayoutMode::List {
-            match self.focus {
+        self.focus = match self.layout_mode {
+            LayoutMode::Split => self.focus.prev(),
+            LayoutMode::List => match self.focus {
                 Focus::Query => Focus::Find,
                 Focus::Project => Focus::Query,
-                Focus::List => Focus::Project,
-                Focus::Preview => Focus::List,
+                Focus::List | Focus::Preview => Focus::Project,
                 Focus::Find => Focus::List,
-            }
-        } else {
-            self.focus.prev()
+            },
+            LayoutMode::Detail => match self.focus {
+                Focus::Preview => Focus::Query,
+                Focus::Find => Focus::Preview,
+                Focus::Query => Focus::Find,
+                Focus::Project | Focus::List => Focus::Preview,
+            },
         };
     }
 
@@ -769,7 +778,7 @@ impl App {
                 self.quick_popup = false;
                 LayoutMode::List
             }
-            LayoutMode::List => LayoutMode::Split,
+            LayoutMode::List | LayoutMode::Detail => LayoutMode::Split,
         };
     }
 
@@ -783,6 +792,21 @@ impl App {
         self.layout_mode = LayoutMode::Split;
         self.quick_popup = false;
         self.focus = Focus::Preview;
+    }
+
+    fn enter_full_history(&mut self) {
+        self.layout_mode = LayoutMode::Detail;
+        self.quick_popup = false;
+        self.preview_mode = PreviewMode::History;
+        self.focus = Focus::Preview;
+        self.last_detail_session = None;
+        self.update_detail();
+    }
+
+    fn return_to_list(&mut self) {
+        self.layout_mode = LayoutMode::List;
+        self.quick_popup = false;
+        self.focus = Focus::List;
     }
 
     fn update_find(&mut self) {
@@ -1007,7 +1031,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.quick_popup = false;
             }
             KeyCode::Enter | KeyCode::Char('l') => {
-                app.enter_preview();
+                app.enter_full_history();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.scroll_quick_popup(-1);
@@ -1027,7 +1051,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
     }
 
     if matches!(key.code, KeyCode::Esc) {
-        if matches!(app.focus, Focus::Find) {
+        if app.layout_mode == LayoutMode::Detail && !matches!(app.focus, Focus::Find) {
+            app.return_to_list();
+        } else if matches!(app.focus, Focus::Find) {
             app.focus = if app.layout_mode == LayoutMode::List {
                 Focus::List
             } else {
@@ -1166,17 +1192,29 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         }
         KeyCode::Char('h') => {
             if matches!(app.focus, Focus::Preview) {
-                app.focus = Focus::List;
+                if app.layout_mode == LayoutMode::Detail {
+                    app.return_to_list();
+                } else {
+                    app.focus = Focus::List;
+                }
             }
         }
         KeyCode::Char('l') => {
             if matches!(app.focus, Focus::List) {
-                app.enter_preview();
+                if app.layout_mode == LayoutMode::List {
+                    app.enter_full_history();
+                } else {
+                    app.enter_preview();
+                }
             }
         }
         KeyCode::Enter => {
             if matches!(app.focus, Focus::List) {
-                app.enter_preview();
+                if app.layout_mode == LayoutMode::List {
+                    app.enter_full_history();
+                } else {
+                    app.enter_preview();
+                }
             }
         }
         KeyCode::PageDown => {
@@ -1202,7 +1240,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.toggle_layout_mode();
         }
         KeyCode::Char(' ') => {
-            if matches!(app.focus, Focus::List) {
+            if app.layout_mode == LayoutMode::List && matches!(app.focus, Focus::List) {
                 app.toggle_quick_popup();
             }
         }
@@ -1348,6 +1386,14 @@ fn draw_query_bar(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Re
 }
 
 fn draw_body(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
+    if app.layout_mode == LayoutMode::Detail {
+        app.list_area = Rect::default();
+        app.project_area = None;
+        app.dragging = false;
+        app.preview_area = draw_preview_panel(frame, app, theme, area);
+        return;
+    }
+
     if app.layout_mode == LayoutMode::List {
         app.preview_area = Rect::default();
         app.dragging = false;
@@ -1606,7 +1652,7 @@ fn draw_quick_popup(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, ar
 
     let title = Line::from(vec![
         Span::styled("Quick matches", theme.text_bold),
-        Span::styled("  enter full  esc close", theme.muted),
+        Span::styled("  enter history  esc close", theme.muted),
     ]);
     frame.render_widget(Paragraph::new(title), header);
 
@@ -1639,6 +1685,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     let view = match app.layout_mode {
         LayoutMode::Split => "split",
         LayoutMode::List => "list",
+        LayoutMode::Detail => "detail",
     };
     let mut right_spans = Vec::new();
     if !app.status.is_empty() {
@@ -1673,11 +1720,69 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
 }
 
 fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
+    if app.layout_mode == LayoutMode::Detail {
+        return Line::from(vec![
+            Span::styled("h", theme.accent),
+            Span::styled(" list  ", theme.muted),
+            Span::styled("j/k", theme.accent),
+            Span::styled(" scroll  ", theme.muted),
+            Span::styled("f", theme.accent),
+            Span::styled(" find  ", theme.muted),
+            Span::styled("t", theme.accent),
+            Span::styled(
+                if app.show_tools {
+                    " tools:on"
+                } else {
+                    " tools:off"
+                },
+                theme.muted,
+            ),
+        ]);
+    }
+
     let tools_hint = if app.show_tools {
         " tools:on  "
     } else {
         " tools:off  "
     };
+
+    if app.layout_mode == LayoutMode::Split {
+        if width >= 110 {
+            return Line::from(vec![
+                Span::styled("tab", theme.accent),
+                Span::styled(" focus  ", theme.muted),
+                Span::styled("/", theme.accent),
+                Span::styled(" query  ", theme.muted),
+                Span::styled("f", theme.accent),
+                Span::styled(" find  ", theme.muted),
+                Span::styled("p", theme.accent),
+                Span::styled(" project  ", theme.muted),
+                Span::styled("s", theme.accent),
+                Span::styled(" source  ", theme.muted),
+                Span::styled("m", theme.accent),
+                Span::styled(" mode  ", theme.muted),
+                Span::styled("v", theme.accent),
+                Span::styled(" list  ", theme.muted),
+                Span::styled("t", theme.accent),
+                Span::styled(tools_hint, theme.muted),
+                Span::styled("r", theme.accent),
+                Span::styled(" resume  ", theme.muted),
+                Span::styled("S", theme.accent),
+                Span::styled(" share", theme.muted),
+            ]);
+        }
+
+        return Line::from(vec![
+            Span::styled("tab", theme.accent),
+            Span::styled(" focus  ", theme.muted),
+            Span::styled("/", theme.accent),
+            Span::styled(" query  ", theme.muted),
+            Span::styled("v", theme.accent),
+            Span::styled(" list  ", theme.muted),
+            Span::styled("r", theme.accent),
+            Span::styled(" resume", theme.muted),
+        ]);
+    }
 
     if width >= 130 {
         return Line::from(vec![
@@ -1698,7 +1803,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled("space", theme.accent),
             Span::styled(" peek  ", theme.muted),
             Span::styled("enter", theme.accent),
-            Span::styled(" full  ", theme.muted),
+            Span::styled(" history  ", theme.muted),
             Span::styled("t", theme.accent),
             Span::styled(tools_hint, theme.muted),
             Span::styled("r", theme.accent),
@@ -1719,7 +1824,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled("space", theme.accent),
             Span::styled(" peek  ", theme.muted),
             Span::styled("enter", theme.accent),
-            Span::styled(" full  ", theme.muted),
+            Span::styled(" history  ", theme.muted),
             Span::styled("r", theme.accent),
             Span::styled(" resume", theme.muted),
         ]);
@@ -1735,7 +1840,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
         Span::styled("sp", theme.accent),
         Span::styled(" peek  ", theme.muted),
         Span::styled("enter", theme.accent),
-        Span::styled(" full", theme.muted),
+        Span::styled(" history", theme.muted),
     ])
 }
 
@@ -2191,11 +2296,12 @@ fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool)
         ts,
         highlight,
     });
-    let text = if record.text.len() > MAX_MESSAGE_CHARS {
-        let trimmed = summarize(&record.text, MAX_MESSAGE_CHARS);
+    let preview_text = record_preview_text(record);
+    let text = if preview_text.len() > MAX_MESSAGE_CHARS {
+        let trimmed = summarize(&preview_text, MAX_MESSAGE_CHARS);
         format!("{trimmed} …")
     } else {
-        record.text.clone()
+        preview_text
     };
     let sanitized = sanitize_preview_lines(&text);
     if sanitized.is_empty() {
@@ -2210,6 +2316,24 @@ fn append_record(lines: &mut Vec<PreviewLine>, record: &Record, highlight: bool)
 
 fn sanitize_preview_lines(text: &str) -> Vec<String> {
     text.split('\n').map(strip_ansi_and_controls).collect()
+}
+
+fn record_preview_text(record: &Record) -> String {
+    if is_tool_role(&record.role)
+        && let Some(pretty) = pretty_json_text(&record.text)
+    {
+        return pretty;
+    }
+    record.text.clone()
+}
+
+fn pretty_json_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    serde_json::to_string_pretty(&value).ok()
 }
 
 fn role_color(role: &str) -> Color {
@@ -2671,4 +2795,57 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
         }
     }
     workspace
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{RecordLinks, SourceKind};
+
+    fn record(role: &str, text: &str) -> Record {
+        Record {
+            source: SourceKind::CodexSession,
+            doc_id: 1,
+            ts: 0,
+            project: "project".to_string(),
+            session_id: "session".to_string(),
+            turn_id: 1,
+            role: role.to_string(),
+            text: text.to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks::default(),
+            source_path: "source.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn record_preview_text_pretty_prints_tool_json() {
+        let record = record(
+            "tool_use",
+            r#"{"cmd":"pwd && rg --files","workdir":"/tmp/app","yield_time_ms":1000}"#,
+        );
+
+        assert_eq!(
+            record_preview_text(&record),
+            "{\n  \"cmd\": \"pwd && rg --files\",\n  \"workdir\": \"/tmp/app\",\n  \"yield_time_ms\": 1000\n}"
+        );
+    }
+
+    #[test]
+    fn record_preview_text_leaves_non_tool_json_unchanged() {
+        let text = r#"{"content":"not a tool call"}"#;
+        let record = record("assistant", text);
+
+        assert_eq!(record_preview_text(&record), text);
+    }
+
+    #[test]
+    fn record_preview_text_leaves_invalid_tool_json_unchanged() {
+        let text = r#"{"cmd":"unterminated"#;
+        let record = record("tool_use", text);
+
+        assert_eq!(record_preview_text(&record), text);
+    }
 }
