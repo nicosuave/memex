@@ -718,9 +718,7 @@ impl App {
             },
             LayoutMode::Detail => match self.focus {
                 Focus::Preview => Focus::Find,
-                Focus::Find => Focus::Query,
-                Focus::Query => Focus::Preview,
-                Focus::Project | Focus::List => Focus::Preview,
+                Focus::Find | Focus::Query | Focus::Project | Focus::List => Focus::Preview,
             },
         };
     }
@@ -735,10 +733,8 @@ impl App {
                 Focus::Find => Focus::List,
             },
             LayoutMode::Detail => match self.focus {
-                Focus::Preview => Focus::Query,
+                Focus::Preview | Focus::Query | Focus::Project | Focus::List => Focus::Find,
                 Focus::Find => Focus::Preview,
-                Focus::Query => Focus::Find,
-                Focus::Project | Focus::List => Focus::Preview,
             },
         };
     }
@@ -1082,7 +1078,11 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.set_status("searching...");
                 terminal.draw(|f| draw_ui(f, app))?;
                 app.refresh_results();
-                app.focus = Focus::List;
+                app.focus = if app.layout_mode == LayoutMode::Detail {
+                    Focus::Preview
+                } else {
+                    Focus::List
+                };
             }
             KeyCode::Backspace => match app.focus {
                 Focus::Query => {
