@@ -2185,10 +2185,6 @@ fn inset(area: Rect, left: u16, right: u16, top: u16, bottom: u16) -> Rect {
     }
 }
 
-fn panel_inner(area: Rect) -> Rect {
-    inset(area, PANEL_PAD_X, PANEL_PAD_X, PANEL_PAD_Y, PANEL_PAD_Y)
-}
-
 fn panel_inner_before_split(area: Rect) -> Rect {
     inset(
         area,
