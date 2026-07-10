@@ -7,7 +7,7 @@ use crate::state::{FileState, IngestState, ScanCache};
 use crate::types::{Record, RecordLinks, SourceKind};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use memchr::memchr;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -23,6 +23,8 @@ use walkdir::WalkDir;
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
 const INDEX_PROGRESS_BATCH: u64 = 1;
+// Keep a small amount of parser/writer overlap without retaining an unbounded transcript backlog.
+const RECORD_CHANNEL_CAPACITY: usize = 8;
 const CURSOR_SUBAGENT_TURN_BASE: u32 = 1_000_000_000;
 const CURSOR_SUBAGENT_TURN_STRIDE: u32 = 50_000;
 const CURSOR_SUBAGENT_TURN_BUCKETS: u32 = 65_536;
@@ -76,6 +78,10 @@ struct WriterContext {
     progress: Arc<Progress>,
     model: ModelChoice,
     embed_runtime: EmbedRuntimeConfig,
+}
+
+fn record_channel() -> (Sender<Record>, Receiver<Record>) {
+    bounded(RECORD_CHANNEL_CAPACITY)
 }
 
 /// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.
@@ -449,7 +455,7 @@ pub fn ingest_all(
 
     let progress = Arc::new(Progress::new(totals, file_totals, options.embeddings));
 
-    let (tx_record, rx_record) = unbounded::<Record>();
+    let (tx_record, rx_record) = record_channel();
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
     let delete_paths: Vec<String> = tasks
@@ -3406,6 +3412,23 @@ mod tests {
             links: RecordLinks::default(),
             source_path: format!("source-{doc_id}.jsonl"),
         }
+    }
+
+    #[test]
+    fn record_channel_applies_backpressure_at_capacity() {
+        let (tx_record, _rx_record) = record_channel();
+        for doc_id in 0..RECORD_CHANNEL_CAPACITY {
+            tx_record
+                .try_send(record(doc_id as u64, "assistant", "text"))
+                .expect("record within channel capacity");
+        }
+
+        let result =
+            tx_record.try_send(record(RECORD_CHANNEL_CAPACITY as u64, "assistant", "text"));
+        assert!(matches!(
+            result,
+            Err(crossbeam_channel::TrySendError::Full(_))
+        ));
     }
 
     fn fresh_scan_cache() -> ScanCache {
