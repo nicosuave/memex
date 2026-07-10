@@ -284,6 +284,8 @@ cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library 
 cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional list of cuDNN library dirs
 compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
 scan_cache_ttl = 3600  # seconds (default 1 hour)
+max_indexed_tool_input_bytes = 65536  # 64 KiB default
+max_indexed_tool_output_bytes = 262144  # 256 KiB default
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
@@ -300,6 +302,10 @@ pi_resume_cmd = "pi --session {source_path_shell}"
 Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
+`max_indexed_tool_*_bytes` limits oversized tool payloads while leaving user and assistant text
+unchanged. memex keeps roughly the first three quarters and final quarter, with a marker reporting
+the omitted middle. Each value must be at least 1024 bytes. Run `memex index --reindex` to apply
+new limits to records that are already indexed.
 `execution_provider` applies to ONNX-backed models; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.

@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index};
-use crate::config::Paths;
+use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::progress::{Progress, SOURCE_COUNT};
@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
+const RETAINED_HEAD_PERCENT: usize = 75;
 const INDEX_PROGRESS_BATCH: u64 = 1;
 // Keep a small amount of parser/writer overlap without retaining an unbounded transcript backlog.
 const RECORD_CHANNEL_CAPACITY: usize = 8;
@@ -42,6 +43,7 @@ pub struct IngestOptions {
     pub backfill_embeddings: bool,
     pub model: ModelChoice,
     pub embed_runtime: EmbedRuntimeConfig,
+    pub tool_content_limits: IndexedToolContentLimits,
 }
 
 #[derive(Debug)]
@@ -70,6 +72,24 @@ struct FileUpdate {
     session_id: Option<String>,
 }
 
+#[derive(Clone)]
+struct RecordSender {
+    sender: Sender<Record>,
+    limits: IndexedToolContentLimits,
+}
+
+impl RecordSender {
+    fn new(sender: Sender<Record>, limits: IndexedToolContentLimits) -> Self {
+        Self { sender, limits }
+    }
+
+    fn send(&self, mut record: Record) -> Result<()> {
+        limit_record_tool_content(&mut record, self.limits);
+        self.sender.send(record)?;
+        Ok(())
+    }
+}
+
 struct WriterContext {
     embeddings: bool,
     do_backfill_embeddings: bool,
@@ -78,6 +98,7 @@ struct WriterContext {
     progress: Arc<Progress>,
     model: ModelChoice,
     embed_runtime: EmbedRuntimeConfig,
+    tool_content_limits: IndexedToolContentLimits,
 }
 
 fn record_channel() -> (Sender<Record>, Receiver<Record>) {
@@ -455,7 +476,8 @@ pub fn ingest_all(
 
     let progress = Arc::new(Progress::new(totals, file_totals, options.embeddings));
 
-    let (tx_record, rx_record) = record_channel();
+    let (raw_tx_record, rx_record) = record_channel();
+    let tx_record = RecordSender::new(raw_tx_record, options.tool_content_limits);
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
     let delete_paths: Vec<String> = tasks
@@ -473,6 +495,7 @@ pub fn ingest_all(
         progress: progress.clone(),
         model: options.model,
         embed_runtime: options.embed_runtime.clone(),
+        tool_content_limits: options.tool_content_limits,
     };
     let writer_handle =
         std::thread::spawn(move || writer_loop(writer_index, rx_record, delete_paths, writer_ctx));
@@ -630,6 +653,7 @@ fn writer_loop(
         progress,
         model,
         embed_runtime,
+        tool_content_limits,
     } = ctx;
     let mut writer = index.writer()?;
     let mut analytics = AnalyticsWriter::open(&analytics_path)?;
@@ -657,6 +681,8 @@ fn writer_loop(
     }
 
     for mut record in rx.iter() {
+        // Parsers apply the limit before queueing; enforce it here as a defensive boundary too.
+        limit_record_tool_content(&mut record, tool_content_limits);
         analytics.record(&record)?;
         index.add_record(&mut writer, &record)?;
         let source_idx = record.source.idx();
@@ -1223,7 +1249,7 @@ fn pi_base_links(obj: &simd_json::borrowed::Object, conversation_kind: &str) -> 
 
 fn parse_claude_file(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
@@ -1474,7 +1500,7 @@ fn parse_claude_file(
 
 fn parse_codex_session(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
@@ -1675,7 +1701,7 @@ fn parse_codex_session(
 
 fn parse_codex_history(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     session_ids: &HashSet<String>,
@@ -1770,7 +1796,7 @@ fn parse_codex_history(
 
 fn parse_opencode_file(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
@@ -1895,7 +1921,7 @@ fn parse_opencode_file(
 
 fn parse_cursor_file(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
@@ -2060,7 +2086,7 @@ fn parse_cursor_file(
 
 fn parse_pi_file(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
@@ -2486,7 +2512,7 @@ struct CopilotWorkspace {
 
 fn parse_copilot_session(
     task: &FileTask,
-    tx_record: &Sender<Record>,
+    tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
     progress: &Arc<Progress>,
@@ -3336,6 +3362,73 @@ fn truncate_for_embedding(mut text: String) -> String {
     text
 }
 
+fn limit_record_tool_content(record: &mut Record, limits: IndexedToolContentLimits) {
+    let text_limit = match record.role.as_str() {
+        "tool_use" => Some(limits.input_bytes),
+        "tool_result" => Some(limits.output_bytes),
+        _ if record.tool_output.is_some() => Some(limits.output_bytes),
+        _ if record.tool_input.is_some() => Some(limits.input_bytes),
+        _ => None,
+    };
+    if let Some(max_bytes) = text_limit {
+        truncate_for_index(&mut record.text, max_bytes);
+    }
+    if let Some(tool_input) = record.tool_input.as_mut() {
+        truncate_for_index(tool_input, limits.input_bytes);
+    }
+    if let Some(tool_output) = record.tool_output.as_mut() {
+        truncate_for_index(tool_output, limits.output_bytes);
+    }
+}
+
+fn truncate_for_index(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+
+    let original_len = text.len();
+    let mut marker = truncation_marker(original_len);
+    let (head_end, tail_start) = loop {
+        let retained_bytes = max_bytes.saturating_sub(marker.len());
+        let head_target = retained_bytes.saturating_mul(RETAINED_HEAD_PERCENT) / 100;
+        let head_end = char_boundary_at_or_before(text, head_target);
+        let tail_target = retained_bytes.saturating_sub(head_end);
+        let tail_start = char_boundary_at_or_after(text, original_len.saturating_sub(tail_target));
+        let omitted_bytes = tail_start.saturating_sub(head_end);
+        let updated_marker = truncation_marker(omitted_bytes);
+        if updated_marker.len() == marker.len() {
+            marker = updated_marker;
+            break (head_end, tail_start);
+        }
+        marker = updated_marker;
+    };
+
+    let tail = text[tail_start..].to_string();
+    text.truncate(head_end);
+    text.push_str(&marker);
+    text.push_str(&tail);
+}
+
+fn char_boundary_at_or_before(text: &str, mut position: usize) -> usize {
+    position = position.min(text.len());
+    while position > 0 && !text.is_char_boundary(position) {
+        position -= 1;
+    }
+    position
+}
+
+fn char_boundary_at_or_after(text: &str, mut position: usize) -> usize {
+    position = position.min(text.len());
+    while position < text.len() && !text.is_char_boundary(position) {
+        position += 1;
+    }
+    position
+}
+
+fn truncation_marker(omitted_bytes: usize) -> String {
+    format!("\n\n[... {omitted_bytes} bytes truncated ...]\n\n")
+}
+
 fn is_embedding_role(role: &str) -> bool {
     role == "user" || role == "assistant"
 }
@@ -3343,7 +3436,7 @@ fn is_embedding_role(role: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Paths;
+    use crate::config::{IndexedToolContentLimits, Paths};
     use crate::embed::{EmbedRuntimeConfig, ModelChoice};
     use crate::index::SearchIndex;
     use crate::test_support::{EnvVarGuard, env_lock};
@@ -3364,6 +3457,7 @@ mod tests {
             backfill_embeddings: false,
             model,
             embed_runtime: EmbedRuntimeConfig::default(),
+            tool_content_limits: IndexedToolContentLimits::default(),
         }
     }
 
@@ -3429,6 +3523,83 @@ mod tests {
             result,
             Err(crossbeam_channel::TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn record_sender_caps_tool_payloads_but_keeps_plain_text() {
+        let limits = IndexedToolContentLimits {
+            input_bytes: 1024,
+            output_bytes: 2048,
+        };
+        let plain_text = format!("plain-begin{}plain-end", "w".repeat(4096));
+        let plain = record(1, "assistant", &plain_text);
+
+        let mut tool_use = record(
+            2,
+            "tool_use",
+            &format!("input-begin{}input-end", "🦀".repeat(2048)),
+        );
+        tool_use.tool_input = Some(tool_use.text.clone());
+        let mut tool_result = record(
+            3,
+            "tool_result",
+            &format!("output-begin{}output-end", "y".repeat(4096)),
+        );
+        tool_result.tool_output = Some(tool_result.text.clone());
+        let role_only_tool_result = record(
+            4,
+            "tool_result",
+            &format!("role-output-begin{}role-output-end", "z".repeat(4096)),
+        );
+
+        let (raw_tx, rx) = unbounded();
+        let tx = RecordSender::new(raw_tx, limits);
+        tx.send(plain).expect("queue plain record");
+        tx.send(tool_use).expect("queue tool-use record");
+        tx.send(tool_result).expect("queue tool-result record");
+        tx.send(role_only_tool_result)
+            .expect("queue role-only tool-result record");
+        drop(tx);
+        let records = rx.iter().collect::<Vec<_>>();
+
+        assert_eq!(records[0].text, plain_text);
+        assert_truncated_content(
+            &records[1].text,
+            limits.input_bytes,
+            "input-begin",
+            "input-end",
+        );
+        assert_truncated_content(
+            records[1].tool_input.as_deref().expect("tool input"),
+            limits.input_bytes,
+            "input-begin",
+            "input-end",
+        );
+        assert_truncated_content(
+            &records[2].text,
+            limits.output_bytes,
+            "output-begin",
+            "output-end",
+        );
+        assert_truncated_content(
+            records[2].tool_output.as_deref().expect("tool output"),
+            limits.output_bytes,
+            "output-begin",
+            "output-end",
+        );
+        assert_truncated_content(
+            &records[3].text,
+            limits.output_bytes,
+            "role-output-begin",
+            "role-output-end",
+        );
+    }
+
+    fn assert_truncated_content(content: &str, max_bytes: usize, prefix: &str, suffix: &str) {
+        assert!(content.len() <= max_bytes);
+        assert!(content.starts_with(prefix));
+        assert!(content.contains("bytes truncated"));
+        assert!(content.ends_with(suffix));
     }
 
     fn fresh_scan_cache() -> ScanCache {
@@ -3636,6 +3807,7 @@ mod tests {
             backfill_embeddings: false,
             model: ModelChoice::default(),
             embed_runtime: EmbedRuntimeConfig::default(),
+            tool_content_limits: IndexedToolContentLimits::default(),
         };
 
         let report = ingest_all(&paths, &index, &options).expect("ingest");
@@ -4004,6 +4176,7 @@ mod tests {
             backfill_embeddings: false,
             model: ModelChoice::default(),
             embed_runtime: EmbedRuntimeConfig::default(),
+            tool_content_limits: IndexedToolContentLimits::default(),
         };
 
         let report = ingest_all(&paths, &index, &options).expect("ingest");
@@ -4105,7 +4278,8 @@ mod tests {
 "#;
         fs::write(&session_file, format!("{existing}{appended}")).expect("write pi fixture");
 
-        let (tx_record, rx_record) = unbounded();
+        let (raw_tx_record, rx_record) = unbounded();
+        let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, _rx_update) = unbounded();
         let task = FileTask {
             path: session_file,
@@ -4180,7 +4354,8 @@ mod tests {
             mtime: 0,
             delete_first: false,
         };
-        let (tx_record, rx_record) = unbounded();
+        let (raw_tx_record, rx_record) = unbounded();
+        let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
@@ -4271,6 +4446,7 @@ mod tests {
             progress,
             model: ModelChoice::default(),
             embed_runtime: EmbedRuntimeConfig::default(),
+            tool_content_limits: IndexedToolContentLimits::default(),
         };
 
         let (records_added, records_embedded) =

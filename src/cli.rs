@@ -608,6 +608,7 @@ fn run_index(
     // Model priority: CLI flag > config file > env var > default
     let model_choice = config.resolve_model(model)?;
     let embed_runtime = config.resolve_embed_runtime()?;
+    let tool_content_limits = config.indexed_tool_content_limits()?;
     let embeddings = resolve_flag(
         config.embeddings_default(),
         embeddings_flag,
@@ -632,6 +633,7 @@ fn run_index(
         backfill_embeddings: false,
         model: model_choice,
         embed_runtime,
+        tool_content_limits,
     };
 
     let report = ingest_all(&paths, &index, &opts)?;
@@ -788,6 +790,7 @@ fn run_search(
     let embeddings_default = config.embeddings_default();
     let scan_cache_ttl = config.scan_cache_ttl();
     if auto_index_on_search {
+        let tool_content_limits = config.indexed_tool_content_limits()?;
         paths.ensure_dirs()?;
         let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
         let opts = IngestOptions {
@@ -802,6 +805,7 @@ fn run_search(
             backfill_embeddings: false,
             model: model_choice,
             embed_runtime: embed_runtime.clone(),
+            tool_content_limits,
         };
         // Skip indexing if we recently scanned (within TTL)
         let _ = ingest_if_stale(&paths, &index, &opts, scan_cache_ttl)?;

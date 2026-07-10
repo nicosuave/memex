@@ -621,6 +621,7 @@ impl App {
                 let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
+                let tool_content_limits = config.indexed_tool_content_limits()?;
                 let opts = IngestOptions {
                     claude_source: default_claude_source(),
                     include_agents: false,
@@ -633,6 +634,7 @@ impl App {
                     backfill_embeddings: false,
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
+                    tool_content_limits,
                 };
                 ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl())
             })();
