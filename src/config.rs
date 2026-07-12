@@ -45,6 +45,25 @@ pub fn default_claude_source() -> PathBuf {
     home.join(".claude").join("projects")
 }
 
+pub const DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_INDEXED_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
+const MIN_INDEXED_TOOL_CONTENT_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedToolContentLimits {
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+}
+
+impl Default for IndexedToolContentLimits {
+    fn default() -> Self {
+        Self {
+            input_bytes: DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES,
+            output_bytes: DEFAULT_MAX_INDEXED_TOOL_OUTPUT_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UserConfig {
     pub embeddings: Option<bool>,
@@ -64,6 +83,10 @@ pub struct UserConfig {
     /// Scan cache TTL in seconds. If a scan was done within this time,
     /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
+    /// Maximum indexed bytes for tool-call input.
+    pub max_indexed_tool_input_bytes: Option<usize>,
+    /// Maximum indexed bytes for tool-call output.
+    pub max_indexed_tool_output_bytes: Option<usize>,
     /// Background index service mode: "interval" or "continuous".
     pub index_service_mode: Option<String>,
     /// Run background index service continuously (legacy).
@@ -207,6 +230,21 @@ impl UserConfig {
         self.scan_cache_ttl.unwrap_or(3600)
     }
 
+    pub fn indexed_tool_content_limits(&self) -> Result<IndexedToolContentLimits> {
+        Ok(IndexedToolContentLimits {
+            input_bytes: indexed_tool_content_limit(
+                self.max_indexed_tool_input_bytes,
+                DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES,
+                "max_indexed_tool_input_bytes",
+            )?,
+            output_bytes: indexed_tool_content_limit(
+                self.max_indexed_tool_output_bytes,
+                DEFAULT_MAX_INDEXED_TOOL_OUTPUT_BYTES,
+                "max_indexed_tool_output_bytes",
+            )?,
+        })
+    }
+
     pub fn index_service_mode(&self) -> Option<&str> {
         self.index_service_mode.as_deref()
     }
@@ -224,10 +262,65 @@ impl UserConfig {
     }
 }
 
+fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -> Result<usize> {
+    let value = value.unwrap_or(default);
+    if value < MIN_INDEXED_TOOL_CONTENT_BYTES {
+        return Err(anyhow!(
+            "{key} must be at least {MIN_INDEXED_TOOL_CONTENT_BYTES} bytes"
+        ));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn indexed_tool_content_limits_use_defaults() {
+        assert_eq!(
+            UserConfig::default()
+                .indexed_tool_content_limits()
+                .expect("resolve defaults"),
+            IndexedToolContentLimits::default()
+        );
+    }
+
+    #[test]
+    fn indexed_tool_content_limits_allow_per_field_overrides() {
+        let config = UserConfig {
+            max_indexed_tool_input_bytes: Some(96 * 1024),
+            max_indexed_tool_output_bytes: Some(384 * 1024),
+            ..UserConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .indexed_tool_content_limits()
+                .expect("resolve overrides"),
+            IndexedToolContentLimits {
+                input_bytes: 96 * 1024,
+                output_bytes: 384 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn indexed_tool_content_limits_reject_too_small_values() {
+        let config = UserConfig {
+            max_indexed_tool_output_bytes: Some(512),
+            ..UserConfig::default()
+        };
+
+        assert!(
+            config
+                .indexed_tool_content_limits()
+                .expect_err("reject too-small limit")
+                .to_string()
+                .contains("max_indexed_tool_output_bytes")
+        );
+    }
 
     #[test]
     fn resolve_compute_units_prefers_config_over_env() {
