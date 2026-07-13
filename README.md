@@ -219,6 +219,7 @@ memex index-service disable
 `index-service` reads config defaults (mode, interval, log paths). Flags override.
 
 On Linux, creates systemd user units in `~/.config/systemd/user/`. On macOS, creates a launchd plist in `~/.memex/`.
+On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
 
 ## Embeddings
 

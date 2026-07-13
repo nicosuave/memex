@@ -24,6 +24,18 @@ description: Search, filter, and retrieve Pi Coding Agent history via memex CLI.
 | Concepts, intent         | `--semantic` | `memex search "auth flow" --source pi --semantic` |
 | Mixed specific + fuzzy   | `--hybrid`   | `memex search "user_id logic" --source pi --hybrid` |
 
+If the vector index is unavailable, memex warns on stderr and falls back to lexical search. Treat this as degraded retrieval and mention `memex embed` as the recovery step when useful.
+
+## Background Index Service
+
+- Use `memex index-service enable` to install the background indexer. It runs via launchd on macOS and systemd user services on Linux.
+- Use `memex index-service enable --continuous` for a long-lived watcher; add `--poll-interval <seconds>` to tune continuous mode.
+- Default mode is periodic indexing, typically every 3600 seconds; add `--interval <seconds>` to tune interval mode.
+- The service inherits indexing flags, so pass source and embedding options at install time when needed, e.g. `memex index-service enable --pi --embeddings`.
+- On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
+- macOS writes `~/.memex/index-service.plist`, `~/.memex/index-service.log`, and `~/.memex/index-service.err.log`. Linux writes systemd user units under `~/.config/systemd/user/`.
+- Use `memex index-service disable` to unload and remove the service.
+
 ## Session Context
 
 Use `--session {session_id}` to isolate a specific interaction thread.
