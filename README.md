@@ -6,7 +6,7 @@ Mostly intended for agents to use via skill. The intended workflow is to ask age
 
 Includes a TUI for browsing, finding and resuming both agent CLI sessions.
 
-![memex tui](docs/tui.png?raw=1&v=2)
+![memex tui](docs/tui.png?raw=1&v=3)
 
 ## Install
 ```bash
