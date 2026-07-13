@@ -78,13 +78,21 @@ Each JSON line includes:
 - `--fields score,ts,doc_id,session_id,snippet,event_id,parent_event_id` to reduce output
 - `-v/--verbose` for human output
 
-### Background index service (macOS launchd)
+### Background index service
 
 ```
 memex index-service enable
 memex index-service enable --continuous
 memex index-service disable
 ```
+
+- Use `memex index-service enable` to install the background indexer. It runs via launchd on macOS and systemd user services on Linux.
+- Default mode is periodic indexing, typically every 3600 seconds. Use `--interval <seconds>` to override.
+- Use `memex index-service enable --continuous` for a long-lived process that watches more frequently; use `--poll-interval <seconds>` to tune continuous mode.
+- The service inherits indexing flags, so pass source and embedding options at install time when needed, e.g. `memex index-service enable --include-agents --embeddings`.
+- On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
+- macOS writes `~/.memex/index-service.plist`, `~/.memex/index-service.log`, and `~/.memex/index-service.err.log`. Linux writes systemd user units under `~/.config/systemd/user/`.
+- Use `memex index-service disable` to unload and remove the service.
 
 ### Narrow first (fastest reducers)
 
@@ -129,6 +137,7 @@ background index service or `index --watch`, and consider setting
 
 - Semantic: `--semantic`
 - Hybrid (BM25 + vectors, RRF): `--hybrid`
+- If the vector index is unavailable, memex warns on stderr and falls back to lexical search. Treat this as degraded retrieval and mention `memex embed` as the recovery step when useful.
 - Recency tuning:
   - `--recency-weight <float>`
   - `--recency-half-life-days <float>`

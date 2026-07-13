@@ -877,14 +877,13 @@ fn run_search(
             },
         );
     }
-    let results = index.search(&options)?;
-    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    let mut reranked =
-        apply_recency_to_results(results, now_ms, recency_weight, recency_half_life_days);
-    reranked.retain(|(_, record)| matches_filters(record, &options));
-    let reranked = apply_post_processing(reranked, &render);
-    render_results(reranked, &render)?;
-    Ok(())
+    run_lexical_search(
+        &index,
+        &options,
+        &render,
+        recency_weight,
+        recency_half_life_days,
+    )
 }
 
 struct SearchContext<'a> {
@@ -902,7 +901,20 @@ fn run_semantic_search(
     limit: usize,
     ctx: &SearchContext,
 ) -> Result<()> {
-    let vector = VectorIndex::open(&ctx.paths.vectors)?;
+    let vector = match VectorIndex::open(&ctx.paths.vectors) {
+        Ok(vector) => vector,
+        Err(err) if is_missing_vector_index_error(&err) => {
+            warn_vector_index_missing("semantic");
+            return run_lexical_search(
+                index,
+                options,
+                ctx.render,
+                ctx.recency_weight,
+                ctx.recency_half_life_days,
+            );
+        }
+        Err(err) => return Err(err),
+    };
     let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
     let embedding = embeddings
@@ -936,7 +948,20 @@ fn run_hybrid_search(
     limit: usize,
     ctx: &SearchContext,
 ) -> Result<()> {
-    let vector = VectorIndex::open(&ctx.paths.vectors)?;
+    let vector = match VectorIndex::open(&ctx.paths.vectors) {
+        Ok(vector) => vector,
+        Err(err) if is_missing_vector_index_error(&err) => {
+            warn_vector_index_missing("hybrid");
+            return run_lexical_search(
+                index,
+                options,
+                ctx.render,
+                ctx.recency_weight,
+                ctx.recency_half_life_days,
+            );
+        }
+        Err(err) => return Err(err),
+    };
     let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
 
     let bm25_k = (limit * 5).clamp(50, 500);
@@ -1004,6 +1029,33 @@ fn run_hybrid_search(
     let merged = apply_post_processing(merged, ctx.render);
     render_results(merged, ctx.render)?;
     Ok(())
+}
+
+fn run_lexical_search(
+    index: &SearchIndex,
+    options: &QueryOptions,
+    render: &RenderOptions,
+    recency_weight: f32,
+    recency_half_life_days: f32,
+) -> Result<()> {
+    let results = index.search(options)?;
+    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let mut reranked =
+        apply_recency_to_results(results, now_ms, recency_weight, recency_half_life_days);
+    reranked.retain(|(_, record)| matches_filters(record, options));
+    let reranked = apply_post_processing(reranked, render);
+    render_results(reranked, render)?;
+    Ok(())
+}
+
+fn is_missing_vector_index_error(err: &anyhow::Error) -> bool {
+    err.to_string() == "vector index not found"
+}
+
+fn warn_vector_index_missing(mode: &str) {
+    eprintln!(
+        "Warning: {mode} search requested, but the local vector index is not available; falling back to lexical search. Run 'memex embed' to build embeddings."
+    );
 }
 
 fn score_from_distance(distance: f32) -> f32 {
@@ -1763,7 +1815,7 @@ fn run_index_service_enable(
 
     std::fs::create_dir_all(&paths.root)?;
 
-    if cfg!(target_os = "macos") {
+    let result = if cfg!(target_os = "macos") {
         run_index_service_enable_launchd(
             &config,
             &paths,
@@ -1791,7 +1843,43 @@ fn run_index_service_enable(
         Err(anyhow!(
             "background service scheduling is only supported on macOS and Linux"
         ))
+    };
+
+    result?;
+    disable_auto_index_on_search_by_default(&paths, &config)?;
+    Ok(())
+}
+
+fn disable_auto_index_on_search_by_default(paths: &Paths, config: &UserConfig) -> Result<()> {
+    if config.auto_index_on_search.is_some() {
+        return Ok(());
     }
+
+    std::fs::create_dir_all(&paths.root)?;
+    let path = paths.root.join("config.toml");
+    let mut contents = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+
+    if !contents.trim().is_empty() {
+        if !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push('\n');
+    }
+    contents.push_str(
+        "# Background indexing handles freshness; avoid duplicate scan work during search.\n",
+    );
+    contents.push_str("auto_index_on_search = false\n");
+
+    std::fs::write(&path, contents)?;
+    println!(
+        "updated config: {} (auto_index_on_search = false)",
+        path.display()
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2909,6 +2997,36 @@ mod tests {
         assert!(args.contains(&"--no-cursor".to_string()));
         assert!(args.contains(&"--no-pi".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
+    }
+
+    #[test]
+    fn disabling_auto_index_on_search_creates_config_when_unset() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+
+        disable_auto_index_on_search_by_default(&paths, &UserConfig::default()).unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        let contents = std::fs::read_to_string(config_path).unwrap();
+        assert!(contents.contains("auto_index_on_search = false"));
+    }
+
+    #[test]
+    fn disabling_auto_index_on_search_preserves_explicit_config() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "auto_index_on_search = true\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+
+        disable_auto_index_on_search_by_default(&paths, &config).unwrap();
+
+        let contents = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert_eq!(contents, "auto_index_on_search = true\n");
     }
 
     fn make_vector(dims: usize) -> Vec<f32> {
