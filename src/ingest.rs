@@ -129,6 +129,8 @@ pub fn ingest_all(
     index: &SearchIndex,
     options: &IngestOptions,
 ) -> Result<IngestReport> {
+    // Apply additive analytics migrations even when the scan finds no changed files.
+    drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
     if index.doc_count()? == 0 && !state.files.is_empty() {
@@ -592,7 +594,8 @@ fn can_skip_fresh_scan(
     if !cache.is_fresh(ttl_seconds) {
         return Ok(false);
     }
-    if !AnalyticsStore::is_complete(analytics_path(&paths.state)) && index.doc_count()? > 0 {
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state))?;
+    if !analytics.complete()? && index.doc_count()? > 0 {
         return Ok(false);
     }
     can_skip_noop_index(paths, index, options)
