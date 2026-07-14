@@ -47,18 +47,69 @@ enum IndexUpdate {
 }
 
 enum SearchUpdate {
-    Started,
-    Results(Vec<SessionSummary>),
+    Results {
+        request_id: u64,
+        sessions: Vec<SessionSummary>,
+    },
     Projects {
+        request_id: u64,
         projects: Vec<String>,
         source: SourceChoice,
     },
     Timeline {
+        request_id: u64,
         rows: Vec<ProjectTimelineRow>,
         source: SourceChoice,
         range: TimelineRange,
         grouping: ProjectDisplayMode,
     },
+    SearchError {
+        request_id: u64,
+        message: String,
+    },
+    ProjectsError {
+        request_id: u64,
+        message: String,
+    },
+    TimelineError {
+        request_id: u64,
+        message: String,
+    },
+    DetailResults {
+        request_id: u64,
+        lines: Vec<PreviewLine>,
+    },
+    DetailError {
+        request_id: u64,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct DetailRequest {
+    request_id: u64,
+    session: SessionSummary,
+    mode: PreviewMode,
+    query: String,
+    show_tools: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum LoadState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded,
+    Empty,
+    Error(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum IndexState {
+    #[default]
+    Idle,
+    Loading,
+    Complete,
     Error(String),
 }
 
@@ -69,6 +120,8 @@ const PREVIEW_LINE_MAX_CHARS: usize = 320;
 const CONTEXT_AROUND_MATCH: usize = 1;
 const RECENT_SESSIONS_LIMIT: usize = 200;
 const RECENT_RECORDS_MULTIPLIER: usize = 50;
+const SPINNER_TICK: Duration = Duration::from_millis(80);
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const OUTER_PAD_X: u16 = 0;
 const OUTER_PAD_Y: u16 = 0;
@@ -311,6 +364,14 @@ struct ProjectTimelineRow {
     session_ts: Vec<u64>,
 }
 
+struct AppChannels {
+    index_tx: std::sync::mpsc::Sender<IndexUpdate>,
+    index_rx: std::sync::mpsc::Receiver<IndexUpdate>,
+    search_tx: std::sync::mpsc::Sender<SearchUpdate>,
+    search_rx: std::sync::mpsc::Receiver<SearchUpdate>,
+    detail_tx: std::sync::mpsc::Sender<DetailRequest>,
+}
+
 struct App {
     paths: Paths,
     config: UserConfig,
@@ -323,16 +384,21 @@ struct App {
     project_options: Vec<String>,
     project_selected: usize,
     project_source: SourceChoice,
+    project_state: LoadState,
+    active_project_request: u64,
     results: Vec<SessionSummary>,
+    sessions_state: LoadState,
+    active_search_request: u64,
     selected: ListState,
     layout_mode: LayoutMode,
     project_display: ProjectDisplayMode,
-    session_project_cache: HashMap<String, String>,
     timeline_range: TimelineRange,
     timeline_density: TimelineDensityMode,
     timeline_rows: Vec<ProjectTimelineRow>,
     timeline_scroll: usize,
     timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode)>,
+    timeline_state: LoadState,
+    active_timeline_request: u64,
     quick_popup: bool,
     quick_scroll: usize,
     quick_lines: Vec<PreviewLine>,
@@ -340,6 +406,8 @@ struct App {
     show_tools: bool,
     find_query: String,
     detail_lines: Vec<PreviewLine>,
+    detail_state: LoadState,
+    active_detail_request: u64,
     detail_scroll: usize,
     last_detail_session: Option<String>,
     last_detail_query: Option<String>,
@@ -348,10 +416,15 @@ struct App {
     status: String,
     last_status_at: Option<Instant>,
     update_message: Option<String>,
+    index_state: IndexState,
+    next_request_id: u64,
+    spinner_frame: usize,
+    last_spinner_at: Instant,
     index_rx: std::sync::mpsc::Receiver<IndexUpdate>,
     index_tx: std::sync::mpsc::Sender<IndexUpdate>,
     search_rx: std::sync::mpsc::Receiver<SearchUpdate>,
     search_tx: std::sync::mpsc::Sender<SearchUpdate>,
+    detail_tx: std::sync::mpsc::Sender<DetailRequest>,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     querybar_area: Rect,
     body_area: Rect,
@@ -524,13 +597,24 @@ pub fn run(
     };
     let (index_tx, index_rx) = std::sync::mpsc::channel();
     let (search_tx, search_rx) = std::sync::mpsc::channel();
+    let (detail_tx, detail_rx) = std::sync::mpsc::channel();
+    spawn_detail_worker(index.clone(), detail_rx, search_tx.clone());
 
     let mut app = App::new(
-        paths, config, index, index_tx, index_rx, search_tx, search_rx,
+        paths,
+        config,
+        index,
+        AppChannels {
+            index_tx,
+            index_rx,
+            search_tx,
+            search_rx,
+            detail_tx,
+        },
     );
     app.stdio_redirect = Some(StdIoRedirect::new()?);
     app.update_rx = update_rx;
-    app.kickoff_index_refresh();
+    app.kickoff_index_refresh(false);
     app.kickoff_search();
 
     let mut terminal = enter_terminal()?;
@@ -542,15 +626,7 @@ pub fn run(
 }
 
 impl App {
-    fn new(
-        paths: Paths,
-        config: UserConfig,
-        index: SearchIndex,
-        index_tx: std::sync::mpsc::Sender<IndexUpdate>,
-        index_rx: std::sync::mpsc::Receiver<IndexUpdate>,
-        search_tx: std::sync::mpsc::Sender<SearchUpdate>,
-        search_rx: std::sync::mpsc::Receiver<SearchUpdate>,
-    ) -> Self {
+    fn new(paths: Paths, config: UserConfig, index: SearchIndex, channels: AppChannels) -> Self {
         Self {
             paths,
             config,
@@ -563,16 +639,21 @@ impl App {
             project_options: Vec::new(),
             project_selected: 0,
             project_source: SourceChoice::All,
+            project_state: LoadState::Idle,
+            active_project_request: 0,
             results: Vec::new(),
+            sessions_state: LoadState::Idle,
+            active_search_request: 0,
             selected: ListState::default(),
             layout_mode: LayoutMode::Split,
             project_display: ProjectDisplayMode::NestedWorktrees,
-            session_project_cache: HashMap::new(),
             timeline_range: TimelineRange::All,
             timeline_density: TimelineDensityMode::Compact,
             timeline_rows: Vec::new(),
             timeline_scroll: 0,
             timeline_loaded: None,
+            timeline_state: LoadState::Idle,
+            active_timeline_request: 0,
             quick_popup: false,
             quick_scroll: 0,
             quick_lines: Vec::new(),
@@ -580,6 +661,8 @@ impl App {
             show_tools: false,
             find_query: String::new(),
             detail_lines: Vec::new(),
+            detail_state: LoadState::Idle,
+            active_detail_request: 0,
             detail_scroll: 0,
             last_detail_session: None,
             last_detail_query: None,
@@ -588,10 +671,15 @@ impl App {
             status: String::new(),
             last_status_at: None,
             update_message: None,
-            index_tx,
-            index_rx,
-            search_tx,
-            search_rx,
+            index_state: IndexState::Idle,
+            next_request_id: 0,
+            spinner_frame: 0,
+            last_spinner_at: Instant::now(),
+            index_tx: channels.index_tx,
+            index_rx: channels.index_rx,
+            search_tx: channels.search_tx,
+            search_rx: channels.search_rx,
+            detail_tx: channels.detail_tx,
             update_rx: None,
             querybar_area: Rect::default(),
             body_area: Rect::default(),
@@ -608,10 +696,40 @@ impl App {
         self.kickoff_search();
     }
 
-    fn kickoff_index_refresh(&self) {
-        if !self.config.auto_index_on_search_default() {
+    fn next_request_id(&mut self) -> u64 {
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.next_request_id
+    }
+
+    fn tick_spinner(&mut self) -> bool {
+        if !self.has_active_loading() || self.last_spinner_at.elapsed() < SPINNER_TICK {
+            return false;
+        }
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+        self.last_spinner_at = Instant::now();
+        true
+    }
+
+    fn has_active_loading(&self) -> bool {
+        self.index_state == IndexState::Loading
+            || self.sessions_state == LoadState::Loading
+            || self.project_state == LoadState::Loading
+            || self.timeline_state == LoadState::Loading
+            || self.detail_state == LoadState::Loading
+    }
+
+    fn spinner(&self) -> char {
+        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+    }
+
+    fn kickoff_index_refresh(&mut self, force: bool) {
+        if (!force && !self.config.auto_index_on_search_default())
+            || self.index_state == IndexState::Loading
+        {
             return;
         }
+        self.index_state = IndexState::Loading;
+        self.last_spinner_at = Instant::now();
         let paths = self.paths.clone();
         let config = self.config.clone();
         let tx = self.index_tx.clone();
@@ -657,16 +775,14 @@ impl App {
 
     fn update_detail(&mut self) {
         let Some(idx) = self.selected.selected() else {
-            self.detail_lines = vec![PreviewLine::Text("no session selected".to_string())];
-            self.detail_scroll = 0;
+            self.clear_detail("no session selected");
             return;
         };
         if idx >= self.results.len() {
-            self.detail_lines = vec![PreviewLine::Text("no session selected".to_string())];
-            self.detail_scroll = 0;
+            self.clear_detail("no session selected");
             return;
         }
-        let session = &self.results[idx];
+        let session = self.results[idx].clone();
         let query_now = self.query.trim().to_string();
         let session_changed = self
             .last_detail_session
@@ -689,36 +805,46 @@ impl App {
             return;
         }
         let active_query = if self.find_query.trim().is_empty() {
-            query_now.as_str()
+            query_now.clone()
         } else {
-            self.find_query.trim()
+            self.find_query.trim().to_string()
         };
-        match build_detail_lines(
-            &self.index,
+        let request_id = self.next_request_id();
+        self.active_detail_request = request_id;
+        self.detail_state = LoadState::Loading;
+        self.detail_lines.clear();
+        self.detail_scroll = 0;
+        self.last_detail_session = Some(session.session_id.clone());
+        self.last_detail_query = Some(query_now);
+        self.last_detail_mode = self.preview_mode;
+        self.last_detail_find = Some(find_now);
+        let request = DetailRequest {
+            request_id,
             session,
-            self.preview_mode,
-            active_query,
-            self.show_tools,
-        ) {
-            Ok(lines) => {
-                self.detail_lines = lines;
-                self.detail_scroll = 0;
-                self.last_detail_session = Some(session.session_id.clone());
-                self.last_detail_query = Some(query_now);
-                self.last_detail_mode = self.preview_mode;
-                self.last_detail_find = Some(find_now);
-            }
-            Err(err) => {
-                self.detail_lines = vec![PreviewLine::Text(format!("detail error: {err}"))];
-                self.detail_scroll = 0;
-                self.last_detail_session = None;
-                self.last_detail_query = None;
-                self.last_detail_find = None;
-            }
+            mode: self.preview_mode,
+            query: active_query,
+            show_tools: self.show_tools,
+        };
+        if self.detail_tx.send(request).is_err() {
+            self.detail_state = LoadState::Error("preview worker stopped".to_string());
         }
     }
 
+    fn clear_detail(&mut self, message: &str) {
+        self.active_detail_request = self.next_request_id();
+        self.detail_lines = vec![PreviewLine::Text(message.to_string())];
+        self.detail_state = LoadState::Empty;
+        self.detail_scroll = 0;
+        self.last_detail_session = None;
+        self.last_detail_query = None;
+        self.last_detail_find = None;
+    }
+
     fn kickoff_search(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_search_request = request_id;
+        self.sessions_state = LoadState::Loading;
+        self.last_spinner_at = Instant::now();
         let query = self.query.trim().to_string();
         let project = self.project.trim().to_string();
         let project_opt = if project.is_empty() {
@@ -732,8 +858,7 @@ impl App {
         let grouping = self.project_display.grouping();
         self.set_status("searching...");
         std::thread::spawn(move || {
-            let _ = tx.send(SearchUpdate::Started);
-            let result = (|| -> Result<(Vec<SessionSummary>, Option<Vec<String>>)> {
+            let result = (|| -> Result<Vec<SessionSummary>> {
                 let sessions = if query.is_empty() {
                     sessions_from_analytics(
                         &paths,
@@ -765,23 +890,29 @@ impl App {
                     }
                     sessions
                 };
-                Ok((sessions, None))
+                Ok(sessions)
             })();
             match result {
-                Ok((sessions, projects)) => {
-                    let _ = tx.send(SearchUpdate::Results(sessions));
-                    if let Some(projects) = projects {
-                        let _ = tx.send(SearchUpdate::Projects { projects, source });
-                    }
+                Ok(sessions) => {
+                    let _ = tx.send(SearchUpdate::Results {
+                        request_id,
+                        sessions,
+                    });
                 }
                 Err(err) => {
-                    let _ = tx.send(SearchUpdate::Error(err.to_string()));
+                    let _ = tx.send(SearchUpdate::SearchError {
+                        request_id,
+                        message: err.to_string(),
+                    });
                 }
             }
         });
     }
 
-    fn kickoff_project_load(&self) {
+    fn kickoff_project_load(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_project_request = request_id;
+        self.project_state = LoadState::Loading;
         let source = self.source;
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
@@ -794,16 +925,26 @@ impl App {
                 });
             match result {
                 Ok(projects) => {
-                    let _ = tx.send(SearchUpdate::Projects { projects, source });
+                    let _ = tx.send(SearchUpdate::Projects {
+                        request_id,
+                        projects,
+                        source,
+                    });
                 }
                 Err(err) => {
-                    let _ = tx.send(SearchUpdate::Error(err.to_string()));
+                    let _ = tx.send(SearchUpdate::ProjectsError {
+                        request_id,
+                        message: err.to_string(),
+                    });
                 }
             }
         });
     }
 
     fn kickoff_timeline_load(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_timeline_request = request_id;
+        self.timeline_state = LoadState::Loading;
         let source = self.source;
         let range = self.timeline_range;
         let grouping = self.project_display;
@@ -816,6 +957,7 @@ impl App {
             match result {
                 Ok(rows) => {
                     let _ = tx.send(SearchUpdate::Timeline {
+                        request_id,
                         rows,
                         source,
                         range,
@@ -823,7 +965,10 @@ impl App {
                     });
                 }
                 Err(err) => {
-                    let _ = tx.send(SearchUpdate::Error(err.to_string()));
+                    let _ = tx.send(SearchUpdate::TimelineError {
+                        request_id,
+                        message: err.to_string(),
+                    });
                 }
             }
         });
@@ -840,6 +985,130 @@ impl App {
         self.project_options = options;
         if self.project_options.is_empty() || self.project_selected >= self.project_options.len() {
             self.project_selected = 0;
+        }
+    }
+
+    fn handle_index_update(&mut self, update: IndexUpdate) {
+        match update {
+            IndexUpdate::Started => {
+                self.index_state = IndexState::Loading;
+            }
+            IndexUpdate::Skipped => {
+                self.index_state = IndexState::Complete;
+                self.set_status("index up to date");
+            }
+            IndexUpdate::Done { added, embedded } => {
+                self.index_state = IndexState::Complete;
+                self.refresh_results();
+                self.set_status(format!("indexed {added} records, embedded {embedded}"));
+            }
+            IndexUpdate::Error(message) => {
+                self.index_state = IndexState::Error(message.clone());
+                self.set_status(format!("index error: {message}"));
+            }
+        }
+    }
+
+    fn handle_search_update(&mut self, update: SearchUpdate) {
+        match update {
+            SearchUpdate::Results {
+                request_id,
+                sessions,
+            } if request_id == self.active_search_request => {
+                self.results = sessions;
+                self.sessions_state = if self.results.is_empty() {
+                    LoadState::Empty
+                } else {
+                    LoadState::Loaded
+                };
+                if self.results.is_empty() {
+                    self.selected.select(None);
+                } else {
+                    self.selected.select(Some(0));
+                }
+                self.quick_popup = false;
+                self.quick_scroll = 0;
+                self.quick_lines.clear();
+                self.last_detail_session = None;
+                self.detail_scroll = 0;
+                if !self.results.is_empty() || self.index_state != IndexState::Loading {
+                    self.set_status(format!("{} sessions", self.results.len()));
+                }
+                self.update_detail();
+            }
+            SearchUpdate::Projects {
+                request_id,
+                projects,
+                source,
+            } if request_id == self.active_project_request => {
+                self.all_projects = projects;
+                self.project_state = if self.all_projects.is_empty() {
+                    LoadState::Empty
+                } else {
+                    LoadState::Loaded
+                };
+                self.project_source = source;
+                self.update_project_options();
+            }
+            SearchUpdate::Timeline {
+                request_id,
+                rows,
+                source,
+                range,
+                grouping,
+            } if request_id == self.active_timeline_request
+                && self.timeline_loaded == Some((source, range, grouping)) =>
+            {
+                self.timeline_rows = rows;
+                self.timeline_state = if self.timeline_rows.is_empty() {
+                    LoadState::Empty
+                } else {
+                    LoadState::Loaded
+                };
+                self.timeline_scroll = 0;
+                self.set_status(format!("{} projects", self.timeline_rows.len()));
+            }
+            SearchUpdate::SearchError {
+                request_id,
+                message,
+            } if request_id == self.active_search_request => {
+                self.sessions_state = LoadState::Error(message.clone());
+                self.set_status(format!("search error: {message}"));
+            }
+            SearchUpdate::ProjectsError {
+                request_id,
+                message,
+            } if request_id == self.active_project_request => {
+                self.project_state = LoadState::Error(message.clone());
+                self.set_status(format!("project load error: {message}"));
+            }
+            SearchUpdate::TimelineError {
+                request_id,
+                message,
+            } if request_id == self.active_timeline_request => {
+                self.timeline_state = LoadState::Error(message.clone());
+                self.set_status(format!("timeline error: {message}"));
+            }
+            SearchUpdate::DetailResults { request_id, lines }
+                if request_id == self.active_detail_request =>
+            {
+                self.detail_lines = lines;
+                self.detail_state = if self.detail_lines.is_empty() {
+                    LoadState::Empty
+                } else {
+                    LoadState::Loaded
+                };
+                self.detail_scroll = 0;
+            }
+            SearchUpdate::DetailError {
+                request_id,
+                message,
+            } if request_id == self.active_detail_request => {
+                self.detail_state = LoadState::Error(message.clone());
+                self.detail_lines = vec![PreviewLine::Text(format!("preview error: {message}"))];
+                self.detail_scroll = 0;
+            }
+            _ => {}
         }
     }
 
@@ -979,7 +1248,6 @@ impl App {
 
     fn toggle_project_display(&mut self) {
         self.project_display = self.project_display.toggle();
-        self.session_project_cache.clear();
         self.set_status(format!("projects: {}", self.project_display.label()));
         if matches!(self.layout_mode, LayoutMode::Timeline) {
             self.kickoff_timeline_load();
@@ -1224,8 +1492,9 @@ impl App {
 }
 
 fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
+    terminal.draw(|frame| draw_ui(frame, app))?;
     loop {
-        let mut dirty = app.clear_status_if_old();
+        let mut dirty = app.clear_status_if_old() || app.tick_spinner();
         if let Some(update_rx) = app.update_rx.as_ref() {
             while let Ok(message) = update_rx.try_recv() {
                 app.update_message = Some(message);
@@ -1233,53 +1502,11 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
             }
         }
         if let Ok(update) = app.index_rx.try_recv() {
-            match update {
-                IndexUpdate::Started => app.set_status("indexing..."),
-                IndexUpdate::Skipped => app.set_status("index up to date"),
-                IndexUpdate::Done { added, embedded } => {
-                    app.set_status(format!("indexed {added} records, embedded {embedded}"))
-                }
-                IndexUpdate::Error(msg) => app.set_status(format!("index error: {msg}")),
-            }
+            app.handle_index_update(update);
             dirty = true;
         }
         while let Ok(update) = app.search_rx.try_recv() {
-            match update {
-                SearchUpdate::Started => app.set_status("searching..."),
-                SearchUpdate::Results(results) => {
-                    app.results = results;
-                    if app.results.is_empty() {
-                        app.selected.select(None);
-                    } else {
-                        app.selected.select(Some(0));
-                    }
-                    app.quick_popup = false;
-                    app.quick_scroll = 0;
-                    app.quick_lines.clear();
-                    app.last_detail_session = None;
-                    app.detail_scroll = 0;
-                    app.set_status(format!("{} sessions", app.results.len()));
-                    app.update_detail();
-                }
-                SearchUpdate::Projects { projects, source } => {
-                    app.all_projects = projects;
-                    app.project_source = source;
-                    app.update_project_options();
-                }
-                SearchUpdate::Timeline {
-                    rows,
-                    source,
-                    range,
-                    grouping,
-                } => {
-                    if app.timeline_loaded == Some((source, range, grouping)) {
-                        app.timeline_rows = rows;
-                        app.timeline_scroll = 0;
-                        app.set_status(format!("{} projects", app.timeline_rows.len()));
-                    }
-                }
-                SearchUpdate::Error(msg) => app.set_status(format!("search error: {msg}")),
-            }
+            app.handle_search_update(update);
             dirty = true;
         }
         let mut should_quit = false;
@@ -1602,7 +1829,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             app.update_find();
         }
         KeyCode::Char('i') => {
-            app.kickoff_index_refresh();
+            app.kickoff_index_refresh(true);
         }
         KeyCode::Char('S') => {
             let _ = app.share_selected();
@@ -1828,24 +2055,49 @@ fn draw_sessions_panel(
     } else {
         theme.text_bold
     };
-    let title = Paragraph::new(Line::from(Span::styled("Sessions", title_style)));
+    let mut title_spans = vec![Span::styled("Sessions", title_style)];
+    if app.sessions_state == LoadState::Loading && !app.results.is_empty() {
+        title_spans.push(Span::styled(
+            format!("  {} loading", app.spinner()),
+            theme.muted,
+        ));
+    }
+    let title = Paragraph::new(Line::from(title_spans));
     frame.render_widget(title, header);
 
     let list_items: Vec<ListItem> = if app.results.is_empty() {
+        let message = match &app.sessions_state {
+            LoadState::Loading | LoadState::Empty if app.index_state == IndexState::Loading => {
+                format!("{} Building conversation index…", app.spinner())
+            }
+            LoadState::Loading => format!("{} Loading conversations…", app.spinner()),
+            LoadState::Error(message) => format!("Couldn’t load conversations: {message}"),
+            LoadState::Empty | LoadState::Loaded | LoadState::Idle => match &app.index_state {
+                IndexState::Error(message) => {
+                    format!("Couldn’t build conversation index: {message}")
+                }
+                IndexState::Idle
+                    if app.query.trim().is_empty()
+                        && app.project.trim().is_empty()
+                        && app.source == SourceChoice::All =>
+                {
+                    "No conversations indexed · press i to index".to_string()
+                }
+                _ => "No conversations found".to_string(),
+            },
+        };
         vec![ListItem::new(Line::from(Span::styled(
-            "no sessions",
+            message,
             theme.muted,
         )))]
     } else {
-        let sessions = app.results.clone();
-        let mut items = Vec::with_capacity(sessions.len());
-        for session in &sessions {
+        let mut items = Vec::with_capacity(app.results.len());
+        for session in &app.results {
             let ts = format_relative_ts(session.last_ts);
-            let project = display_project_for_session(app, session);
             let line = Line::from(vec![
                 Span::styled(format!("{:>4}", session.hit_count), theme.accent),
                 Span::raw(" "),
-                Span::styled(project, theme.text),
+                Span::styled(session.project.clone(), theme.text),
                 Span::raw(" "),
                 Span::styled(session.source.label(), theme.muted),
                 Span::raw(" "),
@@ -1867,37 +2119,6 @@ fn draw_sessions_panel(
     content
 }
 
-fn display_project_for_session(app: &mut App, session: &SessionSummary) -> String {
-    if app.project_display == ProjectDisplayMode::Flat {
-        return session.project.clone();
-    }
-    let key = format!(
-        "{}\0{}\0{}",
-        session.source.storage_label(),
-        session.session_id,
-        session.source_path
-    );
-    if let Some(project) = app.session_project_cache.get(&key) {
-        return project.clone();
-    }
-    let project = AnalyticsStore::open(analytics_path(&app.paths.state))
-        .ok()
-        .and_then(|store| {
-            store
-                .project_for_session(
-                    session.source,
-                    &session.session_id,
-                    &session.source_path,
-                    app.project_display.grouping(),
-                )
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_else(|| session.project.clone());
-    app.session_project_cache.insert(key, project.clone());
-    project
-}
-
 fn draw_project_timeline(
     frame: &mut ratatui::Frame,
     app: &mut App,
@@ -1914,11 +2135,13 @@ fn draw_project_timeline(
     };
 
     if app.timeline_rows.is_empty() {
+        let message = match &app.timeline_state {
+            LoadState::Loading => format!("{} Loading project timeline…", app.spinner()),
+            LoadState::Error(message) => format!("Couldn’t load timeline: {message}"),
+            _ => "No sessions in this window".to_string(),
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "no sessions in this window",
-                theme.muted,
-            ))),
+            Paragraph::new(Line::from(Span::styled(message, theme.muted))),
             content,
         );
         return content;
@@ -2048,8 +2271,14 @@ fn draw_project_panel(
     frame.render_widget(title, header);
 
     let project_items: Vec<ListItem> = if app.project_options.is_empty() {
+        let message = match &app.project_state {
+            LoadState::Loading => format!("{} Loading projects…", app.spinner()),
+            LoadState::Error(message) => format!("Couldn’t load projects: {message}"),
+            _ if !app.project.is_empty() => "No matching projects".to_string(),
+            _ => "No projects found".to_string(),
+        };
         vec![ListItem::new(Line::from(Span::styled(
-            "no projects",
+            message,
             theme.muted,
         )))]
     } else {
@@ -2104,6 +2333,28 @@ fn draw_preview_panel(
     };
     let title = Paragraph::new(Line::from(Span::styled(detail_title, title_style)));
     frame.render_widget(title, header);
+    if app.detail_state == LoadState::Loading {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{} Loading preview…", app.spinner()),
+                theme.muted,
+            ))),
+            content,
+        );
+        return content;
+    }
+    if let LoadState::Error(message) = &app.detail_state
+        && app.detail_lines.is_empty()
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("Couldn’t load preview: {message}"),
+                theme.muted,
+            ))),
+            content,
+        );
+        return content;
+    }
     let view_height = content.height as usize;
     let start = app.detail_scroll.min(app.detail_lines.len());
     let end = if view_height == 0 {
@@ -2183,6 +2434,52 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     if !app.status.is_empty() {
         right_spans.push(Span::styled("\u{25cf} ", theme.accent));
         right_spans.push(Span::styled(app.status.as_str(), theme.text));
+        right_spans.push(Span::raw("   "));
+    }
+    if app.timeline_state == LoadState::Loading
+        && app.layout_mode == LayoutMode::Timeline
+        && !app.timeline_rows.is_empty()
+    {
+        right_spans.push(Span::styled(
+            format!("{} loading timeline", app.spinner()),
+            theme.accent,
+        ));
+        right_spans.push(Span::raw("   "));
+    }
+    if let LoadState::Error(message) = &app.timeline_state
+        && app.layout_mode == LayoutMode::Timeline
+        && !app.timeline_rows.is_empty()
+    {
+        right_spans.push(Span::styled(
+            format!("timeline error: {message}"),
+            theme.muted,
+        ));
+        right_spans.push(Span::raw("   "));
+    }
+    if let IndexState::Error(message) = &app.index_state
+        && !app.results.is_empty()
+    {
+        right_spans.push(Span::styled(format!("index error: {message}"), theme.muted));
+        right_spans.push(Span::raw("   "));
+    }
+    if let LoadState::Error(message) = &app.sessions_state
+        && !app.results.is_empty()
+    {
+        right_spans.push(Span::styled(format!("load error: {message}"), theme.muted));
+        right_spans.push(Span::raw("   "));
+    }
+    if app.index_state == IndexState::Loading {
+        right_spans.push(Span::styled(
+            format!("{} indexing", app.spinner()),
+            theme.accent,
+        ));
+        right_spans.push(Span::raw("   "));
+    }
+    if app.sessions_state == LoadState::Loading && !app.results.is_empty() {
+        right_spans.push(Span::styled(
+            format!("{} loading", app.spinner()),
+            theme.accent,
+        ));
         right_spans.push(Span::raw("   "));
     }
     // Keep an active source filter visible while browsing, when the query bar
@@ -2445,7 +2742,7 @@ fn sessions_from_analytics(
     project: Option<&str>,
     grouping: ProjectGrouping,
 ) -> Result<Vec<SessionSummary>> {
-    let store = AnalyticsStore::open(analytics_path(&paths.state))?;
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
     let rows =
         store.query_sessions(source, None, project, grouping, Some(RECENT_SESSIONS_LIMIT))?;
     if rows.is_empty() {
@@ -2476,7 +2773,7 @@ fn enrich_session_projects(
     if grouping == ProjectGrouping::Flat {
         return;
     }
-    let Ok(store) = AnalyticsStore::open(analytics_path(&paths.state)) else {
+    let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
         return;
     };
     for session in sessions {
@@ -2496,19 +2793,11 @@ fn collect_projects_from_analytics(
     source: Option<SourceFilter>,
     grouping: ProjectGrouping,
 ) -> Result<Vec<String>> {
-    let store = AnalyticsStore::open(analytics_path(&paths.state))?;
-    let rows = store.query_sessions(source, None, None, grouping, None)?;
-    if rows.is_empty() {
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let projects = store.query_projects(source, grouping)?;
+    if projects.is_empty() {
         anyhow::bail!("no analytics projects");
     }
-    let mut set = HashSet::new();
-    for row in rows {
-        if !row.display_project.is_empty() {
-            set.insert(row.display_project);
-        }
-    }
-    let mut projects: Vec<String> = set.into_iter().collect();
-    projects.sort();
     Ok(projects)
 }
 
@@ -2518,19 +2807,14 @@ fn build_project_timeline(
     range: TimelineRange,
     display: ProjectDisplayMode,
 ) -> Result<Vec<ProjectTimelineRow>> {
-    let store = AnalyticsStore::open(analytics_path(&paths.state))?;
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
     let now = now_ms();
-    let rows = store.query_sessions(source, range.since_ms(now), None, display.grouping(), None)?;
+    let rows = store.query_project_timestamps(source, range.since_ms(now), display.grouping())?;
     let mut projects: HashMap<String, ProjectTimelineRow> = HashMap::new();
-    for row in rows {
-        if row.last_at == 0 {
+    for (project_name, last_at) in rows {
+        if last_at == 0 {
             continue;
         }
-        let project_name = if row.display_project.is_empty() {
-            row.project
-        } else {
-            row.display_project
-        };
         let entry = projects
             .entry(project_name.clone())
             .or_insert_with(|| ProjectTimelineRow {
@@ -2540,8 +2824,8 @@ fn build_project_timeline(
                 session_ts: Vec::new(),
             });
         entry.session_count += 1;
-        entry.last_ts = entry.last_ts.max(row.last_at);
-        entry.session_ts.push(row.last_at);
+        entry.last_ts = entry.last_ts.max(last_at);
+        entry.session_ts.push(last_at);
     }
     let mut out: Vec<ProjectTimelineRow> = projects.into_values().collect();
     for row in &mut out {
@@ -2587,6 +2871,39 @@ fn add_record_to_session(
         entry.source_path = record.source_path;
         entry.source_dir = parent_dir(&entry.source_path);
     }
+}
+
+fn spawn_detail_worker(
+    index: SearchIndex,
+    rx: std::sync::mpsc::Receiver<DetailRequest>,
+    tx: std::sync::mpsc::Sender<SearchUpdate>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(mut request) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                request = newer;
+            }
+            let update = match build_detail_lines(
+                &index,
+                &request.session,
+                request.mode,
+                &request.query,
+                request.show_tools,
+            ) {
+                Ok(lines) => SearchUpdate::DetailResults {
+                    request_id: request.request_id,
+                    lines,
+                },
+                Err(err) => SearchUpdate::DetailError {
+                    request_id: request.request_id,
+                    message: err.to_string(),
+                },
+            };
+            if tx.send(update).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn build_detail_lines(
@@ -3726,6 +4043,29 @@ mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
 
+    fn test_app() -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("dirs");
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).expect("index");
+        let (index_tx, index_rx) = std::sync::mpsc::channel();
+        let (search_tx, search_rx) = std::sync::mpsc::channel();
+        let (detail_tx, _detail_rx) = std::sync::mpsc::channel();
+        let app = App::new(
+            paths,
+            UserConfig::default(),
+            index,
+            AppChannels {
+                index_tx,
+                index_rx,
+                search_tx,
+                search_rx,
+                detail_tx,
+            },
+        );
+        (tmp, app)
+    }
+
     fn record(role: &str, text: &str) -> Record {
         Record {
             source: SourceKind::CodexSession,
@@ -3742,6 +4082,38 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn completed_initial_index_reloads_empty_conversation_list() {
+        let (_tmp, mut app) = test_app();
+        app.active_search_request = 7;
+        app.sessions_state = LoadState::Empty;
+        app.index_state = IndexState::Loading;
+
+        app.handle_index_update(IndexUpdate::Done {
+            added: 12,
+            embedded: 0,
+        });
+
+        assert_eq!(app.index_state, IndexState::Complete);
+        assert_eq!(app.sessions_state, LoadState::Loading);
+        assert!(app.active_search_request > 7);
+    }
+
+    #[test]
+    fn stale_search_results_do_not_replace_active_request() {
+        let (_tmp, mut app) = test_app();
+        app.active_search_request = 2;
+        app.sessions_state = LoadState::Loading;
+
+        app.handle_search_update(SearchUpdate::Results {
+            request_id: 1,
+            sessions: Vec::new(),
+        });
+
+        assert_eq!(app.sessions_state, LoadState::Loading);
+        assert!(app.results.is_empty());
     }
 
     #[test]

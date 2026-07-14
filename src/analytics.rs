@@ -1,9 +1,10 @@
 use crate::types::{Record, SourceFilter, SourceKind};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 2;
 
@@ -68,9 +69,20 @@ impl AnalyticsStore {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(2))?;
         let store = Self { conn };
         store.init()?;
         Ok(store)
+    }
+
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.pragma_update(None, "query_only", true)?;
+        Ok(Self { conn })
     }
 
     fn init(&self) -> Result<()> {
@@ -100,6 +112,8 @@ impl AnalyticsStore {
             CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
             CREATE INDEX IF NOT EXISTS sessions_project_last_at_idx ON sessions(project, last_at);
             CREATE INDEX IF NOT EXISTS sessions_repo_project_last_at_idx ON sessions(repo_project, last_at);
+            CREATE INDEX IF NOT EXISTS sessions_display_project_last_at_idx
+                ON sessions(COALESCE(NULLIF(repo_project, ''), project), last_at);
             CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
             "#,
         )?;
@@ -132,14 +146,14 @@ impl AnalyticsStore {
     }
 
     pub fn is_ready(path: impl AsRef<Path>) -> bool {
-        Self::open(path)
+        Self::open_read_only(path)
             .and_then(|store| store.session_count())
             .map(|count| count > 0)
             .unwrap_or(false)
     }
 
     pub fn is_complete(path: impl AsRef<Path>) -> bool {
-        Self::open(path)
+        Self::open_read_only(path)
             .and_then(|store| store.complete())
             .unwrap_or(false)
     }
@@ -259,6 +273,91 @@ impl AnalyticsStore {
         Ok(out)
     }
 
+    pub fn query_projects(
+        &self,
+        source: Option<SourceFilter>,
+        grouping: ProjectGrouping,
+    ) -> Result<Vec<String>> {
+        let project_expr = match grouping {
+            ProjectGrouping::Flat => "project",
+            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+        };
+        let mut sql = format!("SELECT DISTINCT {project_expr} FROM sessions");
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(source) = source {
+            let labels = source.storage_labels();
+            let placeholders = std::iter::repeat_n("?", labels.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" WHERE source IN ({placeholders})"));
+            values.extend(
+                labels
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
+        let mut projects = Vec::new();
+        for row in rows {
+            let project = display_project_name(&row?);
+            if !project.is_empty() {
+                projects.push(project);
+            }
+        }
+        projects.sort();
+        projects.dedup();
+        Ok(projects)
+    }
+
+    pub fn query_project_timestamps(
+        &self,
+        source: Option<SourceFilter>,
+        since_ms: Option<u64>,
+        grouping: ProjectGrouping,
+    ) -> Result<Vec<(String, u64)>> {
+        let project_expr = match grouping {
+            ProjectGrouping::Flat => "project",
+            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+        };
+        let mut sql = format!("SELECT {project_expr}, last_at FROM sessions");
+        let mut clauses = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(source) = source {
+            let labels = source.storage_labels();
+            let placeholders = std::iter::repeat_n("?", labels.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!("source IN ({placeholders})"));
+            values.extend(
+                labels
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+        }
+        if let Some(since_ms) = since_ms {
+            clauses.push("last_at >= ?".to_string());
+            values.push(rusqlite::types::Value::Integer(since_ms as i64));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (project, last_at) = row?;
+            out.push((display_project_name(&project), last_at));
+        }
+        Ok(out)
+    }
+
     pub fn project_for_session(
         &self,
         source: SourceKind,
@@ -270,7 +369,8 @@ impl AnalyticsStore {
             ProjectGrouping::Flat => "project",
             ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
         };
-        self.conn
+        let project: Option<String> = self
+            .conn
             .query_row(
                 &format!(
                     "SELECT {display_expr} FROM sessions
@@ -279,8 +379,8 @@ impl AnalyticsStore {
                 params![source.storage_label(), session_id, source_path],
                 |row| row.get(0),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        Ok(project.map(|project| display_project_name(&project)))
     }
 }
 
@@ -789,6 +889,71 @@ mod tests {
         assert_eq!(rows[0].session_id, "s1");
         assert_eq!(rows[0].message_count, 2);
         assert_eq!(rows[0].last_at, 20);
+    }
+
+    #[test]
+    fn read_only_store_rejects_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        drop(AnalyticsStore::open(&db).expect("initialize analytics"));
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open read only");
+
+        assert!(store.mark_complete().is_err());
+    }
+
+    #[test]
+    fn project_queries_are_distinct_and_timeline_projection_is_narrow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_a = tmp.path().join("a.jsonl");
+        let source_b = tmp.path().join("b.jsonl");
+        fs::write(&source_a, "").expect("source a");
+        fs::write(&source_b, "").expect("source b");
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(
+            &db,
+            [
+                record("alpha", "s1", &source_a, 10),
+                record("alpha", "s2", &source_b, 20),
+            ],
+        )
+        .expect("rebuild");
+        let store = AnalyticsStore::open_read_only(&db).expect("open read only");
+
+        assert_eq!(
+            store
+                .query_projects(None, ProjectGrouping::Flat)
+                .expect("projects"),
+            vec!["alpha"]
+        );
+        assert_eq!(
+            store
+                .query_project_timestamps(None, Some(15), ProjectGrouping::Flat)
+                .expect("timestamps"),
+            vec![("alpha".to_string(), 20)]
+        );
+    }
+
+    #[test]
+    fn repository_project_filter_uses_expression_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        let store = AnalyticsStore::open(&db).expect("open analytics");
+        let plan: String = store
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT source FROM sessions
+                 WHERE COALESCE(NULLIF(repo_project, ''), project) = ?1
+                 ORDER BY last_at DESC LIMIT 200",
+                params!["memex"],
+                |row| row.get(3),
+            )
+            .expect("query plan");
+
+        assert!(
+            plan.contains("sessions_display_project_last_at_idx"),
+            "{plan}"
+        );
     }
 
     #[test]
