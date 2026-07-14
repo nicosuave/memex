@@ -4087,6 +4087,7 @@ mod tests {
     #[test]
     fn completed_initial_index_reloads_empty_conversation_list() {
         let (_tmp, mut app) = test_app();
+        app.next_request_id = 7;
         app.active_search_request = 7;
         app.sessions_state = LoadState::Empty;
         app.index_state = IndexState::Loading;
