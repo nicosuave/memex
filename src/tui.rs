@@ -2458,8 +2458,7 @@ fn home_column_width(area_width: u16) -> u16 {
     let available = area_width.saturating_sub(4);
     let responsive = ((u32::from(area_width) * 2) / 3) as u16;
     responsive
-        .max(HOME_COLUMN_MIN_WIDTH)
-        .min(HOME_COLUMN_MAX_WIDTH)
+        .clamp(HOME_COLUMN_MIN_WIDTH, HOME_COLUMN_MAX_WIDTH)
         .min(available)
         .max(area_width.min(24))
 }
