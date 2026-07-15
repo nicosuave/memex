@@ -424,6 +424,7 @@ struct App {
     timeline_scroll: usize,
     timeline_selected: usize,
     timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
+    timeline_displayed_query: String,
     timeline_state: LoadState,
     active_timeline_request: u64,
     home_activity: Vec<(SourceKind, u64)>,
@@ -708,6 +709,7 @@ impl App {
             timeline_scroll: 0,
             timeline_selected: 0,
             timeline_loaded: None,
+            timeline_displayed_query: String::new(),
             timeline_state: LoadState::Idle,
             active_timeline_request: 0,
             quick_popup: false,
@@ -1333,6 +1335,7 @@ impl App {
                 };
                 self.timeline_scroll = 0;
                 self.timeline_selected = 0;
+                self.timeline_displayed_query = query;
                 self.set_status(format!("{} projects", self.timeline_rows.len()));
             }
             SearchUpdate::SearchError {
@@ -1622,6 +1625,7 @@ impl App {
             self.set_status("no project selected");
             return;
         };
+        self.query = self.timeline_displayed_query.clone();
         self.project = row.project.clone();
         self.layout_mode = LayoutMode::List;
         self.focus = Focus::List;
@@ -5711,7 +5715,14 @@ mod tests {
         let (_tmp, mut app) = test_app();
         app.layout_mode = LayoutMode::Timeline;
         app.focus = Focus::List;
-        app.query = "needle".to_string();
+        app.timeline_displayed_query = "needle".to_string();
+        app.timeline_loaded = Some((
+            SourceChoice::All,
+            TimelineRange::All,
+            ProjectDisplayMode::NestedWorktrees,
+            "pending query".to_string(),
+        ));
+        app.query = "draft query".to_string();
         app.list_area = Rect::new(0, 0, 80, 3); // legend plus two rows
         app.timeline_rows = (0..4)
             .map(|idx| timeline_row(&format!("project-{idx}"), 1))
