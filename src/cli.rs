@@ -1417,6 +1417,7 @@ fn run_usage(
         source,
         project: None,
         project_grouping: crate::analytics::ProjectGrouping::Flat,
+        session_keys: None,
         since_ms: parse_ts_millis(since)?,
         until_ms: parse_ts_millis(until)?,
         cost_mode,

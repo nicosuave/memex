@@ -22,6 +22,7 @@ pub struct UsageQuery {
     pub source: Option<SourceFilter>,
     pub project: Option<String>,
     pub project_grouping: ProjectGrouping,
+    pub session_keys: Option<HashSet<(String, String)>>,
     pub since_ms: Option<u64>,
     pub until_ms: Option<u64>,
     pub cost_mode: CostMode,
@@ -182,6 +183,11 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
                         query.project_grouping,
                         &mut project_cache,
                     )
+                })
+            })
+            && query.session_keys.as_ref().is_none_or(|session_keys| {
+                event.session_id.as_ref().is_some_and(|session_id| {
+                    session_keys.contains(&(event.source.clone(), session_id.clone()))
                 })
             })
     });
@@ -866,11 +872,7 @@ fn scan_pi(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()>
             .file_stem()
             .and_then(|n| n.to_str())
             .map(str::to_string);
-        let project = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(str::to_string);
+        let project = Some(crate::ingest::project_from_pi_session_path(&path));
         let mut current_model = None;
         let mut current_provider = None;
         for (index, value) in lines(&path)? {
@@ -1133,18 +1135,38 @@ fn scan_cursor(out: &mut Vec<UsageEvent>, warnings: &mut Vec<String>) -> Result<
             .map(|e| e.path().to_path_buf()),
     );
     let mut seen = HashSet::new();
+    let project_by_session = cursor_project_by_session();
     for path in databases.into_iter().filter(|path| path.exists()) {
-        if let Err(error) = scan_cursor_db(&path, out, &mut seen) {
+        if let Err(error) = scan_cursor_db(&path, out, &mut seen, &project_by_session) {
             warnings.push(format!("{}: {error:#}", path.display()));
         }
     }
     Ok(())
 }
 
+fn cursor_project_by_session() -> HashMap<String, String> {
+    let root = crate::ingest::cursor_projects_root();
+    let mut projects = HashMap::new();
+    for entry in WalkDir::new(root).into_iter().flatten().filter(|entry| {
+        entry.file_type().is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+    }) {
+        let path = entry.path();
+        let project = crate::ingest::project_from_cursor_path(path);
+        projects.insert(
+            crate::ingest::cursor_session_id_from_path(path),
+            project.clone(),
+        );
+        projects.insert(crate::ingest::cursor_transcript_id(path), project);
+    }
+    projects
+}
+
 fn scan_cursor_db(
     path: &Path,
     out: &mut Vec<UsageEvent>,
     seen: &mut HashSet<String>,
+    project_by_session: &HashMap<String, String>,
 ) -> Result<()> {
     let conn = Connection::open_with_flags(
         path,
@@ -1178,7 +1200,7 @@ fn scan_cursor_db(
             let Ok(value) = serde_json::from_str::<Value>(&raw) else {
                 continue;
             };
-            extract_cursor_objects(&value, &key, table, path, out, seen);
+            extract_cursor_objects(&value, &key, table, path, out, seen, project_by_session);
         }
     }
     Ok(())
@@ -1191,16 +1213,35 @@ fn extract_cursor_objects(
     path: &Path,
     out: &mut Vec<UsageEvent>,
     seen: &mut HashSet<String>,
+    project_by_session: &HashMap<String, String>,
 ) {
     match value {
         Value::Array(values) => {
             for value in values {
-                extract_cursor_objects(value, fallback_id, table, path, out, seen);
+                extract_cursor_objects(
+                    value,
+                    fallback_id,
+                    table,
+                    path,
+                    out,
+                    seen,
+                    project_by_session,
+                );
             }
         }
         Value::Object(object) => {
             let input = nested_u64(object, &["inputTokens", "input_tokens"]);
             let output = nested_u64(object, &["outputTokens", "output_tokens"]);
+            let session_id = object_string(object, &["sessionId", "composerId"]).or_else(|| {
+                fallback_id
+                    .strip_prefix("composerData:")
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            });
+            let project = session_id
+                .as_ref()
+                .and_then(|session_id| project_by_session.get(session_id))
+                .cloned();
             let counted = input > 0 || output > 0;
             if counted {
                 let id = object_string(
@@ -1220,7 +1261,7 @@ fn extract_cursor_objects(
                         source: "cursor".into(),
                         source_path: path.to_string_lossy().to_string(),
                         source_record_id: Some(id),
-                        session_id: object_string(object, &["sessionId", "composerId"]),
+                        session_id,
                         request_id: None,
                         message_id: None,
                         timestamp_ms: object
@@ -1228,7 +1269,7 @@ fn extract_cursor_objects(
                             .or_else(|| object.get("timestamp"))
                             .map(timestamp_ms)
                             .unwrap_or(0),
-                        project: None,
+                        project,
                         provider: None,
                         model: object_string(object, &["model", "modelName"])
                             .or_else(|| {
@@ -1259,7 +1300,15 @@ fn extract_cursor_objects(
                     continue;
                 }
                 if child.is_array() || child.is_object() {
-                    extract_cursor_objects(child, fallback_id, table, path, out, seen);
+                    extract_cursor_objects(
+                        child,
+                        fallback_id,
+                        table,
+                        path,
+                        out,
+                        seen,
+                        project_by_session,
+                    );
                 }
             }
         }
@@ -1721,10 +1770,17 @@ mod tests {
         let matching = scan_usage(&query).expect("scan matching project");
         query.project = Some("memex".into());
         let mismatched = scan_usage(&query).expect("scan mismatched project");
+        query.project = Some("opencode".into());
+        query.session_keys = Some(HashSet::from([("opencode".into(), "ses_test".into())]));
+        let matching_session = scan_usage(&query).expect("scan matching session");
+        query.session_keys = Some(HashSet::from([("opencode".into(), "ses_other".into())]));
+        let mismatched_session = scan_usage(&query).expect("scan mismatched session");
 
         assert_eq!(matching.events, 1);
         assert_eq!(matching.details[0].project.as_deref(), Some("opencode"));
         assert_eq!(mismatched.events, 0);
+        assert_eq!(matching_session.events, 1);
+        assert_eq!(mismatched_session.events, 0);
     }
 
     #[test]
@@ -1732,6 +1788,7 @@ mod tests {
         let value = serde_json::json!([
             {
                 "generationUUID": "usage-parent",
+                "composerId": "composer-main",
                 "usage": { "inputTokens": 10, "outputTokens": 5 },
                 "children": [
                     {
@@ -1748,6 +1805,8 @@ mod tests {
         ]);
         let mut events = Vec::new();
         let mut seen = HashSet::new();
+        let project_by_session =
+            HashMap::from([("composer-main".to_string(), "memex".to_string())]);
 
         extract_cursor_objects(
             &value,
@@ -1756,6 +1815,7 @@ mod tests {
             Path::new("state.vscdb"),
             &mut events,
             &mut seen,
+            &project_by_session,
         );
 
         assert_eq!(events.len(), 3);
@@ -1771,6 +1831,7 @@ mod tests {
             events.iter().map(|event| event.tokens.total()).sum::<u64>(),
             53
         );
+        assert_eq!(events[0].project.as_deref(), Some("memex"));
     }
 
     #[test]
@@ -1804,7 +1865,7 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let agent_root = tmp.path().join("pi-agent");
-        let session_root = agent_root.join("custom/sessions/project");
+        let session_root = agent_root.join("custom/sessions/--C--Users-alice-Code-memex--");
         std::fs::create_dir_all(&session_root).expect("create session root");
         std::fs::write(
             agent_root.join("settings.json"),
@@ -1823,19 +1884,23 @@ mod tests {
             ("PI_CODING_AGENT_SESSION_DIR", None),
             ("PI_CODING_AGENT_DIR", Some(agent_root.as_os_str())),
         ]);
-        let mut events = Vec::new();
-        let mut warnings = Vec::new();
+        let report = scan_usage(&UsageQuery {
+            source: Some(SourceFilter::Pi),
+            project: Some("memex".into()),
+            project_grouping: ProjectGrouping::Flat,
+            include_events: true,
+            ..UsageQuery::default()
+        })
+        .expect("scan pi");
 
-        scan_pi(&mut events, &mut warnings).expect("scan pi");
-
-        assert!(warnings.is_empty());
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].tokens.total(), 19);
-        assert_eq!(events[0].project.as_deref(), Some("project"));
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.events, 1);
+        assert_eq!(report.details[0].tokens.total(), 19);
+        assert_eq!(report.details[0].project.as_deref(), Some("memex"));
         assert!(
-            events[0]
+            report.details[0]
                 .source_path
-                .ends_with("custom/sessions/project/session.jsonl")
+                .ends_with("custom/sessions/--C--Users-alice-Code-memex--/session.jsonl")
         );
     }
 

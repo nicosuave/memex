@@ -1019,26 +1019,44 @@ impl App {
     }
 
     fn kickoff_search(&mut self) {
-        self.pending_home_search = None;
+        let was_pending = self.pending_home_search.take().is_some();
+        let refresh_home_tokens =
+            self.layout_mode == LayoutMode::Home && self.home_chart_mode == HomeChartMode::Tokens;
+        if refresh_home_tokens && !was_pending {
+            self.invalidate_home_token_activity();
+            self.home_token_activity_state = LoadState::Loading;
+        }
         let request_id = self.next_request_id();
         self.active_search_request = request_id;
         self.sessions_state = LoadState::Loading;
         self.last_spinner_at = Instant::now();
+        let query = self.query.trim().to_string();
+        let query_is_empty = query.is_empty();
         self.set_status("searching...");
         let request = SearchRequest {
             request_id,
-            query: self.query.trim().to_string(),
+            query,
             project: self.project.trim().to_string(),
             source: self.source,
             since: self.sessions_since,
             grouping: self.project_display.grouping(),
         };
         if self.search_request_tx.send(request).is_err() {
-            self.sessions_state = LoadState::Error("search worker stopped".to_string());
+            let message = "search worker stopped".to_string();
+            self.sessions_state = LoadState::Error(message.clone());
+            if refresh_home_tokens {
+                self.home_token_activity_state = LoadState::Error(message);
+            }
+        } else if refresh_home_tokens && query_is_empty {
+            self.kickoff_home_token_activity();
         }
     }
 
     fn schedule_home_search(&mut self) {
+        if self.home_chart_mode == HomeChartMode::Tokens {
+            self.invalidate_home_token_activity();
+            self.home_token_activity_state = LoadState::Loading;
+        }
         self.active_search_request = self.next_request_id();
         self.sessions_state = LoadState::Loading;
         self.pending_home_search = Some(Instant::now() + HOME_SEARCH_DEBOUNCE);
@@ -1180,6 +1198,7 @@ impl App {
             self.source,
             &self.project,
             self.project_display.grouping(),
+            home_token_session_keys(&self.query, &self.results),
             self.home_activity_range,
             now_ms(),
         );
@@ -1374,9 +1393,6 @@ impl App {
         }
         if refresh_search {
             self.kickoff_search();
-            if token_filter_changed && self.home_chart_mode == HomeChartMode::Tokens {
-                self.kickoff_home_token_activity();
-            }
         } else if refresh_activity {
             self.kickoff_home_activity();
         }
@@ -1418,12 +1434,30 @@ impl App {
 
     fn toggle_home_chart_mode(&mut self) {
         self.home_chart_mode = self.home_chart_mode.toggle();
-        if self.home_chart_mode == HomeChartMode::Tokens
-            && matches!(
-                self.home_token_activity_state,
-                LoadState::Idle | LoadState::Error(_)
-            )
-        {
+        if self.home_chart_mode != HomeChartMode::Tokens {
+            return;
+        }
+        if !self.query.trim().is_empty() {
+            match &self.sessions_state {
+                LoadState::Loading => {
+                    self.invalidate_home_token_activity();
+                    self.home_token_activity_state = LoadState::Loading;
+                }
+                LoadState::Empty => {
+                    self.invalidate_home_token_activity();
+                    self.home_token_activity_state = LoadState::Empty;
+                }
+                LoadState::Error(message) => {
+                    let message = message.clone();
+                    self.invalidate_home_token_activity();
+                    self.home_token_activity_state = LoadState::Error(message);
+                }
+                _ => self.kickoff_home_token_activity(),
+            }
+        } else if matches!(
+            self.home_token_activity_state,
+            LoadState::Idle | LoadState::Error(_)
+        ) {
             self.kickoff_home_token_activity();
         }
     }
@@ -1512,6 +1546,17 @@ impl App {
                     self.set_status(format!("{} sessions", self.results.len()));
                 }
                 self.update_detail();
+                if self.layout_mode == LayoutMode::Home
+                    && self.home_chart_mode == HomeChartMode::Tokens
+                    && !self.query.trim().is_empty()
+                {
+                    if self.results.is_empty() {
+                        self.invalidate_home_token_activity();
+                        self.home_token_activity_state = LoadState::Empty;
+                    } else {
+                        self.kickoff_home_token_activity();
+                    }
+                }
             }
             SearchUpdate::Projects {
                 request_id,
@@ -1560,6 +1605,13 @@ impl App {
                 message,
             } if request_id == self.active_search_request => {
                 self.sessions_state = LoadState::Error(message.clone());
+                if self.layout_mode == LayoutMode::Home
+                    && self.home_chart_mode == HomeChartMode::Tokens
+                    && !self.query.trim().is_empty()
+                {
+                    self.invalidate_home_token_activity();
+                    self.home_token_activity_state = LoadState::Error(message.clone());
+                }
                 self.set_status(format!("search error: {message}"));
             }
             SearchUpdate::ProjectsError {
@@ -3015,6 +3067,7 @@ fn home_token_usage_query(
     source: SourceChoice,
     project: &str,
     grouping: ProjectGrouping,
+    session_keys: Option<HashSet<(String, String)>>,
     range: TimelineRange,
     now: u64,
 ) -> UsageQuery {
@@ -3022,11 +3075,29 @@ fn home_token_usage_query(
         source: source.as_filter(),
         project: (!project.trim().is_empty()).then(|| project.to_string()),
         project_grouping: grouping,
+        session_keys,
         since_ms: range.since_ms(now),
         until_ms: None,
         cost_mode: CostMode::Source,
         include_events: true,
     }
+}
+
+fn home_token_session_keys(
+    query: &str,
+    sessions: &[SessionSummary],
+) -> Option<HashSet<(String, String)>> {
+    (!query.trim().is_empty()).then(|| {
+        sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.source.label().to_string(),
+                    session.session_id.clone(),
+                )
+            })
+            .collect()
+    })
 }
 
 fn activity_count_in_bounds(points: &[HomeChartPoint], bounds: (u64, u64)) -> usize {
@@ -6261,6 +6332,7 @@ mod tests {
             SourceChoice::Opencode,
             "memex",
             ProjectGrouping::Repository,
+            None,
             TimelineRange::Week,
             10_000,
         );
@@ -6268,8 +6340,44 @@ mod tests {
         assert_eq!(query.source, Some(SourceFilter::Opencode));
         assert_eq!(query.project.as_deref(), Some("memex"));
         assert_eq!(query.project_grouping, ProjectGrouping::Repository);
+        assert!(query.session_keys.is_none());
         assert_eq!(query.since_ms, TimelineRange::Week.since_ms(10_000));
         assert!(query.include_events);
+    }
+
+    #[test]
+    fn token_session_filter_uses_accepted_source_qualified_results() {
+        let sessions = vec![
+            SessionSummary {
+                session_id: "shared".into(),
+                project: "memex".into(),
+                source: SourceKind::CodexHistory,
+                last_ts: 1,
+                hit_count: 1,
+                top_score: 1.0,
+                snippet: String::new(),
+                source_path: "codex.jsonl".into(),
+                source_dir: String::new(),
+            },
+            SessionSummary {
+                session_id: "shared".into(),
+                project: "memex".into(),
+                source: SourceKind::Claude,
+                last_ts: 1,
+                hit_count: 1,
+                top_score: 1.0,
+                snippet: String::new(),
+                source_path: "claude.jsonl".into(),
+                source_dir: String::new(),
+            },
+        ];
+
+        let keys = home_token_session_keys("needle", &sessions).expect("session keys");
+
+        assert!(keys.contains(&("codex".into(), "shared".into())));
+        assert!(keys.contains(&("claude".into(), "shared".into())));
+        assert_eq!(keys.len(), 2);
+        assert!(home_token_session_keys("  ", &sessions).is_none());
     }
 
     #[test]

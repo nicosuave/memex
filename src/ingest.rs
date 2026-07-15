@@ -1068,7 +1068,7 @@ fn codex_history_path() -> PathBuf {
     codex_root().join("history.jsonl")
 }
 
-fn cursor_projects_root() -> PathBuf {
+pub(crate) fn cursor_projects_root() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
@@ -3015,7 +3015,7 @@ fn copilot_tool_output(data: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn project_from_cursor_path(path: &Path) -> String {
+pub(crate) fn project_from_cursor_path(path: &Path) -> String {
     let root = cursor_projects_root();
     let Ok(relative) = path.strip_prefix(root) else {
         return "cursor".to_string();
@@ -3033,7 +3033,7 @@ fn project_from_cursor_path(path: &Path) -> String {
     decode_project_name(project_folder)
 }
 
-fn cursor_session_id_from_path(path: &Path) -> String {
+pub(crate) fn cursor_session_id_from_path(path: &Path) -> String {
     let components: Vec<_> = path.components().collect();
     for (idx, component) in components.iter().enumerate() {
         if component.as_os_str().to_str() == Some("agent-transcripts")
@@ -3083,7 +3083,7 @@ fn cursor_is_subagent_transcript(path: &Path) -> bool {
         .any(|component| component.as_os_str().to_str() == Some("subagents"))
 }
 
-fn cursor_transcript_id(path: &Path) -> String {
+pub(crate) fn cursor_transcript_id(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
@@ -3111,7 +3111,7 @@ fn stable_cursor_turn_bucket(value: &str) -> u32 {
     hash % CURSOR_SUBAGENT_TURN_BUCKETS
 }
 
-fn project_from_pi_session_path(path: &Path) -> String {
+pub(crate) fn project_from_pi_session_path(path: &Path) -> String {
     path.parent()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
