@@ -944,6 +944,7 @@ impl App {
                         &query,
                         source.as_filter(),
                         tantivy_project,
+                        None,
                         RESULT_LIMIT,
                     )?;
                     enrich_session_projects(&paths, &mut sessions, grouping);
@@ -3896,6 +3897,7 @@ fn sessions_from_query(
     query: &str,
     source: Option<SourceFilter>,
     project: Option<&str>,
+    since: Option<u64>,
     limit: usize,
 ) -> Result<Vec<SessionSummary>> {
     let options = QueryOptions {
@@ -3905,7 +3907,7 @@ fn sessions_from_query(
         tool: None,
         session_id: None,
         source,
-        since: None,
+        since,
         until: None,
         limit: limit.max(20),
     };
@@ -4039,9 +4041,8 @@ fn build_project_timeline(
             .collect()
     } else {
         let index = SearchIndex::open_or_create(&paths.index)?;
-        let mut sessions = sessions_from_query(&index, query, source, None, RESULT_LIMIT)?;
+        let mut sessions = sessions_from_query(&index, query, source, None, since, RESULT_LIMIT)?;
         enrich_session_projects(paths, &mut sessions, display.grouping());
-        sessions.retain(|session| since.is_none_or(|start| session.last_ts >= start));
         sessions
     };
     let mut projects: HashMap<String, ProjectTimelineRow> = HashMap::new();
@@ -5599,6 +5600,34 @@ mod tests {
 
         assert_eq!(app.timeline_state, LoadState::Empty);
         assert_eq!(app.query, "draft search");
+    }
+
+    #[test]
+    fn timeline_query_filters_by_range_before_collecting_sessions() {
+        let (_tmp, app) = test_app();
+        let mut writer = app.index.writer().expect("writer");
+        let mut old = record("user", "needle");
+        old.doc_id = 1;
+        old.ts = 10;
+        old.session_id = "old".to_string();
+        old.source_path = "old.jsonl".to_string();
+        app.index.add_record(&mut writer, &old).expect("add old");
+        let mut recent = record("user", "needle");
+        recent.doc_id = 2;
+        recent.ts = 100;
+        recent.session_id = "recent".to_string();
+        recent.source_path = "recent.jsonl".to_string();
+        app.index
+            .add_record(&mut writer, &recent)
+            .expect("add recent");
+        writer.commit().expect("commit");
+
+        let sessions =
+            sessions_from_query(&app.index, "needle", None, None, Some(50), RESULT_LIMIT)
+                .expect("search");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "recent");
     }
 
     #[test]
