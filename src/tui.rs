@@ -83,6 +83,15 @@ enum SearchUpdate {
         request_id: u64,
         message: String,
     },
+    HomeActivity {
+        request_id: u64,
+        timestamps: Vec<(SourceKind, u64)>,
+    },
+    HomeFilters {
+        request_id: u64,
+        sources: Vec<SourceChoice>,
+        projects: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +129,13 @@ const PREVIEW_LINE_MAX_CHARS: usize = 320;
 const CONTEXT_AROUND_MATCH: usize = 1;
 const RECENT_SESSIONS_LIMIT: usize = 200;
 const RECENT_RECORDS_MULTIPLIER: usize = 50;
+const HOME_COLUMN_WIDTH: u16 = 64;
+const HOME_ACTIVITY_DAYS: u64 = 30;
+const HOME_DROPDOWN_MAX_ROWS: u16 = 8;
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+// Braille cells fill bottom-up in four dot rows, giving the chart a dotted
+// texture at 4x the vertical resolution of the character grid.
+const HOME_BRAILLE: [char; 5] = [' ', '⣀', '⣤', '⣶', '⣿'];
 const SPINNER_TICK: Duration = Duration::from_millis(80);
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -183,6 +199,7 @@ enum PreviewMode {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum LayoutMode {
+    Home,
     Split,
     List,
     Timeline,
@@ -295,6 +312,13 @@ impl ProjectDisplayMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+enum HomeDropdown {
+    None,
+    Source,
+    Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum SourceChoice {
     All,
     Claude,
@@ -399,6 +423,19 @@ struct App {
     timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode)>,
     timeline_state: LoadState,
     active_timeline_request: u64,
+    home_activity: Vec<(SourceKind, u64)>,
+    home_activity_state: LoadState,
+    active_home_activity_request: u64,
+    home_input_area: Rect,
+    home_list_area: Rect,
+    home_dropdown: HomeDropdown,
+    home_dropdown_state: ListState,
+    home_dropdown_area: Rect,
+    home_source_area: Rect,
+    home_project_area: Rect,
+    home_sources: Vec<SourceChoice>,
+    home_projects: Vec<String>,
+    active_home_filters_request: u64,
     quick_popup: bool,
     quick_scroll: usize,
     quick_lines: Vec<PreviewLine>,
@@ -616,6 +653,8 @@ pub fn run(
     app.update_rx = update_rx;
     app.kickoff_index_refresh(false);
     app.kickoff_search();
+    app.kickoff_home_activity();
+    app.kickoff_home_filters();
 
     let mut terminal = enter_terminal()?;
     app.suppress_stdio()?;
@@ -634,6 +673,19 @@ impl App {
             focus: Focus::Query,
             query: String::new(),
             project: String::new(),
+            home_activity: Vec::new(),
+            home_activity_state: LoadState::Idle,
+            active_home_activity_request: 0,
+            home_input_area: Rect::default(),
+            home_list_area: Rect::default(),
+            home_dropdown: HomeDropdown::None,
+            home_dropdown_state: ListState::default(),
+            home_dropdown_area: Rect::default(),
+            home_source_area: Rect::default(),
+            home_project_area: Rect::default(),
+            home_sources: Vec::new(),
+            home_projects: Vec::new(),
+            active_home_filters_request: 0,
             source: SourceChoice::All,
             all_projects: Vec::new(),
             project_options: Vec::new(),
@@ -645,7 +697,7 @@ impl App {
             sessions_state: LoadState::Idle,
             active_search_request: 0,
             selected: ListState::default(),
-            layout_mode: LayoutMode::Split,
+            layout_mode: LayoutMode::Home,
             project_display: ProjectDisplayMode::NestedWorktrees,
             timeline_range: TimelineRange::All,
             timeline_density: TimelineDensityMode::Compact,
@@ -716,6 +768,7 @@ impl App {
             || self.project_state == LoadState::Loading
             || self.timeline_state == LoadState::Loading
             || self.detail_state == LoadState::Loading
+            || self.home_activity_state == LoadState::Loading
     }
 
     fn spinner(&self) -> char {
@@ -774,6 +827,11 @@ impl App {
     }
 
     fn update_detail(&mut self) {
+        // The home screen has no preview panel; skip preview work until the
+        // user drops into the browse layouts.
+        if self.layout_mode == LayoutMode::Home {
+            return;
+        }
         let Some(idx) = self.selected.selected() else {
             self.clear_detail("no session selected");
             return;
@@ -974,6 +1032,194 @@ impl App {
         });
     }
 
+    fn kickoff_home_activity(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_home_activity_request = request_id;
+        self.home_activity_state = LoadState::Loading;
+        let paths = self.paths.clone();
+        let tx = self.search_tx.clone();
+        std::thread::spawn(move || {
+            let since = now_ms().saturating_sub(HOME_ACTIVITY_DAYS * DAY_MS);
+            let timestamps = (|| -> Result<Vec<(SourceKind, u64)>> {
+                let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+                let rows = store.query_source_timestamps(Some(since))?;
+                Ok(rows.into_iter().filter(|(_, ts)| *ts > 0).collect())
+            })()
+            .unwrap_or_default();
+            let _ = tx.send(SearchUpdate::HomeActivity {
+                request_id,
+                timestamps,
+            });
+        });
+    }
+
+    fn kickoff_home_filters(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_home_filters_request = request_id;
+        let paths = self.paths.clone();
+        let tx = self.search_tx.clone();
+        let grouping = self.project_display.grouping();
+        std::thread::spawn(move || {
+            let (sources, projects) = (|| -> Result<(Vec<SourceChoice>, Vec<String>)> {
+                let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+                let labels = store.query_source_labels()?;
+                let sources = [
+                    SourceChoice::Claude,
+                    SourceChoice::Codex,
+                    SourceChoice::Opencode,
+                    SourceChoice::Cursor,
+                    SourceChoice::Pi,
+                    SourceChoice::Copilot,
+                ]
+                .into_iter()
+                .filter(|choice| {
+                    labels
+                        .iter()
+                        .any(|label| source_choice_matches_storage_label(*choice, label))
+                })
+                .collect();
+                let rows = store.query_project_timestamps(None, None, grouping)?;
+                let mut latest: HashMap<String, u64> = HashMap::new();
+                for (project, ts) in rows {
+                    if project.is_empty() {
+                        continue;
+                    }
+                    latest
+                        .entry(project)
+                        .and_modify(|v| *v = (*v).max(ts))
+                        .or_insert(ts);
+                }
+                let mut projects: Vec<(String, u64)> = latest.into_iter().collect();
+                projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                Ok((sources, projects.into_iter().map(|(p, _)| p).collect()))
+            })()
+            .unwrap_or_default();
+            let _ = tx.send(SearchUpdate::HomeFilters {
+                request_id,
+                sources,
+                projects,
+            });
+        });
+    }
+
+    fn home_dropdown_options(&self) -> Vec<String> {
+        match self.home_dropdown {
+            HomeDropdown::Source => {
+                let mut options = vec!["all".to_string()];
+                options.extend(self.home_sources.iter().map(|s| s.label().to_string()));
+                options
+            }
+            HomeDropdown::Project => {
+                let mut options = vec!["all projects".to_string()];
+                options.extend(self.home_projects.iter().cloned());
+                options
+            }
+            HomeDropdown::None => Vec::new(),
+        }
+    }
+
+    fn open_home_dropdown(&mut self, kind: HomeDropdown) {
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        self.home_dropdown = kind;
+        let current = match kind {
+            HomeDropdown::Source => self
+                .home_sources
+                .iter()
+                .position(|s| *s == self.source)
+                .map(|idx| idx + 1)
+                .unwrap_or(0),
+            HomeDropdown::Project => self
+                .home_projects
+                .iter()
+                .position(|p| *p == self.project)
+                .map(|idx| idx + 1)
+                .unwrap_or(0),
+            HomeDropdown::None => 0,
+        };
+        self.home_dropdown_state = ListState::default();
+        self.home_dropdown_state.select(Some(current));
+    }
+
+    fn close_home_dropdown(&mut self) {
+        self.home_dropdown = HomeDropdown::None;
+        self.home_dropdown_state = ListState::default();
+    }
+
+    fn move_home_dropdown_selection(&mut self, delta: isize) {
+        let len = self.home_dropdown_options().len();
+        if len == 0 {
+            return;
+        }
+        let idx = self.home_dropdown_state.selected().unwrap_or(0) as isize + delta;
+        let next = idx.clamp(0, (len - 1) as isize) as usize;
+        self.home_dropdown_state.select(Some(next));
+    }
+
+    fn apply_home_dropdown(&mut self) {
+        let Some(idx) = self.home_dropdown_state.selected() else {
+            self.close_home_dropdown();
+            return;
+        };
+        match self.home_dropdown {
+            HomeDropdown::Source => {
+                self.source = if idx == 0 {
+                    SourceChoice::All
+                } else {
+                    self.home_sources
+                        .get(idx - 1)
+                        .copied()
+                        .unwrap_or(SourceChoice::All)
+                };
+            }
+            HomeDropdown::Project => {
+                self.project = if idx == 0 {
+                    String::new()
+                } else {
+                    self.home_projects.get(idx - 1).cloned().unwrap_or_default()
+                };
+            }
+            HomeDropdown::None => {}
+        }
+        self.close_home_dropdown();
+        self.kickoff_search();
+    }
+
+    fn enter_browse(&mut self) {
+        self.layout_mode = LayoutMode::Split;
+        self.focus = Focus::List;
+        if self.selected.selected().is_none() && !self.results.is_empty() {
+            self.selected.select(Some(0));
+        }
+        self.last_detail_session = None;
+        self.update_detail();
+    }
+
+    fn go_home(&mut self) {
+        self.layout_mode = LayoutMode::Home;
+        self.focus = Focus::Query;
+        self.quick_popup = false;
+        self.quick_lines.clear();
+        self.close_home_dropdown();
+        if !self.query.is_empty() || !self.find_query.is_empty() {
+            self.query.clear();
+            self.find_query.clear();
+            self.kickoff_search();
+        }
+        self.kickoff_home_activity();
+        self.kickoff_home_filters();
+    }
+
+    fn home_focus_list(&mut self) {
+        if self.results.is_empty() {
+            return;
+        }
+        if self.selected.selected().is_none() {
+            self.selected.select(Some(0));
+        }
+        self.focus = Focus::List;
+    }
+
     fn update_project_options(&mut self) {
         let filter = self.project.trim().to_lowercase();
         let mut options = Vec::new();
@@ -1000,6 +1246,10 @@ impl App {
             IndexUpdate::Done { added, embedded } => {
                 self.index_state = IndexState::Complete;
                 self.refresh_results();
+                if self.layout_mode == LayoutMode::Home {
+                    self.kickoff_home_activity();
+                    self.kickoff_home_filters();
+                }
                 self.set_status(format!("indexed {added} records, embedded {embedded}"));
             }
             IndexUpdate::Error(message) => {
@@ -1108,6 +1358,25 @@ impl App {
                 self.detail_lines = vec![PreviewLine::Text(format!("preview error: {message}"))];
                 self.detail_scroll = 0;
             }
+            SearchUpdate::HomeActivity {
+                request_id,
+                timestamps,
+            } if request_id == self.active_home_activity_request => {
+                self.home_activity = timestamps;
+                self.home_activity_state = if self.home_activity.is_empty() {
+                    LoadState::Empty
+                } else {
+                    LoadState::Loaded
+                };
+            }
+            SearchUpdate::HomeFilters {
+                request_id,
+                sources,
+                projects,
+            } if request_id == self.active_home_filters_request => {
+                self.home_sources = sources;
+                self.home_projects = projects;
+            }
             _ => {}
         }
     }
@@ -1167,6 +1436,10 @@ impl App {
 
     fn focus_next(&mut self) {
         self.focus = match self.layout_mode {
+            LayoutMode::Home => match self.focus {
+                Focus::Query => Focus::List,
+                _ => Focus::Query,
+            },
             LayoutMode::Split => self.focus.next(),
             LayoutMode::List => match self.focus {
                 Focus::Query => Focus::Project,
@@ -1184,6 +1457,10 @@ impl App {
 
     fn focus_prev(&mut self) {
         self.focus = match self.layout_mode {
+            LayoutMode::Home => match self.focus {
+                Focus::Query => Focus::List,
+                _ => Focus::Query,
+            },
             LayoutMode::Split => self.focus.prev(),
             LayoutMode::List => match self.focus {
                 Focus::Query => Focus::Find,
@@ -1229,6 +1506,7 @@ impl App {
 
     fn toggle_layout_mode(&mut self) {
         self.layout_mode = match self.layout_mode {
+            LayoutMode::Home => LayoutMode::Home,
             LayoutMode::Split => {
                 self.focus = Focus::List;
                 self.quick_popup = false;
@@ -1514,17 +1792,23 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
             loop {
                 match crossterm::event::read()? {
                     Event::Key(key) => {
+                        dirty = true;
                         if handle_key(key, terminal, app)? {
                             should_quit = true;
                             break;
                         }
                     }
                     Event::Mouse(mouse) => {
-                        handle_mouse(mouse, app);
+                        // Mouse capture also reports pure motion; only redraw
+                        // when the handler actually changed something.
+                        if handle_mouse(mouse, terminal, app)? {
+                            dirty = true;
+                        }
                     }
-                    _ => {}
+                    _ => {
+                        dirty = true;
+                    }
                 }
-                dirty = true;
                 if !crossterm::event::poll(Duration::from_millis(0))? {
                     break;
                 }
@@ -1575,6 +1859,10 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         return Ok(false);
     }
 
+    if app.layout_mode == LayoutMode::Home {
+        return handle_home_key(key, terminal, app);
+    }
+
     if matches!(key.code, KeyCode::Esc) {
         if app.layout_mode == LayoutMode::Detail && !matches!(app.focus, Focus::Find) {
             app.return_to_list();
@@ -1584,6 +1872,8 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
             } else {
                 Focus::Preview
             };
+        } else if matches!(app.focus, Focus::List) {
+            app.go_home();
         } else {
             app.focus = Focus::List;
         }
@@ -1839,6 +2129,110 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
     Ok(false)
 }
 
+fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    if app.home_dropdown != HomeDropdown::None {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_home_dropdown();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_home_dropdown_selection(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.move_home_dropdown_selection(1);
+            }
+            KeyCode::Enter => {
+                app.apply_home_dropdown();
+            }
+            KeyCode::Char('s') if app.home_dropdown == HomeDropdown::Source => {
+                app.close_home_dropdown();
+            }
+            KeyCode::Char('p') if app.home_dropdown == HomeDropdown::Project => {
+                app.close_home_dropdown();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    if matches!(app.focus, Focus::Query) {
+        match key.code {
+            KeyCode::Esc => {
+                if !app.query.is_empty() {
+                    app.query.clear();
+                    app.kickoff_search();
+                }
+            }
+            KeyCode::Enter => {
+                if !app.query.trim().is_empty() {
+                    app.enter_browse();
+                } else {
+                    app.home_focus_list();
+                }
+            }
+            KeyCode::Down => {
+                app.home_focus_list();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                app.enter_browse();
+            }
+            KeyCode::Backspace => {
+                if app.query.pop().is_some() {
+                    app.kickoff_search();
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.query.push(ch);
+                app.kickoff_search();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.selected.selected().unwrap_or(0) == 0 {
+                app.focus = Focus::Query;
+            } else {
+                app.move_selection(-1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_selection(1);
+        }
+        KeyCode::PageDown => {
+            app.move_selection(8);
+        }
+        KeyCode::PageUp => {
+            app.move_selection(-8);
+        }
+        KeyCode::Enter | KeyCode::Char('r') => {
+            let _ = app.resume_selected(terminal);
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('l') => {
+            app.enter_browse();
+        }
+        KeyCode::Esc | KeyCode::Char('/') => {
+            app.focus = Focus::Query;
+        }
+        KeyCode::Char(' ') => {
+            app.toggle_quick_popup();
+        }
+        KeyCode::Char('s') => {
+            app.open_home_dropdown(HomeDropdown::Source);
+        }
+        KeyCode::Char('p') => {
+            app.open_home_dropdown(HomeDropdown::Project);
+        }
+        KeyCode::Char('S') => {
+            let _ = app.share_selected();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     let theme = Theme::new();
     frame.render_widget(Block::default().style(theme.base), frame.area());
@@ -1849,6 +2243,22 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
         OUTER_PAD_Y,
         OUTER_PAD_Y,
     );
+
+    if app.layout_mode == LayoutMode::Home {
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(FOOTER_HEIGHT)])
+            .split(area);
+        app.body_area = root[0];
+        app.querybar_area = Rect::default();
+        draw_home(frame, app, &theme, root[0]);
+        draw_footer(frame, app, &theme, root[1]);
+        if app.quick_popup {
+            draw_quick_popup(frame, app, &theme, app.body_area);
+        }
+        return;
+    }
+
     // The query bar only pops up while a text field is focused, so browsing
     // stays at a single row of chrome and typing is unmistakably in a box.
     let editing = matches!(app.focus, Focus::Query | Focus::Project | Focus::Find);
@@ -1874,6 +2284,602 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     if app.quick_popup {
         draw_quick_popup(frame, app, &theme, app.body_area);
     }
+}
+
+fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
+    frame.render_widget(Block::default().style(theme.panel), area);
+    app.home_input_area = Rect::default();
+    app.home_list_area = Rect::default();
+    app.home_source_area = Rect::default();
+    app.home_project_area = Rect::default();
+    app.home_dropdown_area = Rect::default();
+    if area.width < 8 || area.height < 4 {
+        return;
+    }
+
+    let col_width = area
+        .width
+        .saturating_sub(4)
+        .min(HOME_COLUMN_WIDTH)
+        .max(area.width.min(24));
+    let col_x = area.x + (area.width - col_width) / 2;
+    let col = |y: u16, h: u16| Rect {
+        x: col_x,
+        y,
+        width: col_width,
+        height: h,
+    };
+
+    // Chart grows with the terminal: each braille row adds 4 dot levels.
+    let chart_height: u16 = if area.height >= 14 && !app.home_activity.is_empty() {
+        (area.height / 7).clamp(2, 6)
+    } else {
+        0
+    };
+    let caption_height: u16 = if area.height >= 9 { 1 } else { 0 };
+    let fixed = chart_height + caption_height + 9;
+    let top_pad = (area.height.saturating_sub(fixed) / 4).min(4);
+    let mut y = area.y + top_pad;
+
+    if chart_height > 0 {
+        let now = now_ms();
+        let bounds = (now.saturating_sub(HOME_ACTIVITY_DAYS * DAY_MS), now.max(1));
+        let grid = home_chart_grid(
+            &app.home_activity,
+            bounds,
+            col_width as usize,
+            chart_height as usize,
+        );
+        for row in grid {
+            frame.render_widget(Paragraph::new(home_chart_row_line(&row)), col(y, 1));
+            y += 1;
+        }
+    }
+
+    if caption_height > 0 {
+        // Legend: one colored dot per agent, largest volume first — the same
+        // order the chart stacks bottom-up.
+        let groups = home_chart_groups(&app.home_activity);
+        let mut spans: Vec<Span> = Vec::new();
+        if groups.is_empty() {
+            spans.push(Span::styled("memex", theme.focus));
+        } else {
+            for (label, color, _) in &groups {
+                spans.push(Span::styled("● ", Style::default().fg(*color)));
+                spans.push(Span::styled((*label).to_string(), theme.text));
+                spans.push(Span::raw("  "));
+            }
+        }
+        match &app.home_activity_state {
+            LoadState::Loading => spans.push(Span::styled(
+                format!(" {} loading activity…", app.spinner()),
+                theme.muted,
+            )),
+            LoadState::Loaded => spans.push(Span::styled(
+                format!(
+                    "·  {} sessions · {}d",
+                    app.home_activity.len(),
+                    HOME_ACTIVITY_DAYS
+                ),
+                theme.muted,
+            )),
+            _ => {}
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+            col(y, 1),
+        );
+        y += 2;
+    }
+
+    // opencode-style input: a left accent bar spanning a padded three-row box.
+    let input_area = col(y, 3);
+    app.home_input_area = input_area;
+    let input_focused = matches!(app.focus, Focus::Query);
+    let bar_style = if input_focused {
+        theme.accent
+    } else {
+        theme.muted
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("▌", bar_style))),
+        col(y, 1),
+    );
+    let mut input_spans = vec![Span::styled("▌  ", bar_style)];
+    if app.query.is_empty() {
+        if input_focused {
+            input_spans.push(Span::styled(" ", theme.selection));
+            input_spans.push(Span::styled(" search your sessions", theme.muted));
+        } else {
+            input_spans.push(Span::styled("search your sessions", theme.muted));
+        }
+    } else {
+        input_spans.push(Span::styled(app.query.clone(), theme.text_bold));
+        if input_focused {
+            input_spans.push(Span::styled(" ", theme.selection));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(input_spans)), col(y + 1, 1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("▌", bar_style))),
+        col(y + 2, 1),
+    );
+    y += 4;
+
+    // Header row: label on the left, source/project dropdown anchors on the right.
+    let searching = !app.query.trim().is_empty();
+    let header_area = col(y, 1);
+    let mut header_spans = vec![Span::styled(
+        if searching { "matches" } else { "recent" },
+        theme.text_bold,
+    )];
+    if !app.results.is_empty() {
+        header_spans.push(Span::styled(format!(" {}", app.results.len()), theme.muted));
+    }
+    if app.sessions_state == LoadState::Loading && !app.results.is_empty() {
+        header_spans.push(Span::styled(format!("  {}", app.spinner()), theme.muted));
+    }
+    let source_word = format!("{} ▾", app.source.label());
+    let project_word = format!(
+        "{} ▾",
+        if app.project.trim().is_empty() {
+            "projects".to_string()
+        } else {
+            truncate_end(&app.project, 16)
+        }
+    );
+    let source_width = source_word.chars().count() as u16;
+    let project_width_hdr = project_word.chars().count() as u16;
+    let header_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(4),
+            Constraint::Length(source_width),
+            Constraint::Length(3),
+            Constraint::Length(project_width_hdr),
+        ])
+        .split(header_area);
+    app.home_source_area = header_cols[1];
+    app.home_project_area = header_cols[3];
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), header_cols[0]);
+    let source_style = if app.source == SourceChoice::All {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    let project_style = if app.project.trim().is_empty() {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(source_word, source_style))),
+        header_cols[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        header_cols[3],
+    );
+    y += 1;
+
+    // Grow the list with the terminal instead of a fixed sliver, but keep
+    // breathing room below so the layout never runs to the very edge.
+    let list_cap = (area.height * 2 / 5).clamp(8, 30);
+    let list_height = (area.y + area.height).saturating_sub(y).min(list_cap);
+    if list_height == 0 {
+        draw_home_dropdown(frame, app, theme, area, header_area);
+        return;
+    }
+    let list_area = col(y, list_height);
+    app.home_list_area = list_area;
+
+    if app.results.is_empty() {
+        let message = match &app.sessions_state {
+            LoadState::Loading | LoadState::Empty if app.index_state == IndexState::Loading => {
+                format!("{} Building conversation index…", app.spinner())
+            }
+            LoadState::Loading => format!("{} Loading conversations…", app.spinner()),
+            LoadState::Error(message) => format!("Couldn’t load conversations: {message}"),
+            _ if searching => "No matching conversations".to_string(),
+            _ => "No conversations indexed yet".to_string(),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(message, theme.muted))),
+            list_area,
+        );
+        draw_home_dropdown(frame, app, theme, area, header_area);
+        return;
+    }
+
+    let (project_width, detail_width) = session_row_layout(&app.results, col_width as usize);
+    let terms = query_terms(&app.query);
+    let items: Vec<ListItem> = app
+        .results
+        .iter()
+        .map(|session| {
+            ListItem::new(session_result_line(
+                session,
+                &terms,
+                project_width,
+                detail_width,
+                theme,
+            ))
+        })
+        .collect();
+    let highlight = if matches!(app.focus, Focus::List) {
+        theme.selection
+    } else {
+        Style::default()
+    };
+    let list = List::new(items)
+        .style(theme.text)
+        .highlight_style(highlight)
+        .highlight_symbol("");
+    frame.render_stateful_widget(list, list_area, &mut app.selected);
+
+    draw_home_dropdown(frame, app, theme, area, header_area);
+}
+
+fn draw_home_dropdown(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    theme: &Theme,
+    area: Rect,
+    header_area: Rect,
+) {
+    if app.home_dropdown == HomeDropdown::None {
+        return;
+    }
+    let options = app.home_dropdown_options();
+    if options.is_empty() {
+        return;
+    }
+    let anchor = match app.home_dropdown {
+        HomeDropdown::Source => app.home_source_area,
+        _ => app.home_project_area,
+    };
+    let width = options
+        .iter()
+        .map(|o| o.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 32) as u16
+        + 2;
+    let width = width.min(area.width);
+    let x = anchor
+        .right()
+        .saturating_sub(width)
+        .max(area.x)
+        .min(area.right().saturating_sub(width));
+    let y = header_area.y.saturating_add(1);
+    let max_height = area.bottom().saturating_sub(y);
+    let height = (options.len() as u16)
+        .min(HOME_DROPDOWN_MAX_ROWS)
+        .min(max_height);
+    if height == 0 {
+        return;
+    }
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    app.home_dropdown_area = popup;
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(theme.panel_alt), popup);
+    let items: Vec<ListItem> = options
+        .into_iter()
+        .map(|option| ListItem::new(Line::from(Span::styled(format!(" {option}"), theme.text))))
+        .collect();
+    let list = List::new(items)
+        .style(theme.text)
+        .highlight_style(theme.selection)
+        .highlight_symbol("");
+    frame.render_stateful_widget(list, popup, &mut app.home_dropdown_state);
+}
+
+/// Per-agent totals for the home chart, largest volume first. Codex session
+/// and history records collapse into one "codex" group via their shared label.
+fn home_chart_groups(events: &[(SourceKind, u64)]) -> Vec<(&'static str, Color, usize)> {
+    let mut totals: Vec<(&'static str, Color, usize)> = Vec::new();
+    for (kind, _) in events {
+        let label = kind.label();
+        if let Some(entry) = totals.iter_mut().find(|(l, _, _)| *l == label) {
+            entry.2 += 1;
+        } else {
+            totals.push((label, source_color(*kind), 1));
+        }
+    }
+    totals.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    totals
+}
+
+/// Builds the stacked activity chart: each column is a time bucket whose dot
+/// levels are split among agents proportionally, biggest group at the bottom.
+/// Returns rows top-to-bottom of (glyph, color) cells.
+fn home_chart_grid(
+    events: &[(SourceKind, u64)],
+    bounds: (u64, u64),
+    width: usize,
+    height: usize,
+) -> Vec<Vec<(char, Color)>> {
+    let height = height.max(1);
+    if width == 0 {
+        return Vec::new();
+    }
+    let groups = home_chart_groups(events);
+    let group_buckets: Vec<Vec<usize>> = groups
+        .iter()
+        .map(|(label, _, _)| {
+            let ts: Vec<u64> = events
+                .iter()
+                .filter(|(kind, _)| kind.label() == *label)
+                .map(|(_, ts)| *ts)
+                .collect();
+            timeline_bucket_counts(&ts, bounds, width)
+        })
+        .collect();
+    let totals: Vec<usize> = (0..width)
+        .map(|col| group_buckets.iter().map(|buckets| buckets[col]).sum())
+        .collect();
+    let max_total = totals.iter().copied().max().unwrap_or(0);
+    let mut grid = vec![vec![(' ', COLOR_MUTED); width]; height];
+    for col in 0..width {
+        let total = totals[col];
+        if total == 0 {
+            continue;
+        }
+        let level = timeline_density_level(total, max_total, height * 4);
+        let mut dot_colors: Vec<Color> = Vec::with_capacity(level);
+        let mut cum = 0usize;
+        for (group_idx, (_, color, _)) in groups.iter().enumerate() {
+            cum += group_buckets[group_idx][col];
+            let boundary = (cum * level) / total;
+            while dot_colors.len() < boundary {
+                dot_colors.push(*color);
+            }
+        }
+        for (row_idx, row) in grid.iter_mut().enumerate() {
+            let base = (height - 1 - row_idx) * 4;
+            let fill = level.saturating_sub(base).min(4);
+            if fill == 0 {
+                continue;
+            }
+            let color = dot_colors[base + (fill - 1) / 2];
+            row[col] = (HOME_BRAILLE[fill], color);
+        }
+    }
+    grid
+}
+
+fn home_chart_row_line(cells: &[(char, Color)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_color: Option<Color> = None;
+    for (ch, color) in cells {
+        if run_color != Some(*color) {
+            if !run.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut run),
+                    Style::default().fg(run_color.unwrap_or(COLOR_MUTED)),
+                ));
+            }
+            run_color = Some(*color);
+        }
+        run.push(*ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(
+            run,
+            Style::default().fg(run_color.unwrap_or(COLOR_MUTED)),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn query_terms(query: &str) -> Vec<Vec<char>> {
+    let mut seen = HashSet::new();
+    let mut terms = Vec::new();
+    for part in query.split_whitespace() {
+        let cleaned = part.trim_matches(|c: char| !c.is_alphanumeric());
+        if cleaned.chars().count() < 2 {
+            continue;
+        }
+        let key = cleaned.to_lowercase();
+        if seen.insert(key.clone()) {
+            terms.push(key.chars().collect());
+        }
+    }
+    terms
+}
+
+fn find_term(hay: &[char], term: &[char], from: usize) -> Option<usize> {
+    if term.is_empty() || hay.len() < term.len() || from > hay.len() - term.len() {
+        return None;
+    }
+    (from..=hay.len() - term.len()).find(|&i| {
+        hay[i..i + term.len()]
+            .iter()
+            .zip(term)
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    })
+}
+
+/// Renders a window of `text` around the first query-term hit, with every
+/// term occurrence inside the window emphasized. Falls back to a plain
+/// truncated snippet when no term matches literally (e.g. embedding hits).
+fn match_context_spans(
+    text: &str,
+    terms: &[Vec<char>],
+    width: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let first = terms
+        .iter()
+        .filter_map(|term| find_term(&chars, term, 0))
+        .min();
+    let Some(first) = first else {
+        return vec![Span::styled(truncate_end(text, width), theme.muted)];
+    };
+    let start = first.saturating_sub(width / 3);
+    let end = (start + width).min(chars.len());
+
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("…", theme.muted));
+    }
+    let mut i = start;
+    while i < end {
+        let mut best: Option<(usize, usize)> = None;
+        for term in terms {
+            if let Some(pos) = find_term(&chars, term, i)
+                && pos < end
+                && best.is_none_or(|(bp, _)| pos < bp)
+            {
+                best = Some((pos, term.len()));
+            }
+        }
+        match best {
+            Some((pos, len)) => {
+                if pos > i {
+                    spans.push(Span::styled(
+                        chars[i..pos].iter().collect::<String>(),
+                        theme.muted,
+                    ));
+                }
+                let match_end = (pos + len).min(end);
+                spans.push(Span::styled(
+                    chars[pos..match_end].iter().collect::<String>(),
+                    theme.text_bold,
+                ));
+                i = match_end;
+            }
+            None => {
+                spans.push(Span::styled(
+                    chars[i..end].iter().collect::<String>(),
+                    theme.muted,
+                ));
+                i = end;
+            }
+        }
+    }
+    if end < chars.len() {
+        spans.push(Span::styled("…", theme.muted));
+    }
+    spans
+}
+
+fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> bool {
+    match choice {
+        SourceChoice::Claude => label == "claude",
+        SourceChoice::Codex => matches!(label, "codex" | "codex-session" | "codex-history"),
+        SourceChoice::Opencode => label == "opencode",
+        SourceChoice::Cursor => label == "cursor",
+        SourceChoice::Pi => label == "pi",
+        SourceChoice::Copilot => label == "copilot",
+        SourceChoice::All => false,
+    }
+}
+
+fn source_color(source: SourceKind) -> Color {
+    match source {
+        SourceKind::Claude => Color::Rgb(214, 138, 88),
+        SourceKind::CodexSession | SourceKind::CodexHistory => Color::Rgb(160, 180, 200),
+        SourceKind::Opencode => Color::Rgb(150, 180, 150),
+        SourceKind::Cursor => Color::Rgb(170, 150, 200),
+        SourceKind::Pi => Color::Rgb(120, 190, 190),
+        SourceKind::Copilot => Color::Rgb(140, 160, 220),
+    }
+}
+
+/// Widest project name among the visible results, clamped so one long name
+/// can't push the detail column off screen.
+fn results_project_width(results: &[SessionSummary]) -> usize {
+    results
+        .iter()
+        .take(60)
+        .map(|session| session.project.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(6, 24)
+}
+
+/// Columns consumed by everything before the detail text in a session row:
+/// relative time, source dot + label, project column, and the gaps between.
+fn session_row_fixed_cols(project_width: usize) -> usize {
+    4 + 2 + 2 + 9 + project_width + 2
+}
+
+/// Splits a row of `total_width` cells into (project_width, detail_width):
+/// the project column takes its natural width, shrinking on narrow rows so
+/// the match-context detail keeps a readable minimum.
+fn session_row_layout(results: &[SessionSummary], total_width: usize) -> (usize, usize) {
+    const MIN_DETAIL: usize = 16;
+    let project_width = results_project_width(results)
+        .min(total_width.saturating_sub(session_row_fixed_cols(0) + MIN_DETAIL))
+        .max(8);
+    let detail_width = total_width.saturating_sub(session_row_fixed_cols(project_width));
+    (project_width, detail_width)
+}
+
+/// One session as a mini search result — the home-screen list row, shared by
+/// the browse Sessions panel: time, source, project, then the match context
+/// (or the session id when there's no snippet to show).
+fn session_result_line(
+    session: &SessionSummary,
+    terms: &[Vec<char>],
+    project_width: usize,
+    detail_width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let ts = format_relative_ts(session.last_ts);
+    let mut spans = vec![
+        Span::styled(format!("{ts:>4}"), theme.accent),
+        Span::raw("  "),
+        Span::styled("●", Style::default().fg(source_color(session.source))),
+        Span::raw(" "),
+        Span::styled(format!("{:<8}", session.source.label()), theme.muted),
+        Span::raw(" "),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                truncate_middle(&session.project, project_width),
+                width = project_width
+            ),
+            theme.text,
+        ),
+        Span::raw("  "),
+    ];
+    if session.snippet.is_empty() {
+        spans.push(Span::styled(
+            truncate_middle(&session.session_id, detail_width),
+            theme.muted,
+        ));
+    } else {
+        let snippet = strip_ansi_and_controls(&session.snippet);
+        spans.extend(match_context_spans(&snippet, terms, detail_width, theme));
+    }
+    Line::from(spans)
+}
+
+fn truncate_end(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = value.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 fn draw_query_bar(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect) {
@@ -2091,23 +3097,22 @@ fn draw_sessions_panel(
             theme.muted,
         )))]
     } else {
-        let mut items = Vec::with_capacity(app.results.len());
-        for session in &app.results {
-            let ts = format_relative_ts(session.last_ts);
-            let line = Line::from(vec![
-                Span::styled(format!("{:>4}", session.hit_count), theme.accent),
-                Span::raw(" "),
-                Span::styled(session.project.clone(), theme.text),
-                Span::raw(" "),
-                Span::styled(session.source.label(), theme.muted),
-                Span::raw(" "),
-                Span::styled(format!("{ts:>4}"), theme.accent),
-                Span::raw(" "),
-                Span::styled(session.session_id.clone(), theme.text),
-            ]);
-            items.push(ListItem::new(line));
-        }
-        items
+        // Same mini-search-result rows as the home screen list.
+        let (project_width, detail_width) =
+            session_row_layout(&app.results, content.width as usize);
+        let terms = query_terms(&app.query);
+        app.results
+            .iter()
+            .map(|session| {
+                ListItem::new(session_result_line(
+                    session,
+                    &terms,
+                    project_width,
+                    detail_width,
+                    theme,
+                ))
+            })
+            .collect()
     };
 
     let list = List::new(list_items)
@@ -2425,6 +3430,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         PreviewMode::History => "history",
     };
     let view = match app.layout_mode {
+        LayoutMode::Home => "home",
         LayoutMode::Split => "split",
         LayoutMode::List => "list",
         LayoutMode::Timeline => "timeline",
@@ -2520,7 +3526,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::raw(" "));
     }
     right_spans.push(Span::styled(view, theme.text));
-    if app.layout_mode != LayoutMode::Timeline {
+    if !matches!(app.layout_mode, LayoutMode::Timeline | LayoutMode::Home) {
         right_spans.push(Span::raw("   "));
         right_spans.push(Span::styled("mode ", theme.muted));
         right_spans.push(Span::styled(mode, theme.text));
@@ -2540,6 +3546,47 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
 }
 
 fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
+    if app.layout_mode == LayoutMode::Home {
+        if app.home_dropdown != HomeDropdown::None {
+            return Line::from(vec![
+                Span::styled("↑↓", theme.accent),
+                Span::styled(" move  ", theme.muted),
+                Span::styled("enter", theme.accent),
+                Span::styled(" select  ", theme.muted),
+                Span::styled("esc", theme.accent),
+                Span::styled(" close", theme.muted),
+            ]);
+        }
+        if matches!(app.focus, Focus::Query) {
+            return Line::from(vec![
+                Span::styled("type", theme.accent),
+                Span::styled(" to search  ", theme.muted),
+                Span::styled("↓", theme.accent),
+                Span::styled(" sessions  ", theme.muted),
+                Span::styled("enter", theme.accent),
+                Span::styled(" open results  ", theme.muted),
+                Span::styled("tab", theme.accent),
+                Span::styled(" browse", theme.muted),
+            ]);
+        }
+        return Line::from(vec![
+            Span::styled("enter", theme.accent),
+            Span::styled(" resume  ", theme.muted),
+            Span::styled("space", theme.accent),
+            Span::styled(" peek  ", theme.muted),
+            Span::styled("↑↓", theme.accent),
+            Span::styled(" move  ", theme.muted),
+            Span::styled("s", theme.accent),
+            Span::styled(" source  ", theme.muted),
+            Span::styled("p", theme.accent),
+            Span::styled(" projects  ", theme.muted),
+            Span::styled("/", theme.accent),
+            Span::styled(" search  ", theme.muted),
+            Span::styled("tab", theme.accent),
+            Span::styled(" browse", theme.muted),
+        ]);
+    }
+
     if app.layout_mode == LayoutMode::Detail {
         return Line::from(vec![
             Span::styled("h", theme.accent),
@@ -3734,20 +4781,51 @@ fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result
     Ok(projects)
 }
 
-fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+const WHEEL_SCROLL_LINES: isize = 3;
+
+/// Returns whether the event changed any visible state; pure motion events
+/// return false so the caller can skip redrawing.
+fn handle_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    if app.quick_popup {
+        return Ok(match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                app.scroll_quick_popup(WHEEL_SCROLL_LINES);
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                app.scroll_quick_popup(-WHEEL_SCROLL_LINES);
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+                if !quick_popup_area(app.body_area).contains(pos) {
+                    app.quick_popup = false;
+                    app.quick_scroll = 0;
+                    app.quick_lines.clear();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        });
+    }
+    if app.layout_mode == LayoutMode::Home {
+        return handle_home_mouse(mouse, terminal, app);
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if app.layout_mode == LayoutMode::Split
                 && near_divider(mouse.column, app.body_area, app.left_width.unwrap_or(0))
             {
                 app.dragging = true;
-                return;
+                return Ok(true);
             }
             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
             if app.list_area.contains(pos) {
                 app.focus = Focus::List;
                 if app.layout_mode == LayoutMode::Timeline {
-                    return;
+                    return Ok(true);
                 }
                 if let Some(idx) = list_index_from_mouse(pos, app.list_area, app.results.len()) {
                     app.selected.select(Some(idx));
@@ -3768,54 +4846,117 @@ fn handle_mouse(mouse: MouseEvent, app: &mut App) {
             } else if app.querybar_area.contains(pos) {
                 app.focus = query_bar_focus_from_mouse(app, mouse.column);
             }
+            Ok(true)
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if app.dragging && app.layout_mode == LayoutMode::Split {
                 resize_split(mouse.column, app);
+                Ok(true)
+            } else {
+                Ok(false)
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            let was_dragging = app.dragging;
             app.dragging = false;
+            Ok(was_dragging)
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+            let delta: isize = if mouse.kind == MouseEventKind::ScrollDown {
+                1
+            } else {
+                -1
+            };
+            let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if app.preview_area.contains(pos) {
+                app.focus = Focus::Preview;
+                app.scroll_detail(delta * WHEEL_SCROLL_LINES);
+            } else if app.list_area.contains(pos) {
+                app.focus = Focus::List;
+                if app.layout_mode == LayoutMode::Timeline {
+                    app.scroll_timeline(delta);
+                } else {
+                    app.move_selection(delta);
+                }
+            } else if let Some(project_area) = app.project_area
+                && project_area.contains(pos)
+            {
+                app.focus = Focus::Project;
+                app.move_project_selection(delta);
+            } else {
+                return Ok(false);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    if app.home_dropdown != HomeDropdown::None {
+        return Ok(match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+                if app.home_dropdown_area.contains(pos) {
+                    let row = (pos.y - app.home_dropdown_area.y) as usize;
+                    let idx = app.home_dropdown_state.offset() + row;
+                    if idx < app.home_dropdown_options().len() {
+                        app.home_dropdown_state.select(Some(idx));
+                        app.apply_home_dropdown();
+                    }
+                } else {
+                    app.close_home_dropdown();
+                }
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                app.move_home_dropdown_selection(1);
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                app.move_home_dropdown_selection(-1);
+                true
+            }
+            _ => false,
+        });
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if app.home_source_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Source);
+            } else if app.home_project_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Project);
+            } else if app.home_list_area.contains(pos) && app.home_list_area.height > 0 {
+                let row = (pos.y - app.home_list_area.y) as usize;
+                let idx = app.selected.offset() + row;
+                if idx < app.results.len() {
+                    // First click selects; a second click on the selected row resumes.
+                    if app.selected.selected() == Some(idx) && matches!(app.focus, Focus::List) {
+                        app.resume_selected(terminal)?;
+                    } else {
+                        app.selected.select(Some(idx));
+                        app.focus = Focus::List;
+                    }
+                }
+            } else if app.home_input_area.contains(pos) {
+                app.focus = Focus::Query;
+            } else {
+                return Ok(false);
+            }
+            Ok(true)
         }
         MouseEventKind::ScrollDown => {
-            let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-            if app.preview_area.contains(pos) {
-                app.focus = Focus::Preview;
-                app.scroll_detail(1);
-            } else if app.list_area.contains(pos) {
-                app.focus = Focus::List;
-                if app.layout_mode == LayoutMode::Timeline {
-                    app.scroll_timeline(1);
-                } else {
-                    app.move_selection(1);
-                }
-            } else if let Some(project_area) = app.project_area
-                && project_area.contains(pos)
-            {
-                app.focus = Focus::Project;
-                app.move_project_selection(1);
-            }
+            app.home_focus_list();
+            app.move_selection(1);
+            Ok(true)
         }
         MouseEventKind::ScrollUp => {
-            let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-            if app.preview_area.contains(pos) {
-                app.focus = Focus::Preview;
-                app.scroll_detail(-1);
-            } else if app.list_area.contains(pos) {
-                app.focus = Focus::List;
-                if app.layout_mode == LayoutMode::Timeline {
-                    app.scroll_timeline(-1);
-                } else {
-                    app.move_selection(-1);
-                }
-            } else if let Some(project_area) = app.project_area
-                && project_area.contains(pos)
-            {
-                app.focus = Focus::Project;
-                app.move_project_selection(-1);
-            }
+            app.home_focus_list();
+            app.move_selection(-1);
+            Ok(true)
         }
-        _ => {}
+        _ => Ok(false),
     }
 }
 
@@ -3920,16 +5061,14 @@ fn panel_inner(area: Rect) -> Rect {
 }
 
 fn quick_popup_area(area: Rect) -> Rect {
+    // Scale with the terminal instead of capping at a fixed size: keep a
+    // slim margin all around so it still reads as a popup.
     let width = area
         .width
         .saturating_mul(4)
         .saturating_div(5)
-        .clamp(40, 100);
-    let height = area
-        .height
-        .saturating_mul(3)
-        .saturating_div(5)
-        .clamp(10, 30);
+        .clamp(40, 120);
+    let height = area.height.saturating_mul(4).saturating_div(5).max(10);
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -4082,6 +5221,169 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn tui_starts_on_home_with_search_focused() {
+        let (_tmp, app) = test_app();
+        assert_eq!(app.layout_mode, LayoutMode::Home);
+        assert!(matches!(app.focus, Focus::Query));
+    }
+
+    #[test]
+    fn enter_browse_switches_to_split_and_selects_first() {
+        let (_tmp, mut app) = test_app();
+        app.results.push(SessionSummary {
+            session_id: "session".to_string(),
+            project: "project".to_string(),
+            source: SourceKind::Claude,
+            last_ts: 1,
+            hit_count: 1,
+            top_score: 0.0,
+            snippet: String::new(),
+            source_path: "source.jsonl".to_string(),
+            source_dir: String::new(),
+        });
+        app.enter_browse();
+        assert_eq!(app.layout_mode, LayoutMode::Split);
+        assert!(matches!(app.focus, Focus::List));
+        assert_eq!(app.selected.selected(), Some(0));
+    }
+
+    #[test]
+    fn go_home_clears_query_and_returns_focus_to_search() {
+        let (_tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Split;
+        app.focus = Focus::List;
+        app.query = "foo".to_string();
+        app.go_home();
+        assert_eq!(app.layout_mode, LayoutMode::Home);
+        assert!(matches!(app.focus, Focus::Query));
+        assert!(app.query.is_empty());
+    }
+
+    #[test]
+    fn home_chart_groups_order_by_volume_and_merge_codex() {
+        let events = vec![
+            (SourceKind::Claude, 1),
+            (SourceKind::Claude, 2),
+            (SourceKind::Claude, 3),
+            (SourceKind::CodexSession, 4),
+            (SourceKind::CodexHistory, 5),
+        ];
+        let groups = home_chart_groups(&events);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "claude");
+        assert_eq!(groups[0].2, 3);
+        assert_eq!(groups[1].0, "codex");
+        assert_eq!(groups[1].2, 2);
+    }
+
+    #[test]
+    fn home_chart_grid_scales_with_height() {
+        let events = vec![(SourceKind::Claude, 500); 4];
+        let grid = home_chart_grid(&events, (0, 1000), 1, 4);
+        assert_eq!(grid.len(), 4);
+        assert!(grid.iter().all(|row| row[0].0 == '⣿'));
+        assert!(
+            grid.iter()
+                .all(|row| row[0].1 == source_color(SourceKind::Claude))
+        );
+    }
+
+    #[test]
+    fn home_chart_grid_stacks_sources_bottom_up() {
+        let events = vec![
+            (SourceKind::Claude, 500),
+            (SourceKind::Claude, 500),
+            (SourceKind::CodexSession, 500),
+            (SourceKind::CodexSession, 500),
+        ];
+        // Height 2 → 8 dot levels split evenly: claude fills the bottom cell,
+        // codex the top cell.
+        let grid = home_chart_grid(&events, (0, 1000), 1, 2);
+        assert_eq!(grid[1][0].1, source_color(SourceKind::Claude));
+        assert_eq!(grid[0][0].1, source_color(SourceKind::CodexSession));
+    }
+
+    #[test]
+    fn source_choice_matches_legacy_codex_label() {
+        for label in ["codex", "codex-session", "codex-history"] {
+            assert!(source_choice_matches_storage_label(
+                SourceChoice::Codex,
+                label
+            ));
+        }
+        assert!(!source_choice_matches_storage_label(
+            SourceChoice::Claude,
+            "codex"
+        ));
+    }
+
+    #[test]
+    fn match_context_spans_bolds_the_hit() {
+        let theme = Theme::new();
+        let terms = query_terms("sqlite");
+        let spans = match_context_spans("we fixed the sqlite reads today", &terms, 40, &theme);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "we fixed the sqlite reads today");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content == "sqlite" && s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn match_context_spans_windows_long_text() {
+        let theme = Theme::new();
+        let terms = query_terms("needle");
+        let text = format!("{} needle {}", "x".repeat(100), "y".repeat(100));
+        let spans = match_context_spans(&text, &terms, 30, &theme);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.starts_with('…'));
+        assert!(joined.ends_with('…'));
+        assert!(joined.contains("needle"));
+    }
+
+    #[test]
+    fn match_context_spans_fall_back_without_literal_hit() {
+        let theme = Theme::new();
+        let terms = query_terms("zzz");
+        let spans = match_context_spans("completely unrelated text", &terms, 12, &theme);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "completely …");
+    }
+
+    #[test]
+    fn source_dropdown_applies_selection() {
+        let (_tmp, mut app) = test_app();
+        app.home_sources = vec![SourceChoice::Claude, SourceChoice::Codex];
+        app.open_home_dropdown(HomeDropdown::Source);
+        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        app.move_home_dropdown_selection(2);
+        app.apply_home_dropdown();
+        assert_eq!(app.source, SourceChoice::Codex);
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn project_dropdown_first_entry_clears_filter() {
+        let (_tmp, mut app) = test_app();
+        app.home_projects = vec!["memex".to_string()];
+        app.project = "memex".to_string();
+        app.open_home_dropdown(HomeDropdown::Project);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        app.move_home_dropdown_selection(-1);
+        app.apply_home_dropdown();
+        assert!(app.project.is_empty());
+    }
+
+    #[test]
+    fn truncate_end_appends_ellipsis() {
+        assert_eq!(truncate_end("hello world", 5), "hell…");
+        assert_eq!(truncate_end("hi", 5), "hi");
+        assert_eq!(truncate_end("hello", 0), "");
     }
 
     #[test]

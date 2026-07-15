@@ -29,16 +29,17 @@ use std::time::Duration;
     about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, and Copilot",
     after_help = "\
 QUICK START:
+    memex                           # Browse sessions interactively
     memex index                     # Index your agent history
     memex search \"error handling\"   # Search for keywords
-    memex tui                       # Browse sessions interactively
 
 LEARN MORE:
     memex <command> --help          # Detailed help for each command"
 )]
 pub struct Cli {
+    /// Defaults to the interactive TUI when no command is given
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Args, Clone)]
@@ -407,11 +408,13 @@ enum IndexServiceCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let should_check = !matches!(cli.command, Commands::Tui { .. } | Commands::Update { .. });
+    // Bare `memex` opens the TUI home screen.
+    let command = cli.command.unwrap_or(Commands::Tui { root: None });
+    let should_check = !matches!(command, Commands::Tui { .. } | Commands::Update { .. });
     if should_check {
         check_for_update_async(None);
     }
-    match cli.command {
+    match command {
         Commands::Index {
             index,
             watch,
@@ -3068,7 +3071,7 @@ mod tests {
         ])
         .unwrap();
 
-        let Commands::Index { index, .. } = cli.command else {
+        let Some(Commands::Index { index, .. }) = cli.command else {
             panic!("expected index command");
         };
         assert!(index.no_codex);
