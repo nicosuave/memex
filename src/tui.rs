@@ -5061,16 +5061,14 @@ fn panel_inner(area: Rect) -> Rect {
 }
 
 fn quick_popup_area(area: Rect) -> Rect {
+    // Scale with the terminal instead of capping at a fixed size: keep a
+    // slim margin all around so it still reads as a popup.
     let width = area
         .width
         .saturating_mul(4)
         .saturating_div(5)
-        .clamp(40, 100);
-    let height = area
-        .height
-        .saturating_mul(3)
-        .saturating_div(5)
-        .clamp(10, 30);
+        .clamp(40, 120);
+    let height = area.height.saturating_mul(4).saturating_div(5).max(10);
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
