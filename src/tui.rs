@@ -414,6 +414,7 @@ struct App {
     active_project_request: u64,
     results: Vec<SessionSummary>,
     sessions_state: LoadState,
+    sessions_since: Option<u64>,
     active_search_request: u64,
     selected: ListState,
     layout_mode: LayoutMode,
@@ -424,7 +425,7 @@ struct App {
     timeline_scroll: usize,
     timeline_selected: usize,
     timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
-    timeline_displayed_query: String,
+    timeline_displayed: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
     timeline_state: LoadState,
     active_timeline_request: u64,
     home_activity: Vec<(SourceKind, u64)>,
@@ -699,6 +700,7 @@ impl App {
             active_project_request: 0,
             results: Vec::new(),
             sessions_state: LoadState::Idle,
+            sessions_since: None,
             active_search_request: 0,
             selected: ListState::default(),
             layout_mode: LayoutMode::Home,
@@ -709,7 +711,7 @@ impl App {
             timeline_scroll: 0,
             timeline_selected: 0,
             timeline_loaded: None,
-            timeline_displayed_query: String::new(),
+            timeline_displayed: None,
             timeline_state: LoadState::Idle,
             active_timeline_request: 0,
             quick_popup: false,
@@ -917,6 +919,7 @@ impl App {
             Some(project)
         };
         let source = self.source;
+        let since = self.sessions_since;
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
         let grouping = self.project_display.grouping();
@@ -927,12 +930,18 @@ impl App {
                     sessions_from_analytics(
                         &paths,
                         source.as_filter(),
+                        since,
                         project_opt.as_deref(),
                         grouping,
                     )
                     .or_else(|_| {
                         let index = SearchIndex::open_or_create(&paths.index)?;
-                        sessions_from_recent(&index, source.as_filter(), project_opt.as_deref())
+                        sessions_from_recent(
+                            &index,
+                            source.as_filter(),
+                            since,
+                            project_opt.as_deref(),
+                        )
                     })?
                 } else {
                     let index = SearchIndex::open_or_create(&paths.index)?;
@@ -946,7 +955,7 @@ impl App {
                         &query,
                         source.as_filter(),
                         tantivy_project,
-                        None,
+                        since,
                         RESULT_LIMIT,
                     )?;
                     enrich_session_projects(&paths, &mut sessions, grouping);
@@ -1206,12 +1215,13 @@ impl App {
     }
 
     fn go_home(&mut self) {
+        let had_session_range = self.sessions_since.take().is_some();
         self.layout_mode = LayoutMode::Home;
         self.focus = Focus::Query;
         self.quick_popup = false;
         self.quick_lines.clear();
         self.close_home_dropdown();
-        if !self.query.is_empty() || !self.find_query.is_empty() {
+        if !self.query.is_empty() || !self.find_query.is_empty() || had_session_range {
             self.query.clear();
             self.find_query.clear();
             self.kickoff_search();
@@ -1335,7 +1345,7 @@ impl App {
                 };
                 self.timeline_scroll = 0;
                 self.timeline_selected = 0;
-                self.timeline_displayed_query = query;
+                self.timeline_displayed = Some((source, range, grouping, query));
                 self.set_status(format!("{} projects", self.timeline_rows.len()));
             }
             SearchUpdate::SearchError {
@@ -1625,8 +1635,16 @@ impl App {
             self.set_status("no project selected");
             return;
         };
-        self.query = self.timeline_displayed_query.clone();
-        self.project = row.project.clone();
+        let project = row.project.clone();
+        let Some((source, range, display, query)) = self.timeline_displayed.clone() else {
+            self.set_status("timeline context unavailable");
+            return;
+        };
+        self.source = source;
+        self.project_display = display;
+        self.query = query;
+        self.project = project;
+        self.sessions_since = range.since_ms(now_ms());
         self.layout_mode = LayoutMode::List;
         self.focus = Focus::List;
         self.quick_popup = false;
@@ -3936,12 +3954,16 @@ fn sessions_from_query(
 fn sessions_from_recent(
     index: &SearchIndex,
     source: Option<SourceFilter>,
+    since: Option<u64>,
     project: Option<&str>,
 ) -> Result<Vec<SessionSummary>> {
     let record_limit = (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200);
     let records = index.recent_records(record_limit)?;
     let mut sessions: HashMap<String, SessionSummary> = HashMap::new();
     for record in records {
+        if since.is_some_and(|start| record.ts < start) {
+            continue;
+        }
         if let Some(source_filter) = source
             && !source_filter.matches(record.source)
         {
@@ -3965,12 +3987,18 @@ fn sessions_from_recent(
 fn sessions_from_analytics(
     paths: &Paths,
     source: Option<SourceFilter>,
+    since: Option<u64>,
     project: Option<&str>,
     grouping: ProjectGrouping,
 ) -> Result<Vec<SessionSummary>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    let rows =
-        store.query_sessions(source, None, project, grouping, Some(RECENT_SESSIONS_LIMIT))?;
+    let rows = store.query_sessions(
+        source,
+        since,
+        project,
+        grouping,
+        Some(RECENT_SESSIONS_LIMIT),
+    )?;
     if rows.is_empty() {
         anyhow::bail!("no analytics sessions");
     }
@@ -5417,10 +5445,12 @@ mod tests {
         app.layout_mode = LayoutMode::Split;
         app.focus = Focus::List;
         app.query = "foo".to_string();
+        app.sessions_since = Some(123);
         app.go_home();
         assert_eq!(app.layout_mode, LayoutMode::Home);
         assert!(matches!(app.focus, Focus::Query));
         assert!(app.query.is_empty());
+        assert_eq!(app.sessions_since, None);
     }
 
     #[test]
@@ -5715,7 +5745,12 @@ mod tests {
         let (_tmp, mut app) = test_app();
         app.layout_mode = LayoutMode::Timeline;
         app.focus = Focus::List;
-        app.timeline_displayed_query = "needle".to_string();
+        app.timeline_displayed = Some((
+            SourceChoice::Claude,
+            TimelineRange::Week,
+            ProjectDisplayMode::Flat,
+            "needle".to_string(),
+        ));
         app.timeline_loaded = Some((
             SourceChoice::All,
             TimelineRange::All,
@@ -5737,6 +5772,9 @@ mod tests {
         assert!(matches!(app.focus, Focus::List));
         assert_eq!(app.project, "project-3");
         assert_eq!(app.query, "needle");
+        assert_eq!(app.source, SourceChoice::Claude);
+        assert_eq!(app.project_display, ProjectDisplayMode::Flat);
+        assert!(app.sessions_since.is_some());
     }
 
     #[test]
