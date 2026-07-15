@@ -1,6 +1,6 @@
 [package]
 name = "memex"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 build = "build.rs"
 description = "CLI tool for indexing and searching local agent conversation history"
