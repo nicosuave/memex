@@ -8,8 +8,9 @@ use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProjectGrouping {
+    #[default]
     Flat,
     Repository,
 }
@@ -644,6 +645,10 @@ fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
         repo_project,
         status,
     }
+}
+
+pub(crate) fn repository_project_for_cwd(cwd: &str) -> Option<String> {
+    git_metadata_for_cwd(cwd).repo_project
 }
 
 fn claude_worktree_repo_project(cwd: &str) -> Option<String> {

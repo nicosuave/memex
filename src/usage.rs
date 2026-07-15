@@ -3,6 +3,7 @@
 //! This module intentionally does not model provider quota percentages. Local logs are useful for
 //! request-level accounting, but they are not authoritative subscription-limit telemetry.
 
+use crate::analytics::ProjectGrouping;
 use crate::types::SourceFilter;
 use anyhow::{Context, Result};
 use chrono::DateTime;
@@ -19,6 +20,8 @@ use walkdir::WalkDir;
 #[derive(Clone, Debug, Default)]
 pub struct UsageQuery {
     pub source: Option<SourceFilter>,
+    pub project: Option<String>,
+    pub project_grouping: ProjectGrouping,
     pub since_ms: Option<u64>,
     pub until_ms: Option<u64>,
     pub cost_mode: CostMode,
@@ -163,6 +166,7 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
 
     reconcile_claude(&mut events);
     reconcile_codex_copies(&mut events);
+    let mut project_cache = HashMap::new();
     events.retain(|event| {
         query
             .since_ms
@@ -170,6 +174,16 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
             && query
                 .until_ms
                 .is_none_or(|until| event.timestamp_ms < until)
+            && query.project.as_deref().is_none_or(|project| {
+                event.project.as_deref().is_some_and(|candidate| {
+                    usage_project_matches(
+                        candidate,
+                        project,
+                        query.project_grouping,
+                        &mut project_cache,
+                    )
+                })
+            })
     });
     events.sort_by(|a, b| {
         (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
@@ -296,6 +310,44 @@ fn str_at(value: &Value, aliases: &[&str]) -> Option<String> {
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+fn usage_project_matches(
+    candidate: &str,
+    project: &str,
+    grouping: ProjectGrouping,
+    cache: &mut HashMap<String, String>,
+) -> bool {
+    let candidate_key = match grouping {
+        ProjectGrouping::Flat => usage_project_key(candidate),
+        ProjectGrouping::Repository => cache
+            .entry(candidate.to_string())
+            .or_insert_with(|| {
+                if Path::new(candidate).is_dir() {
+                    crate::analytics::repository_project_for_cwd(candidate)
+                        .unwrap_or_else(|| usage_project_key(candidate))
+                } else {
+                    usage_project_key(candidate)
+                }
+            })
+            .clone(),
+    };
+    candidate.eq_ignore_ascii_case(project)
+        || candidate_key.eq_ignore_ascii_case(&usage_project_key(project))
+}
+
+fn usage_project_key(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches(['/', '\\']);
+    let tail = trimmed.rsplit(['/', '\\', ':']).next().unwrap_or(trimmed);
+    let tail = tail.strip_suffix(".git").unwrap_or(tail);
+    let encoded = tail.trim_matches('-');
+    if tail.starts_with('-')
+        && (encoded.to_ascii_lowercase().starts_with("users-")
+            || encoded.to_ascii_lowercase().starts_with("home-"))
+    {
+        return encoded.rsplit('-').next().unwrap_or(encoded).to_string();
+    }
+    tail.to_string()
 }
 
 fn scan_claude(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()> {
@@ -807,13 +859,7 @@ fn reconcile_codex_copies(events: &mut Vec<UsageEvent>) {
 }
 
 fn scan_pi(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()> {
-    let roots = if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
-        vec![PathBuf::from(root)]
-    } else if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
-        vec![PathBuf::from(root).join("sessions")]
-    } else {
-        vec![home().join(".pi/agent/sessions")]
-    };
+    let roots = [crate::ingest::pi_sessions_root()];
     for path in jsonl_files(roots) {
         let source_path = path.to_string_lossy().to_string();
         let session = path
@@ -1153,7 +1199,8 @@ fn extract_cursor_objects(
         Value::Object(object) => {
             let input = nested_u64(object, &["inputTokens", "input_tokens"]);
             let output = nested_u64(object, &["outputTokens", "output_tokens"]);
-            if input > 0 || output > 0 {
+            let counted = input > 0 || output > 0;
+            if counted {
                 let id = object_string(
                     object,
                     &["generationUUID", "generationId", "bubbleId", "id"],
@@ -1205,7 +1252,10 @@ fn extract_cursor_objects(
                     });
                 }
             }
-            for child in object.values() {
+            for (key, child) in object {
+                if counted && matches!(key.as_str(), "usage" | "tokenCount") {
+                    continue;
+                }
                 if child.is_array() || child.is_object() {
                     extract_cursor_objects(child, fallback_id, table, path, out, seen);
                 }
@@ -1628,6 +1678,118 @@ mod tests {
         assert_eq!(events[0].tokens.reasoning, 30);
         assert_eq!(events[0].tokens.output, 50);
         assert_eq!(events[0].tokens.total(), 200);
+    }
+
+    #[test]
+    fn cursor_nested_token_containers_are_not_recounted() {
+        let value = serde_json::json!([
+            {
+                "generationUUID": "usage-parent",
+                "usage": { "inputTokens": 10, "outputTokens": 5 },
+                "children": [
+                    {
+                        "generationId": "nested-request",
+                        "inputTokens": 7,
+                        "outputTokens": 3
+                    }
+                ]
+            },
+            {
+                "generationUUID": "count-parent",
+                "tokenCount": { "input_tokens": 20, "output_tokens": 8 }
+            }
+        ]);
+        let mut events = Vec::new();
+        let mut seen = HashSet::new();
+
+        extract_cursor_objects(
+            &value,
+            "fixture",
+            "cursorDiskKV",
+            Path::new("state.vscdb"),
+            &mut events,
+            &mut seen,
+        );
+
+        assert_eq!(events.len(), 3);
+        let ids: HashSet<_> = events
+            .iter()
+            .filter_map(|event| event.source_record_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            HashSet::from(["usage-parent", "nested-request", "count-parent"])
+        );
+        assert_eq!(
+            events.iter().map(|event| event.tokens.total()).sum::<u64>(),
+            53
+        );
+    }
+
+    #[test]
+    fn usage_project_matching_normalizes_paths_slugs_and_remotes() {
+        let mut cache = HashMap::new();
+
+        for candidate in [
+            "/Users/nico/Code/memex",
+            "--Users-nico-Code-memex--",
+            "git@github.com:nicosuave/memex.git",
+        ] {
+            assert!(usage_project_matches(
+                candidate,
+                "memex",
+                ProjectGrouping::Flat,
+                &mut cache,
+            ));
+        }
+        assert!(!usage_project_matches(
+            "/Users/nico/Code/other",
+            "memex",
+            ProjectGrouping::Flat,
+            &mut cache,
+        ));
+    }
+
+    #[test]
+    fn pi_scanner_uses_configured_session_directory() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent_root = tmp.path().join("pi-agent");
+        let session_root = agent_root.join("custom/sessions/project");
+        std::fs::create_dir_all(&session_root).expect("create session root");
+        std::fs::write(
+            agent_root.join("settings.json"),
+            r#"{ "sessionDir": "custom/sessions" }"#,
+        )
+        .expect("write settings");
+        std::fs::write(
+            session_root.join("session.jsonl"),
+            concat!(
+                r#"{"type":"message","id":"a1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-6","usage":{"input":10,"cacheRead":2,"cacheWrite":3,"output":4}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write session");
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CODING_AGENT_DIR", Some(agent_root.as_os_str())),
+        ]);
+        let mut events = Vec::new();
+        let mut warnings = Vec::new();
+
+        scan_pi(&mut events, &mut warnings).expect("scan pi");
+
+        assert!(warnings.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens.total(), 19);
+        assert_eq!(events[0].project.as_deref(), Some("project"));
+        assert!(
+            events[0]
+                .source_path
+                .ends_with("custom/sessions/project/session.jsonl")
+        );
     }
 
     #[test]

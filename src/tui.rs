@@ -1176,7 +1176,13 @@ impl App {
         self.home_token_activity_state = LoadState::Loading;
         self.home_token_activity_partial = false;
         let tx = self.search_tx.clone();
-        let query = home_token_usage_query(self.source, self.home_activity_range, now_ms());
+        let query = home_token_usage_query(
+            self.source,
+            &self.project,
+            self.project_display.grouping(),
+            self.home_activity_range,
+            now_ms(),
+        );
         std::thread::spawn(move || {
             let result = scan_usage(&query).map(|report| {
                 let partial = !report.warnings.is_empty();
@@ -1328,6 +1334,8 @@ impl App {
         let refresh_activity = self.home_dropdown == HomeDropdown::Range;
         let source_selection = self.home_dropdown == HomeDropdown::Source;
         let previous_source = self.source;
+        let project_selection = self.home_dropdown == HomeDropdown::Project;
+        let previous_project = self.project.clone();
         let refresh_search = match self.home_dropdown {
             HomeDropdown::Range => {
                 self.home_activity_range = TimelineRange::ALL
@@ -1359,12 +1367,14 @@ impl App {
         };
         self.close_home_dropdown();
         let source_changed = source_selection && self.source != previous_source;
-        if source_changed {
+        let project_changed = project_selection && self.project != previous_project;
+        let token_filter_changed = source_changed || project_changed;
+        if token_filter_changed {
             self.invalidate_home_token_activity();
         }
         if refresh_search {
             self.kickoff_search();
-            if source_changed && self.home_chart_mode == HomeChartMode::Tokens {
+            if token_filter_changed && self.home_chart_mode == HomeChartMode::Tokens {
                 self.kickoff_home_token_activity();
             }
         } else if refresh_activity {
@@ -3001,9 +3011,17 @@ fn home_activity_bounds_at(
     (min_seen, max_seen.max(min_seen.saturating_add(1)))
 }
 
-fn home_token_usage_query(source: SourceChoice, range: TimelineRange, now: u64) -> UsageQuery {
+fn home_token_usage_query(
+    source: SourceChoice,
+    project: &str,
+    grouping: ProjectGrouping,
+    range: TimelineRange,
+    now: u64,
+) -> UsageQuery {
     UsageQuery {
         source: source.as_filter(),
+        project: (!project.trim().is_empty()).then(|| project.to_string()),
+        project_grouping: grouping,
         since_ms: range.since_ms(now),
         until_ms: None,
         cost_mode: CostMode::Source,
@@ -6239,9 +6257,17 @@ mod tests {
 
     #[test]
     fn token_usage_query_applies_home_source_and_range() {
-        let query = home_token_usage_query(SourceChoice::Opencode, TimelineRange::Week, 10_000);
+        let query = home_token_usage_query(
+            SourceChoice::Opencode,
+            "memex",
+            ProjectGrouping::Repository,
+            TimelineRange::Week,
+            10_000,
+        );
 
         assert_eq!(query.source, Some(SourceFilter::Opencode));
+        assert_eq!(query.project.as_deref(), Some("memex"));
+        assert_eq!(query.project_grouping, ProjectGrouping::Repository);
         assert_eq!(query.since_ms, TimelineRange::Week.since_ms(10_000));
         assert!(query.include_events);
     }

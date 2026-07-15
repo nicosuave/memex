@@ -1085,7 +1085,7 @@ fn pi_agent_root() -> PathBuf {
     home.join(".pi").join("agent")
 }
 
-fn pi_sessions_root() -> PathBuf {
+pub(crate) fn pi_sessions_root() -> PathBuf {
     if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
         return PathBuf::from(root);
     }

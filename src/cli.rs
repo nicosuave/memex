@@ -1415,6 +1415,8 @@ fn run_usage(
 ) -> Result<()> {
     let query = UsageQuery {
         source,
+        project: None,
+        project_grouping: crate::analytics::ProjectGrouping::Flat,
         since_ms: parse_ts_millis(since)?,
         until_ms: parse_ts_millis(until)?,
         cost_mode,
