@@ -9,6 +9,7 @@ pub mod state;
 pub mod transfer;
 pub mod tui;
 pub mod types;
+pub mod usage;
 pub mod vector;
 
 #[cfg(test)]

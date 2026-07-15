@@ -3,6 +3,7 @@ use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::types::{Record, SourceFilter, SourceKind};
+use crate::usage::{CostMode, UsageQuery, scan_usage};
 use anyhow::Result;
 use chrono::SecondsFormat;
 use crossterm::event::{
@@ -86,7 +87,20 @@ enum SearchUpdate {
     },
     HomeActivity {
         request_id: u64,
-        timestamps: Vec<(SourceKind, u64)>,
+        points: Vec<HomeChartPoint>,
+    },
+    HomeActivityError {
+        request_id: u64,
+        message: String,
+    },
+    HomeTokenActivity {
+        request_id: u64,
+        points: Vec<HomeChartPoint>,
+        partial: bool,
+    },
+    HomeTokenActivityError {
+        request_id: u64,
+        message: String,
     },
     HomeFilters {
         request_id: u64,
@@ -215,6 +229,35 @@ enum LayoutMode {
     List,
     Timeline,
     Detail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeChartMode {
+    Sessions,
+    Tokens,
+}
+
+impl HomeChartMode {
+    fn toggle(self) -> Self {
+        match self {
+            HomeChartMode::Sessions => HomeChartMode::Tokens,
+            HomeChartMode::Tokens => HomeChartMode::Sessions,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            HomeChartMode::Sessions => "sessions",
+            HomeChartMode::Tokens => "tokens",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HomeChartPoint {
+    source: SourceKind,
+    timestamp_ms: u64,
+    value: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,11 +496,16 @@ struct App {
     timeline_displayed: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
     timeline_state: LoadState,
     active_timeline_request: u64,
-    home_activity: Vec<(SourceKind, u64)>,
-    home_result_activity: Vec<(SourceKind, u64)>,
+    home_activity: Vec<HomeChartPoint>,
+    home_result_activity: Vec<HomeChartPoint>,
     home_activity_range: TimelineRange,
     home_activity_state: LoadState,
+    home_token_activity: Vec<HomeChartPoint>,
+    home_token_activity_state: LoadState,
+    home_token_activity_partial: bool,
+    home_chart_mode: HomeChartMode,
     active_home_activity_request: u64,
+    active_home_token_activity_request: u64,
     home_input_area: Rect,
     home_list_area: Rect,
     home_dropdown: HomeDropdown,
@@ -719,7 +767,12 @@ impl App {
             home_result_activity: Vec::new(),
             home_activity_range: TimelineRange::Month,
             home_activity_state: LoadState::Idle,
+            home_token_activity: Vec::new(),
+            home_token_activity_state: LoadState::Idle,
+            home_token_activity_partial: false,
+            home_chart_mode: HomeChartMode::Sessions,
             active_home_activity_request: 0,
+            active_home_token_activity_request: 0,
             home_input_area: Rect::default(),
             home_list_area: Rect::default(),
             home_dropdown: HomeDropdown::None,
@@ -805,11 +858,11 @@ impl App {
             || !self.project.trim().is_empty()
     }
 
-    fn home_chart_activity(&self) -> &[(SourceKind, u64)] {
-        if self.home_chart_is_filtered() {
-            &self.home_result_activity
-        } else {
-            &self.home_activity
+    fn home_chart_activity(&self) -> &[HomeChartPoint] {
+        match self.home_chart_mode {
+            HomeChartMode::Tokens => &self.home_token_activity,
+            HomeChartMode::Sessions if self.home_chart_is_filtered() => &self.home_result_activity,
+            HomeChartMode::Sessions => &self.home_activity,
         }
     }
 
@@ -834,6 +887,8 @@ impl App {
             || self.timeline_state == LoadState::Loading
             || self.detail_state == LoadState::Loading
             || self.home_activity_state == LoadState::Loading
+            || (self.home_chart_mode == HomeChartMode::Tokens
+                && self.home_token_activity_state == LoadState::Loading)
     }
 
     fn spinner(&self) -> char {
@@ -1077,6 +1132,7 @@ impl App {
     }
 
     fn kickoff_home_activity(&mut self) {
+        let refresh_tokens = self.home_chart_mode == HomeChartMode::Tokens;
         let request_id = self.next_request_id();
         self.active_home_activity_request = request_id;
         self.home_activity_state = LoadState::Loading;
@@ -1084,16 +1140,74 @@ impl App {
         let tx = self.search_tx.clone();
         let range = self.home_activity_range;
         std::thread::spawn(move || {
-            let timestamps = (|| -> Result<Vec<(SourceKind, u64)>> {
+            let result = (|| -> Result<Vec<HomeChartPoint>> {
                 let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
                 let rows = store.query_source_timestamps(range.since_ms(now_ms()))?;
-                Ok(rows.into_iter().filter(|(_, ts)| *ts > 0).collect())
-            })()
-            .unwrap_or_default();
-            let _ = tx.send(SearchUpdate::HomeActivity {
-                request_id,
-                timestamps,
+                Ok(rows
+                    .into_iter()
+                    .filter(|(_, timestamp_ms)| *timestamp_ms > 0)
+                    .map(|(source, timestamp_ms)| HomeChartPoint {
+                        source,
+                        timestamp_ms,
+                        value: 1,
+                    })
+                    .collect())
+            })();
+            let _ = match result {
+                Ok(points) => tx.send(SearchUpdate::HomeActivity { request_id, points }),
+                Err(error) => tx.send(SearchUpdate::HomeActivityError {
+                    request_id,
+                    message: error.to_string(),
+                }),
+            };
+        });
+        if refresh_tokens {
+            self.kickoff_home_token_activity();
+        }
+    }
+
+    fn kickoff_home_token_activity(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_home_token_activity_request = request_id;
+        self.home_token_activity_state = LoadState::Loading;
+        let tx = self.search_tx.clone();
+        let range = self.home_activity_range;
+        std::thread::spawn(move || {
+            let result = scan_usage(&UsageQuery {
+                source: None,
+                since_ms: range.since_ms(now_ms()),
+                until_ms: None,
+                cost_mode: CostMode::Source,
+                include_events: true,
+            })
+            .map(|report| {
+                let partial = !report.warnings.is_empty();
+                let points = report
+                    .details
+                    .into_iter()
+                    .filter_map(|event| {
+                        let source = SourceKind::from_label(&event.source)?;
+                        let value = event.tokens.total();
+                        (event.timestamp_ms > 0 && value > 0).then_some(HomeChartPoint {
+                            source,
+                            timestamp_ms: event.timestamp_ms,
+                            value,
+                        })
+                    })
+                    .collect();
+                (points, partial)
             });
+            let _ = match result {
+                Ok((points, partial)) => tx.send(SearchUpdate::HomeTokenActivity {
+                    request_id,
+                    points,
+                    partial,
+                }),
+                Err(error) => tx.send(SearchUpdate::HomeTokenActivityError {
+                    request_id,
+                    message: error.to_string(),
+                }),
+            };
         });
     }
 
@@ -1277,6 +1391,26 @@ impl App {
         self.kickoff_home_filters();
     }
 
+    fn home_chart_state(&self) -> &LoadState {
+        match self.home_chart_mode {
+            HomeChartMode::Sessions if self.home_chart_is_filtered() => &self.sessions_state,
+            HomeChartMode::Sessions => &self.home_activity_state,
+            HomeChartMode::Tokens => &self.home_token_activity_state,
+        }
+    }
+
+    fn toggle_home_chart_mode(&mut self) {
+        self.home_chart_mode = self.home_chart_mode.toggle();
+        if self.home_chart_mode == HomeChartMode::Tokens
+            && matches!(
+                self.home_token_activity_state,
+                LoadState::Idle | LoadState::Error(_)
+            )
+        {
+            self.kickoff_home_token_activity();
+        }
+    }
+
     fn home_focus_list(&mut self) {
         if self.results.is_empty() {
             return;
@@ -1314,6 +1448,10 @@ impl App {
                 self.index_state = IndexState::Complete;
                 self.refresh_results();
                 if self.layout_mode == LayoutMode::Home {
+                    if self.home_chart_mode == HomeChartMode::Sessions {
+                        self.home_token_activity_state = LoadState::Idle;
+                        self.home_token_activity_partial = false;
+                    }
                     self.kickoff_home_activity();
                     self.kickoff_home_filters();
                 }
@@ -1436,16 +1574,40 @@ impl App {
                 self.detail_lines = vec![PreviewLine::Text(format!("preview error: {message}"))];
                 self.detail_scroll = 0;
             }
-            SearchUpdate::HomeActivity {
-                request_id,
-                timestamps,
-            } if request_id == self.active_home_activity_request => {
-                self.home_activity = timestamps;
+            SearchUpdate::HomeActivity { request_id, points }
+                if request_id == self.active_home_activity_request =>
+            {
+                self.home_activity = points;
                 self.home_activity_state = if self.home_activity.is_empty() {
                     LoadState::Empty
                 } else {
                     LoadState::Loaded
                 };
+            }
+            SearchUpdate::HomeActivityError {
+                request_id,
+                message,
+            } if request_id == self.active_home_activity_request => {
+                self.home_activity_state = LoadState::Error(message);
+            }
+            SearchUpdate::HomeTokenActivity {
+                request_id,
+                points,
+                partial,
+            } if request_id == self.active_home_token_activity_request => {
+                self.home_token_activity = points;
+                self.home_token_activity_partial = partial;
+                self.home_token_activity_state = if self.home_token_activity.is_empty() {
+                    LoadState::Empty
+                } else {
+                    LoadState::Loaded
+                };
+            }
+            SearchUpdate::HomeTokenActivityError {
+                request_id,
+                message,
+            } if request_id == self.active_home_token_activity_request => {
+                self.home_token_activity_state = LoadState::Error(message);
             }
             SearchUpdate::HomeFilters {
                 request_id,
@@ -2313,6 +2475,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         return Ok(false);
     }
 
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.toggle_home_chart_mode();
+        return Ok(false);
+    }
+
     if matches!(app.focus, Focus::Query) {
         match key.code {
             KeyCode::Esc if !app.query.is_empty() => {
@@ -2486,7 +2653,8 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         height: h,
     };
 
-    let filtered_chart = app.home_chart_is_filtered();
+    let filtered_chart =
+        app.home_chart_mode == HomeChartMode::Sessions && app.home_chart_is_filtered();
     let chart_activity = app.home_chart_activity();
     let now = now_ms();
     let bounds = home_activity_bounds_at(chart_activity, app.home_activity_range, now);
@@ -2496,7 +2664,10 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     // Chart grows with the terminal: each braille row adds 4 dot levels. Keep
     // its space while a filtered search has no matches so the input does not
     // jump vertically as results arrive.
-    let chart_height: u16 = if !chart_activity.is_empty() || filtered_chart {
+    let chart_height: u16 = if !chart_activity.is_empty()
+        || filtered_chart
+        || app.home_chart_state() == &LoadState::Loading
+    {
         home_chart_height(area.height)
     } else {
         0
@@ -2524,38 +2695,48 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         // order the chart stacks bottom-up.
         let groups = home_chart_groups(chart_activity, bounds);
         let mut spans: Vec<Span> = Vec::new();
-        if groups.is_empty() {
-            if !filtered_chart {
-                spans.push(Span::styled("memex", theme.focus));
+        match app.home_chart_state() {
+            LoadState::Loading => spans.push(Span::styled(
+                format!("{} loading {}…", app.spinner(), app.home_chart_mode.label()),
+                theme.muted,
+            )),
+            LoadState::Loaded | LoadState::Empty => {
+                let metric = match app.home_chart_mode {
+                    HomeChartMode::Sessions if filtered_chart => {
+                        format!("{plotted_count}/{total_count} matches")
+                    }
+                    HomeChartMode::Sessions => format!("{plotted_count} sessions"),
+                    HomeChartMode::Tokens => {
+                        let total = activity_value_in_bounds(chart_activity, bounds);
+                        format!(
+                            "{} tokens{}",
+                            compact_metric(total),
+                            if app.home_token_activity_partial {
+                                " · partial"
+                            } else {
+                                ""
+                            }
+                        )
+                    }
+                };
+                spans.push(Span::styled(metric, theme.muted));
             }
-        } else {
+            LoadState::Error(_) => spans.push(Span::styled(
+                format!("{} unavailable", app.home_chart_mode.label()),
+                theme.muted,
+            )),
+            _ => {}
+        }
+        if !groups.is_empty() {
+            spans.push(Span::raw("  ·  "));
             for (label, color, _) in &groups {
                 spans.push(Span::styled("● ", Style::default().fg(*color)));
                 spans.push(Span::styled((*label).to_string(), theme.text));
                 spans.push(Span::raw("  "));
             }
         }
-        let chart_state = if filtered_chart {
-            &app.sessions_state
-        } else {
-            &app.home_activity_state
-        };
-        let count_text = if filtered_chart {
-            format!("{plotted_count}/{total_count} matches")
-        } else {
-            format!("{plotted_count} sessions")
-        };
-        match chart_state {
-            LoadState::Loading => spans.push(Span::styled(
-                format!(" ·  {} {count_text}", app.spinner()),
-                theme.muted,
-            )),
-            LoadState::Loaded => spans.push(Span::styled(format!("·  {count_text}"), theme.muted)),
-            LoadState::Empty if filtered_chart => spans.push(Span::styled(
-                format!("{plotted_count}/{total_count} matches"),
-                theme.muted,
-            )),
-            _ => {}
+        if spans.is_empty() {
+            spans.push(Span::styled("memex", theme.focus));
         }
         let range_word = format!("{} ▾", app.home_activity_range.short_label());
         let range_width = range_word.chars().count() as u16;
@@ -2787,52 +2968,59 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
 }
 
 fn home_activity_bounds_at(
-    events: &[(SourceKind, u64)],
+    points: &[HomeChartPoint],
     range: TimelineRange,
     now: u64,
 ) -> (u64, u64) {
     if let Some(since) = range.since_ms(now) {
         return (since, now.max(since.saturating_add(1)));
     }
-    let min_seen = events
+    let min_seen = points
         .iter()
-        .map(|(_, ts)| *ts)
+        .map(|point| point.timestamp_ms)
         .filter(|ts| *ts > 0)
         .min()
         .unwrap_or(now);
-    let max_seen = events
+    let max_seen = points
         .iter()
-        .map(|(_, ts)| *ts)
+        .map(|point| point.timestamp_ms)
         .filter(|ts| *ts > 0)
         .max()
         .unwrap_or(now);
     (min_seen, max_seen.max(min_seen.saturating_add(1)))
 }
 
-fn activity_count_in_bounds(events: &[(SourceKind, u64)], bounds: (u64, u64)) -> usize {
-    events
+fn activity_count_in_bounds(points: &[HomeChartPoint], bounds: (u64, u64)) -> usize {
+    points
         .iter()
-        .filter(|(_, ts)| *ts >= bounds.0 && *ts <= bounds.1)
+        .filter(|point| point.timestamp_ms >= bounds.0 && point.timestamp_ms <= bounds.1)
         .count()
+}
+
+fn activity_value_in_bounds(points: &[HomeChartPoint], bounds: (u64, u64)) -> u64 {
+    points
+        .iter()
+        .filter(|point| point.timestamp_ms >= bounds.0 && point.timestamp_ms <= bounds.1)
+        .fold(0u64, |sum, point| sum.saturating_add(point.value))
 }
 
 /// Per-agent totals for the visible home chart window, largest volume first.
 /// Codex session and history records collapse into one "codex" group via their
 /// shared label.
 fn home_chart_groups(
-    events: &[(SourceKind, u64)],
+    points: &[HomeChartPoint],
     bounds: (u64, u64),
-) -> Vec<(&'static str, Color, usize)> {
-    let mut totals: Vec<(&'static str, Color, usize)> = Vec::new();
-    for (kind, ts) in events {
-        if *ts < bounds.0 || *ts > bounds.1 {
+) -> Vec<(&'static str, Color, u64)> {
+    let mut totals: Vec<(&'static str, Color, u64)> = Vec::new();
+    for point in points {
+        if point.timestamp_ms < bounds.0 || point.timestamp_ms > bounds.1 {
             continue;
         }
-        let label = kind.label();
+        let label = point.source.label();
         if let Some(entry) = totals.iter_mut().find(|(l, _, _)| *l == label) {
-            entry.2 += 1;
+            entry.2 = entry.2.saturating_add(point.value);
         } else {
-            totals.push((label, source_color(*kind), 1));
+            totals.push((label, source_color(point.source), point.value));
         }
     }
     totals.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
@@ -2843,7 +3031,7 @@ fn home_chart_groups(
 /// levels are split among agents proportionally, biggest group at the bottom.
 /// Returns rows top-to-bottom of (glyph, color) cells.
 fn home_chart_grid(
-    events: &[(SourceKind, u64)],
+    points: &[HomeChartPoint],
     bounds: (u64, u64),
     width: usize,
     height: usize,
@@ -2852,20 +3040,17 @@ fn home_chart_grid(
     if width == 0 {
         return Vec::new();
     }
-    let groups = home_chart_groups(events, bounds);
-    let group_buckets: Vec<Vec<usize>> = groups
+    let groups = home_chart_groups(points, bounds);
+    let group_buckets: Vec<Vec<u64>> = groups
         .iter()
-        .map(|(label, _, _)| {
-            let ts: Vec<u64> = events
-                .iter()
-                .filter(|(kind, _)| kind.label() == *label)
-                .map(|(_, ts)| *ts)
-                .collect();
-            timeline_bucket_counts(&ts, bounds, width)
-        })
+        .map(|(label, _, _)| home_bucket_values(points, label, bounds, width))
         .collect();
-    let totals: Vec<usize> = (0..width)
-        .map(|col| group_buckets.iter().map(|buckets| buckets[col]).sum())
+    let totals: Vec<u64> = (0..width)
+        .map(|col| {
+            group_buckets
+                .iter()
+                .fold(0u64, |sum, buckets| sum.saturating_add(buckets[col]))
+        })
         .collect();
     let max_total = totals.iter().copied().max().unwrap_or(0);
     let mut grid = vec![vec![(' ', COLOR_MUTED); width]; height];
@@ -2874,12 +3059,12 @@ fn home_chart_grid(
         if total == 0 {
             continue;
         }
-        let level = timeline_density_level(total, max_total, height * 4);
+        let level = weighted_density_level(total, max_total, height * 4);
         let mut dot_colors: Vec<Color> = Vec::with_capacity(level);
-        let mut cum = 0usize;
+        let mut cum = 0u64;
         for (group_idx, (_, color, _)) in groups.iter().enumerate() {
-            cum += group_buckets[group_idx][col];
-            let boundary = (cum * level) / total;
+            cum = cum.saturating_add(group_buckets[group_idx][col]);
+            let boundary = ((cum as u128 * level as u128) / total as u128) as usize;
             while dot_colors.len() < boundary {
                 dot_colors.push(*color);
             }
@@ -2895,6 +3080,72 @@ fn home_chart_grid(
         }
     }
     grid
+}
+
+fn home_bucket_values(
+    points: &[HomeChartPoint],
+    label: &str,
+    bounds: (u64, u64),
+    width: usize,
+) -> Vec<u64> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut buckets = vec![0u64; width];
+    let span = bounds.1.saturating_sub(bounds.0).max(1);
+    for point in points.iter().filter(|point| {
+        point.source.label() == label
+            && point.timestamp_ms >= bounds.0
+            && point.timestamp_ms <= bounds.1
+    }) {
+        let offset = point.timestamp_ms.saturating_sub(bounds.0);
+        let mut idx = ((offset as u128 * width as u128) / span as u128) as usize;
+        if idx >= width {
+            idx = width - 1;
+        }
+        buckets[idx] = buckets[idx].saturating_add(point.value);
+    }
+    buckets
+}
+
+fn weighted_density_level(value: u64, max: u64, levels: usize) -> usize {
+    if value == 0 || max == 0 || levels == 0 {
+        return 0;
+    }
+    (value as u128 * levels as u128).div_ceil(max as u128) as usize
+}
+
+fn compact_metric(value: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+    for (divisor, suffix) in UNITS {
+        if value >= divisor {
+            let scaled = value as f64 / divisor as f64;
+            if scaled >= 10.0 {
+                return format!("{scaled:.0}{suffix}");
+            }
+            return format!("{scaled:.1}{suffix}");
+        }
+    }
+    value.to_string()
+}
+
+fn session_chart_groups(events: &[(SourceKind, u64)]) -> Vec<(&'static str, Color, usize)> {
+    let mut totals: Vec<(&'static str, Color, usize)> = Vec::new();
+    for (kind, _) in events {
+        let label = kind.label();
+        if let Some(entry) = totals.iter_mut().find(|(l, _, _)| *l == label) {
+            entry.2 += 1;
+        } else {
+            totals.push((label, source_color(*kind), 1));
+        }
+    }
+    totals.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    totals
 }
 
 fn home_chart_row_line(cells: &[(char, Color)]) -> Line<'static> {
@@ -2933,7 +3184,7 @@ fn timeline_chart_grid(
     if width == 0 {
         return Vec::new();
     }
-    let groups = home_chart_groups(events, bounds);
+    let groups = session_chart_groups(events);
     let group_buckets: Vec<Vec<usize>> = groups
         .iter()
         .map(|(label, _, _)| {
@@ -3465,7 +3716,7 @@ fn draw_project_timeline(
         .flat_map(|row| row.session_events.iter().copied())
         .collect();
     let range = timeline_bounds(&app.timeline_rows, app.timeline_range);
-    let groups = home_chart_groups(&all_events, range);
+    let groups = session_chart_groups(&all_events);
     let legend = Line::from(
         groups
             .iter()
@@ -3880,6 +4131,12 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::raw(" "));
     }
     right_spans.push(Span::styled(view, theme.text));
+    if app.layout_mode == LayoutMode::Home {
+        right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("chart", theme.muted));
+        right_spans.push(Span::styled("(^t) ", theme.accent));
+        right_spans.push(Span::styled(app.home_chart_mode.label(), theme.text));
+    }
     if !matches!(app.layout_mode, LayoutMode::Timeline | LayoutMode::Home) {
         right_spans.push(Span::raw("   "));
         right_spans.push(Span::styled("mode ", theme.muted));
@@ -4117,11 +4374,15 @@ fn sessions_from_query(
 
 /// Reduces accepted search results to the only two values the home chart
 /// needs. This is computed once per completed search, not once per frame.
-fn session_activity(sessions: &[SessionSummary]) -> Vec<(SourceKind, u64)> {
+fn session_activity(sessions: &[SessionSummary]) -> Vec<HomeChartPoint> {
     sessions
         .iter()
         .filter(|session| session.last_ts > 0)
-        .map(|session| (session.source, session.last_ts))
+        .map(|session| HomeChartPoint {
+            source: session.source,
+            timestamp_ms: session.last_ts,
+            value: 1,
+        })
         .collect()
 }
 
@@ -5760,17 +6021,32 @@ mod tests {
 
     #[test]
     fn home_chart_groups_order_by_volume_and_merge_codex() {
-        let events = vec![
-            (SourceKind::Claude, 1),
-            (SourceKind::Claude, 2),
-            (SourceKind::Claude, 3),
-            (SourceKind::CodexSession, 4),
-            (SourceKind::CodexHistory, 5),
+        let points = vec![
+            HomeChartPoint {
+                source: SourceKind::Claude,
+                timestamp_ms: 1,
+                value: 2,
+            },
+            HomeChartPoint {
+                source: SourceKind::Claude,
+                timestamp_ms: 2,
+                value: 3,
+            },
+            HomeChartPoint {
+                source: SourceKind::CodexSession,
+                timestamp_ms: 4,
+                value: 1,
+            },
+            HomeChartPoint {
+                source: SourceKind::CodexHistory,
+                timestamp_ms: 5,
+                value: 1,
+            },
         ];
-        let groups = home_chart_groups(&events, (0, 10));
+        let groups = home_chart_groups(&points, (0, 10));
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0, "claude");
-        assert_eq!(groups[0].2, 3);
+        assert_eq!(groups[0].2, 5);
         assert_eq!(groups[1].0, "codex");
         assert_eq!(groups[1].2, 2);
     }
@@ -5778,8 +6054,16 @@ mod tests {
     #[test]
     fn home_chart_uses_accepted_results_while_searching() {
         let (_tmp, mut app) = test_app();
-        app.home_activity = vec![(SourceKind::Claude, 10)];
-        app.home_result_activity = vec![(SourceKind::CodexSession, 20)];
+        app.home_activity = vec![HomeChartPoint {
+            source: SourceKind::Claude,
+            timestamp_ms: 10,
+            value: 1,
+        }];
+        app.home_result_activity = vec![HomeChartPoint {
+            source: SourceKind::CodexSession,
+            timestamp_ms: 20,
+            value: 1,
+        }];
 
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
 
@@ -5816,13 +6100,24 @@ mod tests {
             }],
         });
 
-        assert_eq!(app.home_result_activity, vec![(SourceKind::Pi, 42)]);
+        assert_eq!(
+            app.home_result_activity,
+            vec![HomeChartPoint {
+                source: SourceKind::Pi,
+                timestamp_ms: 42,
+                value: 1,
+            }]
+        );
     }
 
     #[test]
     fn home_chart_grid_scales_with_height() {
-        let events = vec![(SourceKind::Claude, 500); 4];
-        let grid = home_chart_grid(&events, (0, 1000), 1, 4);
+        let points = vec![HomeChartPoint {
+            source: SourceKind::Claude,
+            timestamp_ms: 500,
+            value: 4,
+        }];
+        let grid = home_chart_grid(&points, (0, 1000), 1, 4);
         assert_eq!(grid.len(), 4);
         assert!(grid.iter().all(|row| row[0].0 == '⣿'));
         assert!(
@@ -5833,47 +6128,92 @@ mod tests {
 
     #[test]
     fn home_chart_grid_stacks_sources_bottom_up() {
-        let events = vec![
-            (SourceKind::Claude, 500),
-            (SourceKind::Claude, 500),
-            (SourceKind::CodexSession, 500),
-            (SourceKind::CodexSession, 500),
+        let points = vec![
+            HomeChartPoint {
+                source: SourceKind::Claude,
+                timestamp_ms: 500,
+                value: 2,
+            },
+            HomeChartPoint {
+                source: SourceKind::CodexSession,
+                timestamp_ms: 500,
+                value: 2,
+            },
         ];
         // Height 2 → 8 dot levels split evenly: claude fills the bottom cell,
         // codex the top cell.
-        let grid = home_chart_grid(&events, (0, 1000), 1, 2);
+        let grid = home_chart_grid(&points, (0, 1000), 1, 2);
         assert_eq!(grid[1][0].1, source_color(SourceKind::Claude));
         assert_eq!(grid[0][0].1, source_color(SourceKind::CodexSession));
     }
 
     #[test]
     fn home_chart_excludes_activity_outside_selected_range() {
-        let events = vec![
-            (SourceKind::Claude, 10),
-            (SourceKind::CodexSession, 50),
-            (SourceKind::Pi, 90),
+        let points = vec![
+            HomeChartPoint {
+                source: SourceKind::Claude,
+                timestamp_ms: 10,
+                value: 2,
+            },
+            HomeChartPoint {
+                source: SourceKind::CodexSession,
+                timestamp_ms: 50,
+                value: 3,
+            },
+            HomeChartPoint {
+                source: SourceKind::Pi,
+                timestamp_ms: 90,
+                value: 4,
+            },
         ];
         let bounds = (25, 75);
 
-        assert_eq!(activity_count_in_bounds(&events, bounds), 1);
-        let groups = home_chart_groups(&events, bounds);
+        assert_eq!(activity_count_in_bounds(&points, bounds), 1);
+        assert_eq!(activity_value_in_bounds(&points, bounds), 3);
+        let groups = home_chart_groups(&points, bounds);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, "codex");
-        assert_eq!(timeline_bucket_counts(&[10, 50, 90], bounds, 2), vec![0, 1]);
+        assert_eq!(home_bucket_values(&points, "codex", bounds, 2), vec![0, 3]);
     }
 
     #[test]
     fn all_home_activity_range_uses_matching_event_bounds() {
-        let events = vec![(SourceKind::Claude, 10), (SourceKind::CodexSession, 90)];
+        let points = vec![
+            HomeChartPoint {
+                source: SourceKind::Claude,
+                timestamp_ms: 10,
+                value: 1,
+            },
+            HomeChartPoint {
+                source: SourceKind::CodexSession,
+                timestamp_ms: 90,
+                value: 1,
+            },
+        ];
 
         assert_eq!(
-            home_activity_bounds_at(&events, TimelineRange::All, 100),
+            home_activity_bounds_at(&points, TimelineRange::All, 100),
             (10, 90)
         );
         assert_eq!(
-            home_activity_bounds_at(&events, TimelineRange::Month, 100),
+            home_activity_bounds_at(&points, TimelineRange::Month, 100),
             (0, 100)
         );
+    }
+
+    #[test]
+    fn compact_metric_keeps_chart_caption_short() {
+        assert_eq!(compact_metric(184), "184");
+        assert_eq!(compact_metric(1_240_000), "1.2M");
+        assert_eq!(compact_metric(12_400_000), "12M");
+    }
+
+    #[test]
+    fn visible_token_loading_keeps_spinner_active() {
+        let (_tmp, mut app) = test_app();
+        app.home_chart_mode = HomeChartMode::Tokens;
+        app.home_token_activity_state = LoadState::Loading;
+        assert!(app.has_active_loading());
     }
 
     #[test]
