@@ -130,10 +130,9 @@ const PREVIEW_LINE_MAX_CHARS: usize = 320;
 const CONTEXT_AROUND_MATCH: usize = 1;
 const RECENT_SESSIONS_LIMIT: usize = 200;
 const RECENT_RECORDS_MULTIPLIER: usize = 50;
-const HOME_COLUMN_WIDTH: u16 = 64;
-const HOME_ACTIVITY_DAYS: u64 = 30;
+const HOME_COLUMN_MIN_WIDTH: u16 = 64;
+const HOME_COLUMN_MAX_WIDTH: u16 = 112;
 const HOME_DROPDOWN_MAX_ROWS: u16 = 8;
-const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 // Braille cells fill bottom-up in four dot rows, giving the chart a dotted
 // texture at 4x the vertical resolution of the character grid.
 const HOME_BRAILLE: [char; 5] = [' ', '⣀', '⣤', '⣶', '⣿'];
@@ -216,6 +215,8 @@ enum TimelineRange {
 }
 
 impl TimelineRange {
+    const ALL: [Self; 4] = [Self::Day, Self::Week, Self::Month, Self::All];
+
     fn next(self) -> Self {
         match self {
             TimelineRange::Day => TimelineRange::Week,
@@ -240,6 +241,15 @@ impl TimelineRange {
             TimelineRange::Week => "last 7d",
             TimelineRange::Month => "last 30d",
             TimelineRange::All => "all history",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            TimelineRange::Day => "24h",
+            TimelineRange::Week => "7d",
+            TimelineRange::Month => "30d",
+            TimelineRange::All => "all",
         }
     }
 
@@ -315,6 +325,7 @@ impl ProjectDisplayMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum HomeDropdown {
     None,
+    Range,
     Source,
     Project,
 }
@@ -418,6 +429,7 @@ struct App {
     active_search_request: u64,
     selected: ListState,
     layout_mode: LayoutMode,
+    detail_return_mode: LayoutMode,
     project_display: ProjectDisplayMode,
     timeline_range: TimelineRange,
     timeline_density: TimelineDensityMode,
@@ -429,6 +441,8 @@ struct App {
     timeline_state: LoadState,
     active_timeline_request: u64,
     home_activity: Vec<(SourceKind, u64)>,
+    home_result_activity: Vec<(SourceKind, u64)>,
+    home_activity_range: TimelineRange,
     home_activity_state: LoadState,
     active_home_activity_request: u64,
     home_input_area: Rect,
@@ -436,6 +450,7 @@ struct App {
     home_dropdown: HomeDropdown,
     home_dropdown_state: ListState,
     home_dropdown_area: Rect,
+    home_range_area: Rect,
     home_source_area: Rect,
     home_project_area: Rect,
     home_sources: Vec<SourceChoice>,
@@ -679,6 +694,8 @@ impl App {
             query: String::new(),
             project: String::new(),
             home_activity: Vec::new(),
+            home_result_activity: Vec::new(),
+            home_activity_range: TimelineRange::Month,
             home_activity_state: LoadState::Idle,
             active_home_activity_request: 0,
             home_input_area: Rect::default(),
@@ -686,6 +703,7 @@ impl App {
             home_dropdown: HomeDropdown::None,
             home_dropdown_state: ListState::default(),
             home_dropdown_area: Rect::default(),
+            home_range_area: Rect::default(),
             home_source_area: Rect::default(),
             home_project_area: Rect::default(),
             home_sources: Vec::new(),
@@ -704,6 +722,7 @@ impl App {
             active_search_request: 0,
             selected: ListState::default(),
             layout_mode: LayoutMode::Home,
+            detail_return_mode: LayoutMode::List,
             project_display: ProjectDisplayMode::NestedWorktrees,
             timeline_range: TimelineRange::All,
             timeline_density: TimelineDensityMode::Compact,
@@ -754,6 +773,20 @@ impl App {
 
     fn refresh_results(&mut self) {
         self.kickoff_search();
+    }
+
+    fn home_chart_is_filtered(&self) -> bool {
+        !self.query.trim().is_empty()
+            || self.source != SourceChoice::All
+            || !self.project.trim().is_empty()
+    }
+
+    fn home_chart_activity(&self) -> &[(SourceKind, u64)] {
+        if self.home_chart_is_filtered() {
+            &self.home_result_activity
+        } else {
+            &self.home_activity
+        }
     }
 
     fn next_request_id(&mut self) -> u64 {
@@ -1057,11 +1090,11 @@ impl App {
         self.home_activity_state = LoadState::Loading;
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
+        let range = self.home_activity_range;
         std::thread::spawn(move || {
-            let since = now_ms().saturating_sub(HOME_ACTIVITY_DAYS * DAY_MS);
             let timestamps = (|| -> Result<Vec<(SourceKind, u64)>> {
                 let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-                let rows = store.query_source_timestamps(Some(since))?;
+                let rows = store.query_source_timestamps(range.since_ms(now_ms()))?;
                 Ok(rows.into_iter().filter(|(_, ts)| *ts > 0).collect())
             })()
             .unwrap_or_default();
@@ -1123,6 +1156,10 @@ impl App {
 
     fn home_dropdown_options(&self) -> Vec<String> {
         match self.home_dropdown {
+            HomeDropdown::Range => TimelineRange::ALL
+                .iter()
+                .map(|range| range.short_label().to_string())
+                .collect(),
             HomeDropdown::Source => {
                 let mut options = vec!["all".to_string()];
                 options.extend(self.home_sources.iter().map(|s| s.label().to_string()));
@@ -1142,6 +1179,10 @@ impl App {
         self.quick_lines.clear();
         self.home_dropdown = kind;
         let current = match kind {
+            HomeDropdown::Range => TimelineRange::ALL
+                .iter()
+                .position(|range| *range == self.home_activity_range)
+                .unwrap_or(0),
             HomeDropdown::Source => self
                 .home_sources
                 .iter()
@@ -1180,7 +1221,15 @@ impl App {
             self.close_home_dropdown();
             return;
         };
-        match self.home_dropdown {
+        let refresh_activity = self.home_dropdown == HomeDropdown::Range;
+        let refresh_search = match self.home_dropdown {
+            HomeDropdown::Range => {
+                self.home_activity_range = TimelineRange::ALL
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(TimelineRange::Month);
+                false
+            }
             HomeDropdown::Source => {
                 self.source = if idx == 0 {
                     SourceChoice::All
@@ -1190,6 +1239,7 @@ impl App {
                         .copied()
                         .unwrap_or(SourceChoice::All)
                 };
+                true
             }
             HomeDropdown::Project => {
                 self.project = if idx == 0 {
@@ -1197,11 +1247,16 @@ impl App {
                 } else {
                     self.home_projects.get(idx - 1).cloned().unwrap_or_default()
                 };
+                true
             }
-            HomeDropdown::None => {}
-        }
+            HomeDropdown::None => false,
+        };
         self.close_home_dropdown();
-        self.kickoff_search();
+        if refresh_search {
+            self.kickoff_search();
+        } else if refresh_activity {
+            self.kickoff_home_activity();
+        }
     }
 
     fn enter_browse(&mut self) {
@@ -1285,6 +1340,7 @@ impl App {
                 request_id,
                 sessions,
             } if request_id == self.active_search_request => {
+                self.home_result_activity = session_activity(&sessions);
                 self.results = sessions;
                 self.sessions_state = if self.results.is_empty() {
                     LoadState::Empty
@@ -1698,6 +1754,11 @@ impl App {
     }
 
     fn enter_full_history(&mut self) {
+        self.detail_return_mode = if self.layout_mode == LayoutMode::Home {
+            LayoutMode::Home
+        } else {
+            LayoutMode::List
+        };
         self.layout_mode = LayoutMode::Detail;
         self.quick_popup = false;
         self.quick_lines.clear();
@@ -1712,6 +1773,23 @@ impl App {
         self.quick_popup = false;
         self.quick_lines.clear();
         self.focus = Focus::List;
+    }
+
+    fn return_to_home_from_detail(&mut self) {
+        self.layout_mode = LayoutMode::Home;
+        self.focus = Focus::List;
+        self.quick_popup = false;
+        self.quick_scroll = 0;
+        self.quick_lines.clear();
+        self.close_home_dropdown();
+    }
+
+    fn exit_detail(&mut self) {
+        if self.detail_return_mode == LayoutMode::Home {
+            self.return_to_home_from_detail();
+        } else {
+            self.return_to_list();
+        }
     }
 
     fn update_find(&mut self) {
@@ -1939,7 +2017,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
 
     if matches!(key.code, KeyCode::Esc) {
         if app.layout_mode == LayoutMode::Detail && !matches!(app.focus, Focus::Find) {
-            app.return_to_list();
+            app.exit_detail();
         } else if matches!(app.focus, Focus::Find) {
             app.focus = if app.layout_mode == LayoutMode::List {
                 Focus::List
@@ -2098,7 +2176,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         KeyCode::Char('h') => {
             if matches!(app.focus, Focus::Preview) {
                 if app.layout_mode == LayoutMode::Detail {
-                    app.return_to_list();
+                    app.exit_detail();
                 } else {
                     app.focus = Focus::List;
                 }
@@ -2226,6 +2304,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Enter => {
                 app.apply_home_dropdown();
             }
+            KeyCode::Char('t') if app.home_dropdown == HomeDropdown::Range => {
+                app.close_home_dropdown();
+            }
             KeyCode::Char('s') if app.home_dropdown == HomeDropdown::Source => {
                 app.close_home_dropdown();
             }
@@ -2301,6 +2382,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char(' ') => {
             app.toggle_quick_popup();
         }
+        KeyCode::Char('t') => {
+            if app.home_range_area.width > 0 {
+                app.open_home_dropdown(HomeDropdown::Range);
+            }
+        }
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
         }
@@ -2368,10 +2454,32 @@ fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
+fn home_column_width(area_width: u16) -> u16 {
+    let available = area_width.saturating_sub(4);
+    let responsive = ((u32::from(area_width) * 2) / 3) as u16;
+    responsive
+        .clamp(HOME_COLUMN_MIN_WIDTH, HOME_COLUMN_MAX_WIDTH)
+        .min(available)
+        .max(area_width.min(24))
+}
+
+fn home_chart_height(area_height: u16) -> u16 {
+    if area_height < 14 {
+        0
+    } else {
+        (area_height / 6).clamp(2, 10)
+    }
+}
+
+fn home_list_capacity(area_height: u16) -> u16 {
+    (((u32::from(area_height) * 3) / 5) as u16).clamp(8, 48)
+}
+
 fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
     frame.render_widget(Block::default().style(theme.panel), area);
     app.home_input_area = Rect::default();
     app.home_list_area = Rect::default();
+    app.home_range_area = Rect::default();
     app.home_source_area = Rect::default();
     app.home_project_area = Rect::default();
     app.home_dropdown_area = Rect::default();
@@ -2379,11 +2487,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         return;
     }
 
-    let col_width = area
-        .width
-        .saturating_sub(4)
-        .min(HOME_COLUMN_WIDTH)
-        .max(area.width.min(24));
+    let col_width = home_column_width(area.width);
     let col_x = area.x + (area.width - col_width) / 2;
     let col = |y: u16, h: u16| Rect {
         x: col_x,
@@ -2392,9 +2496,18 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         height: h,
     };
 
-    // Chart grows with the terminal: each braille row adds 4 dot levels.
-    let chart_height: u16 = if area.height >= 14 && !app.home_activity.is_empty() {
-        (area.height / 7).clamp(2, 6)
+    let filtered_chart = app.home_chart_is_filtered();
+    let chart_activity = app.home_chart_activity();
+    let now = now_ms();
+    let bounds = home_activity_bounds_at(chart_activity, app.home_activity_range, now);
+    let plotted_count = activity_count_in_bounds(chart_activity, bounds);
+    let total_count = chart_activity.len();
+
+    // Chart grows with the terminal: each braille row adds 4 dot levels. Keep
+    // its space while a filtered search has no matches so the input does not
+    // jump vertically as results arrive.
+    let chart_height: u16 = if !chart_activity.is_empty() || filtered_chart {
+        home_chart_height(area.height)
     } else {
         0
     };
@@ -2404,10 +2517,8 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     let mut y = area.y + top_pad;
 
     if chart_height > 0 {
-        let now = now_ms();
-        let bounds = (now.saturating_sub(HOME_ACTIVITY_DAYS * DAY_MS), now.max(1));
         let grid = home_chart_grid(
-            &app.home_activity,
+            chart_activity,
             bounds,
             col_width as usize,
             chart_height as usize,
@@ -2421,10 +2532,12 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     if caption_height > 0 {
         // Legend: one colored dot per agent, largest volume first — the same
         // order the chart stacks bottom-up.
-        let groups = home_chart_groups(&app.home_activity);
+        let groups = home_chart_groups(chart_activity, bounds);
         let mut spans: Vec<Span> = Vec::new();
         if groups.is_empty() {
-            spans.push(Span::styled("memex", theme.focus));
+            if !filtered_chart {
+                spans.push(Span::styled("memex", theme.focus));
+            }
         } else {
             for (label, color, _) in &groups {
                 spans.push(Span::styled("● ", Style::default().fg(*color)));
@@ -2432,24 +2545,47 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
                 spans.push(Span::raw("  "));
             }
         }
-        match &app.home_activity_state {
+        let chart_state = if filtered_chart {
+            &app.sessions_state
+        } else {
+            &app.home_activity_state
+        };
+        let count_text = if filtered_chart {
+            format!("{plotted_count}/{total_count} matches")
+        } else {
+            format!("{plotted_count} sessions")
+        };
+        match chart_state {
             LoadState::Loading => spans.push(Span::styled(
-                format!(" {} loading activity…", app.spinner()),
+                format!(" ·  {} {count_text}", app.spinner()),
                 theme.muted,
             )),
-            LoadState::Loaded => spans.push(Span::styled(
-                format!(
-                    "·  {} sessions · {}d",
-                    app.home_activity.len(),
-                    HOME_ACTIVITY_DAYS
-                ),
+            LoadState::Loaded => spans.push(Span::styled(format!("·  {count_text}"), theme.muted)),
+            LoadState::Empty if filtered_chart => spans.push(Span::styled(
+                format!("{plotted_count}/{total_count} matches"),
                 theme.muted,
             )),
             _ => {}
         }
+        let range_word = format!("{} ▾", app.home_activity_range.short_label());
+        let range_width = range_word.chars().count() as u16;
+        let caption_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(2),
+                Constraint::Length(range_width),
+            ])
+            .split(col(y, 1));
         frame.render_widget(
             Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
-            col(y, 1),
+            caption_cols[0],
+        );
+        app.home_range_area = caption_cols[2];
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(range_word, theme.accent)))
+                .alignment(Alignment::Right),
+            caption_cols[2],
         );
         y += 2;
     }
@@ -2546,10 +2682,10 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
 
     // Grow the list with the terminal instead of a fixed sliver, but keep
     // breathing room below so the layout never runs to the very edge.
-    let list_cap = (area.height * 2 / 5).clamp(8, 30);
+    let list_cap = home_list_capacity(area.height);
     let list_height = (area.y + area.height).saturating_sub(y).min(list_cap);
     if list_height == 0 {
-        draw_home_dropdown(frame, app, theme, area, header_area);
+        draw_home_dropdown(frame, app, theme, area);
         return;
     }
     let list_area = col(y, list_height);
@@ -2569,7 +2705,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             Paragraph::new(Line::from(Span::styled(message, theme.muted))),
             list_area,
         );
-        draw_home_dropdown(frame, app, theme, area, header_area);
+        draw_home_dropdown(frame, app, theme, area);
         return;
     }
 
@@ -2599,16 +2735,10 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         .highlight_symbol("");
     frame.render_stateful_widget(list, list_area, &mut app.selected);
 
-    draw_home_dropdown(frame, app, theme, area, header_area);
+    draw_home_dropdown(frame, app, theme, area);
 }
 
-fn draw_home_dropdown(
-    frame: &mut ratatui::Frame,
-    app: &mut App,
-    theme: &Theme,
-    area: Rect,
-    header_area: Rect,
-) {
+fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rect) {
     if app.home_dropdown == HomeDropdown::None {
         return;
     }
@@ -2617,9 +2747,14 @@ fn draw_home_dropdown(
         return;
     }
     let anchor = match app.home_dropdown {
+        HomeDropdown::Range => app.home_range_area,
         HomeDropdown::Source => app.home_source_area,
-        _ => app.home_project_area,
+        HomeDropdown::Project => app.home_project_area,
+        HomeDropdown::None => Rect::default(),
     };
+    if anchor.width == 0 {
+        return;
+    }
     let width = options
         .iter()
         .map(|o| o.chars().count())
@@ -2633,7 +2768,7 @@ fn draw_home_dropdown(
         .saturating_sub(width)
         .max(area.x)
         .min(area.right().saturating_sub(width));
-    let y = header_area.y.saturating_add(1);
+    let y = anchor.bottom();
     let max_height = area.bottom().saturating_sub(y);
     let height = (options.len() as u16)
         .min(HOME_DROPDOWN_MAX_ROWS)
@@ -2661,11 +2796,48 @@ fn draw_home_dropdown(
     frame.render_stateful_widget(list, popup, &mut app.home_dropdown_state);
 }
 
-/// Per-agent totals for the home chart, largest volume first. Codex session
-/// and history records collapse into one "codex" group via their shared label.
-fn home_chart_groups(events: &[(SourceKind, u64)]) -> Vec<(&'static str, Color, usize)> {
+fn home_activity_bounds_at(
+    events: &[(SourceKind, u64)],
+    range: TimelineRange,
+    now: u64,
+) -> (u64, u64) {
+    if let Some(since) = range.since_ms(now) {
+        return (since, now.max(since.saturating_add(1)));
+    }
+    let min_seen = events
+        .iter()
+        .map(|(_, ts)| *ts)
+        .filter(|ts| *ts > 0)
+        .min()
+        .unwrap_or(now);
+    let max_seen = events
+        .iter()
+        .map(|(_, ts)| *ts)
+        .filter(|ts| *ts > 0)
+        .max()
+        .unwrap_or(now);
+    (min_seen, max_seen.max(min_seen.saturating_add(1)))
+}
+
+fn activity_count_in_bounds(events: &[(SourceKind, u64)], bounds: (u64, u64)) -> usize {
+    events
+        .iter()
+        .filter(|(_, ts)| *ts >= bounds.0 && *ts <= bounds.1)
+        .count()
+}
+
+/// Per-agent totals for the visible home chart window, largest volume first.
+/// Codex session and history records collapse into one "codex" group via their
+/// shared label.
+fn home_chart_groups(
+    events: &[(SourceKind, u64)],
+    bounds: (u64, u64),
+) -> Vec<(&'static str, Color, usize)> {
     let mut totals: Vec<(&'static str, Color, usize)> = Vec::new();
-    for (kind, _) in events {
+    for (kind, ts) in events {
+        if *ts < bounds.0 || *ts > bounds.1 {
+            continue;
+        }
         let label = kind.label();
         if let Some(entry) = totals.iter_mut().find(|(l, _, _)| *l == label) {
             entry.2 += 1;
@@ -2690,7 +2862,7 @@ fn home_chart_grid(
     if width == 0 {
         return Vec::new();
     }
-    let groups = home_chart_groups(events);
+    let groups = home_chart_groups(events, bounds);
     let group_buckets: Vec<Vec<usize>> = groups
         .iter()
         .map(|(label, _, _)| {
@@ -2771,7 +2943,7 @@ fn timeline_chart_grid(
     if width == 0 {
         return Vec::new();
     }
-    let groups = home_chart_groups(events);
+    let groups = home_chart_groups(events, bounds);
     let group_buckets: Vec<Vec<usize>> = groups
         .iter()
         .map(|(label, _, _)| {
@@ -3302,7 +3474,8 @@ fn draw_project_timeline(
         .iter()
         .flat_map(|row| row.session_events.iter().copied())
         .collect();
-    let groups = home_chart_groups(&all_events);
+    let range = timeline_bounds(&app.timeline_rows, app.timeline_range);
+    let groups = home_chart_groups(&all_events, range);
     let legend = Line::from(
         groups
             .iter()
@@ -3356,7 +3529,6 @@ fn draw_project_timeline(
         Constraint::Length(1),
         Constraint::Length(last_width),
     ];
-    let range = timeline_bounds(&app.timeline_rows, app.timeline_range);
     let density_max = timeline_density_max(&app.timeline_rows[start..end], range, chart_width);
 
     for (line_idx, row) in app.timeline_rows[start..end].iter().enumerate() {
@@ -3768,6 +3940,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" peek  ", theme.muted),
             Span::styled("↑↓", theme.accent),
             Span::styled(" move  ", theme.muted),
+            Span::styled("t", theme.accent),
+            Span::styled(" timeframe  ", theme.muted),
             Span::styled("s", theme.accent),
             Span::styled(" source  ", theme.muted),
             Span::styled("p", theme.accent),
@@ -3949,6 +4123,16 @@ fn sessions_from_query(
         out.truncate(limit);
     }
     Ok(out)
+}
+
+/// Reduces accepted search results to the only two values the home chart
+/// needs. This is computed once per completed search, not once per frame.
+fn session_activity(sessions: &[SessionSummary]) -> Vec<(SourceKind, u64)> {
+    sessions
+        .iter()
+        .filter(|session| session.last_ts > 0)
+        .map(|session| (session.source, session.last_ts))
+        .collect()
 }
 
 fn sessions_from_recent(
@@ -4566,8 +4750,10 @@ fn timeline_bucket_counts(session_ts: &[u64], bounds: (u64, u64), width: usize) 
     let mut buckets = vec![0usize; width];
     let span = bounds.1.saturating_sub(bounds.0).max(1);
     for &ts in session_ts {
-        let clamped = ts.clamp(bounds.0, bounds.1);
-        let offset = clamped.saturating_sub(bounds.0);
+        if ts < bounds.0 || ts > bounds.1 {
+            continue;
+        }
+        let offset = ts.saturating_sub(bounds.0);
         let mut idx = ((offset as u128 * width as u128) / span as u128) as usize;
         if idx >= width {
             idx = width - 1;
@@ -5112,7 +5298,9 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-            if app.home_source_area.contains(pos) {
+            if app.home_range_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Range);
+            } else if app.home_source_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Source);
             } else if app.home_project_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Project);
@@ -5454,6 +5642,42 @@ mod tests {
     }
 
     #[test]
+    fn full_history_from_home_exits_directly_to_home() {
+        let (_tmp, mut app) = test_app();
+        app.query = "ghostree".to_string();
+        app.focus = Focus::List;
+
+        app.enter_full_history();
+        assert_eq!(app.layout_mode, LayoutMode::Detail);
+        assert_eq!(app.detail_return_mode, LayoutMode::Home);
+
+        app.exit_detail();
+        assert_eq!(app.layout_mode, LayoutMode::Home);
+        assert!(matches!(app.focus, Focus::List));
+        assert_eq!(app.query, "ghostree");
+    }
+
+    #[test]
+    fn full_history_from_browse_exits_to_list() {
+        let (_tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Split;
+
+        app.enter_full_history();
+        assert_eq!(app.detail_return_mode, LayoutMode::List);
+
+        app.exit_detail();
+        assert_eq!(app.layout_mode, LayoutMode::List);
+    }
+
+    #[test]
+    fn home_layout_scales_up_on_large_terminals() {
+        assert_eq!(home_column_width(100), 66);
+        assert_eq!(home_column_width(200), HOME_COLUMN_MAX_WIDTH);
+        assert!(home_chart_height(72) > home_chart_height(36));
+        assert!(home_list_capacity(72) > home_list_capacity(36));
+    }
+
+    #[test]
     fn home_chart_groups_order_by_volume_and_merge_codex() {
         let events = vec![
             (SourceKind::Claude, 1),
@@ -5462,12 +5686,56 @@ mod tests {
             (SourceKind::CodexSession, 4),
             (SourceKind::CodexHistory, 5),
         ];
-        let groups = home_chart_groups(&events);
+        let groups = home_chart_groups(&events, (0, 10));
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0, "claude");
         assert_eq!(groups[0].2, 3);
         assert_eq!(groups[1].0, "codex");
         assert_eq!(groups[1].2, 2);
+    }
+
+    #[test]
+    fn home_chart_uses_accepted_results_while_searching() {
+        let (_tmp, mut app) = test_app();
+        app.home_activity = vec![(SourceKind::Claude, 10)];
+        app.home_result_activity = vec![(SourceKind::CodexSession, 20)];
+
+        assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
+
+        app.query = "rust".to_string();
+        assert_eq!(
+            app.home_chart_activity(),
+            app.home_result_activity.as_slice()
+        );
+
+        app.query.clear();
+        app.source = SourceChoice::Codex;
+        assert_eq!(
+            app.home_chart_activity(),
+            app.home_result_activity.as_slice()
+        );
+    }
+
+    #[test]
+    fn accepted_search_results_refresh_home_chart_activity() {
+        let (_tmp, mut app) = test_app();
+        app.active_search_request = 3;
+        app.handle_search_update(SearchUpdate::Results {
+            request_id: 3,
+            sessions: vec![SessionSummary {
+                session_id: "session".to_string(),
+                project: "project".to_string(),
+                source: SourceKind::Pi,
+                last_ts: 42,
+                hit_count: 1,
+                top_score: 1.0,
+                snippet: String::new(),
+                source_path: "source.jsonl".to_string(),
+                source_dir: String::new(),
+            }],
+        });
+
+        assert_eq!(app.home_result_activity, vec![(SourceKind::Pi, 42)]);
     }
 
     #[test]
@@ -5495,6 +5763,36 @@ mod tests {
         let grid = home_chart_grid(&events, (0, 1000), 1, 2);
         assert_eq!(grid[1][0].1, source_color(SourceKind::Claude));
         assert_eq!(grid[0][0].1, source_color(SourceKind::CodexSession));
+    }
+
+    #[test]
+    fn home_chart_excludes_activity_outside_selected_range() {
+        let events = vec![
+            (SourceKind::Claude, 10),
+            (SourceKind::CodexSession, 50),
+            (SourceKind::Pi, 90),
+        ];
+        let bounds = (25, 75);
+
+        assert_eq!(activity_count_in_bounds(&events, bounds), 1);
+        let groups = home_chart_groups(&events, bounds);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "codex");
+        assert_eq!(timeline_bucket_counts(&[10, 50, 90], bounds, 2), vec![0, 1]);
+    }
+
+    #[test]
+    fn all_home_activity_range_uses_matching_event_bounds() {
+        let events = vec![(SourceKind::Claude, 10), (SourceKind::CodexSession, 90)];
+
+        assert_eq!(
+            home_activity_bounds_at(&events, TimelineRange::All, 100),
+            (10, 90)
+        );
+        assert_eq!(
+            home_activity_bounds_at(&events, TimelineRange::Month, 100),
+            (0, 100)
+        );
     }
 
     #[test]
@@ -5568,6 +5866,21 @@ mod tests {
         app.move_home_dropdown_selection(-1);
         app.apply_home_dropdown();
         assert!(app.project.is_empty());
+    }
+
+    #[test]
+    fn range_dropdown_changes_chart_without_restarting_search() {
+        let (_tmp, mut app) = test_app();
+        app.active_search_request = 7;
+        app.open_home_dropdown(HomeDropdown::Range);
+        assert_eq!(app.home_dropdown_state.selected(), Some(2));
+
+        app.move_home_dropdown_selection(1);
+        app.apply_home_dropdown();
+
+        assert_eq!(app.home_activity_range, TimelineRange::All);
+        assert_eq!(app.active_search_request, 7);
+        assert_eq!(app.home_activity_state, LoadState::Loading);
     }
 
     #[test]
