@@ -4,7 +4,7 @@
 //! request-level accounting, but they are not authoritative subscription-limit telemetry.
 
 use crate::analytics::ProjectGrouping;
-use crate::types::SourceFilter;
+use crate::types::{SourceFilter, SourceKind};
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use clap::ValueEnum;
@@ -1103,7 +1103,9 @@ fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut
             .pointer("/time/created")
             .map(timestamp_ms)
             .unwrap_or(0),
-        project: str_at(value, &["directory", "cwd"]),
+        // Ingestion currently groups all OpenCode sessions under this
+        // synthetic project, so usage must use the same attribution.
+        project: Some(SourceKind::Opencode.label().to_string()),
         provider: str_at(value, &["providerID", "provider"]),
         model: str_at(value, &["modelID", "model"]),
         tokens,
@@ -1658,6 +1660,7 @@ mod tests {
     #[test]
     fn opencode_reasoning_is_included_in_output_and_total() {
         let value = serde_json::json!({
+            "path": { "cwd": "/repo/memex" },
             "tokens": {
                 "input": 100,
                 "output": 20,
@@ -1678,6 +1681,50 @@ mod tests {
         assert_eq!(events[0].tokens.reasoning, 30);
         assert_eq!(events[0].tokens.output, 50);
         assert_eq!(events[0].tokens.total(), 200);
+        assert_eq!(events[0].project.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn opencode_project_filter_matches_indexed_project() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let message_dir = tmp.path().join("storage/message/ses_test");
+        std::fs::create_dir_all(&message_dir).expect("create message directory");
+        std::fs::write(
+            message_dir.join("msg_test.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "msg_test",
+                "sessionID": "ses_test",
+                "path": { "cwd": "/repo/memex" },
+                "time": { "created": 1_750_000_000_000u64 },
+                "tokens": {
+                    "input": 10,
+                    "output": 5,
+                    "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                }
+            }))
+            .expect("serialize message"),
+        )
+        .expect("write message");
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+        let mut query = UsageQuery {
+            source: Some(SourceFilter::Opencode),
+            project: Some("opencode".into()),
+            project_grouping: ProjectGrouping::Flat,
+            include_events: true,
+            ..UsageQuery::default()
+        };
+
+        let matching = scan_usage(&query).expect("scan matching project");
+        query.project = Some("memex".into());
+        let mismatched = scan_usage(&query).expect("scan mismatched project");
+
+        assert_eq!(matching.events, 1);
+        assert_eq!(matching.details[0].project.as_deref(), Some("opencode"));
+        assert_eq!(mismatched.events, 0);
     }
 
     #[test]

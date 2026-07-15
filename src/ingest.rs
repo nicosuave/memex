@@ -1811,7 +1811,7 @@ fn parse_opencode_file(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let project = "opencode".to_string();
+    let project = SourceKind::Opencode.label().to_string();
     let session_links = opencode_session_links
         .get(&session_id)
         .cloned()
