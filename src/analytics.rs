@@ -310,6 +310,41 @@ impl AnalyticsStore {
         Ok(projects)
     }
 
+    pub fn query_source_timestamps(&self, since_ms: Option<u64>) -> Result<Vec<(SourceKind, u64)>> {
+        let mut sql = String::from("SELECT source, last_at FROM sessions");
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(since_ms) = since_ms {
+            sql.push_str(" WHERE last_at >= ?");
+            values.push(rusqlite::types::Value::Integer(since_ms as i64));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (label, ts) = row?;
+            if let Some(kind) = SourceKind::from_label(&label) {
+                out.push((kind, ts));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn query_source_labels(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT source FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out.sort();
+        Ok(out)
+    }
+
     pub fn query_project_timestamps(
         &self,
         source: Option<SourceFilter>,
