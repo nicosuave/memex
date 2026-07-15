@@ -1133,6 +1133,9 @@ impl App {
 
     fn kickoff_home_activity(&mut self) {
         let refresh_tokens = self.home_chart_mode == HomeChartMode::Tokens;
+        if !refresh_tokens {
+            self.invalidate_home_token_activity();
+        }
         let request_id = self.next_request_id();
         self.active_home_activity_request = request_id;
         self.home_activity_state = LoadState::Loading;
@@ -1169,18 +1172,13 @@ impl App {
     fn kickoff_home_token_activity(&mut self) {
         let request_id = self.next_request_id();
         self.active_home_token_activity_request = request_id;
+        self.home_token_activity.clear();
         self.home_token_activity_state = LoadState::Loading;
+        self.home_token_activity_partial = false;
         let tx = self.search_tx.clone();
-        let range = self.home_activity_range;
+        let query = home_token_usage_query(self.source, self.home_activity_range, now_ms());
         std::thread::spawn(move || {
-            let result = scan_usage(&UsageQuery {
-                source: None,
-                since_ms: range.since_ms(now_ms()),
-                until_ms: None,
-                cost_mode: CostMode::Source,
-                include_events: true,
-            })
-            .map(|report| {
+            let result = scan_usage(&query).map(|report| {
                 let partial = !report.warnings.is_empty();
                 let points = report
                     .details
@@ -1328,6 +1326,8 @@ impl App {
             return;
         };
         let refresh_activity = self.home_dropdown == HomeDropdown::Range;
+        let source_selection = self.home_dropdown == HomeDropdown::Source;
+        let previous_source = self.source;
         let refresh_search = match self.home_dropdown {
             HomeDropdown::Range => {
                 self.home_activity_range = TimelineRange::ALL
@@ -1358,8 +1358,15 @@ impl App {
             HomeDropdown::None => false,
         };
         self.close_home_dropdown();
+        let source_changed = source_selection && self.source != previous_source;
+        if source_changed {
+            self.invalidate_home_token_activity();
+        }
         if refresh_search {
             self.kickoff_search();
+            if source_changed && self.home_chart_mode == HomeChartMode::Tokens {
+                self.kickoff_home_token_activity();
+            }
         } else if refresh_activity {
             self.kickoff_home_activity();
         }
@@ -1411,6 +1418,14 @@ impl App {
         }
     }
 
+    fn invalidate_home_token_activity(&mut self) {
+        let request_id = self.next_request_id();
+        self.active_home_token_activity_request = request_id;
+        self.home_token_activity.clear();
+        self.home_token_activity_state = LoadState::Idle;
+        self.home_token_activity_partial = false;
+    }
+
     fn home_focus_list(&mut self) {
         if self.results.is_empty() {
             return;
@@ -1448,10 +1463,6 @@ impl App {
                 self.index_state = IndexState::Complete;
                 self.refresh_results();
                 if self.layout_mode == LayoutMode::Home {
-                    if self.home_chart_mode == HomeChartMode::Sessions {
-                        self.home_token_activity_state = LoadState::Idle;
-                        self.home_token_activity_partial = false;
-                    }
                     self.kickoff_home_activity();
                     self.kickoff_home_filters();
                 }
@@ -2988,6 +2999,16 @@ fn home_activity_bounds_at(
         .max()
         .unwrap_or(now);
     (min_seen, max_seen.max(min_seen.saturating_add(1)))
+}
+
+fn home_token_usage_query(source: SourceChoice, range: TimelineRange, now: u64) -> UsageQuery {
+    UsageQuery {
+        source: source.as_filter(),
+        since_ms: range.since_ms(now),
+        until_ms: None,
+        cost_mode: CostMode::Source,
+        include_events: true,
+    }
 }
 
 fn activity_count_in_bounds(points: &[HomeChartPoint], bounds: (u64, u64)) -> usize {
@@ -6214,6 +6235,43 @@ mod tests {
         app.home_chart_mode = HomeChartMode::Tokens;
         app.home_token_activity_state = LoadState::Loading;
         assert!(app.has_active_loading());
+    }
+
+    #[test]
+    fn token_usage_query_applies_home_source_and_range() {
+        let query = home_token_usage_query(SourceChoice::Opencode, TimelineRange::Week, 10_000);
+
+        assert_eq!(query.source, Some(SourceFilter::Opencode));
+        assert_eq!(query.since_ms, TimelineRange::Week.since_ms(10_000));
+        assert!(query.include_events);
+    }
+
+    #[test]
+    fn invalidating_token_activity_discards_an_in_flight_result() {
+        let (_tmp, mut app) = test_app();
+        app.next_request_id = 7;
+        app.active_home_token_activity_request = 7;
+        app.home_token_activity_state = LoadState::Loading;
+        app.home_token_activity = vec![HomeChartPoint {
+            source: SourceKind::Claude,
+            timestamp_ms: 1,
+            value: 10,
+        }];
+
+        app.invalidate_home_token_activity();
+        app.handle_search_update(SearchUpdate::HomeTokenActivity {
+            request_id: 7,
+            points: vec![HomeChartPoint {
+                source: SourceKind::Claude,
+                timestamp_ms: 2,
+                value: 20,
+            }],
+            partial: false,
+        });
+
+        assert_eq!(app.active_home_token_activity_request, 8);
+        assert_eq!(app.home_token_activity_state, LoadState::Idle);
+        assert!(app.home_token_activity.is_empty());
     }
 
     #[test]

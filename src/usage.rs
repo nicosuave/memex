@@ -44,7 +44,9 @@ pub struct TokenBuckets {
     pub cache_write: u64,
     /// One-hour cache writes, a subset of `cache_write`.
     pub cache_write_1h: u64,
+    /// Billable output, including reasoning when a provider reports it separately.
     pub output: u64,
+    /// Reasoning output, retained as a subset of `output` for reporting.
     pub reasoning: u64,
 }
 
@@ -1025,7 +1027,8 @@ fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut
     let Some(usage) = value.get("tokens") else {
         return;
     };
-    let tokens = TokenBuckets::disjoint(
+    let reasoning = u64_at(usage, &["reasoning"]);
+    let mut tokens = TokenBuckets::disjoint(
         u64_at(usage, &["input"]),
         usage
             .pointer("/cache/read")
@@ -1035,8 +1038,11 @@ fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut
             .pointer("/cache/write")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        u64_at(usage, &["output"]),
+        u64_at(usage, &["output"]).saturating_add(reasoning),
     );
+    // OpenCode persists reasoning separately from output. Fold it into the
+    // additive output bucket while retaining the detail field for reporting.
+    tokens.reasoning = reasoning;
     if tokens.additive_total() == 0 {
         return;
     }
@@ -1597,6 +1603,31 @@ mod tests {
         assert_eq!(tokens.uncached_input, 20);
         assert_eq!(tokens.cache_read, 80);
         assert_eq!(tokens.additive_total(), 110);
+    }
+
+    #[test]
+    fn opencode_reasoning_is_included_in_output_and_total() {
+        let value = serde_json::json!({
+            "tokens": {
+                "input": 100,
+                "output": 20,
+                "reasoning": 30,
+                "cache": { "read": 40, "write": 10 }
+            }
+        });
+        let mut events = Vec::new();
+
+        push_opencode_event(
+            &value,
+            Path::new("message.json"),
+            Some("message".into()),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens.reasoning, 30);
+        assert_eq!(events[0].tokens.output, 50);
+        assert_eq!(events[0].tokens.total(), 200);
     }
 
     #[test]
