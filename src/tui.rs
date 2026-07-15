@@ -2777,7 +2777,7 @@ fn match_context_spans(
 fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> bool {
     match choice {
         SourceChoice::Claude => label == "claude",
-        SourceChoice::Codex => label == "codex-session" || label == "codex-history",
+        SourceChoice::Codex => matches!(label, "codex" | "codex-session" | "codex-history"),
         SourceChoice::Opencode => label == "opencode",
         SourceChoice::Cursor => label == "cursor",
         SourceChoice::Pi => label == "pi",
@@ -5306,6 +5306,20 @@ mod tests {
         let grid = home_chart_grid(&events, (0, 1000), 1, 2);
         assert_eq!(grid[1][0].1, source_color(SourceKind::Claude));
         assert_eq!(grid[0][0].1, source_color(SourceKind::CodexSession));
+    }
+
+    #[test]
+    fn source_choice_matches_legacy_codex_label() {
+        for label in ["codex", "codex-session", "codex-history"] {
+            assert!(source_choice_matches_storage_label(
+                SourceChoice::Codex,
+                label
+            ));
+        }
+        assert!(!source_choice_matches_storage_label(
+            SourceChoice::Claude,
+            "codex"
+        ));
     }
 
     #[test]
