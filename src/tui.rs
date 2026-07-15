@@ -62,6 +62,7 @@ enum SearchUpdate {
         source: SourceChoice,
         range: TimelineRange,
         grouping: ProjectDisplayMode,
+        query: String,
     },
     SearchError {
         request_id: u64,
@@ -1025,6 +1026,7 @@ impl App {
                         source,
                         range,
                         grouping,
+                        query,
                     });
                 }
                 Err(err) => {
@@ -1311,9 +1313,16 @@ impl App {
                 source,
                 range,
                 grouping,
+                query,
             } if request_id == self.active_timeline_request
-                && self.timeline_loaded
-                    == Some((source, range, grouping, self.query.trim().to_string())) =>
+                && self.timeline_loaded.as_ref().is_some_and(
+                    |(loaded_source, loaded_range, loaded_grouping, loaded_query)| {
+                        *loaded_source == source
+                            && *loaded_range == range
+                            && *loaded_grouping == grouping
+                            && loaded_query == &query
+                    },
+                ) =>
             {
                 self.timeline_rows = rows;
                 self.timeline_state = if self.timeline_rows.is_empty() {
@@ -5564,6 +5573,32 @@ mod tests {
 
         assert_eq!(app.sessions_state, LoadState::Loading);
         assert!(app.results.is_empty());
+    }
+
+    #[test]
+    fn timeline_result_uses_captured_query_while_search_buffer_is_edited() {
+        let (_tmp, mut app) = test_app();
+        app.active_timeline_request = 7;
+        app.timeline_state = LoadState::Loading;
+        app.timeline_loaded = Some((
+            SourceChoice::All,
+            TimelineRange::All,
+            ProjectDisplayMode::NestedWorktrees,
+            String::new(),
+        ));
+        app.query = "draft search".to_string();
+
+        app.handle_search_update(SearchUpdate::Timeline {
+            request_id: 7,
+            rows: Vec::new(),
+            source: SourceChoice::All,
+            range: TimelineRange::All,
+            grouping: ProjectDisplayMode::NestedWorktrees,
+            query: String::new(),
+        });
+
+        assert_eq!(app.timeline_state, LoadState::Empty);
+        assert_eq!(app.query, "draft search");
     }
 
     #[test]
