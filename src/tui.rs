@@ -104,6 +104,16 @@ struct DetailRequest {
     show_tools: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SearchRequest {
+    request_id: u64,
+    query: String,
+    project: String,
+    source: SourceChoice,
+    since: Option<u64>,
+    grouping: ProjectGrouping,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum LoadState {
     #[default]
@@ -137,6 +147,7 @@ const HOME_DROPDOWN_MAX_ROWS: u16 = 8;
 // texture at 4x the vertical resolution of the character grid.
 const HOME_BRAILLE: [char; 5] = [' ', '⣀', '⣤', '⣶', '⣿'];
 const SPINNER_TICK: Duration = Duration::from_millis(80);
+const HOME_SEARCH_DEBOUNCE: Duration = Duration::from_millis(100);
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const OUTER_PAD_X: u16 = 0;
@@ -406,6 +417,7 @@ struct AppChannels {
     index_rx: std::sync::mpsc::Receiver<IndexUpdate>,
     search_tx: std::sync::mpsc::Sender<SearchUpdate>,
     search_rx: std::sync::mpsc::Receiver<SearchUpdate>,
+    search_request_tx: std::sync::mpsc::Sender<SearchRequest>,
     detail_tx: std::sync::mpsc::Sender<DetailRequest>,
 }
 
@@ -427,6 +439,7 @@ struct App {
     sessions_state: LoadState,
     sessions_since: Option<u64>,
     active_search_request: u64,
+    pending_home_search: Option<Instant>,
     selected: ListState,
     layout_mode: LayoutMode,
     detail_return_mode: LayoutMode,
@@ -481,6 +494,7 @@ struct App {
     index_tx: std::sync::mpsc::Sender<IndexUpdate>,
     search_rx: std::sync::mpsc::Receiver<SearchUpdate>,
     search_tx: std::sync::mpsc::Sender<SearchUpdate>,
+    search_request_tx: std::sync::mpsc::Sender<SearchRequest>,
     detail_tx: std::sync::mpsc::Sender<DetailRequest>,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     querybar_area: Rect,
@@ -654,7 +668,14 @@ pub fn run(
     };
     let (index_tx, index_rx) = std::sync::mpsc::channel();
     let (search_tx, search_rx) = std::sync::mpsc::channel();
+    let (search_request_tx, search_request_rx) = std::sync::mpsc::channel();
     let (detail_tx, detail_rx) = std::sync::mpsc::channel();
+    spawn_search_worker(
+        paths.clone(),
+        index.clone(),
+        search_request_rx,
+        search_tx.clone(),
+    );
     spawn_detail_worker(index.clone(), detail_rx, search_tx.clone());
 
     let mut app = App::new(
@@ -666,6 +687,7 @@ pub fn run(
             index_rx,
             search_tx,
             search_rx,
+            search_request_tx,
             detail_tx,
         },
     );
@@ -720,6 +742,7 @@ impl App {
             sessions_state: LoadState::Idle,
             sessions_since: None,
             active_search_request: 0,
+            pending_home_search: None,
             selected: ListState::default(),
             layout_mode: LayoutMode::Home,
             detail_return_mode: LayoutMode::List,
@@ -758,6 +781,7 @@ impl App {
             index_rx: channels.index_rx,
             search_tx: channels.search_tx,
             search_rx: channels.search_rx,
+            search_request_tx: channels.search_request_tx,
             detail_tx: channels.detail_tx,
             update_rx: None,
             querybar_area: Rect::default(),
@@ -940,80 +964,48 @@ impl App {
     }
 
     fn kickoff_search(&mut self) {
+        self.pending_home_search = None;
         let request_id = self.next_request_id();
         self.active_search_request = request_id;
         self.sessions_state = LoadState::Loading;
         self.last_spinner_at = Instant::now();
-        let query = self.query.trim().to_string();
-        let project = self.project.trim().to_string();
-        let project_opt = if project.is_empty() {
-            None
-        } else {
-            Some(project)
-        };
-        let source = self.source;
-        let since = self.sessions_since;
-        let paths = self.paths.clone();
-        let tx = self.search_tx.clone();
-        let grouping = self.project_display.grouping();
         self.set_status("searching...");
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Vec<SessionSummary>> {
-                let sessions = if query.is_empty() {
-                    sessions_from_analytics(
-                        &paths,
-                        source.as_filter(),
-                        since,
-                        project_opt.as_deref(),
-                        grouping,
-                    )
-                    .or_else(|_| {
-                        let index = SearchIndex::open_or_create(&paths.index)?;
-                        sessions_from_recent(
-                            &index,
-                            source.as_filter(),
-                            since,
-                            project_opt.as_deref(),
-                        )
-                    })?
-                } else {
-                    let index = SearchIndex::open_or_create(&paths.index)?;
-                    let tantivy_project = if grouping == ProjectGrouping::Flat {
-                        project_opt.as_deref()
-                    } else {
-                        None
-                    };
-                    let mut sessions = sessions_from_query(
-                        &index,
-                        &query,
-                        source.as_filter(),
-                        tantivy_project,
-                        since,
-                        RESULT_LIMIT,
-                    )?;
-                    enrich_session_projects(&paths, &mut sessions, grouping);
-                    if let Some(project) = project_opt.as_deref() {
-                        sessions.retain(|session| session.project == project);
-                    }
-                    sessions
-                };
-                Ok(sessions)
-            })();
-            match result {
-                Ok(sessions) => {
-                    let _ = tx.send(SearchUpdate::Results {
-                        request_id,
-                        sessions,
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(SearchUpdate::SearchError {
-                        request_id,
-                        message: err.to_string(),
-                    });
-                }
-            }
-        });
+        let request = SearchRequest {
+            request_id,
+            query: self.query.trim().to_string(),
+            project: self.project.trim().to_string(),
+            source: self.source,
+            since: self.sessions_since,
+            grouping: self.project_display.grouping(),
+        };
+        if self.search_request_tx.send(request).is_err() {
+            self.sessions_state = LoadState::Error("search worker stopped".to_string());
+        }
+    }
+
+    fn schedule_home_search(&mut self) {
+        self.active_search_request = self.next_request_id();
+        self.sessions_state = LoadState::Loading;
+        self.pending_home_search = Some(Instant::now() + HOME_SEARCH_DEBOUNCE);
+        self.last_spinner_at = Instant::now();
+        self.set_status("searching...");
+    }
+
+    fn flush_home_search_if_due(&mut self) -> bool {
+        if self
+            .pending_home_search
+            .is_some_and(|at| Instant::now() >= at)
+        {
+            self.kickoff_search();
+            return true;
+        }
+        false
+    }
+
+    fn flush_home_search(&mut self) {
+        if self.pending_home_search.is_some() {
+            self.kickoff_search();
+        }
     }
 
     fn kickoff_project_load(&mut self) {
@@ -1925,6 +1917,9 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
     terminal.draw(|frame| draw_ui(frame, app))?;
     loop {
         let mut dirty = app.clear_status_if_old() || app.tick_spinner();
+        if app.flush_home_search_if_due() {
+            dirty = true;
+        }
         if let Some(update_rx) = app.update_rx.as_ref() {
             while let Ok(message) = update_rx.try_recv() {
                 app.update_message = Some(message);
@@ -2246,10 +2241,10 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         KeyCode::Char('v') => {
             app.toggle_layout_mode();
         }
-        KeyCode::Char(' ') => {
-            if app.layout_mode == LayoutMode::List && matches!(app.focus, Focus::List) {
-                app.toggle_quick_popup();
-            }
+        KeyCode::Char(' ')
+            if app.layout_mode == LayoutMode::List && matches!(app.focus, Focus::List) =>
+        {
+            app.toggle_quick_popup();
         }
         KeyCode::Char('t') => {
             app.toggle_tools();
@@ -2320,13 +2315,12 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
 
     if matches!(app.focus, Focus::Query) {
         match key.code {
-            KeyCode::Esc => {
-                if !app.query.is_empty() {
-                    app.query.clear();
-                    app.kickoff_search();
-                }
+            KeyCode::Esc if !app.query.is_empty() => {
+                app.query.clear();
+                app.schedule_home_search();
             }
             KeyCode::Enter => {
+                app.flush_home_search();
                 if !app.query.trim().is_empty() {
                     app.enter_browse();
                 } else {
@@ -2339,14 +2333,12 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Tab | KeyCode::BackTab => {
                 app.enter_browse();
             }
-            KeyCode::Backspace => {
-                if app.query.pop().is_some() {
-                    app.kickoff_search();
-                }
+            KeyCode::Backspace if app.query.pop().is_some() => {
+                app.schedule_home_search();
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.query.push(ch);
-                app.kickoff_search();
+                app.schedule_home_search();
             }
             _ => {}
         }
@@ -2382,10 +2374,8 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char(' ') => {
             app.toggle_quick_popup();
         }
-        KeyCode::Char('t') => {
-            if app.home_range_area.width > 0 {
-                app.open_home_dropdown(HomeDropdown::Range);
-            }
+        KeyCode::Char('t') if app.home_range_area.width > 0 => {
+            app.open_home_dropdown(HomeDropdown::Range);
         }
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
@@ -4214,14 +4204,27 @@ fn enrich_session_projects(
     let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
         return;
     };
+    let keys: Vec<_> = sessions
+        .iter()
+        .map(|session| {
+            (
+                session.source,
+                session.session_id.clone(),
+                session.source_path.clone(),
+            )
+        })
+        .collect();
+    let Ok(projects) = store.query_session_projects(&keys, grouping) else {
+        return;
+    };
     for session in sessions {
-        if let Ok(Some(project)) = store.project_for_session(
+        let key = (
             session.source,
-            &session.session_id,
-            &session.source_path,
-            grouping,
-        ) {
-            session.project = project;
+            session.session_id.clone(),
+            session.source_path.clone(),
+        );
+        if let Some(project) = projects.get(&key) {
+            session.project.clone_from(project);
         }
     }
 }
@@ -4324,6 +4327,76 @@ fn add_record_to_session(
         entry.source_path = record.source_path;
         entry.source_dir = parent_dir(&entry.source_path);
     }
+}
+
+fn spawn_search_worker(
+    paths: Paths,
+    index: SearchIndex,
+    rx: std::sync::mpsc::Receiver<SearchRequest>,
+    tx: std::sync::mpsc::Sender<SearchUpdate>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(mut request) = rx.recv() {
+            // Keep only the newest queued query so fast typing cannot build a
+            // backlog of obsolete searches.
+            while let Ok(newer) = rx.try_recv() {
+                request = newer;
+            }
+            let request_id = request.request_id;
+            let update = match run_search_request(&paths, &index, request) {
+                Ok(sessions) => SearchUpdate::Results {
+                    request_id,
+                    sessions,
+                },
+                Err(err) => SearchUpdate::SearchError {
+                    request_id,
+                    message: err.to_string(),
+                },
+            };
+            if tx.send(update).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn run_search_request(
+    paths: &Paths,
+    index: &SearchIndex,
+    request: SearchRequest,
+) -> Result<Vec<SessionSummary>> {
+    let project = (!request.project.is_empty()).then_some(request.project.as_str());
+    if request.query.is_empty() {
+        return sessions_from_analytics(
+            paths,
+            request.source.as_filter(),
+            request.since,
+            project,
+            request.grouping,
+        )
+        .or_else(|_| {
+            sessions_from_recent(index, request.source.as_filter(), request.since, project)
+        });
+    }
+
+    let tantivy_project = if request.grouping == ProjectGrouping::Flat {
+        project
+    } else {
+        None
+    };
+    let mut sessions = sessions_from_query(
+        index,
+        &request.query,
+        request.source.as_filter(),
+        tantivy_project,
+        request.since,
+        RESULT_LIMIT,
+    )?;
+    enrich_session_projects(paths, &mut sessions, request.grouping);
+    if let Some(project) = project {
+        sessions.retain(|session| session.project == project);
+    }
+    Ok(sessions)
 }
 
 fn spawn_detail_worker(
@@ -5566,7 +5639,14 @@ mod tests {
         let index = SearchIndex::open_or_create_for_ingest(&paths.index).expect("index");
         let (index_tx, index_rx) = std::sync::mpsc::channel();
         let (search_tx, search_rx) = std::sync::mpsc::channel();
+        let (search_request_tx, search_request_rx) = std::sync::mpsc::channel();
         let (detail_tx, _detail_rx) = std::sync::mpsc::channel();
+        spawn_search_worker(
+            paths.clone(),
+            index.clone(),
+            search_request_rx,
+            search_tx.clone(),
+        );
         let app = App::new(
             paths,
             UserConfig::default(),
@@ -5576,6 +5656,7 @@ mod tests {
                 index_rx,
                 search_tx,
                 search_rx,
+                search_request_tx,
                 detail_tx,
             },
         );

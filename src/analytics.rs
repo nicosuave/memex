@@ -417,6 +417,59 @@ impl AnalyticsStore {
             .optional()?;
         Ok(project.map(|project| display_project_name(&project)))
     }
+
+    pub fn query_session_projects(
+        &self,
+        sessions: &[(SourceKind, String, String)],
+        grouping: ProjectGrouping,
+    ) -> Result<HashMap<(SourceKind, String, String), String>> {
+        if sessions.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let display_expr = match grouping {
+            ProjectGrouping::Flat => "project",
+            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+        };
+        let conditions = std::iter::repeat_n(
+            "(source = ? AND session_id = ? AND source_path = ?)",
+            sessions.len(),
+        )
+        .collect::<Vec<_>>()
+        .join(" OR ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT source, session_id, source_path, {display_expr}
+             FROM sessions WHERE {conditions}"
+        ))?;
+        let values = sessions
+            .iter()
+            .flat_map(|(source, session_id, source_path)| {
+                [
+                    rusqlite::types::Value::Text(source.storage_label().to_string()),
+                    rusqlite::types::Value::Text(session_id.clone()),
+                    rusqlite::types::Value::Text(source_path.clone()),
+                ]
+            });
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut projects = HashMap::new();
+        for row in rows {
+            let (source, session_id, source_path, project) = row?;
+            let Some(source) = SourceKind::from_label(&source) else {
+                continue;
+            };
+            projects.insert(
+                (source, session_id, source_path),
+                display_project_name(&project),
+            );
+        }
+        Ok(projects)
+    }
 }
 
 impl AnalyticsWriter {
