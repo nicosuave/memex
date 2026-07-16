@@ -1436,6 +1436,7 @@ fn run_usage(
         cost_mode,
         include_events,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
+        memo_ttl_ms: 0,
     };
     let report = scan_usage(&query)?;
     if json {

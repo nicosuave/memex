@@ -8,16 +8,18 @@ use crate::types::{SourceFilter, SourceKind};
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use clap::ValueEnum;
+use memchr::memmem;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug, Default)]
@@ -31,6 +33,10 @@ pub struct UsageQuery {
     pub cost_mode: CostMode,
     pub include_events: bool,
     pub cache_path: Option<PathBuf>,
+    /// Reuse the previous in-process scan result when it is at most this old. Filters
+    /// (`since_ms`, `project`, `session_keys`, ...) apply after assembly, so repeated
+    /// queries over the same corpus can share one scan. Zero disables the memo.
+    pub memo_ttl_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -152,75 +158,48 @@ pub struct UsageReport {
 }
 
 pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
-    let mut events = Vec::new();
-    let mut warnings = Vec::new();
-    if query
-        .source
-        .is_none_or(|source| source == SourceFilter::Claude)
-        && let Err(error) = scan_claude(&mut events, &mut warnings, query.cache_path.as_deref())
-    {
-        warnings.push(format!(
-            "{} scanner: {error:#}",
-            SourceFilter::Claude.as_str()
-        ));
-    }
-    let mut scan =
-        |filter: SourceFilter, f: fn(&mut Vec<UsageEvent>, &mut Vec<String>) -> Result<()>| {
-            if query.source.is_none_or(|source| source == filter)
-                && let Err(error) = f(&mut events, &mut warnings)
-            {
-                warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
-            }
-        };
-    scan(SourceFilter::Codex, scan_codex);
-    scan(SourceFilter::Opencode, scan_opencode);
-    scan(SourceFilter::Pi, scan_pi);
-    scan(SourceFilter::Cursor, scan_cursor);
-    scan(SourceFilter::Copilot, scan_copilot);
-
-    reconcile_claude(&mut events);
-    reconcile_codex_copies(&mut events);
+    let _scan_guard = USAGE_SCAN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (assembled, warnings) = memoized_usage_events(query);
     let mut project_cache = HashMap::new();
-    events.retain(|event| {
-        query
-            .since_ms
-            .is_none_or(|since| event.timestamp_ms >= since)
-            && query
-                .until_ms
-                .is_none_or(|until| event.timestamp_ms < until)
-            && query.project.as_deref().is_none_or(|project| {
-                event.project.as_deref().is_some_and(|candidate| {
-                    usage_project_matches(
-                        candidate,
-                        project,
-                        query.project_grouping,
-                        &mut project_cache,
-                    )
+    // Assembled events are already sorted; filtering preserves that order.
+    let events: Vec<&UsageEvent> = assembled
+        .iter()
+        .filter(|event| {
+            query
+                .since_ms
+                .is_none_or(|since| event.timestamp_ms >= since)
+                && query
+                    .until_ms
+                    .is_none_or(|until| event.timestamp_ms < until)
+                && query.project.as_deref().is_none_or(|project| {
+                    event.project.as_deref().is_some_and(|candidate| {
+                        usage_project_matches(
+                            candidate,
+                            project,
+                            query.project_grouping,
+                            &mut project_cache,
+                        )
+                    })
                 })
-            })
-            && query.session_keys.as_ref().is_none_or(|session_keys| {
-                event.session_id.as_ref().is_some_and(|session_id| {
-                    session_keys.contains(&(event.source.clone(), session_id.clone()))
+                && query.session_keys.as_ref().is_none_or(|session_keys| {
+                    event.session_id.as_ref().is_some_and(|session_id| {
+                        session_keys.contains(&(event.source.clone(), session_id.clone()))
+                    })
                 })
-            })
-    });
-    events.sort_by(|a, b| {
-        (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
-            b.timestamp_ms,
-            &b.source_path,
-            b.source_order,
-        ))
-    });
+        })
+        .collect();
 
     let mut by_source: HashMap<String, UsageSummary> = HashMap::new();
     let mut report = UsageReport {
         authority: "local_log",
         cost_mode: query.cost_mode,
         price_catalog: PRICE_CATALOG_ID,
-        warnings,
+        warnings: warnings.as_ref().clone(),
         ..UsageReport::default()
     };
-    for event in &events {
+    for event in events.iter().copied() {
         let total = event.tokens.additive_total();
         report.events += 1;
         report.total_tokens = report.total_tokens.saturating_add(total);
@@ -258,9 +237,96 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
     report.by_source = by_source.into_values().collect();
     report.by_source.sort_by(|a, b| a.source.cmp(&b.source));
     if query.include_events {
-        report.details = events;
+        report.details = events.into_iter().cloned().collect();
     }
     Ok(report)
+}
+
+struct UsageMemo {
+    key: (Option<SourceFilter>, Option<PathBuf>),
+    built: Instant,
+    events: Arc<Vec<UsageEvent>>,
+    warnings: Arc<Vec<String>>,
+}
+
+static USAGE_MEMO: Lazy<Mutex<Option<UsageMemo>>> = Lazy::new(|| Mutex::new(None));
+
+/// Returns the assembled (pre-filter) events, reusing the previous in-process assembly
+/// when the query opts into a memo TTL. Callers must hold `USAGE_SCAN_LOCK`.
+fn memoized_usage_events(query: &UsageQuery) -> (Arc<Vec<UsageEvent>>, Arc<Vec<String>>) {
+    let key = (query.source, query.cache_path.clone());
+    let ttl = Duration::from_millis(query.memo_ttl_ms);
+    if !ttl.is_zero()
+        && let Some(memo) = USAGE_MEMO
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        && memo.key == key
+        && memo.built.elapsed() < ttl
+    {
+        return (memo.events.clone(), memo.warnings.clone());
+    }
+    let built = Instant::now();
+    let (events, warnings) = assemble_usage_events(query.source, query.cache_path.as_deref());
+    let events = Arc::new(events);
+    let warnings = Arc::new(warnings);
+    if !ttl.is_zero() {
+        *USAGE_MEMO
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(UsageMemo {
+            key,
+            built,
+            events: events.clone(),
+            warnings: warnings.clone(),
+        });
+    }
+    (events, warnings)
+}
+
+fn assemble_usage_events(
+    source: Option<SourceFilter>,
+    cache_path: Option<&Path>,
+) -> (Vec<UsageEvent>, Vec<String>) {
+    let mut events = Vec::new();
+    let mut warnings = Vec::new();
+    let mut cache = match cache_path.map(UsageCache::open).transpose() {
+        Ok(cache) => cache,
+        Err(error) => {
+            warnings.push(format!("usage cache disabled: {error:#}"));
+            None
+        }
+    };
+    type SourceScanner =
+        fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
+    const SCANNERS: [(SourceFilter, SourceScanner); 6] = [
+        (SourceFilter::Claude, scan_claude),
+        (SourceFilter::Codex, scan_codex),
+        (SourceFilter::Opencode, scan_opencode),
+        (SourceFilter::Pi, scan_pi),
+        (SourceFilter::Cursor, scan_cursor),
+        (SourceFilter::Copilot, scan_copilot),
+    ];
+    for (filter, scanner) in SCANNERS {
+        if source.is_none_or(|selected| selected == filter)
+            && let Err(error) = scanner(&mut events, &mut warnings, cache.as_mut())
+        {
+            warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
+        }
+    }
+
+    reconcile_claude(&mut events);
+    reconcile_codex_copies(&mut events);
+    reconcile_cursor_copies(&mut events);
+    reconcile_copilot_copies(&mut events);
+    reconcile_opencode_copies(&mut events);
+    events.par_sort_by(|a, b| {
+        (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
+            b.timestamp_ms,
+            &b.source_path,
+            b.source_order,
+        ))
+    });
+    (events, warnings)
 }
 
 fn home() -> PathBuf {
@@ -480,11 +546,22 @@ where
     Ok(Value::deserialize(deserializer)?.as_u64().unwrap_or(0))
 }
 
-const CLAUDE_USAGE_CACHE_VERSION: i64 = 1;
-static CLAUDE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+// Parser versions also cover the cached blob encoding (postcard); bump them when either
+// the per-source parsing or `CachedUsageEvent` changes shape.
+const CLAUDE_PARSER_VERSION: i64 = 3;
+const CODEX_PARSER_VERSION: i64 = 2;
+const PI_PARSER_VERSION: i64 = 2;
+const CURSOR_PARSER_VERSION: i64 = 2;
+const COPILOT_PARSER_VERSION: i64 = 2;
+const OPENCODE_PARSER_VERSION: i64 = 2;
+/// Reuse cached Cursor state databases this long even when their metadata changed: a
+/// running Cursor rewrites its (potentially multi-GB) databases continuously, and
+/// re-reading them on every scan makes live scans unusable.
+const VOLATILE_DB_REUSE_MS: i64 = 60_000;
+static USAGE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Serialize, Deserialize)]
-struct ClaudeCachedEvent {
+struct CachedUsageEvent {
     source_record_id: Option<String>,
     session_id: Option<String>,
     request_id: Option<String>,
@@ -495,12 +572,13 @@ struct ClaudeCachedEvent {
     model: Option<String>,
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
-    exact_dedupe: bool,
+    dedupe_confidence: String,
+    conservative_undercount: bool,
     sidechain: bool,
     source_order: u64,
 }
 
-impl ClaudeCachedEvent {
+impl CachedUsageEvent {
     fn from_event(event: &UsageEvent) -> Self {
         Self {
             source_record_id: event.source_record_id.clone(),
@@ -513,15 +591,16 @@ impl ClaudeCachedEvent {
             model: event.model.clone(),
             tokens: event.tokens.clone(),
             source_cost_usd: event.source_cost_usd,
-            exact_dedupe: event.dedupe_confidence == "exact",
+            dedupe_confidence: event.dedupe_confidence.to_string(),
+            conservative_undercount: event.conservative_undercount,
             sidechain: event.sidechain,
             source_order: event.source_order,
         }
     }
 
-    fn into_event(self, source_path: String) -> UsageEvent {
+    fn into_event(self, source: &'static str, source_path: String) -> UsageEvent {
         UsageEvent {
-            source: "claude".into(),
+            source: source.into(),
             source_path,
             source_record_id: self.source_record_id,
             session_id: self.session_id,
@@ -533,23 +612,30 @@ impl ClaudeCachedEvent {
             model: self.model,
             tokens: self.tokens,
             source_cost_usd: self.source_cost_usd,
-            dedupe_confidence: if self.exact_dedupe {
-                "exact"
-            } else {
-                "heuristic"
+            dedupe_confidence: match self.dedupe_confidence.as_str() {
+                "exact" => "exact",
+                "strong" => "strong",
+                _ => "heuristic",
             },
-            conservative_undercount: false,
+            conservative_undercount: self.conservative_undercount,
             sidechain: self.sidechain,
             source_order: self.source_order,
         }
     }
 }
 
-struct ClaudeUsageCache {
+struct UsageCache {
     connection: Connection,
 }
 
-struct ParsedClaudeFile {
+struct CachedFileRow {
+    size: u64,
+    mtime_ns: i64,
+    scanned_at_ms: i64,
+    events_blob: Vec<u8>,
+}
+
+struct ParsedUsageFile {
     index: usize,
     path: PathBuf,
     size: u64,
@@ -557,110 +643,240 @@ struct ParsedClaudeFile {
     events: Vec<UsageEvent>,
 }
 
-struct PreparedClaudeCacheFile {
-    path: PathBuf,
-    size: u64,
-    mtime_ns: i64,
-    max_timestamp_ms: u64,
-    events_json: Vec<u8>,
-}
-
-impl ClaudeUsageCache {
+impl UsageCache {
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(2))?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        // Drop pre-postcard cache tables: the JSON-era claude table and any
+        // usage_file_cache created before the blob column was renamed.
+        let has_blob_column: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('usage_file_cache') WHERE name = 'events_blob'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_blob_column == 0 {
+            connection.execute_batch("DROP TABLE IF EXISTS usage_file_cache;")?;
+        }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS claude_usage_file_cache (
-                 path TEXT PRIMARY KEY,
+             DROP TABLE IF EXISTS claude_usage_file_cache;
+             CREATE TABLE IF NOT EXISTS usage_file_cache (
+                 source TEXT NOT NULL,
+                 path TEXT NOT NULL,
                  parser_version INTEGER NOT NULL,
                  size INTEGER NOT NULL,
                  mtime_ns INTEGER NOT NULL,
-                 max_timestamp_ms INTEGER NOT NULL,
-                 events_json BLOB NOT NULL
+                 scanned_at_ms INTEGER NOT NULL,
+                 events_blob BLOB NOT NULL,
+                 PRIMARY KEY (source, path)
              );",
         )?;
         Ok(Self { connection })
     }
 
-    fn load(&self, path: &Path, size: u64, mtime_ns: i64) -> Result<Option<Vec<UsageEvent>>> {
-        let source_path = path.to_string_lossy();
-        let cached = self
-            .connection
-            .query_row(
-                "SELECT events_json FROM claude_usage_file_cache
-                 WHERE path = ?1 AND parser_version = ?2 AND size = ?3 AND mtime_ns = ?4",
-                params![
-                    source_path.as_ref(),
-                    CLAUDE_USAGE_CACHE_VERSION,
-                    size as i64,
-                    mtime_ns
-                ],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        let Some(blob) = cached else {
-            return Ok(None);
-        };
-        let cached: Vec<ClaudeCachedEvent> = serde_json::from_slice(&blob)?;
-        Ok(Some(
-            cached
-                .into_iter()
-                .map(|event| event.into_event(source_path.to_string()))
-                .collect(),
-        ))
+    fn load_source(
+        &self,
+        source: &str,
+        parser_version: i64,
+    ) -> Result<HashMap<String, CachedFileRow>> {
+        self.connection.execute(
+            "DELETE FROM usage_file_cache WHERE source = ?1 AND parser_version != ?2",
+            params![source, parser_version],
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob FROM usage_file_cache
+             WHERE source = ?1 AND parser_version = ?2",
+        )?;
+        let rows = statement.query_map(params![source, parser_version], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CachedFileRow {
+                    size: row.get::<_, i64>(1)? as u64,
+                    mtime_ns: row.get(2)?,
+                    scanned_at_ms: row.get(3)?,
+                    events_blob: row.get(4)?,
+                },
+            ))
+        })?;
+        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map_err(Into::into)
     }
 
-    fn save_batch(&mut self, parsed: &[ParsedClaudeFile]) -> Result<()> {
+    fn save_batch(
+        &mut self,
+        source: &str,
+        parser_version: i64,
+        scanned_at_ms: i64,
+        parsed: &[ParsedUsageFile],
+        stale_paths: &[String],
+    ) -> Result<()> {
         let prepared = parsed
             .iter()
             .map(|file| {
                 let cached = file
                     .events
                     .iter()
-                    .map(ClaudeCachedEvent::from_event)
+                    .map(CachedUsageEvent::from_event)
                     .collect::<Vec<_>>();
-                Ok(PreparedClaudeCacheFile {
-                    path: file.path.clone(),
-                    size: file.size,
-                    mtime_ns: file.mtime_ns,
-                    max_timestamp_ms: file
-                        .events
-                        .iter()
-                        .map(|event| event.timestamp_ms)
-                        .max()
-                        .unwrap_or(0),
-                    events_json: serde_json::to_vec(&cached)?,
-                })
+                Ok((
+                    file.path.to_string_lossy().to_string(),
+                    file.size,
+                    file.mtime_ns,
+                    postcard::to_stdvec(&cached)?,
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
         let transaction = self.connection.transaction()?;
-        for file in prepared {
+        for (path, size, mtime_ns, events_blob) in prepared {
             transaction.execute(
-                "INSERT INTO claude_usage_file_cache(
-                     path, parser_version, size, mtime_ns, max_timestamp_ms, events_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(path) DO UPDATE SET
+                "INSERT INTO usage_file_cache(
+                     source, path, parser_version, size, mtime_ns, scanned_at_ms, events_blob
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(source, path) DO UPDATE SET
                      parser_version = excluded.parser_version,
                      size = excluded.size,
                      mtime_ns = excluded.mtime_ns,
-                     max_timestamp_ms = excluded.max_timestamp_ms,
-                     events_json = excluded.events_json",
+                     scanned_at_ms = excluded.scanned_at_ms,
+                     events_blob = excluded.events_blob",
                 params![
-                    file.path.to_string_lossy().as_ref(),
-                    CLAUDE_USAGE_CACHE_VERSION,
-                    file.size as i64,
-                    file.mtime_ns,
-                    file.max_timestamp_ms,
-                    file.events_json
+                    source,
+                    path,
+                    parser_version,
+                    size as i64,
+                    mtime_ns,
+                    scanned_at_ms,
+                    events_blob
                 ],
+            )?;
+        }
+        for path in stale_paths {
+            transaction.execute(
+                "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
+                params![source, path],
             )?;
         }
         transaction.commit()?;
         Ok(())
+    }
+}
+
+fn epoch_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+#[derive(Clone, Copy)]
+struct SourceScan {
+    source: &'static str,
+    parser_version: i64,
+    /// Returns how long cached rows for this path may be reused even if the file metadata
+    /// changed, or `None` to always re-parse on change. Used for databases that are
+    /// continuously rewritten while their application runs; plain log files must return
+    /// `None` so appends are picked up immediately.
+    volatile_reuse_ms: fn(&Path) -> Option<i64>,
+}
+
+/// Scan `files` through the per-file cache: unchanged files are served from cached blobs
+/// (decoded in parallel), changed or new files are re-parsed in parallel, and cache rows
+/// for vanished files are dropped. Events are appended to `out` in `files` order.
+fn scan_files_cached(
+    scan: SourceScan,
+    files: &[PathBuf],
+    cache: Option<&mut UsageCache>,
+    warnings: &mut Vec<String>,
+    out: &mut Vec<UsageEvent>,
+    parse: impl Fn(&Path) -> Result<Vec<UsageEvent>> + Sync,
+) {
+    let SourceScan {
+        source,
+        parser_version,
+        volatile_reuse_ms,
+    } = scan;
+    let now_ms = epoch_ms_now();
+    let mut rows = match cache.as_deref() {
+        Some(cache) => match cache.load_source(source, parser_version) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warnings.push(format!("{source} usage cache read failed: {error:#}"));
+                HashMap::new()
+            }
+        },
+        None => HashMap::new(),
+    };
+    let mut slots: Vec<Option<Vec<UsageEvent>>> = (0..files.len()).map(|_| None).collect();
+    let mut hits: Vec<(usize, String, Vec<u8>)> = Vec::new();
+    let mut missing: Vec<(usize, PathBuf, (u64, i64))> = Vec::new();
+    for (index, path) in files.iter().enumerate() {
+        let metadata = match usage_file_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(format!(
+                    "{source} usage file skipped ({}): {error:#}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let key = path.to_string_lossy().to_string();
+        match rows.remove(&key) {
+            Some(row)
+                if (row.size, row.mtime_ns) == metadata
+                    || volatile_reuse_ms(path).is_some_and(|window| {
+                        now_ms.saturating_sub(row.scanned_at_ms) < window
+                    }) =>
+            {
+                hits.push((index, key, row.events_blob));
+            }
+            _ => missing.push((index, path.clone(), metadata)),
+        }
+    }
+    let decoded = hits
+        .into_par_iter()
+        .map(|(index, key, blob)| {
+            let events = postcard::from_bytes::<Vec<CachedUsageEvent>>(&blob).map(|events| {
+                events
+                    .into_iter()
+                    .map(|event| event.into_event(source, key.clone()))
+                    .collect::<Vec<_>>()
+            });
+            (index, key, events)
+        })
+        .collect::<Vec<_>>();
+    for (index, key, events) in decoded {
+        match events {
+            Ok(events) => slots[index] = Some(events),
+            // A corrupt cached blob demotes the file to a fresh parse.
+            Err(_) => {
+                let path = PathBuf::from(&key);
+                match usage_file_metadata(&path) {
+                    Ok(metadata) => missing.push((index, path, metadata)),
+                    Err(error) => warnings.push(format!(
+                        "{source} usage file skipped ({}): {error:#}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+    let parsed = parse_missing_usage_files(source, &missing, warnings, &parse);
+    let stale_paths: Vec<String> = rows.into_keys().collect();
+    if let Some(cache) = cache
+        && (!parsed.is_empty() || !stale_paths.is_empty())
+        && let Err(error) = cache.save_batch(source, parser_version, now_ms, &parsed, &stale_paths)
+    {
+        warnings.push(format!("{source} usage cache write failed: {error:#}"));
+    }
+    for file in parsed {
+        slots[file.index] = Some(file.events);
+    }
+    for events in slots.into_iter().flatten() {
+        out.extend(events);
     }
 }
 
@@ -678,11 +894,8 @@ fn usage_file_metadata(path: &Path) -> Result<(u64, i64)> {
 fn scan_claude(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
-    cache_path: Option<&Path>,
+    cache: Option<&mut UsageCache>,
 ) -> Result<()> {
-    let _scan_guard = CLAUDE_SCAN_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let roots = if let Some(config) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         config
             .to_string_lossy()
@@ -703,64 +916,31 @@ fn scan_claude(
         ]
     };
     let files = jsonl_files(roots);
-    let mut cache = match cache_path.map(ClaudeUsageCache::open).transpose() {
-        Ok(cache) => cache,
-        Err(error) => {
-            warnings.push(format!("Claude usage cache disabled: {error:#}"));
-            None
-        }
-    };
-    let mut slots = (0..files.len()).map(|_| None).collect::<Vec<_>>();
-    let mut missing = Vec::new();
-    for (index, path) in files.iter().enumerate() {
-        let metadata = match usage_file_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                warnings.push(format!(
-                    "Claude usage file skipped ({}): {error:#}",
-                    path.display()
-                ));
-                continue;
-            }
-        };
-        let cached = cache
-            .as_ref()
-            .map_or(Ok(None), |cache| cache.load(path, metadata.0, metadata.1));
-        match cached {
-            Ok(Some(events)) => slots[index] = Some(events),
-            Ok(None) => missing.push((index, path.clone(), metadata)),
-            Err(error) => {
-                warnings.push(format!(
-                    "Claude usage cache read failed ({}): {error:#}",
-                    path.display()
-                ));
-                missing.push((index, path.clone(), metadata));
-            }
-        }
-    }
-    let parsed = parse_missing_claude_files(&missing, warnings);
-    if let Some(cache) = &mut cache
-        && let Err(error) = cache.save_batch(&parsed)
-    {
-        warnings.push(format!("Claude usage cache write failed: {error:#}"));
-    }
-    for file in parsed {
-        slots[file.index] = Some(file.events);
-    }
-    for events in slots.into_iter().flatten() {
-        out.extend(events);
-    }
+    scan_files_cached(
+        SourceScan {
+            source: "claude",
+            parser_version: CLAUDE_PARSER_VERSION,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        scan_claude_file,
+    );
     Ok(())
 }
 
-fn parse_missing_claude_files(
+fn parse_missing_usage_files(
+    source: &str,
     missing: &[(usize, PathBuf, (u64, i64))],
     warnings: &mut Vec<String>,
-) -> Vec<ParsedClaudeFile> {
+    parse: &(impl Fn(&Path) -> Result<Vec<UsageEvent>> + Sync),
+) -> Vec<ParsedUsageFile> {
     let outcomes = missing
         .par_iter()
         .map(|(index, path, metadata)| {
-            scan_claude_file(path).map(|events| ParsedClaudeFile {
+            parse(path).map(|events| ParsedUsageFile {
                 index: *index,
                 path: path.clone(),
                 size: metadata.0,
@@ -774,7 +954,7 @@ fn parse_missing_claude_files(
         match outcome {
             Ok(file) => parsed.push(file),
             Err(error) => warnings.push(format!(
-                "Claude usage file skipped ({}): {error:#}",
+                "{source} usage file skipped ({}): {error:#}",
                 path.display()
             )),
         }
@@ -782,32 +962,50 @@ fn parse_missing_claude_files(
     parsed
 }
 
+/// Stream a file line by line as raw bytes, reusing one buffer. Line indices count every
+/// line in the file so record ids stay stable across parser changes.
+fn for_each_line(path: &Path, mut visit: impl FnMut(u64, &[u8])) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut line = Vec::with_capacity(16 * 1024);
+    let mut index = 0u64;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        visit(index, &line);
+        index += 1;
+    }
+}
+
 fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    static USAGE_NEEDLE: Lazy<memmem::Finder<'static>> =
+        Lazy::new(|| memmem::Finder::new(b"\"usage\""));
     let source_path = path.to_string_lossy().to_string();
     let fallback_session = path
         .file_stem()
         .and_then(|n| n.to_str())
         .map(str::to_string);
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut events = Vec::new();
-    for (index, line) in BufReader::new(file).lines().enumerate() {
-        let Ok(line) = line else {
-            continue;
-        };
-        if !line.contains("\"usage\"") {
-            continue;
+    for_each_line(path, |index, line| {
+        if USAGE_NEEDLE.find(line).is_none() {
+            return;
         }
-        let Ok(value) = serde_json::from_str::<ClaudeUsageLine>(&line) else {
-            continue;
+        let Ok(value) = serde_json::from_slice::<ClaudeUsageLine>(line) else {
+            return;
         };
         if value.kind.as_deref() != Some("assistant") {
-            continue;
+            return;
         }
         let Some(message) = value.message else {
-            continue;
+            return;
         };
         let Some(usage) = message.usage else {
-            continue;
+            return;
         };
         let cache_write = usage.cache_creation_input_tokens;
         let mut tokens = TokenBuckets::disjoint(
@@ -824,7 +1022,7 @@ fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
             .unwrap_or_default()
             .min(tokens.cache_write);
         if tokens.additive_total() == 0 {
-            continue;
+            return;
         }
         let exact_dedupe = message.id.is_some() && value.request_id.is_some();
         events.push(UsageEvent {
@@ -843,9 +1041,9 @@ fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
             dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },
             conservative_undercount: false,
             sidechain: value.is_sidechain,
-            source_order: index as u64,
+            source_order: index,
         });
-    }
+    })?;
     Ok(events)
 }
 
@@ -1090,7 +1288,11 @@ fn contained(current: CodexTokens, watermark: CodexTokens, counted: CodexTokens)
     }
 }
 
-fn scan_codex(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()> {
+fn scan_codex(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
     let homes: Vec<PathBuf> = std::env::var_os("CODEX_HOME")
         .map(|v| {
             v.to_string_lossy()
@@ -1109,13 +1311,37 @@ fn scan_codex(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<
             files.extend(jsonl_files([root]));
         }
     }
-    for path in files {
-        scan_codex_file(&path, out)?;
-    }
+    scan_files_cached(
+        SourceScan {
+            source: "codex",
+            parser_version: CODEX_PARSER_VERSION,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        scan_codex_file,
+    );
     Ok(())
 }
 
-fn scan_codex_file(path: &Path, out: &mut Vec<UsageEvent>) -> Result<()> {
+/// Matches every line kind `scan_codex_file` can consume; other lines (the vast majority:
+/// prompts, tool output, reasoning) are skipped without a JSON parse.
+static CODEX_LINE_NEEDLES: Lazy<Vec<memmem::Finder<'static>>> = Lazy::new(|| {
+    [
+        &b"token_count"[..],
+        b"turn_context",
+        b"session_meta",
+        b"task_started",
+        b"\"usage\"",
+    ]
+    .into_iter()
+    .map(memmem::Finder::new)
+    .collect()
+});
+
+fn scan_codex_file(path: &Path) -> Result<Vec<UsageEvent>> {
     let source_path = path.to_string_lossy().to_string();
     let mut session = path
         .file_stem()
@@ -1129,12 +1355,22 @@ fn scan_codex_file(path: &Path, out: &mut Vec<UsageEvent>) -> Result<()> {
     let mut counter = CodexCounter::default();
     let mut event_index = 0u64;
     let mut unresolved_fork_baseline_seen = false;
-    for (line_index, value) in lines(path)? {
+    let mut out = Vec::new();
+    for_each_line(path, |line_index, line| {
+        if !CODEX_LINE_NEEDLES
+            .iter()
+            .any(|needle| needle.find(line).is_some())
+        {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
         let payload = value.get("payload").unwrap_or(&Value::Null);
         match kind {
             "session_meta" => {
-                session = str_at(payload, &["id", "session_id"]).or(session);
+                session = str_at(payload, &["id", "session_id"]).or_else(|| session.take());
                 parent = str_at(
                     payload,
                     &["forked_from_id", "parent_session_id", "parentSessionId"],
@@ -1166,7 +1402,7 @@ fn scan_codex_file(path: &Path, out: &mut Vec<UsageEvent>) -> Result<()> {
                         counter.establish_unresolved_fork_baseline(total);
                         unresolved_fork_baseline_seen = true;
                     }
-                    continue;
+                    return;
                 }
                 if parent.is_some()
                     && !unresolved_fork_baseline_seen
@@ -1174,11 +1410,11 @@ fn scan_codex_file(path: &Path, out: &mut Vec<UsageEvent>) -> Result<()> {
                 {
                     counter.establish_unresolved_fork_baseline(total);
                     unresolved_fork_baseline_seen = true;
-                    continue;
+                    return;
                 }
                 let delta = counter.account(last, total);
                 if delta.zero() {
-                    continue;
+                    return;
                 }
                 out.push(UsageEvent {
                     source: "codex".into(),
@@ -1216,7 +1452,7 @@ fn scan_codex_file(path: &Path, out: &mut Vec<UsageEvent>) -> Result<()> {
                 {
                     let tokens = CodexTokens::from(usage);
                     if tokens.zero() {
-                        continue;
+                        return;
                     }
                     out.push(UsageEvent {
                         source: "codex".into(),
@@ -1250,8 +1486,8 @@ fn scan_codex_file(path: &Path, out: &mut Vec<UsageEvent>) -> Result<()> {
                 }
             }
         }
-    }
-    Ok(())
+    })?;
+    Ok(out)
 }
 
 fn reconcile_codex_copies(events: &mut Vec<UsageEvent>) {
@@ -1270,15 +1506,36 @@ fn reconcile_codex_copies(events: &mut Vec<UsageEvent>) {
     });
 }
 
-fn scan_pi(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()> {
-    let roots = [crate::ingest::pi_sessions_root()];
-    for path in jsonl_files(roots) {
+fn scan_pi(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = jsonl_files([crate::ingest::pi_sessions_root()]);
+    scan_files_cached(
+        SourceScan {
+            source: "pi",
+            parser_version: PI_PARSER_VERSION,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        scan_pi_file,
+    );
+    Ok(())
+}
+
+fn scan_pi_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    let mut out = Vec::new();
+    {
         let source_path = path.to_string_lossy().to_string();
-        let mut session = crate::ingest::pi_session_id_from_path(&path);
-        let mut project = crate::ingest::project_from_pi_session_path(&path);
+        let mut session = crate::ingest::pi_session_id_from_path(path);
+        let mut project = crate::ingest::project_from_pi_session_path(path);
         let mut current_model = None;
         let mut current_provider = None;
-        for (index, value) in lines(&path)? {
+        for (index, value) in lines(path)? {
             if value.get("type").and_then(Value::as_str) == Some("session") {
                 crate::ingest::apply_pi_session_identity(
                     value.get("id").and_then(Value::as_str),
@@ -1378,10 +1635,14 @@ fn scan_pi(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()>
             });
         }
     }
-    Ok(())
+    Ok(out)
 }
 
-fn scan_opencode(out: &mut Vec<UsageEvent>, warnings: &mut Vec<String>) -> Result<()> {
+fn scan_opencode(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
     let roots: Vec<PathBuf> = std::env::var_os("OPENCODE_DATA_DIR")
         .map(|v| {
             v.to_string_lossy()
@@ -1390,10 +1651,12 @@ fn scan_opencode(out: &mut Vec<UsageEvent>, warnings: &mut Vec<String>) -> Resul
                 .collect()
         })
         .unwrap_or_else(|| vec![home().join(".local/share/opencode")]);
-    for root in roots {
-        let mut database_ids = HashSet::new();
+    // Databases come before message files so `reconcile_opencode_copies` keeps the
+    // database copy of a message, matching the pre-cache suppression order.
+    let mut files = Vec::new();
+    for root in &roots {
         let mut databases = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&root) {
+        if let Ok(entries) = std::fs::read_dir(root) {
             databases.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
                 path.extension().and_then(|v| v.to_str()) == Some("db")
                     && path
@@ -1402,55 +1665,92 @@ fn scan_opencode(out: &mut Vec<UsageEvent>, warnings: &mut Vec<String>) -> Resul
                         .is_some_and(|n| n.starts_with("opencode"))
             }));
         }
-        for database in databases {
-            if let Err(error) = scan_opencode_db(&database, out, &mut database_ids) {
-                warnings.push(format!("{}: {error:#}", database.display()));
-            }
-        }
+        databases.sort();
+        files.extend(databases);
+    }
+    for root in &roots {
         let message_root = root.join("storage/message");
         if message_root.exists() {
-            for entry in WalkDir::new(message_root)
-                .into_iter()
-                .flatten()
-                .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().and_then(|v| v.to_str()) == Some("json")
-                })
-            {
-                let value: Value = match File::open(entry.path())
-                    .ok()
-                    .and_then(|file| serde_json::from_reader(file).ok())
-                {
-                    Some(value) => value,
-                    None => continue,
-                };
-                let id = str_at(&value, &["id"]).or_else(|| {
-                    entry
-                        .path()
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .map(str::to_string)
-                });
-                if id.as_ref().is_some_and(|id| database_ids.contains(id)) {
-                    continue;
-                }
-                push_opencode_event(&value, entry.path(), id, out);
-            }
+            files.extend(
+                WalkDir::new(message_root)
+                    .into_iter()
+                    .flatten()
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().and_then(|v| v.to_str()) == Some("json")
+                    })
+                    .map(|e| e.path().to_path_buf()),
+            );
         }
     }
+    scan_files_cached(
+        SourceScan {
+            source: "opencode",
+            parser_version: OPENCODE_PARSER_VERSION,
+            // Only the databases are volatile; message JSON files are updated in place
+            // while a response streams and must re-parse as soon as they change.
+            volatile_reuse_ms: |path| {
+                (path.extension().and_then(|v| v.to_str()) == Some("db"))
+                    .then_some(VOLATILE_DB_REUSE_MS)
+            },
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| {
+            if path.extension().and_then(|v| v.to_str()) == Some("db") {
+                scan_opencode_db(path)
+            } else {
+                scan_opencode_message_file(path)
+            }
+        },
+    );
     Ok(())
 }
 
-fn scan_opencode_db(
-    path: &Path,
-    out: &mut Vec<UsageEvent>,
-    ids: &mut HashSet<String>,
-) -> Result<()> {
+/// A message can exist both in an OpenCode database and as a JSON file under
+/// `storage/message` (and in databases from several roots). Keep the first copy in scan
+/// order, which lists databases first.
+fn reconcile_opencode_copies(events: &mut Vec<UsageEvent>) {
+    let mut seen = HashSet::new();
+    events.retain(|event| {
+        if event.source != "opencode" {
+            return true;
+        }
+        let Some(record) = &event.source_record_id else {
+            return true;
+        };
+        seen.insert(record.clone())
+    });
+}
+
+fn scan_opencode_message_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    let mut out = Vec::new();
+    let value: Value = match File::open(path)
+        .ok()
+        .and_then(|file| serde_json::from_reader(file).ok())
+    {
+        Some(value) => value,
+        None => return Ok(out),
+    };
+    let id = str_at(&value, &["id"]).or_else(|| {
+        path.file_stem()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    });
+    push_opencode_event(&value, path, id, &mut out);
+    Ok(out)
+}
+
+fn scan_opencode_db(path: &Path) -> Result<Vec<UsageEvent>> {
+    let mut out = Vec::new();
+    let mut ids = HashSet::new();
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.busy_timeout(std::time::Duration::from_secs(1))?;
+    conn.busy_timeout(Duration::from_secs(1))?;
     let mut stmt = conn.prepare("SELECT id, session_id, data FROM message")?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -1474,13 +1774,13 @@ fn scan_opencode_db(
         }
         let before = out.len();
         if !ids.contains(&id) {
-            push_opencode_event(&value, path, Some(id.clone()), out);
+            push_opencode_event(&value, path, Some(id.clone()), &mut out);
         }
         if out.len() > before {
             ids.insert(id);
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut Vec<UsageEvent>) {
@@ -1531,7 +1831,11 @@ fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut
     });
 }
 
-fn scan_cursor(out: &mut Vec<UsageEvent>, warnings: &mut Vec<String>) -> Result<()> {
+fn scan_cursor(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
     let user = if cfg!(target_os = "macos") {
         home().join("Library/Application Support/Cursor/User")
     } else {
@@ -1546,14 +1850,37 @@ fn scan_cursor(out: &mut Vec<UsageEvent>, warnings: &mut Vec<String>) -> Result<
             .filter(|e| e.file_type().is_file() && e.file_name() == "state.vscdb")
             .map(|e| e.path().to_path_buf()),
     );
-    let mut seen = HashSet::new();
+    let databases: Vec<PathBuf> = databases.into_iter().filter(|path| path.exists()).collect();
     let project_by_session = cursor_project_by_session();
-    for path in databases.into_iter().filter(|path| path.exists()) {
-        if let Err(error) = scan_cursor_db(&path, out, &mut seen, &project_by_session) {
-            warnings.push(format!("{}: {error:#}", path.display()));
-        }
-    }
+    scan_files_cached(
+        SourceScan {
+            source: "cursor",
+            parser_version: CURSOR_PARSER_VERSION,
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+        },
+        &databases,
+        cache,
+        warnings,
+        out,
+        |path| scan_cursor_db(path, &project_by_session),
+    );
     Ok(())
+}
+
+/// Cursor generations can appear in both the global and a workspace database. Keep the
+/// first copy in database order, mirroring the shared `seen` set the scanners used before
+/// results were cached per database.
+fn reconcile_cursor_copies(events: &mut Vec<UsageEvent>) {
+    let mut seen = HashSet::new();
+    events.retain(|event| {
+        if event.source != "cursor" {
+            return true;
+        }
+        let Some(record) = &event.source_record_id else {
+            return true;
+        };
+        seen.insert((record.clone(), event.tokens.raw_input, event.tokens.output))
+    });
 }
 
 fn cursor_project_by_session() -> HashMap<String, String> {
@@ -1576,15 +1903,15 @@ fn cursor_project_by_session() -> HashMap<String, String> {
 
 fn scan_cursor_db(
     path: &Path,
-    out: &mut Vec<UsageEvent>,
-    seen: &mut HashSet<String>,
     project_by_session: &HashMap<String, String>,
-) -> Result<()> {
+) -> Result<Vec<UsageEvent>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.busy_timeout(std::time::Duration::from_secs(1))?;
+    conn.busy_timeout(Duration::from_secs(1))?;
     for (table, query) in [
         (
             "cursorDiskKV",
@@ -1605,17 +1932,28 @@ fn scan_cursor_db(
         }
         let mut stmt = conn.prepare(query)?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         for row in rows {
             let (key, raw) = row?;
+            let Some(raw) = raw else {
+                continue;
+            };
             let Ok(value) = serde_json::from_str::<Value>(&raw) else {
                 continue;
             };
-            extract_cursor_objects(&value, &key, table, path, out, seen, project_by_session);
+            extract_cursor_objects(
+                &value,
+                &key,
+                table,
+                path,
+                &mut out,
+                &mut seen,
+                project_by_session,
+            );
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn extract_cursor_objects(
@@ -1756,7 +2094,11 @@ fn object_string(object: &Map<String, Value>, aliases: &[&str]) -> Option<String
         .map(str::to_string)
 }
 
-fn scan_copilot(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()> {
+fn scan_copilot(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
     let mut roots = vec![home().join(".copilot/otel")];
     if let Some(path) = std::env::var_os("COPILOT_OTEL_FILE_EXPORTER_PATH") {
         roots.push(PathBuf::from(path));
@@ -1771,13 +2113,44 @@ fn scan_copilot(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Resul
             }
         })
         .collect::<Vec<_>>();
-    let mut seen = HashSet::new();
-    for path in files {
-        for (index, value) in lines(&path)? {
-            extract_otel(&value, &path, index, out, &mut seen);
-        }
-    }
+    scan_files_cached(
+        SourceScan {
+            source: "copilot",
+            parser_version: COPILOT_PARSER_VERSION,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        scan_copilot_file,
+    );
     Ok(())
+}
+
+fn scan_copilot_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, value) in lines(path)? {
+        extract_otel(&value, path, index, &mut out, &mut seen);
+    }
+    Ok(out)
+}
+
+/// OTel spans can repeat across exporter files (same trace/span or response id). Keep the
+/// first copy in file order, mirroring the shared `seen` set the scanner used before
+/// results were cached per file.
+fn reconcile_copilot_copies(events: &mut Vec<UsageEvent>) {
+    let mut seen = HashSet::new();
+    events.retain(|event| {
+        if event.source != "copilot" {
+            return true;
+        }
+        let Some(record) = &event.source_record_id else {
+            return true;
+        };
+        seen.insert(record.clone())
+    });
 }
 
 fn extract_otel(
@@ -2148,9 +2521,11 @@ mod tests {
         let warm = scan_usage(&query).expect("warm scan");
         let cache = Connection::open(cache_path).expect("open cache");
         let cached_files: u64 = cache
-            .query_row("SELECT count(*) FROM claude_usage_file_cache", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
             .expect("count cached files");
 
         assert_eq!(cold.events, 1);
@@ -2199,9 +2574,11 @@ mod tests {
         let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
             .expect("open usage cache");
         let cached_files: u64 = cache
-            .query_row("SELECT count(*) FROM claude_usage_file_cache", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
             .expect("count cached files");
         let warm = scan_usage(&query).expect("warm scan");
 
@@ -2234,13 +2611,144 @@ mod tests {
         ];
         let mut warnings = Vec::new();
 
-        let parsed = parse_missing_claude_files(&missing, &mut warnings);
+        let parsed =
+            parse_missing_usage_files("claude", &missing, &mut warnings, &scan_claude_file);
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].index, 0);
         assert_eq!(parsed[0].events.len(), 1);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(vanished.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn codex_scanner_caches_events_by_file_metadata() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions/2026/07/03");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        std::fs::write(
+            sessions.join("rollout-2026-07-03-session.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-03T01:02:03Z","payload":{"id":"codex-session","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-03T01:02:05Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":25},"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":25}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write session");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let cold = scan_usage(&query).expect("cold scan");
+        let warm = scan_usage(&query).expect("warm scan");
+        let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
+            .expect("open usage cache");
+        let cached_files: u64 = cache
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cached files");
+
+        assert_eq!(cold.events, 1);
+        assert_eq!(cold.details[0].tokens.total(), 125);
+        assert_eq!(cold.details[0].model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(cold.details[0].session_id.as_deref(), Some("codex-session"));
+        assert_eq!(cold.details[0].project.as_deref(), Some("/repo/memex"));
+        assert_eq!(warm.events, cold.events);
+        assert_eq!(warm.total_tokens, cold.total_tokens);
+        assert_eq!(cached_files, 1);
+    }
+
+    #[test]
+    fn opencode_message_file_changes_bypass_volatile_reuse() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let message_dir = tmp.path().join("storage/message/ses_test");
+        std::fs::create_dir_all(&message_dir).expect("create message directory");
+        let message_path = message_dir.join("msg_test.json");
+        let message = |output: u64| {
+            serde_json::to_vec(&serde_json::json!({
+                "id": "msg_test",
+                "sessionID": "ses_test",
+                "time": { "created": 1_750_000_000_000u64 },
+                "tokens": {
+                    "input": 10,
+                    "output": output,
+                    "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                }
+            }))
+            .expect("serialize message")
+        };
+        std::fs::write(&message_path, message(5)).expect("write message");
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Opencode),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let initial = scan_usage(&query).expect("initial scan");
+        // The message file is rewritten while a response streams; unlike the opencode
+        // databases it must not be served from the 60s volatile window.
+        std::fs::write(&message_path, message(500)).expect("rewrite message");
+        let updated = scan_usage(&query).expect("updated scan");
+
+        assert_eq!(initial.total_tokens, 15);
+        assert_eq!(updated.total_tokens, 510);
+    }
+
+    #[test]
+    fn memoized_scan_reuses_assembled_events_within_ttl() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        let transcript = projects.join("session.jsonl");
+        let line = |input: u64| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"session","timestamp":1000,"message":{{"id":"m-{input}","usage":{{"inputTokens":{input}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&transcript, line(10)).expect("write transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            memo_ttl_ms: 60_000,
+            ..UsageQuery::default()
+        };
+
+        let first = scan_usage(&query).expect("first scan");
+        std::fs::write(&transcript, format!("{}{}", line(10), line(70))).expect("grow transcript");
+        let memoized = scan_usage(&query).expect("memoized scan");
+        let fresh = scan_usage(&UsageQuery {
+            memo_ttl_ms: 0,
+            ..query.clone()
+        })
+        .expect("fresh scan");
+
+        assert_eq!(first.total_tokens, 10);
+        assert_eq!(memoized.total_tokens, 10);
+        assert_eq!(fresh.total_tokens, 80);
     }
 
     #[test]
