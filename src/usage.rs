@@ -1851,7 +1851,7 @@ fn scan_cursor(
             .map(|e| e.path().to_path_buf()),
     );
     let databases: Vec<PathBuf> = databases.into_iter().filter(|path| path.exists()).collect();
-    let project_by_session = cursor_project_by_session();
+    let start = out.len();
     scan_files_cached(
         SourceScan {
             source: "cursor",
@@ -1862,9 +1862,24 @@ fn scan_cursor(
         cache,
         warnings,
         out,
-        |path| scan_cursor_db(path, &project_by_session),
+        scan_cursor_db,
     );
+    apply_cursor_projects(&mut out[start..], &cursor_project_by_session());
     Ok(())
+}
+
+/// Project attribution comes from `.cursor/projects` transcripts, which change independently
+/// of the database files the cache is keyed on. Derive it fresh on every scan (cached rows
+/// included) so a transcript that is indexed or moved after a database was cached still
+/// updates attribution.
+fn apply_cursor_projects(events: &mut [UsageEvent], project_by_session: &HashMap<String, String>) {
+    for event in events {
+        event.project = event
+            .session_id
+            .as_deref()
+            .and_then(|session_id| project_by_session.get(session_id))
+            .cloned();
+    }
 }
 
 /// Cursor generations can appear in both the global and a workspace database. Keep the
@@ -1901,10 +1916,7 @@ fn cursor_project_by_session() -> HashMap<String, String> {
     projects
 }
 
-fn scan_cursor_db(
-    path: &Path,
-    project_by_session: &HashMap<String, String>,
-) -> Result<Vec<UsageEvent>> {
+fn scan_cursor_db(path: &Path) -> Result<Vec<UsageEvent>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let conn = Connection::open_with_flags(
@@ -1942,15 +1954,7 @@ fn scan_cursor_db(
             let Ok(value) = serde_json::from_str::<Value>(&raw) else {
                 continue;
             };
-            extract_cursor_objects(
-                &value,
-                &key,
-                table,
-                path,
-                &mut out,
-                &mut seen,
-                project_by_session,
-            );
+            extract_cursor_objects(&value, &key, table, path, &mut out, &mut seen);
         }
     }
     Ok(out)
@@ -1963,20 +1967,11 @@ fn extract_cursor_objects(
     path: &Path,
     out: &mut Vec<UsageEvent>,
     seen: &mut HashSet<String>,
-    project_by_session: &HashMap<String, String>,
 ) {
     match value {
         Value::Array(values) => {
             for value in values {
-                extract_cursor_objects(
-                    value,
-                    fallback_id,
-                    table,
-                    path,
-                    out,
-                    seen,
-                    project_by_session,
-                );
+                extract_cursor_objects(value, fallback_id, table, path, out, seen);
             }
         }
         Value::Object(object) => {
@@ -1988,10 +1983,6 @@ fn extract_cursor_objects(
                     .filter(|id| !id.is_empty())
                     .map(str::to_string)
             });
-            let project = session_id
-                .as_ref()
-                .and_then(|session_id| project_by_session.get(session_id))
-                .cloned();
             let counted = input > 0 || output > 0;
             if counted {
                 let id = object_string(
@@ -2019,7 +2010,8 @@ fn extract_cursor_objects(
                             .or_else(|| object.get("timestamp"))
                             .map(timestamp_ms)
                             .unwrap_or(0),
-                        project,
+                        // Derived per scan by `apply_cursor_projects`; never cached.
+                        project: None,
                         provider: None,
                         model: object_string(object, &["model", "modelName"])
                             .or_else(|| {
@@ -2050,15 +2042,7 @@ fn extract_cursor_objects(
                     continue;
                 }
                 if child.is_array() || child.is_object() {
-                    extract_cursor_objects(
-                        child,
-                        fallback_id,
-                        table,
-                        path,
-                        out,
-                        seen,
-                        project_by_session,
-                    );
+                    extract_cursor_objects(child, fallback_id, table, path, out, seen);
                 }
             }
         }
@@ -2860,8 +2844,8 @@ mod tests {
             Path::new("state.vscdb"),
             &mut events,
             &mut seen,
-            &project_by_session,
         );
+        apply_cursor_projects(&mut events, &project_by_session);
 
         assert_eq!(events.len(), 3);
         let ids: HashSet<_> = events
@@ -2877,6 +2861,56 @@ mod tests {
             53
         );
         assert_eq!(events[0].project.as_deref(), Some("memex"));
+    }
+
+    #[test]
+    fn cursor_project_mapping_is_recomputed_on_cache_hits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("state.vscdb");
+        let conn = Connection::open(&db_path).expect("create cursor db");
+        conn.execute_batch(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT); \
+             INSERT INTO cursorDiskKV VALUES ('composerData:composer-main', \
+             '{\"generationUUID\":\"gen-1\",\"inputTokens\":10,\"outputTokens\":5}');",
+        )
+        .expect("populate cursor db");
+        drop(conn);
+        let cache_path = tmp.path().join("usage-cache.sqlite3");
+        let files = vec![db_path];
+        let run = |project_by_session: &HashMap<String, String>| {
+            let mut cache = UsageCache::open(&cache_path).expect("open cache");
+            let mut warnings = Vec::new();
+            let mut events = Vec::new();
+            scan_files_cached(
+                SourceScan {
+                    source: "cursor",
+                    parser_version: CURSOR_PARSER_VERSION,
+                    volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+                },
+                &files,
+                Some(&mut cache),
+                &mut warnings,
+                &mut events,
+                scan_cursor_db,
+            );
+            assert_eq!(warnings, Vec::<String>::new());
+            apply_cursor_projects(&mut events, project_by_session);
+            events
+        };
+
+        // Cold scan before any transcript is indexed: no attribution.
+        let cold = run(&HashMap::new());
+        // The database is unchanged, so this scan is served from the cache; a transcript
+        // mapping discovered afterwards must still take effect.
+        let warm = run(&HashMap::from([(
+            "composer-main".to_string(),
+            "memex".to_string(),
+        )]));
+
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].project, None);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0].project.as_deref(), Some("memex"));
     }
 
     #[test]
