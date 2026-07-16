@@ -90,6 +90,7 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
             cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]; # optional override
             compute_units = "ane"; # CoreML only: ane, gpu, cpu, all
             auto_index_on_search = true;
+            token_usage = false; # opt in to local token and cost tracking
             index_service_interval = 3600;
           };
         };
@@ -147,7 +148,13 @@ memex search "your query" -v
 
 ## Token usage
 
-Reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, and Copilot logs:
+Token tracking is disabled by default because it scans and caches local agent logs. Enable it in `~/.memex/config.toml`:
+
+```toml
+token_usage = true
+```
+
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, and Copilot logs:
 
 ```
 memex usage
@@ -159,7 +166,7 @@ memex usage --json --events
 
 Local token history is reconstructed usage. It is deliberately kept separate from authoritative subscription quota percentages and reset windows.
 
-On the TUI home screen, press `Ctrl+T` to toggle the 30-day activity chart between session count and token volume. Token activity is loaded lazily and cached when first shown.
+When token tracking is enabled, press `Ctrl+T` on the TUI home screen to toggle the 30-day activity chart between session count and token volume. Token activity is loaded lazily and cached when first shown.
 
 ## Build from source
 
@@ -294,6 +301,7 @@ Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
 ```toml
 embeddings = true
 auto_index_on_search = true
+token_usage = false  # opt in to local token and cost tracking
 model = "minilm"  # minilm, bge, nomic, gemma, potion
 execution_provider = "auto"  # auto, cpu, coreml, cuda
 cuda_device_id = 0  # optional, when execution_provider = "cuda"

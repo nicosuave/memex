@@ -1188,6 +1188,10 @@ impl App {
     }
 
     fn kickoff_home_token_activity(&mut self) {
+        if !self.config.token_usage_enabled() {
+            self.invalidate_home_token_activity();
+            return;
+        }
         let request_id = self.next_request_id();
         self.active_home_token_activity_request = request_id;
         self.home_token_activity.clear();
@@ -1201,6 +1205,7 @@ impl App {
             home_token_session_keys(&self.query, &self.results),
             self.home_activity_range,
             now_ms(),
+            self.paths.state.join("usage-cache.sqlite3"),
         );
         std::thread::spawn(move || {
             let result = scan_usage(&query).map(|report| {
@@ -1433,6 +1438,9 @@ impl App {
     }
 
     fn toggle_home_chart_mode(&mut self) {
+        if !self.config.token_usage_enabled() {
+            return;
+        }
         self.home_chart_mode = self.home_chart_mode.toggle();
         if self.home_chart_mode != HomeChartMode::Tokens {
             return;
@@ -3070,6 +3078,7 @@ fn home_token_usage_query(
     session_keys: Option<HashSet<(String, String)>>,
     range: TimelineRange,
     now: u64,
+    cache_path: PathBuf,
 ) -> UsageQuery {
     UsageQuery {
         source: source.as_filter(),
@@ -3080,6 +3089,7 @@ fn home_token_usage_query(
         until_ms: None,
         cost_mode: CostMode::Source,
         include_events: true,
+        cache_path: Some(cache_path),
     }
 }
 
@@ -4244,7 +4254,11 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
     if app.layout_mode == LayoutMode::Home {
         right_spans.push(Span::raw("   "));
         right_spans.push(Span::styled("chart", theme.muted));
-        right_spans.push(Span::styled("(^t) ", theme.accent));
+        if app.config.token_usage_enabled() {
+            right_spans.push(Span::styled("(^t) ", theme.accent));
+        } else {
+            right_spans.push(Span::raw(" "));
+        }
         right_spans.push(Span::styled(app.home_chart_mode.label(), theme.text));
     }
     if !matches!(app.layout_mode, LayoutMode::Timeline | LayoutMode::Home) {
@@ -6327,6 +6341,34 @@ mod tests {
     }
 
     #[test]
+    fn token_chart_toggle_requires_opt_in() {
+        let (_tmp, mut app) = test_app();
+
+        app.toggle_home_chart_mode();
+        assert_eq!(app.home_chart_mode, HomeChartMode::Sessions);
+
+        app.config.token_usage = Some(true);
+        app.toggle_home_chart_mode();
+        assert_eq!(app.home_chart_mode, HomeChartMode::Tokens);
+    }
+
+    #[test]
+    fn token_activity_scan_requires_opt_in() {
+        let (_tmp, mut app) = test_app();
+        app.home_token_activity.push(HomeChartPoint {
+            source: SourceKind::Claude,
+            timestamp_ms: 1,
+            value: 1,
+        });
+        app.home_token_activity_state = LoadState::Loaded;
+
+        app.kickoff_home_token_activity();
+
+        assert!(app.home_token_activity.is_empty());
+        assert_eq!(app.home_token_activity_state, LoadState::Idle);
+    }
+
+    #[test]
     fn token_usage_query_applies_home_source_and_range() {
         let query = home_token_usage_query(
             SourceChoice::Opencode,
@@ -6335,6 +6377,7 @@ mod tests {
             None,
             TimelineRange::Week,
             10_000,
+            PathBuf::from("usage-cache.sqlite3"),
         );
 
         assert_eq!(query.source, Some(SourceFilter::Opencode));

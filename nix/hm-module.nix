@@ -25,6 +25,7 @@ in {
         Supported keys:
         - embeddings (bool)
         - auto_index_on_search (bool)
+        - token_usage (bool): opt in to local token and cost tracking
         - model (string): "minilm", "bge", "nomic", "gemma", "potion"
         - execution_provider (string): "auto", "cpu", "coreml", "cuda"
         - cuda_device_id (int): GPU index when using the CUDA execution provider
@@ -49,6 +50,7 @@ in {
         execution_provider = "auto";
         cuda_device_id = 0;
         auto_index_on_search = true;
+        token_usage = false;
       };
     };
   };

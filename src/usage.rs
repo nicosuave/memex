@@ -8,13 +8,16 @@ use crate::types::{SourceFilter, SourceKind};
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use clap::ValueEnum;
-use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug, Default)]
@@ -27,6 +30,7 @@ pub struct UsageQuery {
     pub until_ms: Option<u64>,
     pub cost_mode: CostMode,
     pub include_events: bool,
+    pub cache_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
@@ -39,7 +43,7 @@ pub enum CostMode {
     Reprice,
 }
 
-#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TokenBuckets {
     /// Provider-reported input. For OpenAI-shaped records this includes the cached subset.
     pub raw_input: u64,
@@ -150,6 +154,16 @@ pub struct UsageReport {
 pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
     let mut events = Vec::new();
     let mut warnings = Vec::new();
+    if query
+        .source
+        .is_none_or(|source| source == SourceFilter::Claude)
+        && let Err(error) = scan_claude(&mut events, &mut warnings, query.cache_path.as_deref())
+    {
+        warnings.push(format!(
+            "{} scanner: {error:#}",
+            SourceFilter::Claude.as_str()
+        ));
+    }
     let mut scan =
         |filter: SourceFilter, f: fn(&mut Vec<UsageEvent>, &mut Vec<String>) -> Result<()>| {
             if query.source.is_none_or(|source| source == filter)
@@ -158,7 +172,6 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
                 warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
             }
         };
-    scan(SourceFilter::Claude, scan_claude);
     scan(SourceFilter::Codex, scan_codex);
     scan(SourceFilter::Opencode, scan_opencode);
     scan(SourceFilter::Pi, scan_pi);
@@ -356,7 +369,320 @@ fn usage_project_key(value: &str) -> String {
     tail.to_string()
 }
 
-fn scan_claude(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()> {
+#[derive(Deserialize)]
+struct ClaudeUsageLine {
+    #[serde(
+        rename = "type",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    kind: Option<String>,
+    message: Option<ClaudeUsageMessage>,
+    #[serde(
+        rename = "sessionId",
+        alias = "session_id",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    session_id: Option<String>,
+    #[serde(
+        rename = "requestId",
+        alias = "request_id",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    request_id: Option<String>,
+    timestamp: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    cwd: Option<String>,
+    #[serde(
+        rename = "costUSD",
+        default,
+        deserialize_with = "deserialize_optional_f64"
+    )]
+    cost_usd: Option<f64>,
+    #[serde(
+        rename = "isSidechain",
+        default,
+        deserialize_with = "deserialize_bool_or_false"
+    )]
+    is_sidechain: bool,
+}
+
+#[derive(Deserialize)]
+struct ClaudeUsageMessage {
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    model: Option<String>,
+    usage: Option<ClaudeTokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeTokenUsage {
+    #[serde(
+        default,
+        alias = "inputTokens",
+        deserialize_with = "deserialize_u64_or_zero"
+    )]
+    input_tokens: u64,
+    #[serde(
+        default,
+        alias = "cacheReadInputTokens",
+        deserialize_with = "deserialize_u64_or_zero"
+    )]
+    cache_read_input_tokens: u64,
+    #[serde(
+        default,
+        alias = "cacheCreationInputTokens",
+        deserialize_with = "deserialize_u64_or_zero"
+    )]
+    cache_creation_input_tokens: u64,
+    #[serde(
+        default,
+        alias = "outputTokens",
+        deserialize_with = "deserialize_u64_or_zero"
+    )]
+    output_tokens: u64,
+    cache_creation: Option<Value>,
+}
+
+fn deserialize_optional_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
+}
+
+fn deserialize_optional_f64<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?.as_f64())
+}
+
+fn deserialize_bool_or_false<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?.as_bool().unwrap_or(false))
+}
+
+fn deserialize_u64_or_zero<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?.as_u64().unwrap_or(0))
+}
+
+const CLAUDE_USAGE_CACHE_VERSION: i64 = 1;
+static CLAUDE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[derive(Serialize, Deserialize)]
+struct ClaudeCachedEvent {
+    source_record_id: Option<String>,
+    session_id: Option<String>,
+    request_id: Option<String>,
+    message_id: Option<String>,
+    timestamp_ms: u64,
+    project: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    tokens: TokenBuckets,
+    source_cost_usd: Option<f64>,
+    exact_dedupe: bool,
+    sidechain: bool,
+    source_order: u64,
+}
+
+impl ClaudeCachedEvent {
+    fn from_event(event: &UsageEvent) -> Self {
+        Self {
+            source_record_id: event.source_record_id.clone(),
+            session_id: event.session_id.clone(),
+            request_id: event.request_id.clone(),
+            message_id: event.message_id.clone(),
+            timestamp_ms: event.timestamp_ms,
+            project: event.project.clone(),
+            provider: event.provider.clone(),
+            model: event.model.clone(),
+            tokens: event.tokens.clone(),
+            source_cost_usd: event.source_cost_usd,
+            exact_dedupe: event.dedupe_confidence == "exact",
+            sidechain: event.sidechain,
+            source_order: event.source_order,
+        }
+    }
+
+    fn into_event(self, source_path: String) -> UsageEvent {
+        UsageEvent {
+            source: "claude".into(),
+            source_path,
+            source_record_id: self.source_record_id,
+            session_id: self.session_id,
+            request_id: self.request_id,
+            message_id: self.message_id,
+            timestamp_ms: self.timestamp_ms,
+            project: self.project,
+            provider: self.provider,
+            model: self.model,
+            tokens: self.tokens,
+            source_cost_usd: self.source_cost_usd,
+            dedupe_confidence: if self.exact_dedupe {
+                "exact"
+            } else {
+                "heuristic"
+            },
+            conservative_undercount: false,
+            sidechain: self.sidechain,
+            source_order: self.source_order,
+        }
+    }
+}
+
+struct ClaudeUsageCache {
+    connection: Connection,
+}
+
+struct ParsedClaudeFile {
+    index: usize,
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i64,
+    events: Vec<UsageEvent>,
+}
+
+struct PreparedClaudeCacheFile {
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i64,
+    max_timestamp_ms: u64,
+    events_json: Vec<u8>,
+}
+
+impl ClaudeUsageCache {
+    fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(2))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS claude_usage_file_cache (
+                 path TEXT PRIMARY KEY,
+                 parser_version INTEGER NOT NULL,
+                 size INTEGER NOT NULL,
+                 mtime_ns INTEGER NOT NULL,
+                 max_timestamp_ms INTEGER NOT NULL,
+                 events_json BLOB NOT NULL
+             );",
+        )?;
+        Ok(Self { connection })
+    }
+
+    fn load(&self, path: &Path, size: u64, mtime_ns: i64) -> Result<Option<Vec<UsageEvent>>> {
+        let source_path = path.to_string_lossy();
+        let cached = self
+            .connection
+            .query_row(
+                "SELECT events_json FROM claude_usage_file_cache
+                 WHERE path = ?1 AND parser_version = ?2 AND size = ?3 AND mtime_ns = ?4",
+                params![
+                    source_path.as_ref(),
+                    CLAUDE_USAGE_CACHE_VERSION,
+                    size as i64,
+                    mtime_ns
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        let Some(blob) = cached else {
+            return Ok(None);
+        };
+        let cached: Vec<ClaudeCachedEvent> = serde_json::from_slice(&blob)?;
+        Ok(Some(
+            cached
+                .into_iter()
+                .map(|event| event.into_event(source_path.to_string()))
+                .collect(),
+        ))
+    }
+
+    fn save_batch(&mut self, parsed: &[ParsedClaudeFile]) -> Result<()> {
+        let prepared = parsed
+            .iter()
+            .map(|file| {
+                let cached = file
+                    .events
+                    .iter()
+                    .map(ClaudeCachedEvent::from_event)
+                    .collect::<Vec<_>>();
+                Ok(PreparedClaudeCacheFile {
+                    path: file.path.clone(),
+                    size: file.size,
+                    mtime_ns: file.mtime_ns,
+                    max_timestamp_ms: file
+                        .events
+                        .iter()
+                        .map(|event| event.timestamp_ms)
+                        .max()
+                        .unwrap_or(0),
+                    events_json: serde_json::to_vec(&cached)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let transaction = self.connection.transaction()?;
+        for file in prepared {
+            transaction.execute(
+                "INSERT INTO claude_usage_file_cache(
+                     path, parser_version, size, mtime_ns, max_timestamp_ms, events_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                     parser_version = excluded.parser_version,
+                     size = excluded.size,
+                     mtime_ns = excluded.mtime_ns,
+                     max_timestamp_ms = excluded.max_timestamp_ms,
+                     events_json = excluded.events_json",
+                params![
+                    file.path.to_string_lossy().as_ref(),
+                    CLAUDE_USAGE_CACHE_VERSION,
+                    file.size as i64,
+                    file.mtime_ns,
+                    file.max_timestamp_ms,
+                    file.events_json
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+fn usage_file_metadata(path: &Path) -> Result<(u64, i64)> {
+    let metadata = path.metadata()?;
+    let mtime_ns = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64;
+    Ok((metadata.len(), mtime_ns))
+}
+
+fn scan_claude(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache_path: Option<&Path>,
+) -> Result<()> {
+    let _scan_guard = CLAUDE_SCAN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let roots = if let Some(config) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         config
             .to_string_lossy()
@@ -376,71 +702,151 @@ fn scan_claude(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result
             home().join(".config/claude/projects"),
         ]
     };
-    for path in jsonl_files(roots) {
-        let source_path = path.to_string_lossy().to_string();
-        let fallback_session = path
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .map(str::to_string);
-        for (index, value) in lines(&path)? {
-            if value.get("type").and_then(Value::as_str) != Some("assistant") {
+    let files = jsonl_files(roots);
+    let mut cache = match cache_path.map(ClaudeUsageCache::open).transpose() {
+        Ok(cache) => cache,
+        Err(error) => {
+            warnings.push(format!("Claude usage cache disabled: {error:#}"));
+            None
+        }
+    };
+    let mut slots = (0..files.len()).map(|_| None).collect::<Vec<_>>();
+    let mut missing = Vec::new();
+    for (index, path) in files.iter().enumerate() {
+        let metadata = match usage_file_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(format!(
+                    "Claude usage file skipped ({}): {error:#}",
+                    path.display()
+                ));
                 continue;
             }
-            let Some(message) = value.get("message") else {
-                continue;
-            };
-            let Some(usage) = message.get("usage") else {
-                continue;
-            };
-            let cache_write = u64_at(
-                usage,
-                &["cache_creation_input_tokens", "cacheCreationInputTokens"],
-            );
-            let mut tokens = TokenBuckets::disjoint(
-                u64_at(usage, &["input_tokens", "inputTokens"]),
-                u64_at(usage, &["cache_read_input_tokens", "cacheReadInputTokens"]),
-                cache_write,
-                u64_at(usage, &["output_tokens", "outputTokens"]),
-            );
-            tokens.cache_write_1h = usage
-                .pointer("/cache_creation/ephemeral_1h_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .min(tokens.cache_write);
-            if tokens.additive_total() == 0 {
-                continue;
+        };
+        let cached = cache
+            .as_ref()
+            .map_or(Ok(None), |cache| cache.load(path, metadata.0, metadata.1));
+        match cached {
+            Ok(Some(events)) => slots[index] = Some(events),
+            Ok(None) => missing.push((index, path.clone(), metadata)),
+            Err(error) => {
+                warnings.push(format!(
+                    "Claude usage cache read failed ({}): {error:#}",
+                    path.display()
+                ));
+                missing.push((index, path.clone(), metadata));
             }
-            out.push(UsageEvent {
-                source: "claude".into(),
-                source_path: source_path.clone(),
-                source_record_id: Some(format!("line:{index}")),
-                session_id: str_at(&value, &["sessionId", "session_id"])
-                    .or_else(|| fallback_session.clone()),
-                request_id: str_at(&value, &["requestId", "request_id"]),
-                message_id: str_at(message, &["id"]),
-                timestamp_ms: value.get("timestamp").map(timestamp_ms).unwrap_or(0),
-                project: str_at(&value, &["cwd"]),
-                provider: Some("anthropic".into()),
-                model: str_at(message, &["model"]),
-                tokens,
-                source_cost_usd: value.get("costUSD").and_then(Value::as_f64),
-                dedupe_confidence: if message.get("id").is_some()
-                    && value.get("requestId").is_some()
-                {
-                    "exact"
-                } else {
-                    "heuristic"
-                },
-                conservative_undercount: false,
-                sidechain: value
-                    .get("isSidechain")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                source_order: index,
-            });
         }
     }
+    let parsed = parse_missing_claude_files(&missing, warnings);
+    if let Some(cache) = &mut cache
+        && let Err(error) = cache.save_batch(&parsed)
+    {
+        warnings.push(format!("Claude usage cache write failed: {error:#}"));
+    }
+    for file in parsed {
+        slots[file.index] = Some(file.events);
+    }
+    for events in slots.into_iter().flatten() {
+        out.extend(events);
+    }
     Ok(())
+}
+
+fn parse_missing_claude_files(
+    missing: &[(usize, PathBuf, (u64, i64))],
+    warnings: &mut Vec<String>,
+) -> Vec<ParsedClaudeFile> {
+    let outcomes = missing
+        .par_iter()
+        .map(|(index, path, metadata)| {
+            scan_claude_file(path).map(|events| ParsedClaudeFile {
+                index: *index,
+                path: path.clone(),
+                size: metadata.0,
+                mtime_ns: metadata.1,
+                events,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut parsed = Vec::with_capacity(outcomes.len());
+    for ((_, path, _), outcome) in missing.iter().zip(outcomes) {
+        match outcome {
+            Ok(file) => parsed.push(file),
+            Err(error) => warnings.push(format!(
+                "Claude usage file skipped ({}): {error:#}",
+                path.display()
+            )),
+        }
+    }
+    parsed
+}
+
+fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    let source_path = path.to_string_lossy().to_string();
+    let fallback_session = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut events = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<ClaudeUsageLine>(&line) else {
+            continue;
+        };
+        if value.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(message) = value.message else {
+            continue;
+        };
+        let Some(usage) = message.usage else {
+            continue;
+        };
+        let cache_write = usage.cache_creation_input_tokens;
+        let mut tokens = TokenBuckets::disjoint(
+            usage.input_tokens,
+            usage.cache_read_input_tokens,
+            cache_write,
+            usage.output_tokens,
+        );
+        tokens.cache_write_1h = usage
+            .cache_creation
+            .as_ref()
+            .and_then(|cache| cache.get("ephemeral_1h_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .min(tokens.cache_write);
+        if tokens.additive_total() == 0 {
+            continue;
+        }
+        let exact_dedupe = message.id.is_some() && value.request_id.is_some();
+        events.push(UsageEvent {
+            source: "claude".into(),
+            source_path: source_path.clone(),
+            source_record_id: Some(format!("line:{index}")),
+            session_id: value.session_id.or_else(|| fallback_session.clone()),
+            request_id: value.request_id,
+            message_id: message.id,
+            timestamp_ms: value.timestamp.as_ref().map(timestamp_ms).unwrap_or(0),
+            project: value.cwd,
+            provider: Some("anthropic".into()),
+            model: message.model,
+            tokens,
+            source_cost_usd: value.cost_usd,
+            dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },
+            conservative_undercount: false,
+            sidechain: value.is_sidechain,
+            source_order: index as u64,
+        });
+    }
+    Ok(events)
 }
 
 fn reconcile_claude(events: &mut Vec<UsageEvent>) {
@@ -1713,6 +2119,131 @@ mod tests {
     }
 
     #[test]
+    fn claude_scanner_caches_normalized_usage_by_file_metadata() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        let transcript = projects.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","sessionId":"session","requestId":"request","timestamp":"2026-07-03T01:02:05Z","cwd":"/repo/memex","costUSD":"invalid optional value","message":{"id":"message","model":"claude-sonnet-4-6","content":[{"type":"text","text":"ignored payload"}],"usage":{"inputTokens":10,"cacheReadInputTokens":2,"cacheCreationInputTokens":3,"outputTokens":4,"cache_creation":{"ephemeral_1h_input_tokens":1}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write transcript");
+        let cache_path = tmp.path().join("usage-cache.sqlite3");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(cache_path.clone()),
+            ..UsageQuery::default()
+        };
+
+        let cold = scan_usage(&query).expect("cold scan");
+        let warm = scan_usage(&query).expect("warm scan");
+        let cache = Connection::open(cache_path).expect("open cache");
+        let cached_files: u64 = cache
+            .query_row("SELECT count(*) FROM claude_usage_file_cache", [], |row| {
+                row.get(0)
+            })
+            .expect("count cached files");
+
+        assert_eq!(cold.events, 1);
+        assert_eq!(cold.details[0].tokens.total(), 19);
+        assert_eq!(cold.details[0].tokens.cache_write_1h, 1);
+        assert_eq!(cold.details[0].dedupe_confidence, "exact");
+        assert_eq!(warm.total_tokens, cold.total_tokens);
+        assert_eq!(cached_files, 1);
+    }
+
+    #[test]
+    fn claude_warm_cache_reconciles_old_parents_before_since_filter() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        let subagents = projects.join("subagents");
+        std::fs::create_dir_all(&subagents).expect("create projects");
+        std::fs::write(
+            projects.join("parent.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"parent","requestId":"parent-request","timestamp":1000,"cwd":"/repo/memex","message":{"id":"shared-message","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent transcript");
+        std::fs::write(
+            subagents.join("agent.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"agent","requestId":"sidechain-request","timestamp":3000,"cwd":"/repo/memex","isSidechain":true,"message":{"id":"shared-message","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write sidechain transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            since_ms: Some(2_000_000),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let cold = scan_usage(&query).expect("cold scan");
+        let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
+            .expect("open usage cache");
+        let cached_files: u64 = cache
+            .query_row("SELECT count(*) FROM claude_usage_file_cache", [], |row| {
+                row.get(0)
+            })
+            .expect("count cached files");
+        let warm = scan_usage(&query).expect("warm scan");
+
+        assert_eq!(cold.events, 0);
+        assert_eq!(cached_files, 2);
+        assert_eq!(warm.events, cold.events);
+        assert_eq!(warm.total_tokens, 0);
+    }
+
+    #[test]
+    fn claude_file_parse_failures_preserve_successful_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let valid = tmp.path().join("valid.jsonl");
+        let vanished = tmp.path().join("vanished.jsonl");
+        std::fs::write(
+            &valid,
+            concat!(
+                r#"{"type":"assistant","timestamp":1000,"message":{"id":"valid","usage":{"inputTokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write valid transcript");
+        std::fs::write(&vanished, "").expect("write disappearing transcript");
+        let valid_metadata = usage_file_metadata(&valid).expect("valid metadata");
+        let vanished_metadata = usage_file_metadata(&vanished).expect("vanished metadata");
+        std::fs::remove_file(&vanished).expect("remove transcript");
+        let missing = vec![
+            (0, valid, valid_metadata),
+            (1, vanished.clone(), vanished_metadata),
+        ];
+        let mut warnings = Vec::new();
+
+        let parsed = parse_missing_claude_files(&missing, &mut warnings);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].index, 0);
+        assert_eq!(parsed[0].events.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(vanished.to_string_lossy().as_ref()));
+    }
+
+    #[test]
     fn opencode_reasoning_is_included_in_output_and_total() {
         let value = serde_json::json!({
             "path": { "cwd": "/repo/memex" },
@@ -1930,6 +2461,7 @@ mod tests {
                     r#"{{"type":"message","id":"a1","timestamp":"2026-07-03T01:02:05Z","message":{{"role":"assistant","usage":{{"input":10,"output":4}}}}}}"#,
                     "\n"
                 ),
+                header_id = header_id,
             ),
         )
         .expect("write header session");
