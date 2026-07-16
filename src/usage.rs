@@ -266,8 +266,10 @@ fn memoized_usage_events(query: &UsageQuery) -> (Arc<Vec<UsageEvent>>, Arc<Vec<S
     {
         return (memo.events.clone(), memo.warnings.clone());
     }
-    let built = Instant::now();
     let (events, warnings) = assemble_usage_events(query.source, query.cache_path.as_deref());
+    // Stamp the memo after assembly: an assembly slower than the TTL would otherwise be
+    // expired the moment it finishes, and queued follow-up queries would reassemble.
+    let built = Instant::now();
     let events = Arc::new(events);
     let warnings = Arc::new(warnings);
     if !ttl.is_zero() {
@@ -313,6 +315,7 @@ fn assemble_usage_events(
             warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
         }
     }
+    publish_scan_progress(None);
 
     reconcile_claude(&mut events);
     reconcile_codex_copies(&mut events);
@@ -571,7 +574,44 @@ const OPENCODE_PARSER_VERSION: i64 = 2;
 /// running Cursor rewrites its (potentially multi-GB) databases continuously, and
 /// re-reading them on every scan makes live scans unusable.
 const VOLATILE_DB_REUSE_MS: i64 = 60_000;
+/// Cache rows are persisted after every chunk of parsed files, not once per source, so an
+/// interrupted cold scan resumes from the last completed chunk instead of starting over.
+const PARSE_SAVE_CHUNK: usize = 128;
 static USAGE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// Parse-phase progress of the usage scan currently holding `USAGE_SCAN_LOCK`. Cache hits
+/// are not counted: progress is only published while files are being (re)parsed, which is
+/// the phase that can take minutes on a cold cache.
+#[derive(Clone, Copy, Debug)]
+pub struct UsageScanProgress {
+    pub source: &'static str,
+    pub done: usize,
+    pub total: usize,
+}
+
+static USAGE_SCAN_PROGRESS: Lazy<Mutex<Option<UsageScanProgress>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn usage_scan_progress() -> Option<UsageScanProgress> {
+    *USAGE_SCAN_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn publish_scan_progress(progress: Option<UsageScanProgress>) {
+    *USAGE_SCAN_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = progress;
+}
+
+fn bump_scan_progress() {
+    if let Some(progress) = USAGE_SCAN_PROGRESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_mut()
+    {
+        progress.done += 1;
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct CachedUsageEvent {
@@ -748,13 +788,24 @@ impl UsageCache {
             .map_err(Into::into)
     }
 
+    fn delete_stale(&mut self, source: &str, stale_paths: &[String]) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        for path in stale_paths {
+            transaction.execute(
+                "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
+                params![source, path],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn save_batch(
         &mut self,
         source: &str,
         parser_version: i64,
         scanned_at_ms: i64,
         parsed: &[ParsedUsageFile],
-        stale_paths: &[String],
     ) -> Result<()> {
         let prepared = parsed
             .iter()
@@ -797,12 +848,6 @@ impl UsageCache {
                     events_blob,
                     deps_blob
                 ],
-            )?;
-        }
-        for path in stale_paths {
-            transaction.execute(
-                "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
-                params![source, path],
             )?;
         }
         transaction.commit()?;
@@ -935,19 +980,40 @@ fn scan_files_cached_with(
             }
         }
     }
-    let parsed = parse_missing_usage_files(source, &missing, warnings, &parse);
+    let mut cache = cache;
     let stale_paths: Vec<String> = rows.into_keys().collect();
-    // Unresolved-fork parses (cacheable == false) are excluded from persistence so a later
-    // scan re-runs them once their fork parent is available; they still populate `out`.
-    let has_persistable = parsed.iter().any(|file| file.cacheable) || !stale_paths.is_empty();
-    if let Some(cache) = cache
-        && has_persistable
-        && let Err(error) = cache.save_batch(source, parser_version, now_ms, &parsed, &stale_paths)
+    if let Some(cache) = cache.as_deref_mut()
+        && !stale_paths.is_empty()
+        && let Err(error) = cache.delete_stale(source, &stale_paths)
     {
         warnings.push(format!("{source} usage cache write failed: {error:#}"));
     }
-    for file in parsed {
-        slots[file.index] = Some(file.events);
+    if !missing.is_empty() {
+        publish_scan_progress(Some(UsageScanProgress {
+            source,
+            done: 0,
+            total: missing.len(),
+        }));
+    }
+    // Parse and persist in chunks so an interrupted cold scan keeps the chunks it finished;
+    // the next scan resumes from there instead of re-parsing the whole source.
+    let mut save_warned = false;
+    for chunk in missing.chunks(PARSE_SAVE_CHUNK) {
+        let parsed = parse_missing_usage_files(source, chunk, warnings, &parse);
+        // Unresolved-fork parses (cacheable == false) are excluded from persistence so a
+        // later scan re-runs them once their fork parent is available; they still populate
+        // `out`.
+        if let Some(cache) = cache.as_deref_mut()
+            && parsed.iter().any(|file| file.cacheable)
+            && let Err(error) = cache.save_batch(source, parser_version, now_ms, &parsed)
+            && !save_warned
+        {
+            save_warned = true;
+            warnings.push(format!("{source} usage cache write failed: {error:#}"));
+        }
+        for file in parsed {
+            slots[file.index] = Some(file.events);
+        }
     }
     for events in slots.into_iter().flatten() {
         out.extend(events);
@@ -1014,7 +1080,7 @@ fn parse_missing_usage_files(
     let outcomes = missing
         .par_iter()
         .map(|(index, path, metadata)| {
-            parse(path).map(|parsed| ParsedUsageFile {
+            let outcome = parse(path).map(|parsed| ParsedUsageFile {
                 index: *index,
                 path: path.clone(),
                 size: metadata.0,
@@ -1022,7 +1088,9 @@ fn parse_missing_usage_files(
                 events: parsed.events,
                 cacheable: parsed.cacheable,
                 deps: parsed.deps,
-            })
+            });
+            bump_scan_progress();
+            outcome
         })
         .collect::<Vec<_>>();
     let mut parsed = Vec::with_capacity(outcomes.len());

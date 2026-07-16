@@ -2777,10 +2777,21 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         let groups = home_chart_groups(chart_activity, bounds);
         let mut spans: Vec<Span> = Vec::new();
         match app.home_chart_state() {
-            LoadState::Loading => spans.push(Span::styled(
-                format!("{} loading {}…", app.spinner(), app.home_chart_mode.label()),
-                theme.muted,
-            )),
+            LoadState::Loading => {
+                // A cold usage cache re-parses whole log corpora, which can take minutes;
+                // show which source is being backfilled so the scan doesn't read as a hang.
+                let label = match crate::usage::usage_scan_progress() {
+                    Some(progress) if app.home_chart_mode == HomeChartMode::Tokens => format!(
+                        "{} scanning {} logs {}/{}…",
+                        app.spinner(),
+                        progress.source,
+                        progress.done,
+                        progress.total
+                    ),
+                    _ => format!("{} loading {}…", app.spinner(), app.home_chart_mode.label()),
+                };
+                spans.push(Span::styled(label, theme.muted));
+            }
             LoadState::Loaded | LoadState::Empty => {
                 let metric = match app.home_chart_mode {
                     HomeChartMode::Sessions if filtered_chart => {
