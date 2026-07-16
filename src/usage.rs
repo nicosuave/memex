@@ -868,14 +868,20 @@ fn scan_pi(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()>
     let roots = [crate::ingest::pi_sessions_root()];
     for path in jsonl_files(roots) {
         let source_path = path.to_string_lossy().to_string();
-        let session = path
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .map(str::to_string);
-        let project = Some(crate::ingest::project_from_pi_session_path(&path));
+        let mut session = crate::ingest::pi_session_id_from_path(&path);
+        let mut project = crate::ingest::project_from_pi_session_path(&path);
         let mut current_model = None;
         let mut current_provider = None;
         for (index, value) in lines(&path)? {
+            if value.get("type").and_then(Value::as_str) == Some("session") {
+                crate::ingest::apply_pi_session_identity(
+                    value.get("id").and_then(Value::as_str),
+                    value.get("cwd").and_then(Value::as_str),
+                    &mut session,
+                    &mut project,
+                );
+                continue;
+            }
             if value.get("type").and_then(Value::as_str) == Some("model_change") {
                 current_model = str_at(&value, &["modelId", "model", "model_id"]);
                 current_provider = str_at(&value, &["provider", "providerId", "provider_id"]);
@@ -946,11 +952,11 @@ fn scan_pi(out: &mut Vec<UsageEvent>, _warnings: &mut Vec<String>) -> Result<()>
                 source: "pi".into(),
                 source_path: source_path.clone(),
                 source_record_id: Some(format!("line:{index}")),
-                session_id: session.clone(),
+                session_id: Some(session.clone()),
                 request_id: None,
                 message_id: str_at(&value, &["id"]),
                 timestamp_ms: value.get("timestamp").map(timestamp_ms).unwrap_or(0),
-                project: project.clone(),
+                project: Some(project.clone()),
                 provider: str_at(message, &["provider"])
                     .or_else(|| str_at(&value, &["provider"]))
                     .or_else(|| current_provider.clone()),
@@ -1902,6 +1908,67 @@ mod tests {
                 .source_path
                 .ends_with("custom/sessions/--C--Users-alice-Code-memex--/session.jsonl")
         );
+    }
+
+    #[test]
+    fn pi_scanner_matches_indexed_header_and_filename_session_ids() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_root = tmp.path().join("--Users-nico-Code-other--");
+        std::fs::create_dir_all(&session_root).expect("create session root");
+
+        let filename_id = "11111111-1111-1111-1111-111111111111";
+        let header_id = "22222222-2222-2222-2222-222222222222";
+        std::fs::write(
+            session_root.join(format!("20260703T010203Z_{filename_id}.jsonl")),
+            format!(
+                concat!(
+                    r#"{{"type":"session","id":"{header_id}","cwd":"/Users/nico/Code/memex"}}"#,
+                    "\n",
+                    r#"{{"type":"message","id":"a1","timestamp":"2026-07-03T01:02:05Z","message":{{"role":"assistant","usage":{{"input":10,"output":4}}}}}}"#,
+                    "\n"
+                ),
+            ),
+        )
+        .expect("write header session");
+
+        let fallback_id = "33333333-3333-3333-3333-333333333333";
+        let fallback_stem = format!("20260703T010204Z_{fallback_id}");
+        std::fs::write(
+            session_root.join(format!("{fallback_stem}.jsonl")),
+            concat!(
+                r#"{"type":"message","id":"a2","timestamp":"2026-07-03T01:02:06Z","message":{"role":"assistant","usage":{"input":20,"output":5}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write filename session");
+
+        let _env =
+            EnvVarGuard::set_os(&[("PI_CODING_AGENT_SESSION_DIR", Some(tmp.path().as_os_str()))]);
+        let mut query = UsageQuery {
+            source: Some(SourceFilter::Pi),
+            include_events: true,
+            ..UsageQuery::default()
+        };
+
+        query.session_keys = Some(HashSet::from([("pi".into(), header_id.into())]));
+        let header = scan_usage(&query).expect("scan header session");
+        query.session_keys = Some(HashSet::from([("pi".into(), filename_id.into())]));
+        let overridden_filename = scan_usage(&query).expect("scan overridden filename session");
+        query.session_keys = Some(HashSet::from([("pi".into(), fallback_id.into())]));
+        let fallback = scan_usage(&query).expect("scan filename session");
+        query.session_keys = Some(HashSet::from([("pi".into(), fallback_stem)]));
+        let full_stem = scan_usage(&query).expect("scan full filename stem");
+
+        assert_eq!(header.events, 1);
+        assert_eq!(header.details[0].session_id.as_deref(), Some(header_id));
+        assert_eq!(header.details[0].project.as_deref(), Some("memex"));
+        assert_eq!(overridden_filename.events, 0);
+        assert_eq!(fallback.events, 1);
+        assert_eq!(fallback.details[0].session_id.as_deref(), Some(fallback_id));
+        assert_eq!(full_stem.events, 0);
     }
 
     #[test]
