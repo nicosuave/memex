@@ -444,20 +444,33 @@ struct ClaudeUsageLine {
     )]
     kind: Option<String>,
     message: Option<ClaudeUsageMessage>,
+    // Claude Code 2.1.210+ writes BOTH spellings on one line; a serde `alias` would
+    // reject that as a duplicate field and silently drop the event, so each spelling
+    // gets its own field and they are merged at use sites.
     #[serde(
         rename = "sessionId",
-        alias = "session_id",
         default,
         deserialize_with = "deserialize_optional_string"
     )]
-    session_id: Option<String>,
+    session_id_camel: Option<String>,
+    #[serde(
+        rename = "session_id",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    session_id_snake: Option<String>,
     #[serde(
         rename = "requestId",
-        alias = "request_id",
         default,
         deserialize_with = "deserialize_optional_string"
     )]
-    request_id: Option<String>,
+    request_id_camel: Option<String>,
+    #[serde(
+        rename = "request_id",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    request_id_snake: Option<String>,
     timestamp: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     cwd: Option<String>,
@@ -548,7 +561,7 @@ where
 
 // Parser versions also cover the cached blob encoding (postcard); bump them when either
 // the per-source parsing or `CachedUsageEvent` changes shape.
-const CLAUDE_PARSER_VERSION: i64 = 3;
+const CLAUDE_PARSER_VERSION: i64 = 4;
 const CODEX_PARSER_VERSION: i64 = 2;
 const PI_PARSER_VERSION: i64 = 2;
 const CURSOR_PARSER_VERSION: i64 = 2;
@@ -1024,13 +1037,15 @@ fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
         if tokens.additive_total() == 0 {
             return;
         }
-        let exact_dedupe = message.id.is_some() && value.request_id.is_some();
+        let session_id = value.session_id_camel.or(value.session_id_snake);
+        let request_id = value.request_id_camel.or(value.request_id_snake);
+        let exact_dedupe = message.id.is_some() && request_id.is_some();
         events.push(UsageEvent {
             source: "claude".into(),
             source_path: source_path.clone(),
             source_record_id: Some(format!("line:{index}")),
-            session_id: value.session_id.or_else(|| fallback_session.clone()),
-            request_id: value.request_id,
+            session_id: session_id.or_else(|| fallback_session.clone()),
+            request_id,
             message_id: message.id,
             timestamp_ms: value.timestamp.as_ref().map(timestamp_ms).unwrap_or(0),
             project: value.cwd,
@@ -2570,6 +2585,30 @@ mod tests {
         assert_eq!(cached_files, 2);
         assert_eq!(warm.events, cold.events);
         assert_eq!(warm.total_tokens, 0);
+    }
+
+    #[test]
+    fn claude_lines_with_both_session_field_spellings_are_counted() {
+        // Claude Code 2.1.210+ writes `session_id` AND `sessionId` (and can do the same
+        // for request ids) on one line; a duplicate-field parse error must not drop it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","session_id":"ses-1","sessionId":"ses-1","requestId":"req-1","request_id":"req-1","timestamp":1000,"cwd":"/repo/memex","message":{"id":"msg-1","model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_read_input_tokens":52196,"cache_creation_input_tokens":558,"output_tokens":108}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let events = scan_claude_file(&transcript).expect("scan transcript");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("ses-1"));
+        assert_eq!(events[0].request_id.as_deref(), Some("req-1"));
+        assert_eq!(events[0].dedupe_confidence, "exact");
+        assert_eq!(events[0].tokens.total(), 52_864);
     }
 
     #[test]
