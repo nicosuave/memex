@@ -145,6 +145,22 @@ Human output:
 memex search "your query" -v
 ```
 
+## Token usage
+
+Reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, and Copilot logs:
+
+```
+memex usage
+memex usage --source codex --since 2026-07-01
+memex usage --json --events
+```
+
+`--cost auto` prefers a provider-stored request cost and otherwise applies the versioned built-in API price catalog. `--cost source` uses only stored costs; `--cost reprice` always applies the catalog. Calculated costs are API-equivalent estimates, not subscription charges. Events with unknown models or prices remain in token totals and are reported as unpriced.
+
+Local token history is reconstructed usage. It is deliberately kept separate from authoritative subscription quota percentages and reset windows.
+
+On the TUI home screen, press `Ctrl+T` to toggle the 30-day activity chart between session count and token volume. Token activity is loaded lazily and cached when first shown.
+
 ## Build from source
 
 ```

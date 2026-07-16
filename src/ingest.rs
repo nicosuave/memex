@@ -1068,7 +1068,7 @@ fn codex_history_path() -> PathBuf {
     codex_root().join("history.jsonl")
 }
 
-fn cursor_projects_root() -> PathBuf {
+pub(crate) fn cursor_projects_root() -> PathBuf {
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
@@ -1085,7 +1085,7 @@ fn pi_agent_root() -> PathBuf {
     home.join(".pi").join("agent")
 }
 
-fn pi_sessions_root() -> PathBuf {
+pub(crate) fn pi_sessions_root() -> PathBuf {
     if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
         return PathBuf::from(root);
     }
@@ -1811,7 +1811,7 @@ fn parse_opencode_file(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
-    let project = "opencode".to_string();
+    let project = SourceKind::Opencode.label().to_string();
     let session_links = opencode_session_links
         .get(&session_id)
         .cloned()
@@ -2100,8 +2100,7 @@ fn parse_pi_file(
     let mut turn_id = task.turn_id;
 
     let source_path = task.path.to_string_lossy().to_string();
-    let mut session_id =
-        session_id_from_filename(&task.path).unwrap_or_else(|| source_path.clone());
+    let mut session_id = pi_session_id_from_path(&task.path);
     let mut project = project_from_pi_session_path(&task.path);
     let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
 
@@ -2493,14 +2492,24 @@ fn apply_pi_session_header(
     session_id: &mut String,
     project: &mut String,
 ) {
-    if let Some(id) = obj.get("id").and_then(|v| v.as_str())
-        && !id.is_empty()
-    {
+    apply_pi_session_identity(
+        obj.get("id").and_then(|v| v.as_str()),
+        obj.get("cwd").and_then(|v| v.as_str()),
+        session_id,
+        project,
+    );
+}
+
+pub(crate) fn apply_pi_session_identity(
+    id: Option<&str>,
+    cwd: Option<&str>,
+    session_id: &mut String,
+    project: &mut String,
+) {
+    if let Some(id) = id.filter(|id| !id.is_empty()) {
         *session_id = id.to_string();
     }
-    if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str())
-        && !cwd.is_empty()
-    {
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
         *project = project_from_path(cwd);
     }
 }
@@ -3015,7 +3024,7 @@ fn copilot_tool_output(data: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn project_from_cursor_path(path: &Path) -> String {
+pub(crate) fn project_from_cursor_path(path: &Path) -> String {
     let root = cursor_projects_root();
     let Ok(relative) = path.strip_prefix(root) else {
         return "cursor".to_string();
@@ -3033,7 +3042,7 @@ fn project_from_cursor_path(path: &Path) -> String {
     decode_project_name(project_folder)
 }
 
-fn cursor_session_id_from_path(path: &Path) -> String {
+pub(crate) fn cursor_session_id_from_path(path: &Path) -> String {
     let components: Vec<_> = path.components().collect();
     for (idx, component) in components.iter().enumerate() {
         if component.as_os_str().to_str() == Some("agent-transcripts")
@@ -3083,7 +3092,7 @@ fn cursor_is_subagent_transcript(path: &Path) -> bool {
         .any(|component| component.as_os_str().to_str() == Some("subagents"))
 }
 
-fn cursor_transcript_id(path: &Path) -> String {
+pub(crate) fn cursor_transcript_id(path: &Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
@@ -3111,7 +3120,7 @@ fn stable_cursor_turn_bucket(value: &str) -> u32 {
     hash % CURSOR_SUBAGENT_TURN_BUCKETS
 }
 
-fn project_from_pi_session_path(path: &Path) -> String {
+pub(crate) fn project_from_pi_session_path(path: &Path) -> String {
     path.parent()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
@@ -3293,6 +3302,10 @@ fn session_id_from_filename(path: &Path) -> Option<String> {
         .captures(&name)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
+}
+
+pub(crate) fn pi_session_id_from_path(path: &Path) -> String {
+    session_id_from_filename(path).unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 fn is_system_instruction(text: &str) -> bool {

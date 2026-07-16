@@ -9,6 +9,7 @@ use crate::transfer::{
 };
 use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
+use crate::usage::{CostMode, UsageQuery, scan_usage};
 use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
 use chrono::SecondsFormat;
@@ -247,6 +248,32 @@ OUTPUT FIELDS (--fields):
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Reconstruct local token usage from agent logs
+    #[command(after_help = "\
+EXAMPLES:
+    memex usage
+    memex usage --source codex --since 2026-07-01
+    memex usage --json")]
+    Usage {
+        /// Filter by source: claude, codex, cursor, opencode, pi, or copilot
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Only include events on or after this date/timestamp
+        #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
+        since: Option<String>,
+        /// Only include events before this date/timestamp
+        #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
+        until: Option<String>,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Include normalized request-level events in JSON output
+        #[arg(long, requires = "json")]
+        events: bool,
+        /// Cost source: stored source cost, automatic fallback, or API-rate repricing
+        #[arg(long, value_enum, default_value = "auto")]
+        cost: CostMode,
     },
     /// Rebuild the SQLite analytics cache from the existing Tantivy index
     #[command(hide = true)]
@@ -533,6 +560,16 @@ pub fn run() -> Result<()> {
         }
         Commands::Stats { root } => {
             run_stats(root)?;
+        }
+        Commands::Usage {
+            source,
+            since,
+            until,
+            json,
+            events,
+            cost,
+        } => {
+            run_usage(source, since, until, json, events, cost)?;
         }
         Commands::AnalyticsBackfill { root } => {
             run_analytics_backfill(root)?;
@@ -1365,6 +1402,72 @@ fn run_stats(root: Option<PathBuf>) -> Result<()> {
     println!("index: {}", paths.index.display());
     println!("documents: {}", index.doc_count()?);
     print_vector_stats(&paths.vectors)?;
+    Ok(())
+}
+
+fn run_usage(
+    source: Option<SourceFilter>,
+    since: Option<String>,
+    until: Option<String>,
+    json: bool,
+    include_events: bool,
+    cost_mode: CostMode,
+) -> Result<()> {
+    let query = UsageQuery {
+        source,
+        project: None,
+        project_grouping: crate::analytics::ProjectGrouping::Flat,
+        session_keys: None,
+        since_ms: parse_ts_millis(since)?,
+        until_ms: parse_ts_millis(until)?,
+        cost_mode,
+        include_events,
+    };
+    let report = scan_usage(&query)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("local reconstructed usage (not subscription quota)");
+        for row in &report.by_source {
+            println!(
+                "{:<10} {:>12} tokens  {:>9} input  {:>9} cache read  {:>9} cache write  {:>9} output  {:>5} events",
+                row.source,
+                row.total_tokens,
+                row.uncached_input,
+                row.cache_read,
+                row.cache_write,
+                row.output,
+                row.events,
+            );
+            if row.priced_events > 0 {
+                println!(
+                    "             ${:.4} API-equivalent cost ({} priced, {} unpriced)",
+                    row.known_cost_usd, row.priced_events, row.unpriced_events
+                );
+            }
+        }
+        println!(
+            "total      {:>12} tokens  {} events",
+            report.total_tokens, report.events
+        );
+        println!(
+            "cost       ${:.4} known API-equivalent ({} priced, {} unpriced; {:?}, {})",
+            report.known_cost_usd,
+            report.priced_events,
+            report.unpriced_events,
+            report.cost_mode,
+            report.price_catalog
+        );
+        if report.unknown_model_events > 0 || report.conservative_events > 0 {
+            println!(
+                "quality: {} unknown-model events, {} conservatively undercounted events",
+                report.unknown_model_events, report.conservative_events
+            );
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
     Ok(())
 }
 
@@ -2523,6 +2626,13 @@ fn parse_ts_millis(value: Option<String>) -> Result<Option<u64>> {
             return Ok(Some(num));
         }
         return Ok(Some(num * 1000));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| anyhow!("invalid date: {value}"))?
+            .and_utc();
+        return Ok(Some(midnight.timestamp_millis() as u64));
     }
     let dt = chrono::DateTime::parse_from_rfc3339(&value)
         .map_err(|_| anyhow!("invalid timestamp: {value}"))?;
