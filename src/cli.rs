@@ -1413,6 +1413,8 @@ fn run_usage(
     include_events: bool,
     cost_mode: CostMode,
 ) -> Result<()> {
+    let paths = Paths::new(None)?;
+    paths.ensure_dirs()?;
     let query = UsageQuery {
         source,
         project: None,
@@ -1422,6 +1424,7 @@ fn run_usage(
         until_ms: parse_ts_millis(until)?,
         cost_mode,
         include_events,
+        cache_path: Some(paths.state.join("usage-cache.sqlite3")),
     };
     let report = scan_usage(&query)?;
     if json {

@@ -1201,6 +1201,7 @@ impl App {
             home_token_session_keys(&self.query, &self.results),
             self.home_activity_range,
             now_ms(),
+            self.paths.state.join("usage-cache.sqlite3"),
         );
         std::thread::spawn(move || {
             let result = scan_usage(&query).map(|report| {
@@ -3070,6 +3071,7 @@ fn home_token_usage_query(
     session_keys: Option<HashSet<(String, String)>>,
     range: TimelineRange,
     now: u64,
+    cache_path: PathBuf,
 ) -> UsageQuery {
     UsageQuery {
         source: source.as_filter(),
@@ -3080,6 +3082,7 @@ fn home_token_usage_query(
         until_ms: None,
         cost_mode: CostMode::Source,
         include_events: true,
+        cache_path: Some(cache_path),
     }
 }
 
@@ -6335,6 +6338,7 @@ mod tests {
             None,
             TimelineRange::Week,
             10_000,
+            PathBuf::from("usage-cache.sqlite3"),
         );
 
         assert_eq!(query.source, Some(SourceFilter::Opencode));
