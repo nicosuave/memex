@@ -3090,6 +3090,9 @@ fn home_token_usage_query(
         cost_mode: CostMode::Source,
         include_events: true,
         cache_path: Some(cache_path),
+        // Keystrokes and result updates re-run this query with different post-assembly
+        // filters; reuse the assembled scan between them instead of re-reading logs.
+        memo_ttl_ms: 15_000,
     }
 }
 
