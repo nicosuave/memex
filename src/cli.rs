@@ -1414,6 +1414,13 @@ fn run_usage(
     cost_mode: CostMode,
 ) -> Result<()> {
     let paths = Paths::new(None)?;
+    let config = UserConfig::load(&paths)?;
+    if !config.token_usage_enabled() {
+        return Err(anyhow!(
+            "token usage tracking is disabled; set `token_usage = true` in {}",
+            paths.root.join("config.toml").display()
+        ));
+    }
     paths.ensure_dirs()?;
     let query = UsageQuery {
         source,

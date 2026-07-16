@@ -68,6 +68,8 @@ impl Default for IndexedToolContentLimits {
 pub struct UserConfig {
     pub embeddings: Option<bool>,
     pub auto_index_on_search: Option<bool>,
+    /// Reconstruct token usage from local agent logs (disabled by default).
+    pub token_usage: Option<bool>,
     /// Embedding model: minilm, bge, nomic, gemma (default), potion
     pub model: Option<String>,
     /// Execution provider: auto, cpu, coreml, cuda
@@ -138,6 +140,10 @@ impl UserConfig {
 
     pub fn auto_index_on_search_default(&self) -> bool {
         self.auto_index_on_search.unwrap_or(true)
+    }
+
+    pub fn token_usage_enabled(&self) -> bool {
+        self.token_usage.unwrap_or(false)
     }
 
     pub fn resolve_model(&self, cli_model: Option<String>) -> Result<ModelChoice> {
@@ -276,6 +282,21 @@ fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn token_usage_is_disabled_by_default() {
+        assert!(!UserConfig::default().token_usage_enabled());
+    }
+
+    #[test]
+    fn token_usage_can_be_enabled() {
+        let config = UserConfig {
+            token_usage: Some(true),
+            ..UserConfig::default()
+        };
+
+        assert!(config.token_usage_enabled());
+    }
 
     #[test]
     fn indexed_tool_content_limits_use_defaults() {
