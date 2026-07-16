@@ -562,7 +562,7 @@ where
 // Parser versions also cover the cached blob encoding (postcard); bump them when either
 // the per-source parsing or `CachedUsageEvent` changes shape.
 const CLAUDE_PARSER_VERSION: i64 = 4;
-const CODEX_PARSER_VERSION: i64 = 2;
+const CODEX_PARSER_VERSION: i64 = 3;
 const PI_PARSER_VERSION: i64 = 2;
 const CURSOR_PARSER_VERSION: i64 = 2;
 const COPILOT_PARSER_VERSION: i64 = 2;
@@ -1224,6 +1224,10 @@ struct CodexCounter {
     raw_baseline: CodexTokens,
     watermark: CodexTokens,
     seen: Vec<CodexTokens>,
+    /// Cumulative totals the fork parent reached before the fork point. Fork files replay
+    /// the parent's history with re-stamped timestamps; any total in this set is a replayed
+    /// snapshot, not new usage, regardless of event order or replay truncation.
+    inherited_seen: HashSet<CodexTokens>,
     divergent: bool,
     interleaved: bool,
 }
@@ -1240,9 +1244,21 @@ impl CodexCounter {
         }
     }
 
+    /// Seeds the counter from the fork parent's snapshots at-or-before the fork timestamp
+    /// (the CodexBar inherited-baseline policy): new usage counts as growth beyond the
+    /// parent's final pre-fork totals, and every replayed parent snapshot is suppressed.
+    fn seed_inherited(&mut self, snapshots: &[CodexTokens]) {
+        let Some(baseline) = snapshots.last().copied() else {
+            return;
+        };
+        self.inherited_seen.extend(snapshots.iter().copied());
+        self.raw_baseline = baseline;
+        self.watermark = self.watermark.max(baseline);
+    }
+
     fn account(&mut self, last: Option<CodexTokens>, total: Option<CodexTokens>) -> CodexTokens {
         if let Some(total) = total {
-            if self.seen.contains(&total) {
+            if self.seen.contains(&total) || self.inherited_seen.contains(&total) {
                 return CodexTokens::default();
             }
             if !total.at_least(self.watermark) {
@@ -1303,6 +1319,114 @@ fn contained(current: CodexTokens, watermark: CodexTokens, counted: CodexTokens)
     }
 }
 
+/// Resolves a forked session's parent rollout file and the parent's cumulative token
+/// totals, so fork children can inherit a baseline instead of recounting replayed history.
+/// Rollout files are append-only, so a parent's snapshots at-or-before the fork timestamp
+/// are immutable once the fork exists; caching child parse results that depend on them is
+/// sound.
+type CodexSnapshots = Option<Arc<Vec<(u64, CodexTokens)>>>;
+
+struct CodexParentIndex {
+    by_session: HashMap<String, PathBuf>,
+    snapshots: Mutex<HashMap<String, CodexSnapshots>>,
+}
+
+impl CodexParentIndex {
+    fn new(files: &[PathBuf]) -> Self {
+        let mut by_session = HashMap::new();
+        for path in files {
+            if let Some(session) = codex_session_uuid_from_stem(path) {
+                by_session.entry(session).or_insert_with(|| path.clone());
+            }
+        }
+        Self {
+            by_session,
+            snapshots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Parent totals recorded at-or-before `cutoff_ms`, in file order. Empty result means
+    /// the parent is unknown or had no usage before the fork; callers fall back to the
+    /// unresolved-fork baseline.
+    fn totals_at_or_before(&self, parent: &str, cutoff_ms: u64) -> Vec<CodexTokens> {
+        let cached = self.snapshots.lock().unwrap().get(parent).cloned();
+        let snapshots = match cached {
+            Some(snapshots) => snapshots,
+            None => {
+                let loaded = self
+                    .by_session
+                    .get(parent)
+                    .and_then(|path| codex_total_snapshots(path).ok())
+                    .map(Arc::new);
+                self.snapshots
+                    .lock()
+                    .unwrap()
+                    .entry(parent.to_string())
+                    .or_insert(loaded)
+                    .clone()
+            }
+        };
+        snapshots
+            .map(|snapshots| {
+                snapshots
+                    .iter()
+                    .filter(|(ts, _)| *ts <= cutoff_ms)
+                    .map(|(_, totals)| *totals)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn codex_session_uuid_from_stem(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    if stem.len() < 36 {
+        return None;
+    }
+    let candidate = &stem[stem.len() - 36..];
+    let uuid_shaped = candidate.bytes().enumerate().all(|(i, b)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            b == b'-'
+        } else {
+            b.is_ascii_hexdigit()
+        }
+    });
+    uuid_shaped.then(|| candidate.to_string())
+}
+
+/// Extracts every (timestamp, total_token_usage) snapshot from a rollout file.
+fn codex_total_snapshots(path: &Path) -> Result<Vec<(u64, CodexTokens)>> {
+    static TOKEN_COUNT_NEEDLE: Lazy<memmem::Finder<'static>> =
+        Lazy::new(|| memmem::Finder::new(b"token_count"));
+    let mut snapshots = Vec::new();
+    for_each_line(path, |_, line| {
+        if TOKEN_COUNT_NEEDLE.find(line).is_none() {
+            return;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            return;
+        }
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            return;
+        }
+        let info = payload.get("info").unwrap_or(payload);
+        let Some(total) = info
+            .get("total_token_usage")
+            .map(CodexTokens::from)
+            .filter(|total| !total.zero())
+        else {
+            return;
+        };
+        let ts = value.get("timestamp").map(timestamp_ms).unwrap_or(0);
+        snapshots.push((ts, total));
+    })?;
+    Ok(snapshots)
+}
+
 fn scan_codex(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
@@ -1326,6 +1450,7 @@ fn scan_codex(
             files.extend(jsonl_files([root]));
         }
     }
+    let parents = CodexParentIndex::new(&files);
     scan_files_cached(
         SourceScan {
             source: "codex",
@@ -1336,7 +1461,7 @@ fn scan_codex(
         cache,
         warnings,
         out,
-        scan_codex_file,
+        |path| scan_codex_file(path, &parents),
     );
     Ok(())
 }
@@ -1356,7 +1481,7 @@ static CODEX_LINE_NEEDLES: Lazy<Vec<memmem::Finder<'static>>> = Lazy::new(|| {
     .collect()
 });
 
-fn scan_codex_file(path: &Path) -> Result<Vec<UsageEvent>> {
+fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<Vec<UsageEvent>> {
     let source_path = path.to_string_lossy().to_string();
     let mut session = path
         .file_stem()
@@ -1364,6 +1489,7 @@ fn scan_codex_file(path: &Path) -> Result<Vec<UsageEvent>> {
         .map(str::to_string);
     let mut parent = None;
     let mut fork_timestamp_ms = None;
+    let mut fork_resolved = false;
     let mut project = None;
     let mut model = None;
     let mut turn = None;
@@ -1392,6 +1518,16 @@ fn scan_codex_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 );
                 if parent.is_some() {
                     fork_timestamp_ms = value.get("timestamp").map(timestamp_ms);
+                }
+                if let (Some(parent_id), Some(fork_ms)) = (&parent, fork_timestamp_ms) {
+                    let inherited = parents.totals_at_or_before(parent_id, fork_ms);
+                    if !inherited.is_empty() {
+                        counter.seed_inherited(&inherited);
+                        // The parent baseline is resolved; the first post-fork event is a
+                        // real turn and must not be swallowed as a baseline guess.
+                        unresolved_fork_baseline_seen = true;
+                        fork_resolved = true;
+                    }
                 }
                 project = str_at(payload, &["cwd"]);
             }
@@ -1452,7 +1588,8 @@ fn scan_codex_file(path: &Path) -> Result<Vec<UsageEvent>> {
                     ),
                     source_cost_usd: None,
                     dedupe_confidence: "strong",
-                    conservative_undercount: counter.interleaved || parent.is_some(),
+                    conservative_undercount: counter.interleaved
+                        || (parent.is_some() && !fork_resolved),
                     sidechain: false,
                     source_order: line_index,
                 });
@@ -2692,6 +2829,70 @@ mod tests {
         assert_eq!(warm.events, cold.events);
         assert_eq!(warm.total_tokens, cold.total_tokens);
         assert_eq!(cached_files, 1);
+    }
+
+    #[test]
+    fn codex_fork_children_inherit_parent_baselines() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        std::fs::write(
+            parent_dir.join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":200},"total_token_usage":{"input_tokens":300}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:03:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent rollout");
+        // The child replays a TRUNCATED parent history (the total=300 snapshot is missing)
+        // under its own session id, so cross-file tuple dedupe cannot suppress it; only the
+        // inherited parent baseline can.
+        std::fs::write(
+            child_dir.join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let report = scan_usage(&query).expect("scan usage");
+
+        // Parent turns: 100 + 200 + 300. Child: only the post-fork turn of 150.
+        assert_eq!(report.total_tokens, 750);
+        assert_eq!(report.events, 4);
+        let child_events: Vec<_> = report
+            .details
+            .iter()
+            .filter(|event| event.source_path.contains("2026-07-15T09-00-00"))
+            .collect();
+        assert_eq!(child_events.len(), 1);
+        assert_eq!(child_events[0].tokens.total(), 150);
+        assert!(!child_events[0].conservative_undercount);
     }
 
     #[test]
