@@ -840,6 +840,25 @@ fn scan_files_cached(
     out: &mut Vec<UsageEvent>,
     parse: impl Fn(&Path) -> Result<FileParse> + Sync,
 ) {
+    scan_files_cached_with(scan, files, cache, warnings, out, parse, |_| true);
+}
+
+/// Like `scan_files_cached`, but with a source-specific validity predicate over a cached
+/// row's recorded dependencies. `deps_current` runs in addition to each dependency's own
+/// metadata check; a source uses it to invalidate cache hits on state that per-file metadata
+/// cannot see — e.g. codex forks, whose baseline depends on the *set* of parent rollout
+/// copies, so a newly appearing parent copy must invalidate the child even though every
+/// already-recorded dependency is still unchanged.
+#[allow(clippy::too_many_arguments)]
+fn scan_files_cached_with(
+    scan: SourceScan,
+    files: &[PathBuf],
+    cache: Option<&mut UsageCache>,
+    warnings: &mut Vec<String>,
+    out: &mut Vec<UsageEvent>,
+    parse: impl Fn(&Path) -> Result<FileParse> + Sync,
+    deps_current: impl Fn(&[UsageFileDep]) -> bool,
+) {
     let SourceScan {
         source,
         parser_version,
@@ -872,14 +891,16 @@ fn scan_files_cached(
         };
         let key = path.to_string_lossy().to_string();
         match rows.remove(&key) {
-            // A dependency change (e.g. a fork's parent rollout was extended) invalidates the
-            // cached result even when the file itself is unchanged, so it must re-parse.
+            // A dependency change (e.g. a fork's parent rollout was extended, or a new parent
+            // copy appeared) invalidates the cached result even when the file itself is
+            // unchanged, so it must re-parse.
             Some(row)
                 if ((row.size, row.mtime_ns) == metadata
                     || volatile_reuse_ms(path).is_some_and(|window| {
                         now_ms.saturating_sub(row.scanned_at_ms) < window
                     }))
-                    && row.deps.iter().all(UsageFileDep::is_current) =>
+                    && row.deps.iter().all(UsageFileDep::is_current)
+                    && deps_current(&row.deps) =>
             {
                 hits.push((index, key, row.events_blob));
             }
@@ -1451,6 +1472,27 @@ impl CodexParentIndex {
             .clone()
     }
 
+    /// True if the current set of parent copies still matches the copies recorded when a fork
+    /// child was cached. A child's `deps` are the parent rollout copies present at resolution
+    /// time; if a fuller copy later appears at a new path (an archive lands, another
+    /// CODEX_HOME root syncs), the merged baseline changes even though every recorded copy is
+    /// unchanged, so the child must re-parse. Non-fork rows have no deps and are always valid.
+    fn deps_match_current_candidates(&self, deps: &[UsageFileDep]) -> bool {
+        let Some(first) = deps.first() else {
+            return true;
+        };
+        let Some(session) = codex_session_uuid_from_stem(Path::new(&first.path)) else {
+            return true;
+        };
+        let current: HashSet<&str> = self
+            .by_session
+            .get(&session)
+            .map(|paths| paths.iter().filter_map(|path| path.to_str()).collect())
+            .unwrap_or_default();
+        let recorded: HashSet<&str> = deps.iter().map(|dep| dep.path.as_str()).collect();
+        current == recorded
+    }
+
     /// Parent snapshots recorded at-or-before `cutoff_ms` paired with the dependency
     /// fingerprints of every parent copy. `None` means the parent is unknown or had no usage
     /// before the fork, so the caller falls back to the unresolved-fork baseline and does not
@@ -1563,7 +1605,7 @@ fn scan_codex(
         }
     }
     let parents = CodexParentIndex::new(&files);
-    scan_files_cached(
+    scan_files_cached_with(
         SourceScan {
             source: "codex",
             parser_version: CODEX_PARSER_VERSION,
@@ -1574,6 +1616,7 @@ fn scan_codex(
         warnings,
         out,
         |path| scan_codex_file(path, &parents),
+        |deps| parents.deps_match_current_candidates(deps),
     );
     Ok(())
 }
@@ -3245,6 +3288,79 @@ mod tests {
             .map(|event| event.tokens.total())
             .sum();
         assert_eq!(child, 150);
+    }
+
+    #[test]
+    fn codex_fork_reparses_when_a_new_parent_copy_appears() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let active_dir = tmp.path().join("sessions/2026/07/14");
+        let archived_dir = tmp.path().join("archived_sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&active_dir).expect("create active dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let parent_name = "rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl";
+        // At first only a truncated parent copy exists (just the total=100 snapshot).
+        std::fs::write(
+            active_dir.join(parent_name),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write truncated parent copy");
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        // First scan: the only parent copy is truncated, so the child treats the not-yet-seen
+        // total=600 snapshot as new. The child is cached with a dependency on that one copy.
+        let before = scan_usage(&query).expect("first scan");
+        assert_eq!(before.total_tokens, 750);
+
+        // A fuller parent copy lands at a new (archived) path. The originally recorded copy is
+        // untouched, so only the changed candidate set can trigger the child to re-parse.
+        std::fs::create_dir_all(&archived_dir).expect("create archived dir");
+        std::fs::write(
+            archived_dir.join(parent_name),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fuller parent copy");
+
+        let after = scan_usage(&query).expect("second scan");
+
+        // Without candidate-set invalidation the child would stay cached and the fuller copy's
+        // 500 would be counted twice (total 1250); re-parsing merges both copies and keeps 750.
+        assert_eq!(after.total_tokens, 750);
     }
 
     #[test]
