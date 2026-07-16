@@ -546,12 +546,14 @@ where
     Ok(Value::deserialize(deserializer)?.as_u64().unwrap_or(0))
 }
 
-const CLAUDE_PARSER_VERSION: i64 = 2;
-const CODEX_PARSER_VERSION: i64 = 1;
-const PI_PARSER_VERSION: i64 = 1;
-const CURSOR_PARSER_VERSION: i64 = 1;
-const COPILOT_PARSER_VERSION: i64 = 1;
-const OPENCODE_PARSER_VERSION: i64 = 1;
+// Parser versions also cover the cached blob encoding (postcard); bump them when either
+// the per-source parsing or `CachedUsageEvent` changes shape.
+const CLAUDE_PARSER_VERSION: i64 = 3;
+const CODEX_PARSER_VERSION: i64 = 2;
+const PI_PARSER_VERSION: i64 = 2;
+const CURSOR_PARSER_VERSION: i64 = 2;
+const COPILOT_PARSER_VERSION: i64 = 2;
+const OPENCODE_PARSER_VERSION: i64 = 2;
 /// Reuse cached Cursor state databases this long even when their metadata changed: a
 /// running Cursor rewrites its (potentially multi-GB) databases continuously, and
 /// re-reading them on every scan makes live scans unusable.
@@ -630,7 +632,7 @@ struct CachedFileRow {
     size: u64,
     mtime_ns: i64,
     scanned_at_ms: i64,
-    events_json: Vec<u8>,
+    events_blob: Vec<u8>,
 }
 
 struct ParsedUsageFile {
@@ -648,6 +650,16 @@ impl UsageCache {
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
+        // Drop pre-postcard cache tables: the JSON-era claude table and any
+        // usage_file_cache created before the blob column was renamed.
+        let has_blob_column: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('usage_file_cache') WHERE name = 'events_blob'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_blob_column == 0 {
+            connection.execute_batch("DROP TABLE IF EXISTS usage_file_cache;")?;
+        }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              DROP TABLE IF EXISTS claude_usage_file_cache;
@@ -658,7 +670,7 @@ impl UsageCache {
                  size INTEGER NOT NULL,
                  mtime_ns INTEGER NOT NULL,
                  scanned_at_ms INTEGER NOT NULL,
-                 events_json BLOB NOT NULL,
+                 events_blob BLOB NOT NULL,
                  PRIMARY KEY (source, path)
              );",
         )?;
@@ -675,7 +687,7 @@ impl UsageCache {
             params![source, parser_version],
         )?;
         let mut statement = self.connection.prepare(
-            "SELECT path, size, mtime_ns, scanned_at_ms, events_json FROM usage_file_cache
+            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob FROM usage_file_cache
              WHERE source = ?1 AND parser_version = ?2",
         )?;
         let rows = statement.query_map(params![source, parser_version], |row| {
@@ -685,7 +697,7 @@ impl UsageCache {
                     size: row.get::<_, i64>(1)? as u64,
                     mtime_ns: row.get(2)?,
                     scanned_at_ms: row.get(3)?,
-                    events_json: row.get(4)?,
+                    events_blob: row.get(4)?,
                 },
             ))
         })?;
@@ -713,22 +725,22 @@ impl UsageCache {
                     file.path.to_string_lossy().to_string(),
                     file.size,
                     file.mtime_ns,
-                    serde_json::to_vec(&cached)?,
+                    postcard::to_stdvec(&cached)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let transaction = self.connection.transaction()?;
-        for (path, size, mtime_ns, events_json) in prepared {
+        for (path, size, mtime_ns, events_blob) in prepared {
             transaction.execute(
                 "INSERT INTO usage_file_cache(
-                     source, path, parser_version, size, mtime_ns, scanned_at_ms, events_json
+                     source, path, parser_version, size, mtime_ns, scanned_at_ms, events_blob
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(source, path) DO UPDATE SET
                      parser_version = excluded.parser_version,
                      size = excluded.size,
                      mtime_ns = excluded.mtime_ns,
                      scanned_at_ms = excluded.scanned_at_ms,
-                     events_json = excluded.events_json",
+                     events_blob = excluded.events_blob",
                 params![
                     source,
                     path,
@@ -736,7 +748,7 @@ impl UsageCache {
                     size as i64,
                     mtime_ns,
                     scanned_at_ms,
-                    events_json
+                    events_blob
                 ],
             )?;
         }
@@ -817,7 +829,7 @@ fn scan_files_cached(
                         now_ms.saturating_sub(row.scanned_at_ms) < window
                     }) =>
             {
-                hits.push((index, key, row.events_json));
+                hits.push((index, key, row.events_blob));
             }
             _ => missing.push((index, path.clone(), metadata)),
         }
@@ -825,7 +837,7 @@ fn scan_files_cached(
     let decoded = hits
         .into_par_iter()
         .map(|(index, key, blob)| {
-            let events = serde_json::from_slice::<Vec<CachedUsageEvent>>(&blob).map(|events| {
+            let events = postcard::from_bytes::<Vec<CachedUsageEvent>>(&blob).map(|events| {
                 events
                     .into_iter()
                     .map(|event| event.into_event(source, key.clone()))
