@@ -775,9 +775,11 @@ fn epoch_ms_now() -> i64 {
 struct SourceScan {
     source: &'static str,
     parser_version: i64,
-    /// When set, reuse cached rows this long even if the file metadata changed. Used for
-    /// databases that are continuously rewritten while their application runs.
-    volatile_reuse_ms: Option<i64>,
+    /// Returns how long cached rows for this path may be reused even if the file metadata
+    /// changed, or `None` to always re-parse on change. Used for databases that are
+    /// continuously rewritten while their application runs; plain log files must return
+    /// `None` so appends are picked up immediately.
+    volatile_reuse_ms: fn(&Path) -> Option<i64>,
 }
 
 /// Scan `files` through the per-file cache: unchanged files are served from cached blobs
@@ -825,7 +827,7 @@ fn scan_files_cached(
         match rows.remove(&key) {
             Some(row)
                 if (row.size, row.mtime_ns) == metadata
-                    || volatile_reuse_ms.is_some_and(|window| {
+                    || volatile_reuse_ms(path).is_some_and(|window| {
                         now_ms.saturating_sub(row.scanned_at_ms) < window
                     }) =>
             {
@@ -918,7 +920,7 @@ fn scan_claude(
         SourceScan {
             source: "claude",
             parser_version: CLAUDE_PARSER_VERSION,
-            volatile_reuse_ms: None,
+            volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
@@ -1313,7 +1315,7 @@ fn scan_codex(
         SourceScan {
             source: "codex",
             parser_version: CODEX_PARSER_VERSION,
-            volatile_reuse_ms: None,
+            volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
@@ -1514,7 +1516,7 @@ fn scan_pi(
         SourceScan {
             source: "pi",
             parser_version: PI_PARSER_VERSION,
-            volatile_reuse_ms: None,
+            volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
@@ -1685,7 +1687,12 @@ fn scan_opencode(
         SourceScan {
             source: "opencode",
             parser_version: OPENCODE_PARSER_VERSION,
-            volatile_reuse_ms: Some(VOLATILE_DB_REUSE_MS),
+            // Only the databases are volatile; message JSON files are updated in place
+            // while a response streams and must re-parse as soon as they change.
+            volatile_reuse_ms: |path| {
+                (path.extension().and_then(|v| v.to_str()) == Some("db"))
+                    .then_some(VOLATILE_DB_REUSE_MS)
+            },
         },
         &files,
         cache,
@@ -1849,7 +1856,7 @@ fn scan_cursor(
         SourceScan {
             source: "cursor",
             parser_version: CURSOR_PARSER_VERSION,
-            volatile_reuse_ms: Some(VOLATILE_DB_REUSE_MS),
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
         },
         &databases,
         cache,
@@ -2110,7 +2117,7 @@ fn scan_copilot(
         SourceScan {
             source: "copilot",
             parser_version: COPILOT_PARSER_VERSION,
-            volatile_reuse_ms: None,
+            volatile_reuse_ms: |_| None,
         },
         &files,
         cache,
@@ -2662,6 +2669,48 @@ mod tests {
         assert_eq!(warm.events, cold.events);
         assert_eq!(warm.total_tokens, cold.total_tokens);
         assert_eq!(cached_files, 1);
+    }
+
+    #[test]
+    fn opencode_message_file_changes_bypass_volatile_reuse() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let message_dir = tmp.path().join("storage/message/ses_test");
+        std::fs::create_dir_all(&message_dir).expect("create message directory");
+        let message_path = message_dir.join("msg_test.json");
+        let message = |output: u64| {
+            serde_json::to_vec(&serde_json::json!({
+                "id": "msg_test",
+                "sessionID": "ses_test",
+                "time": { "created": 1_750_000_000_000u64 },
+                "tokens": {
+                    "input": 10,
+                    "output": output,
+                    "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                }
+            }))
+            .expect("serialize message")
+        };
+        std::fs::write(&message_path, message(5)).expect("write message");
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Opencode),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let initial = scan_usage(&query).expect("initial scan");
+        // The message file is rewritten while a response streams; unlike the opencode
+        // databases it must not be served from the 60s volatile window.
+        std::fs::write(&message_path, message(500)).expect("rewrite message");
+        let updated = scan_usage(&query).expect("updated scan");
+
+        assert_eq!(initial.total_tokens, 15);
+        assert_eq!(updated.total_tokens, 510);
     }
 
     #[test]
