@@ -1438,7 +1438,34 @@ fn run_usage(
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: 0,
     };
-    let report = scan_usage(&query)?;
+    // A cold usage cache re-parses whole log corpora, which can take minutes; narrate the
+    // parse phase on stderr so the scan doesn't read as a hang.
+    let scan_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reporter = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(|| {
+        let scan_finished = scan_finished.clone();
+        std::thread::spawn(move || {
+            let mut printed = false;
+            while !scan_finished.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(progress) = crate::usage::usage_scan_progress() {
+                    eprint!(
+                        "\rscanning {} logs {}/{}…   ",
+                        progress.source, progress.done, progress.total
+                    );
+                    printed = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if printed {
+                eprint!("\r{:<60}\r", "");
+            }
+        })
+    });
+    let report = scan_usage(&query);
+    scan_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(reporter) = reporter {
+        let _ = reporter.join();
+    }
+    let report = report?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
