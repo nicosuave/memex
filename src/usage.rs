@@ -646,6 +646,7 @@ struct CachedFileRow {
     mtime_ns: i64,
     scanned_at_ms: i64,
     events_blob: Vec<u8>,
+    deps: Vec<UsageFileDep>,
 }
 
 /// A parse closure's output: the file's events plus whether the result may be persisted.
@@ -655,6 +656,8 @@ struct CachedFileRow {
 struct FileParse {
     events: Vec<UsageEvent>,
     cacheable: bool,
+    /// Other files this parse's result depends on; a change to any invalidates the cache.
+    deps: Vec<UsageFileDep>,
 }
 
 impl FileParse {
@@ -662,6 +665,7 @@ impl FileParse {
         Self {
             events,
             cacheable: true,
+            deps: Vec::new(),
         }
     }
 }
@@ -673,6 +677,7 @@ struct ParsedUsageFile {
     mtime_ns: i64,
     events: Vec<UsageEvent>,
     cacheable: bool,
+    deps: Vec<UsageFileDep>,
 }
 
 impl UsageCache {
@@ -682,14 +687,17 @@ impl UsageCache {
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
-        // Drop pre-postcard cache tables: the JSON-era claude table and any
-        // usage_file_cache created before the blob column was renamed.
-        let has_blob_column: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('usage_file_cache') WHERE name = 'events_blob'",
+        // Drop pre-postcard cache tables and any schema missing a required column: the
+        // JSON-era claude table, the pre-rename blob column, and the deps_blob column that
+        // records cross-file dependencies. A missing column means an older layout, so the
+        // table is rebuilt rather than migrated.
+        let current_columns: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('usage_file_cache')
+             WHERE name IN ('events_blob', 'deps_blob')",
             [],
             |row| row.get(0),
         )?;
-        if has_blob_column == 0 {
+        if current_columns < 2 {
             connection.execute_batch("DROP TABLE IF EXISTS usage_file_cache;")?;
         }
         connection.execute_batch(
@@ -703,6 +711,7 @@ impl UsageCache {
                  mtime_ns INTEGER NOT NULL,
                  scanned_at_ms INTEGER NOT NULL,
                  events_blob BLOB NOT NULL,
+                 deps_blob BLOB NOT NULL,
                  PRIMARY KEY (source, path)
              );",
         )?;
@@ -719,10 +728,11 @@ impl UsageCache {
             params![source, parser_version],
         )?;
         let mut statement = self.connection.prepare(
-            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob FROM usage_file_cache
+            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob, deps_blob FROM usage_file_cache
              WHERE source = ?1 AND parser_version = ?2",
         )?;
         let rows = statement.query_map(params![source, parser_version], |row| {
+            let deps_blob: Vec<u8> = row.get(5)?;
             Ok((
                 row.get::<_, String>(0)?,
                 CachedFileRow {
@@ -730,6 +740,7 @@ impl UsageCache {
                     mtime_ns: row.get(2)?,
                     scanned_at_ms: row.get(3)?,
                     events_blob: row.get(4)?,
+                    deps: postcard::from_bytes(&deps_blob).unwrap_or_default(),
                 },
             ))
         })?;
@@ -759,21 +770,23 @@ impl UsageCache {
                     file.size,
                     file.mtime_ns,
                     postcard::to_stdvec(&cached)?,
+                    postcard::to_stdvec(&file.deps)?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let transaction = self.connection.transaction()?;
-        for (path, size, mtime_ns, events_blob) in prepared {
+        for (path, size, mtime_ns, events_blob, deps_blob) in prepared {
             transaction.execute(
                 "INSERT INTO usage_file_cache(
-                     source, path, parser_version, size, mtime_ns, scanned_at_ms, events_blob
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     source, path, parser_version, size, mtime_ns, scanned_at_ms, events_blob, deps_blob
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(source, path) DO UPDATE SET
                      parser_version = excluded.parser_version,
                      size = excluded.size,
                      mtime_ns = excluded.mtime_ns,
                      scanned_at_ms = excluded.scanned_at_ms,
-                     events_blob = excluded.events_blob",
+                     events_blob = excluded.events_blob,
+                     deps_blob = excluded.deps_blob",
                 params![
                     source,
                     path,
@@ -781,7 +794,8 @@ impl UsageCache {
                     size as i64,
                     mtime_ns,
                     scanned_at_ms,
-                    events_blob
+                    events_blob,
+                    deps_blob
                 ],
             )?;
         }
@@ -858,11 +872,14 @@ fn scan_files_cached(
         };
         let key = path.to_string_lossy().to_string();
         match rows.remove(&key) {
+            // A dependency change (e.g. a fork's parent rollout was extended) invalidates the
+            // cached result even when the file itself is unchanged, so it must re-parse.
             Some(row)
-                if (row.size, row.mtime_ns) == metadata
+                if ((row.size, row.mtime_ns) == metadata
                     || volatile_reuse_ms(path).is_some_and(|window| {
                         now_ms.saturating_sub(row.scanned_at_ms) < window
-                    }) =>
+                    }))
+                    && row.deps.iter().all(UsageFileDep::is_current) =>
             {
                 hits.push((index, key, row.events_blob));
             }
@@ -983,6 +1000,7 @@ fn parse_missing_usage_files(
                 mtime_ns: metadata.1,
                 events: parsed.events,
                 cacheable: parsed.cacheable,
+                deps: parsed.deps,
             })
         })
         .collect::<Vec<_>>();
@@ -1343,16 +1361,41 @@ fn contained(current: CodexTokens, watermark: CodexTokens, counted: CodexTokens)
     }
 }
 
+/// A file whose content a cached parse depended on, recorded so the cached result can be
+/// invalidated when that file changes. Used for codex fork children, whose baseline comes
+/// from a separate parent rollout that can change (be synced, extended) without the child
+/// file changing.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct UsageFileDep {
+    path: String,
+    size: u64,
+    mtime_ns: i64,
+}
+
+impl UsageFileDep {
+    /// True if the file still matches the recorded size and mtime. A vanished or changed
+    /// dependency invalidates the cached parse that depended on it.
+    fn is_current(&self) -> bool {
+        usage_file_metadata(Path::new(&self.path))
+            .map(|(size, mtime_ns)| size == self.size && mtime_ns == self.mtime_ns)
+            .unwrap_or(false)
+    }
+}
+
+struct CodexParentData {
+    dep: UsageFileDep,
+    snapshots: Vec<(u64, CodexTokens)>,
+}
+
 /// Resolves a forked session's parent rollout file and the parent's cumulative token
 /// totals, so fork children can inherit a baseline instead of recounting replayed history.
-/// Rollout files are append-only, so a parent's snapshots at-or-before the fork timestamp
-/// are immutable once the fork exists; caching child parse results that depend on them is
-/// sound.
-type CodexSnapshots = Option<Arc<Vec<(u64, CodexTokens)>>>;
+/// The parent's metadata travels with the resolution so a child cached against a partial
+/// (still-syncing) parent is re-parsed once the parent changes.
+type CodexParentSlot = Option<Arc<CodexParentData>>;
 
 struct CodexParentIndex {
     by_session: HashMap<String, PathBuf>,
-    snapshots: Mutex<HashMap<String, CodexSnapshots>>,
+    parents: Mutex<HashMap<String, CodexParentSlot>>,
 }
 
 impl CodexParentIndex {
@@ -1365,41 +1408,66 @@ impl CodexParentIndex {
         }
         Self {
             by_session,
-            snapshots: Mutex::new(HashMap::new()),
+            parents: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Parent totals recorded at-or-before `cutoff_ms`, in file order. Empty result means
-    /// the parent is unknown or had no usage before the fork; callers fall back to the
-    /// unresolved-fork baseline.
-    fn totals_at_or_before(&self, parent: &str, cutoff_ms: u64) -> Vec<CodexTokens> {
-        let cached = self.snapshots.lock().unwrap().get(parent).cloned();
-        let snapshots = match cached {
-            Some(snapshots) => snapshots,
-            None => {
-                let loaded = self
-                    .by_session
-                    .get(parent)
-                    .and_then(|path| codex_total_snapshots(path).ok())
-                    .map(Arc::new);
-                self.snapshots
-                    .lock()
-                    .unwrap()
-                    .entry(parent.to_string())
-                    .or_insert(loaded)
-                    .clone()
-            }
-        };
-        snapshots
-            .map(|snapshots| {
-                snapshots
-                    .iter()
-                    .filter(|(ts, _)| *ts <= cutoff_ms)
-                    .map(|(_, totals)| *totals)
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn load(&self, parent: &str) -> CodexParentSlot {
+        if let Some(slot) = self.parents.lock().unwrap().get(parent) {
+            return slot.clone();
+        }
+        let loaded = self.by_session.get(parent).and_then(|path| {
+            let (size, mtime_ns) = usage_file_metadata(path).ok()?;
+            let snapshots = codex_total_snapshots(path).ok()?;
+            Some(Arc::new(CodexParentData {
+                dep: UsageFileDep {
+                    path: path.to_string_lossy().to_string(),
+                    size,
+                    mtime_ns,
+                },
+                snapshots,
+            }))
+        });
+        self.parents
+            .lock()
+            .unwrap()
+            .entry(parent.to_string())
+            .or_insert(loaded)
+            .clone()
     }
+
+    /// Parent snapshots recorded at-or-before `cutoff_ms` paired with the parent file's
+    /// dependency fingerprint. `None` means the parent is unknown or had no usage before the
+    /// fork, so the caller falls back to the unresolved-fork baseline and does not cache.
+    fn resolve(&self, parent: &str, cutoff_ms: u64) -> Option<(UsageFileDep, Vec<CodexTokens>)> {
+        let data = self.load(parent)?;
+        let totals: Vec<CodexTokens> = data
+            .snapshots
+            .iter()
+            .filter(|(ts, _)| *ts <= cutoff_ms)
+            .map(|(_, totals)| *totals)
+            .collect();
+        if totals.is_empty() {
+            return None;
+        }
+        Some((data.dep.clone(), totals))
+    }
+}
+
+/// Codex records a fork/subagent parent either as a flat `forked_from_id` or nested under
+/// `source.subagent.thread_spawn.parent_thread_id`. Matches `apply_codex_session_meta` in
+/// `ingest.rs` so both shapes are treated as forks.
+fn codex_parent_session_id(payload: &Value) -> Option<String> {
+    str_at(
+        payload,
+        &["forked_from_id", "parent_session_id", "parentSessionId"],
+    )
+    .or_else(|| {
+        payload
+            .pointer("/source/subagent/thread_spawn/parent_thread_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 fn codex_session_uuid_from_stem(path: &Path) -> Option<String> {
@@ -1514,6 +1582,7 @@ fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse>
     let mut parent = None;
     let mut fork_timestamp_ms = None;
     let mut fork_resolved = false;
+    let mut parent_dep: Option<UsageFileDep> = None;
     let mut project = None;
     let mut model = None;
     let mut turn = None;
@@ -1536,22 +1605,19 @@ fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse>
         match kind {
             "session_meta" => {
                 session = str_at(payload, &["id", "session_id"]).or_else(|| session.take());
-                parent = str_at(
-                    payload,
-                    &["forked_from_id", "parent_session_id", "parentSessionId"],
-                );
+                parent = codex_parent_session_id(payload);
                 if parent.is_some() {
                     fork_timestamp_ms = value.get("timestamp").map(timestamp_ms);
                 }
-                if let (Some(parent_id), Some(fork_ms)) = (&parent, fork_timestamp_ms) {
-                    let inherited = parents.totals_at_or_before(parent_id, fork_ms);
-                    if !inherited.is_empty() {
-                        counter.seed_inherited(&inherited);
-                        // The parent baseline is resolved; the first post-fork event is a
-                        // real turn and must not be swallowed as a baseline guess.
-                        unresolved_fork_baseline_seen = true;
-                        fork_resolved = true;
-                    }
+                if let (Some(parent_id), Some(fork_ms)) = (&parent, fork_timestamp_ms)
+                    && let Some((dep, inherited)) = parents.resolve(parent_id, fork_ms)
+                {
+                    counter.seed_inherited(&inherited);
+                    // The parent baseline is resolved; the first post-fork event is a
+                    // real turn and must not be swallowed as a baseline guess.
+                    unresolved_fork_baseline_seen = true;
+                    fork_resolved = true;
+                    parent_dep = Some(dep);
                 }
                 project = str_at(payload, &["cwd"]);
             }
@@ -1667,9 +1733,14 @@ fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse>
     // baseline; persisting it would freeze that guess even after the parent appears, so the
     // result is provisional and must be recomputed on the next scan.
     let cacheable = parent.is_none() || fork_resolved;
+    // A resolved fork depends on the parent rollout's content: if the parent is later
+    // synced further or extended, the cached child must be re-parsed so its baseline
+    // reflects the fuller parent instead of a partial prefix.
+    let deps = parent_dep.into_iter().collect();
     Ok(FileParse {
         events: out,
         cacheable,
+        deps,
     })
 }
 
@@ -3013,6 +3084,144 @@ mod tests {
             .map(|event| event.tokens.total())
             .sum();
         assert_eq!(child_after, 150);
+    }
+
+    #[test]
+    fn codex_nested_thread_spawn_parent_is_resolved() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        std::fs::write(
+            parent_dir
+                .join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent rollout");
+        // The parent link is only present in the nested subagent thread_spawn shape.
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","source":{"subagent":{"thread_spawn":{"parent_thread_id":"019f0000-0000-7000-8000-000000000001"}}},"cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write nested fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let report = scan_usage(&query).expect("scan usage");
+
+        // Parent 100 + 500; child replays both and adds only its 150 turn.
+        assert_eq!(report.total_tokens, 750);
+        let child: u64 = report
+            .details
+            .iter()
+            .filter(|event| {
+                event
+                    .source_path
+                    .contains("019f0000-0000-7000-8000-000000000002")
+            })
+            .map(|event| event.tokens.total())
+            .sum();
+        assert_eq!(child, 150);
+    }
+
+    #[test]
+    fn codex_fork_reparses_when_partial_parent_is_extended() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent_dir = tmp.path().join("sessions/2026/07/14");
+        let child_dir = tmp.path().join("sessions/2026/07/15");
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let parent = parent_dir
+            .join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl");
+        // Parent is only partially synced: it has the total=100 snapshot but not yet the
+        // total=600 snapshot the child replays.
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write partial parent");
+        std::fs::write(
+            child_dir
+                .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        // Partial parent: it emits only 100, and the child counts the not-yet-synced
+        // total=600 snapshot as new (its baseline is the partial 100). The child result is
+        // cached against the parent's current metadata.
+        let partial = scan_usage(&query).expect("scan with partial parent");
+        assert_eq!(partial.total_tokens, 750);
+
+        // Parent finishes syncing the total=600 snapshot. The child file is unchanged, but
+        // its cached dependency on the parent is now stale, so it must re-parse.
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("extend parent");
+
+        let extended = scan_usage(&query).expect("scan with extended parent");
+
+        // Without dependency invalidation the child would stay cached and the parent's newly
+        // synced 500 would be counted twice (total 1250); re-parsing keeps it at 750.
+        assert_eq!(extended.total_tokens, 750);
     }
 
     #[test]
