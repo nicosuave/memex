@@ -713,7 +713,16 @@ fn scan_claude(
     let mut slots = (0..files.len()).map(|_| None).collect::<Vec<_>>();
     let mut missing = Vec::new();
     for (index, path) in files.iter().enumerate() {
-        let metadata = usage_file_metadata(path)?;
+        let metadata = match usage_file_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warnings.push(format!(
+                    "Claude usage file skipped ({}): {error:#}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         let cached = cache
             .as_ref()
             .map_or(Ok(None), |cache| cache.load(path, metadata.0, metadata.1));
@@ -721,23 +730,15 @@ fn scan_claude(
             Ok(Some(events)) => slots[index] = Some(events),
             Ok(None) => missing.push((index, path.clone(), metadata)),
             Err(error) => {
-                warnings.push(format!("Claude usage cache read failed: {error:#}"));
+                warnings.push(format!(
+                    "Claude usage cache read failed ({}): {error:#}",
+                    path.display()
+                ));
                 missing.push((index, path.clone(), metadata));
             }
         }
     }
-    let parsed = missing
-        .par_iter()
-        .map(|(index, path, metadata)| {
-            scan_claude_file(path).map(|events| ParsedClaudeFile {
-                index: *index,
-                path: path.clone(),
-                size: metadata.0,
-                mtime_ns: metadata.1,
-                events,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let parsed = parse_missing_claude_files(&missing, warnings);
     if let Some(cache) = &mut cache
         && let Err(error) = cache.save_batch(&parsed)
     {
@@ -750,6 +751,35 @@ fn scan_claude(
         out.extend(events);
     }
     Ok(())
+}
+
+fn parse_missing_claude_files(
+    missing: &[(usize, PathBuf, (u64, i64))],
+    warnings: &mut Vec<String>,
+) -> Vec<ParsedClaudeFile> {
+    let outcomes = missing
+        .par_iter()
+        .map(|(index, path, metadata)| {
+            scan_claude_file(path).map(|events| ParsedClaudeFile {
+                index: *index,
+                path: path.clone(),
+                size: metadata.0,
+                mtime_ns: metadata.1,
+                events,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut parsed = Vec::with_capacity(outcomes.len());
+    for ((_, path, _), outcome) in missing.iter().zip(outcomes) {
+        match outcome {
+            Ok(file) => parsed.push(file),
+            Err(error) => warnings.push(format!(
+                "Claude usage file skipped ({}): {error:#}",
+                path.display()
+            )),
+        }
+    }
+    parsed
 }
 
 fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
@@ -2179,6 +2209,38 @@ mod tests {
         assert_eq!(cached_files, 2);
         assert_eq!(warm.events, cold.events);
         assert_eq!(warm.total_tokens, 0);
+    }
+
+    #[test]
+    fn claude_file_parse_failures_preserve_successful_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let valid = tmp.path().join("valid.jsonl");
+        let vanished = tmp.path().join("vanished.jsonl");
+        std::fs::write(
+            &valid,
+            concat!(
+                r#"{"type":"assistant","timestamp":1000,"message":{"id":"valid","usage":{"inputTokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write valid transcript");
+        std::fs::write(&vanished, "").expect("write disappearing transcript");
+        let valid_metadata = usage_file_metadata(&valid).expect("valid metadata");
+        let vanished_metadata = usage_file_metadata(&vanished).expect("vanished metadata");
+        std::fs::remove_file(&vanished).expect("remove transcript");
+        let missing = vec![
+            (0, valid, valid_metadata),
+            (1, vanished.clone(), vanished_metadata),
+        ];
+        let mut warnings = Vec::new();
+
+        let parsed = parse_missing_claude_files(&missing, &mut warnings);
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].index, 0);
+        assert_eq!(parsed[0].events.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(vanished.to_string_lossy().as_ref()));
     }
 
     #[test]

@@ -274,6 +274,9 @@ EXAMPLES:
         /// Cost source: stored source cost, automatic fallback, or API-rate repricing
         #[arg(long, value_enum, default_value = "auto")]
         cost: CostMode,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Rebuild the SQLite analytics cache from the existing Tantivy index
     #[command(hide = true)]
@@ -568,8 +571,9 @@ pub fn run() -> Result<()> {
             json,
             events,
             cost,
+            root,
         } => {
-            run_usage(source, since, until, json, events, cost)?;
+            run_usage(source, since, until, json, events, cost, root)?;
         }
         Commands::AnalyticsBackfill { root } => {
             run_analytics_backfill(root)?;
@@ -1412,8 +1416,9 @@ fn run_usage(
     json: bool,
     include_events: bool,
     cost_mode: CostMode,
+    root: Option<PathBuf>,
 ) -> Result<()> {
-    let paths = Paths::new(None)?;
+    let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     if !config.token_usage_enabled() {
         return Err(anyhow!(
@@ -3197,6 +3202,17 @@ mod tests {
         assert!(index.no_opencode);
         assert!(index.no_pi);
         assert!(index.no_copilot);
+    }
+
+    #[test]
+    fn usage_accepts_custom_root() {
+        let cli = Cli::try_parse_from(["memex", "usage", "--root", "/tmp/custom-memex"])
+            .expect("parse usage root");
+
+        let Some(Commands::Usage { root, .. }) = cli.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(root, Some(PathBuf::from("/tmp/custom-memex")));
     }
 
     #[test]
