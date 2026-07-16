@@ -104,8 +104,10 @@ impl TokenBuckets {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UsageEvent {
-    pub source: String,
-    pub source_path: String,
+    pub source: &'static str,
+    /// Shared across every event of a file: assembled scans materialize millions of
+    /// events, and per-event owned paths dominated allocation time.
+    pub source_path: Arc<str>,
     pub source_record_id: Option<String>,
     pub session_id: Option<String>,
     pub request_id: Option<String>,
@@ -157,41 +159,71 @@ pub struct UsageReport {
     pub warnings: Vec<String>,
 }
 
+/// One filtered usage event projected to what activity charts need.
+#[derive(Clone, Copy, Debug)]
+pub struct UsageActivityPoint {
+    pub source: &'static str,
+    pub timestamp_ms: u64,
+    pub total_tokens: u64,
+}
+
+/// Filters the assembled events exactly like `scan_usage`, but returns lightweight chart
+/// points instead of deep-cloning full events out of the memoized assembly. The boolean is
+/// true when any scanner reported a warning, i.e. the totals may be partial.
+pub fn scan_usage_activity(query: &UsageQuery) -> Result<(Vec<UsageActivityPoint>, bool)> {
+    let _scan_guard = USAGE_SCAN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (assembled, warnings) = memoized_usage_events(query);
+    let points = filtered_events(&assembled, query)
+        .map(|event| UsageActivityPoint {
+            source: event.source,
+            timestamp_ms: event.timestamp_ms,
+            total_tokens: event.tokens.total(),
+        })
+        .collect();
+    Ok((points, !warnings.is_empty()))
+}
+
+/// Assembled events are already sorted; filtering preserves that order.
+fn filtered_events<'a>(
+    assembled: &'a [UsageEvent],
+    query: &'a UsageQuery,
+) -> impl Iterator<Item = &'a UsageEvent> + 'a {
+    let mut project_cache = HashMap::new();
+    assembled.iter().filter(move |event| {
+        query
+            .since_ms
+            .is_none_or(|since| event.timestamp_ms >= since)
+            && query
+                .until_ms
+                .is_none_or(|until| event.timestamp_ms < until)
+            && query.project.as_deref().is_none_or(|project| {
+                event.project.as_deref().is_some_and(|candidate| {
+                    usage_project_matches(
+                        candidate,
+                        project,
+                        query.project_grouping,
+                        &mut project_cache,
+                    )
+                })
+            })
+            && query.session_keys.as_ref().is_none_or(|session_keys| {
+                event.session_id.as_ref().is_some_and(|session_id| {
+                    session_keys.contains(&(event.source.to_string(), session_id.clone()))
+                })
+            })
+    })
+}
+
 pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
     let _scan_guard = USAGE_SCAN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (assembled, warnings) = memoized_usage_events(query);
-    let mut project_cache = HashMap::new();
-    // Assembled events are already sorted; filtering preserves that order.
-    let events: Vec<&UsageEvent> = assembled
-        .iter()
-        .filter(|event| {
-            query
-                .since_ms
-                .is_none_or(|since| event.timestamp_ms >= since)
-                && query
-                    .until_ms
-                    .is_none_or(|until| event.timestamp_ms < until)
-                && query.project.as_deref().is_none_or(|project| {
-                    event.project.as_deref().is_some_and(|candidate| {
-                        usage_project_matches(
-                            candidate,
-                            project,
-                            query.project_grouping,
-                            &mut project_cache,
-                        )
-                    })
-                })
-                && query.session_keys.as_ref().is_none_or(|session_keys| {
-                    event.session_id.as_ref().is_some_and(|session_id| {
-                        session_keys.contains(&(event.source.clone(), session_id.clone()))
-                    })
-                })
-        })
-        .collect();
+    let events: Vec<&UsageEvent> = filtered_events(&assembled, query).collect();
 
-    let mut by_source: HashMap<String, UsageSummary> = HashMap::new();
+    let mut by_source: HashMap<&'static str, UsageSummary> = HashMap::new();
     let mut report = UsageReport {
         authority: "local_log",
         cost_mode: query.cost_mode,
@@ -213,9 +245,9 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
             report.unpriced_events += 1;
         }
         let row = by_source
-            .entry(event.source.clone())
+            .entry(event.source)
             .or_insert_with(|| UsageSummary {
-                source: event.source.clone(),
+                source: event.source.to_string(),
                 ..UsageSummary::default()
             });
         row.events += 1;
@@ -651,9 +683,9 @@ impl CachedUsageEvent {
         }
     }
 
-    fn into_event(self, source: &'static str, source_path: String) -> UsageEvent {
+    fn into_event(self, source: &'static str, source_path: Arc<str>) -> UsageEvent {
         UsageEvent {
-            source: source.into(),
+            source,
             source_path,
             source_record_id: self.source_record_id,
             session_id: self.session_id,
@@ -755,7 +787,29 @@ impl UsageCache {
                  PRIMARY KEY (source, path)
              );",
         )?;
+        Self::maybe_compact(&connection);
         Ok(Self { connection })
+    }
+
+    /// Chunked saves rewrite blob rows continuously and freed pages are never returned to
+    /// the filesystem, so the cache file can grow to a large multiple of its live data.
+    /// Reclaim it once free pages dominate; a failure (e.g. another process holds the
+    /// database) just leaves the file bloated until a later open.
+    fn maybe_compact(connection: &Connection) {
+        let stats = (|| -> rusqlite::Result<(i64, i64, i64)> {
+            let single = |pragma: &str| connection.query_row(pragma, [], |row| row.get(0));
+            Ok((
+                single("PRAGMA page_count")?,
+                single("PRAGMA freelist_count")?,
+                single("PRAGMA page_size")?,
+            ))
+        })();
+        if let Ok((page_count, freelist_count, page_size)) = stats
+            && freelist_count.saturating_mul(page_size) >= 64 * 1024 * 1024
+            && freelist_count >= page_count / 4
+        {
+            let _ = connection.execute_batch("VACUUM;");
+        }
     }
 
     fn load_source(
@@ -955,10 +1009,11 @@ fn scan_files_cached_with(
     let decoded = hits
         .into_par_iter()
         .map(|(index, key, blob)| {
+            let source_path: Arc<str> = Arc::from(key.as_str());
             let events = postcard::from_bytes::<Vec<CachedUsageEvent>>(&blob).map(|events| {
                 events
                     .into_iter()
-                    .map(|event| event.into_event(source, key.clone()))
+                    .map(|event| event.into_event(source, source_path.clone()))
                     .collect::<Vec<_>>()
             });
             (index, key, events)
@@ -1129,7 +1184,7 @@ fn for_each_line(path: &Path, mut visit: impl FnMut(u64, &[u8])) -> Result<()> {
 fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
     static USAGE_NEEDLE: Lazy<memmem::Finder<'static>> =
         Lazy::new(|| memmem::Finder::new(b"\"usage\""));
-    let source_path = path.to_string_lossy().to_string();
+    let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let fallback_session = path
         .file_stem()
         .and_then(|n| n.to_str())
@@ -1172,7 +1227,7 @@ fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
         let request_id = value.request_id_camel.or(value.request_id_snake);
         let exact_dedupe = message.id.is_some() && request_id.is_some();
         events.push(UsageEvent {
-            source: "claude".into(),
+            source: "claude",
             source_path: source_path.clone(),
             source_record_id: Some(format!("line:{index}")),
             session_id: session_id.or_else(|| fallback_session.clone()),
@@ -1194,21 +1249,22 @@ fn scan_claude_file(path: &Path) -> Result<Vec<UsageEvent>> {
 }
 
 fn reconcile_claude(events: &mut Vec<UsageEvent>) {
-    let mut best_exact: HashMap<(String, String), usize> = HashMap::new();
+    // Map keys borrow from `events`: both passes only read events and write `keep`, and
+    // assembled scans hold millions of events, so per-event key clones matter.
+    let mut best_exact: HashMap<(&str, &str), usize> = HashMap::new();
     let mut keep = vec![true; events.len()];
-    for index in 0..events.len() {
-        if events[index].source != "claude" {
+    for (index, event) in events.iter().enumerate() {
+        if event.source != "claude" {
             continue;
         }
-        let (Some(message), Some(request)) = (
-            events[index].message_id.clone(),
-            events[index].request_id.clone(),
-        ) else {
+        let (Some(message), Some(request)) =
+            (event.message_id.as_deref(), event.request_id.as_deref())
+        else {
             continue;
         };
         let key = (message, request);
         if let Some(previous) = best_exact.get(&key).copied() {
-            let winner = choose_claude(&events[previous], &events[index]);
+            let winner = choose_claude(&events[previous], event);
             if winner {
                 keep[index] = false;
             } else {
@@ -1219,13 +1275,13 @@ fn reconcile_claude(events: &mut Vec<UsageEvent>) {
             best_exact.insert(key, index);
         }
     }
-    let mut by_message: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_message: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, event) in events.iter().enumerate() {
         if keep[index]
             && event.source == "claude"
-            && let Some(message) = &event.message_id
+            && let Some(message) = event.message_id.as_deref()
         {
-            by_message.entry(message.clone()).or_default().push(index);
+            by_message.entry(message).or_default().push(index);
         }
     }
     for indices in by_message.into_values() {
@@ -1705,7 +1761,7 @@ static CODEX_LINE_NEEDLES: Lazy<Vec<memmem::Finder<'static>>> = Lazy::new(|| {
 });
 
 fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse> {
-    let source_path = path.to_string_lossy().to_string();
+    let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut session = path
         .file_stem()
         .and_then(|n| n.to_str())
@@ -1789,7 +1845,7 @@ fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse>
                     return;
                 }
                 out.push(UsageEvent {
-                    source: "codex".into(),
+                    source: "codex",
                     source_path: source_path.clone(),
                     source_record_id: Some(format!("event:{event_index}")),
                     session_id: session.clone(),
@@ -1828,7 +1884,7 @@ fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse>
                         return;
                     }
                     out.push(UsageEvent {
-                        source: "codex".into(),
+                        source: "codex",
                         source_path: source_path.clone(),
                         source_record_id: Some(format!("line:{line_index}")),
                         session_id: session.clone(),
@@ -1914,7 +1970,7 @@ fn scan_pi(
 fn scan_pi_file(path: &Path) -> Result<Vec<UsageEvent>> {
     let mut out = Vec::new();
     {
-        let source_path = path.to_string_lossy().to_string();
+        let source_path: Arc<str> = Arc::from(path.to_string_lossy());
         let mut session = crate::ingest::pi_session_id_from_path(path);
         let mut project = crate::ingest::project_from_pi_session_path(path);
         let mut current_model = None;
@@ -1996,7 +2052,7 @@ fn scan_pi_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 continue;
             }
             out.push(UsageEvent {
-                source: "pi".into(),
+                source: "pi",
                 source_path: source_path.clone(),
                 source_record_id: Some(format!("line:{index}")),
                 session_id: Some(session.clone()),
@@ -2192,8 +2248,8 @@ fn push_opencode_event(value: &Value, path: &Path, id: Option<String>, out: &mut
         return;
     }
     out.push(UsageEvent {
-        source: "opencode".into(),
-        source_path: path.to_string_lossy().to_string(),
+        source: "opencode",
+        source_path: Arc::from(path.to_string_lossy()),
         source_record_id: id.clone(),
         session_id: str_at(value, &["sessionID", "session_id"]),
         request_id: None,
@@ -2384,8 +2440,8 @@ fn extract_cursor_objects(
                 let dedupe = format!("{id}:{input}:{output}");
                 if seen.insert(dedupe) {
                     out.push(UsageEvent {
-                        source: "cursor".into(),
-                        source_path: path.to_string_lossy().to_string(),
+                        source: "cursor",
+                        source_path: Arc::from(path.to_string_lossy()),
                         source_record_id: Some(id),
                         session_id,
                         request_id: None,
@@ -2578,8 +2634,8 @@ fn extract_otel(
                         .unwrap_or(0)
                         .min(input);
                     out.push(UsageEvent {
-                        source: "copilot".into(),
-                        source_path: path.to_string_lossy().to_string(),
+                        source: "copilot",
+                        source_path: Arc::from(path.to_string_lossy()),
                         source_record_id: Some(id),
                         session_id: attrs
                             .get("gen_ai.conversation.id")
@@ -3900,7 +3956,7 @@ mod tests {
         let mut tokens = TokenBuckets::disjoint(100, 40, 30, 20);
         tokens.cache_write_1h = 10;
         let event = UsageEvent {
-            source: "claude".into(),
+            source: "claude",
             source_path: "x".into(),
             source_record_id: None,
             session_id: None,
@@ -3924,7 +3980,7 @@ mod tests {
     #[test]
     fn auto_cost_honors_explicit_zero_source_cost() {
         let event = UsageEvent {
-            source: "claude".into(),
+            source: "claude",
             source_path: "x".into(),
             source_record_id: None,
             session_id: None,
