@@ -4,9 +4,9 @@ Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Age
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
-Includes a TUI for browsing, finding and resuming both agent CLI sessions.
+Includes a TUI for browsing, finding and resuming agent CLI sessions, with optional [token usage](#token-usage) tracking.
 
-![memex tui](docs/tui.png?raw=1&v=3)
+![memex tui](docs/tui.png?raw=1&v=4)
 
 ## Install
 ```bash
