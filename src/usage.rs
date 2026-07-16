@@ -157,12 +157,7 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
     if query
         .source
         .is_none_or(|source| source == SourceFilter::Claude)
-        && let Err(error) = scan_claude(
-            &mut events,
-            &mut warnings,
-            query.since_ms,
-            query.cache_path.as_deref(),
-        )
+        && let Err(error) = scan_claude(&mut events, &mut warnings, query.cache_path.as_deref())
     {
         warnings.push(format!(
             "{} scanner: {error:#}",
@@ -591,18 +586,12 @@ impl ClaudeUsageCache {
         Ok(Self { connection })
     }
 
-    fn load(
-        &self,
-        path: &Path,
-        size: u64,
-        mtime_ns: i64,
-        since_ms: Option<u64>,
-    ) -> Result<Option<Vec<UsageEvent>>> {
+    fn load(&self, path: &Path, size: u64, mtime_ns: i64) -> Result<Option<Vec<UsageEvent>>> {
         let source_path = path.to_string_lossy();
         let cached = self
             .connection
             .query_row(
-                "SELECT events_json, max_timestamp_ms FROM claude_usage_file_cache
+                "SELECT events_json FROM claude_usage_file_cache
                  WHERE path = ?1 AND parser_version = ?2 AND size = ?3 AND mtime_ns = ?4",
                 params![
                     source_path.as_ref(),
@@ -610,15 +599,12 @@ impl ClaudeUsageCache {
                     size as i64,
                     mtime_ns
                 ],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u64>(1)?)),
+                |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?;
-        let Some((blob, max_timestamp_ms)) = cached else {
+        let Some(blob) = cached else {
             return Ok(None);
         };
-        if since_ms.is_some_and(|since_ms| max_timestamp_ms < since_ms) {
-            return Ok(Some(Vec::new()));
-        }
         let cached: Vec<ClaudeCachedEvent> = serde_json::from_slice(&blob)?;
         Ok(Some(
             cached
@@ -692,7 +678,6 @@ fn usage_file_metadata(path: &Path) -> Result<(u64, i64)> {
 fn scan_claude(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
-    since_ms: Option<u64>,
     cache_path: Option<&Path>,
 ) -> Result<()> {
     let _scan_guard = CLAUDE_SCAN_LOCK
@@ -729,9 +714,9 @@ fn scan_claude(
     let mut missing = Vec::new();
     for (index, path) in files.iter().enumerate() {
         let metadata = usage_file_metadata(path)?;
-        let cached = cache.as_ref().map_or(Ok(None), |cache| {
-            cache.load(path, metadata.0, metadata.1, since_ms)
-        });
+        let cached = cache
+            .as_ref()
+            .map_or(Ok(None), |cache| cache.load(path, metadata.0, metadata.1));
         match cached {
             Ok(Some(events)) => slots[index] = Some(events),
             Ok(None) => missing.push((index, path.clone(), metadata)),
@@ -2144,6 +2129,56 @@ mod tests {
         assert_eq!(cold.details[0].dedupe_confidence, "exact");
         assert_eq!(warm.total_tokens, cold.total_tokens);
         assert_eq!(cached_files, 1);
+    }
+
+    #[test]
+    fn claude_warm_cache_reconciles_old_parents_before_since_filter() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        let subagents = projects.join("subagents");
+        std::fs::create_dir_all(&subagents).expect("create projects");
+        std::fs::write(
+            projects.join("parent.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"parent","requestId":"parent-request","timestamp":1000,"cwd":"/repo/memex","message":{"id":"shared-message","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent transcript");
+        std::fs::write(
+            subagents.join("agent.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"agent","requestId":"sidechain-request","timestamp":3000,"cwd":"/repo/memex","isSidechain":true,"message":{"id":"shared-message","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write sidechain transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            since_ms: Some(2_000_000),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        let cold = scan_usage(&query).expect("cold scan");
+        let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
+            .expect("open usage cache");
+        let cached_files: u64 = cache
+            .query_row("SELECT count(*) FROM claude_usage_file_cache", [], |row| {
+                row.get(0)
+            })
+            .expect("count cached files");
+        let warm = scan_usage(&query).expect("warm scan");
+
+        assert_eq!(cold.events, 0);
+        assert_eq!(cached_files, 2);
+        assert_eq!(warm.events, cold.events);
+        assert_eq!(warm.total_tokens, 0);
     }
 
     #[test]

@@ -1421,7 +1421,6 @@ fn run_usage(
             paths.root.join("config.toml").display()
         ));
     }
-    paths.ensure_dirs()?;
     let query = UsageQuery {
         source,
         project: None,
