@@ -562,7 +562,7 @@ where
 // Parser versions also cover the cached blob encoding (postcard); bump them when either
 // the per-source parsing or `CachedUsageEvent` changes shape.
 const CLAUDE_PARSER_VERSION: i64 = 4;
-const CODEX_PARSER_VERSION: i64 = 3;
+const CODEX_PARSER_VERSION: i64 = 4;
 const PI_PARSER_VERSION: i64 = 2;
 const CURSOR_PARSER_VERSION: i64 = 2;
 const COPILOT_PARSER_VERSION: i64 = 2;
@@ -648,12 +648,31 @@ struct CachedFileRow {
     events_blob: Vec<u8>,
 }
 
+/// A parse closure's output: the file's events plus whether the result may be persisted.
+/// `cacheable` is false when parsing depended on state outside the file that can change
+/// while the file itself does not — e.g. a codex fork whose parent rollout was not yet on
+/// disk, so its baseline was guessed and must be recomputed once the parent appears.
+struct FileParse {
+    events: Vec<UsageEvent>,
+    cacheable: bool,
+}
+
+impl FileParse {
+    fn cacheable(events: Vec<UsageEvent>) -> Self {
+        Self {
+            events,
+            cacheable: true,
+        }
+    }
+}
+
 struct ParsedUsageFile {
     index: usize,
     path: PathBuf,
     size: u64,
     mtime_ns: i64,
     events: Vec<UsageEvent>,
+    cacheable: bool,
 }
 
 impl UsageCache {
@@ -728,6 +747,7 @@ impl UsageCache {
     ) -> Result<()> {
         let prepared = parsed
             .iter()
+            .filter(|file| file.cacheable)
             .map(|file| {
                 let cached = file
                     .events
@@ -804,7 +824,7 @@ fn scan_files_cached(
     cache: Option<&mut UsageCache>,
     warnings: &mut Vec<String>,
     out: &mut Vec<UsageEvent>,
-    parse: impl Fn(&Path) -> Result<Vec<UsageEvent>> + Sync,
+    parse: impl Fn(&Path) -> Result<FileParse> + Sync,
 ) {
     let SourceScan {
         source,
@@ -879,8 +899,11 @@ fn scan_files_cached(
     }
     let parsed = parse_missing_usage_files(source, &missing, warnings, &parse);
     let stale_paths: Vec<String> = rows.into_keys().collect();
+    // Unresolved-fork parses (cacheable == false) are excluded from persistence so a later
+    // scan re-runs them once their fork parent is available; they still populate `out`.
+    let has_persistable = parsed.iter().any(|file| file.cacheable) || !stale_paths.is_empty();
     if let Some(cache) = cache
-        && (!parsed.is_empty() || !stale_paths.is_empty())
+        && has_persistable
         && let Err(error) = cache.save_batch(source, parser_version, now_ms, &parsed, &stale_paths)
     {
         warnings.push(format!("{source} usage cache write failed: {error:#}"));
@@ -939,7 +962,7 @@ fn scan_claude(
         cache,
         warnings,
         out,
-        scan_claude_file,
+        |path| scan_claude_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }
@@ -948,17 +971,18 @@ fn parse_missing_usage_files(
     source: &str,
     missing: &[(usize, PathBuf, (u64, i64))],
     warnings: &mut Vec<String>,
-    parse: &(impl Fn(&Path) -> Result<Vec<UsageEvent>> + Sync),
+    parse: &(impl Fn(&Path) -> Result<FileParse> + Sync),
 ) -> Vec<ParsedUsageFile> {
     let outcomes = missing
         .par_iter()
         .map(|(index, path, metadata)| {
-            parse(path).map(|events| ParsedUsageFile {
+            parse(path).map(|parsed| ParsedUsageFile {
                 index: *index,
                 path: path.clone(),
                 size: metadata.0,
                 mtime_ns: metadata.1,
-                events,
+                events: parsed.events,
+                cacheable: parsed.cacheable,
             })
         })
         .collect::<Vec<_>>();
@@ -1481,7 +1505,7 @@ static CODEX_LINE_NEEDLES: Lazy<Vec<memmem::Finder<'static>>> = Lazy::new(|| {
     .collect()
 });
 
-fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<Vec<UsageEvent>> {
+fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<FileParse> {
     let source_path = path.to_string_lossy().to_string();
     let mut session = path
         .file_stem()
@@ -1639,7 +1663,14 @@ fn scan_codex_file(path: &Path, parents: &CodexParentIndex) -> Result<Vec<UsageE
             }
         }
     })?;
-    Ok(out)
+    // A fork whose parent rollout was not on disk this scan was counted with a guessed
+    // baseline; persisting it would freeze that guess even after the parent appears, so the
+    // result is provisional and must be recomputed on the next scan.
+    let cacheable = parent.is_none() || fork_resolved;
+    Ok(FileParse {
+        events: out,
+        cacheable,
+    })
 }
 
 fn reconcile_codex_copies(events: &mut Vec<UsageEvent>) {
@@ -1674,7 +1705,7 @@ fn scan_pi(
         cache,
         warnings,
         out,
-        scan_pi_file,
+        |path| scan_pi_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }
@@ -1856,6 +1887,7 @@ fn scan_opencode(
             } else {
                 scan_opencode_message_file(path)
             }
+            .map(FileParse::cacheable)
         },
     );
     Ok(())
@@ -2014,7 +2046,7 @@ fn scan_cursor(
         cache,
         warnings,
         out,
-        scan_cursor_db,
+        |path| scan_cursor_db(path).map(FileParse::cacheable),
     );
     apply_cursor_projects(&mut out[start..], &cursor_project_by_session());
     Ok(())
@@ -2259,7 +2291,7 @@ fn scan_copilot(
         cache,
         warnings,
         out,
-        scan_copilot_file,
+        |path| scan_copilot_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }
@@ -2772,7 +2804,9 @@ mod tests {
         let mut warnings = Vec::new();
 
         let parsed =
-            parse_missing_usage_files("claude", &missing, &mut warnings, &scan_claude_file);
+            parse_missing_usage_files("claude", &missing, &mut warnings, &|path: &Path| {
+                scan_claude_file(path).map(FileParse::cacheable)
+            });
 
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].index, 0);
@@ -2893,6 +2927,92 @@ mod tests {
         assert_eq!(child_events.len(), 1);
         assert_eq!(child_events[0].tokens.total(), 150);
         assert!(!child_events[0].conservative_undercount);
+    }
+
+    #[test]
+    fn codex_unresolved_fork_is_not_cached_until_parent_appears() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        let parent_dir = sessions.join("2026/07/14");
+        let child_dir = sessions.join("2026/07/15");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        let child = child_dir
+            .join("rollout-2026-07-15T09-00-00-019f0000-0000-7000-8000-000000000002.jsonl");
+        // Child replays the parent's total=100 and total=600 snapshots, then does one new
+        // turn (total=750). With the parent absent the replay is counted via the guessed
+        // baseline; with the parent present only the +150 turn should remain.
+        std::fs::write(
+            &child,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-15T09:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000002","forked_from_id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:01Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-15T09:05:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":150},"total_token_usage":{"input_tokens":750}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write fork rollout");
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+
+        // Parent not yet on disk: fork is unresolved, so nothing is cached for it. Had the
+        // guessed result been cached, the next scan would serve it and double-count the 500
+        // replayed tokens on top of the parent's own count.
+        scan_usage(&query).expect("scan without parent");
+        let cache = Connection::open(query.cache_path.as_ref().expect("cache path"))
+            .expect("open usage cache");
+        let cached_files: u64 = cache
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cached files");
+        assert_eq!(cached_files, 0, "unresolved fork must not be cached");
+
+        // Parent appears; the child file is byte-for-byte unchanged. Because the unresolved
+        // result was never cached, this scan re-parses and resolves the baseline.
+        std::fs::create_dir_all(&parent_dir).expect("create parent dir");
+        std::fs::write(
+            parent_dir
+                .join("rollout-2026-07-14T10-00-00-019f0000-0000-7000-8000-000000000001.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-07-14T10:00:00Z","payload":{"id":"019f0000-0000-7000-8000-000000000001","cwd":"/repo/memex"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:01:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100},"total_token_usage":{"input_tokens":100}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-07-14T10:02:00Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500},"total_token_usage":{"input_tokens":600}}}}"#,
+                "\n"
+            ),
+        )
+        .expect("write parent rollout");
+
+        let after = scan_usage(&query).expect("scan with parent");
+
+        // Parent contributes 100 + 500; child only its new +150 turn.
+        assert_eq!(after.total_tokens, 750);
+        let child_after: u64 = after
+            .details
+            .iter()
+            .filter(|event| {
+                event
+                    .source_path
+                    .contains("019f0000-0000-7000-8000-000000000002")
+            })
+            .map(|event| event.tokens.total())
+            .sum();
+        assert_eq!(child_after, 150);
     }
 
     #[test]
@@ -3131,7 +3251,7 @@ mod tests {
                 Some(&mut cache),
                 &mut warnings,
                 &mut events,
-                scan_cursor_db,
+                |path| scan_cursor_db(path).map(FileParse::cacheable),
             );
             assert_eq!(warnings, Vec::<String>::new());
             apply_cursor_projects(&mut events, project_by_session);
