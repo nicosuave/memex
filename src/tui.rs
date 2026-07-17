@@ -3,7 +3,7 @@ use crate::config::{Paths, UserConfig, default_claude_source};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::types::{Record, SourceFilter, SourceKind};
-use crate::usage::{CostMode, UsageQuery, scan_usage};
+use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
 use anyhow::Result;
 use chrono::SecondsFormat;
 use crossterm::event::{
@@ -1208,19 +1208,18 @@ impl App {
             self.paths.state.join("usage-cache.sqlite3"),
         );
         std::thread::spawn(move || {
-            let result = scan_usage(&query).map(|report| {
-                let partial = !report.warnings.is_empty();
-                let points = report
-                    .details
+            let result = scan_usage_activity(&query).map(|(events, partial)| {
+                let points = events
                     .into_iter()
                     .filter_map(|event| {
-                        let source = SourceKind::from_label(&event.source)?;
-                        let value = event.tokens.total();
-                        (event.timestamp_ms > 0 && value > 0).then_some(HomeChartPoint {
-                            source,
-                            timestamp_ms: event.timestamp_ms,
-                            value,
-                        })
+                        let source = SourceKind::from_label(event.source)?;
+                        (event.timestamp_ms > 0 && event.total_tokens > 0).then_some(
+                            HomeChartPoint {
+                                source,
+                                timestamp_ms: event.timestamp_ms,
+                                value: event.total_tokens,
+                            },
+                        )
                     })
                     .collect();
                 (points, partial)
@@ -3099,7 +3098,9 @@ fn home_token_usage_query(
         since_ms: range.since_ms(now),
         until_ms: None,
         cost_mode: CostMode::Source,
-        include_events: true,
+        // The chart consumes `scan_usage_activity`, which projects points straight from
+        // the memoized assembly; full event details are never materialized.
+        include_events: false,
         cache_path: Some(cache_path),
         // Keystrokes and result updates re-run this query with different post-assembly
         // filters; reuse the assembled scan between them instead of re-reading logs.
@@ -6399,7 +6400,9 @@ mod tests {
         assert_eq!(query.project_grouping, ProjectGrouping::Repository);
         assert!(query.session_keys.is_none());
         assert_eq!(query.since_ms, TimelineRange::Week.since_ms(10_000));
-        assert!(query.include_events);
+        // The chart consumes scan_usage_activity, which projects points from the memoized
+        // assembly without materializing full event details.
+        assert!(!query.include_events);
     }
 
     #[test]
