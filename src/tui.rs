@@ -6400,7 +6400,9 @@ mod tests {
         assert_eq!(query.project_grouping, ProjectGrouping::Repository);
         assert!(query.session_keys.is_none());
         assert_eq!(query.since_ms, TimelineRange::Week.since_ms(10_000));
-        assert!(query.include_events);
+        // The chart consumes scan_usage_activity, which projects points from the memoized
+        // assembly without materializing full event details.
+        assert!(!query.include_events);
     }
 
     #[test]
