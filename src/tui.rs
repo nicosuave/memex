@@ -3103,8 +3103,10 @@ fn home_token_usage_query(
         include_events: false,
         cache_path: Some(cache_path),
         // Keystrokes and result updates re-run this query with different post-assembly
-        // filters; reuse the assembled scan between them instead of re-reading logs.
-        memo_ttl_ms: 15_000,
+        // filters; reuse the assembled scan between them instead of re-reading logs. On a
+        // large corpus assembly takes seconds even warm, so favor staleness (the chart lags
+        // live sessions by up to a minute) over re-paying it on every interaction.
+        memo_ttl_ms: 60_000,
     }
 }
 
