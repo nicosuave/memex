@@ -139,6 +139,34 @@ pub struct UsageSummary {
     pub known_cost_usd: f64,
     pub priced_events: u64,
     pub unpriced_events: u64,
+    pub cache_waste: CacheWaste,
+}
+
+/// Estimated prompt-cache waste: prompt tokens that were in the previous request's prompt
+/// (so a warm cache would have served them as cache reads) but were re-billed at
+/// input/cache-write rates instead.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct CacheWaste {
+    pub missed_tokens: u64,
+    /// Extra USD paid vs. a full cache hit, at catalog rates; misses on unpriced models
+    /// contribute tokens but no cost.
+    pub missed_cost_usd: f64,
+    /// Misses above the per-request noise floor.
+    pub miss_count: u64,
+    /// Misses following an idle gap of at least the cache TTL (same model).
+    pub idle_misses: u64,
+    /// Misses where the model changed relative to the previous request.
+    pub model_switch_misses: u64,
+}
+
+impl CacheWaste {
+    fn absorb(&mut self, other: &CacheWaste) {
+        self.missed_tokens = self.missed_tokens.saturating_add(other.missed_tokens);
+        self.missed_cost_usd += other.missed_cost_usd;
+        self.miss_count += other.miss_count;
+        self.idle_misses += other.idle_misses;
+        self.model_switch_misses += other.model_switch_misses;
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -153,6 +181,7 @@ pub struct UsageReport {
     pub known_cost_usd: f64,
     pub priced_events: u64,
     pub unpriced_events: u64,
+    pub cache_waste: CacheWaste,
     pub by_source: Vec<UsageSummary>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<UsageEvent>,
@@ -266,12 +295,156 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
             row.unpriced_events += 1;
         }
     }
+    for (source, waste) in compute_cache_waste(events.iter().copied()) {
+        report.cache_waste.absorb(&waste);
+        if let Some(row) = by_source.get_mut(&source) {
+            row.cache_waste = waste;
+        }
+    }
     report.by_source = by_source.into_values().collect();
     report.by_source.sort_by(|a, b| a.source.cmp(&b.source));
     if query.include_events {
         report.details = events.into_iter().cloned().collect();
     }
     Ok(report)
+}
+
+/// Prompt-cache TTL: misses after idle gaps at least this long are attributed to expiry.
+/// Anthropic's default cache TTL is 5 minutes.
+const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Per-request misses at or below this are cache breakpoint granularity noise.
+const CACHE_MISS_NOISE_FLOOR_TOKENS: u64 = 1024;
+
+/// The last request seen in a session chain; everything in its prompt should be cached.
+struct CacheChainState<'a> {
+    prompt_tokens: u64,
+    /// (provider, model); a change re-bills the full prompt and is counted as a miss.
+    model: (&'a str, &'a str),
+    timestamp_ms: u64,
+    /// Sticky: some earlier request in this chain reported cache activity. Distinguishes a
+    /// total miss on a read-only-reporting provider (OpenAI-style, writes unreported) from
+    /// a provider that never reports caching at all.
+    reported_cache: bool,
+}
+
+/// Estimate per-source cache waste by chaining each session's requests in order and
+/// comparing every request's cache reads against the previous request's prompt.
+///
+/// This follows pi's cache-stats algorithm (earendil-works/pi, core/cache-stats.ts) with
+/// adaptations for reconstructed logs: sidechain requests are excluded (subagents have
+/// their own prompt caches), conservatively undercounted events break the chain (their
+/// buckets are clamped dedupe deltas, not a real request's shape), and a prompt shrinking
+/// below half of its predecessor stands in for the compaction/clear markers the logs don't
+/// carry — the context legitimately changed, so the re-billing is not counted as waste.
+/// Chains start at the first event a caller passes in, so window filters only undercount at
+/// their leading edge.
+fn compute_cache_waste<'a>(
+    events: impl IntoIterator<Item = &'a UsageEvent>,
+) -> HashMap<&'static str, CacheWaste> {
+    let mut chains: HashMap<(&'a str, &'a str, &'a str), CacheChainState<'a>> = HashMap::new();
+    let mut by_source: HashMap<&'static str, CacheWaste> = HashMap::new();
+    for event in events {
+        if event.sidechain {
+            continue;
+        }
+        let Some(session_id) = event.session_id.as_deref() else {
+            continue;
+        };
+        // A chain is one process's linear request stream, which is the transcript file, not
+        // the session: codex spawned/resumed threads share a session id across rollout
+        // files, and interleaving them fabricates misses. OpenCode is the exception — it
+        // persists one file per message, so there the session is the stream.
+        let thread = if event.source == "opencode" {
+            ""
+        } else {
+            event.source_path.as_ref()
+        };
+        let key = (event.source, session_id, thread);
+        if event.conservative_undercount {
+            chains.remove(&key);
+            continue;
+        }
+        let tokens = &event.tokens;
+        let prompt_tokens = tokens
+            .uncached_input
+            .saturating_add(tokens.cache_read)
+            .saturating_add(tokens.cache_write);
+        if prompt_tokens == 0 {
+            continue;
+        }
+        let cached = tokens.cache_read.saturating_add(tokens.cache_write);
+        let model = (
+            event.provider.as_deref().unwrap_or(""),
+            event.model.as_deref().unwrap_or(""),
+        );
+        let mut reported_cache = cached > 0;
+        if let Some(prev) = chains.get(&key) {
+            reported_cache |= prev.reported_cache;
+            // A current cache write alone doesn't qualify: the chain's first write creates
+            // the cache, so the previous prompt could not have been served from it. A read
+            // proves a cache already existed (OpenAI-style writes are unreported), as does
+            // earlier reported activity.
+            if (tokens.cache_read > 0 || prev.reported_cache)
+                && prompt_tokens.saturating_mul(2) >= prev.prompt_tokens
+            {
+                let missed = prev
+                    .prompt_tokens
+                    .min(prompt_tokens)
+                    .saturating_sub(tokens.cache_read);
+                if missed > CACHE_MISS_NOISE_FLOOR_TOKENS {
+                    let waste = by_source.entry(event.source).or_default();
+                    waste.miss_count += 1;
+                    waste.missed_tokens = waste.missed_tokens.saturating_add(missed);
+                    waste.missed_cost_usd += cache_miss_cost_usd(event, missed);
+                    if model != prev.model {
+                        waste.model_switch_misses += 1;
+                    } else if event.timestamp_ms.saturating_sub(prev.timestamp_ms) >= CACHE_TTL_MS {
+                        waste.idle_misses += 1;
+                    }
+                }
+            }
+        }
+        chains.insert(
+            key,
+            CacheChainState {
+                prompt_tokens,
+                model,
+                timestamp_ms: event.timestamp_ms,
+                reported_cache,
+            },
+        );
+    }
+    by_source
+}
+
+/// Extra USD paid for `missed_tokens` vs. reading them from cache. Missed tokens can only
+/// land in the uncached-input or cache-write buckets, so the paid rate is the blend of this
+/// event's own paid buckets at catalog rates; 0 when the model is unpriced.
+fn cache_miss_cost_usd(event: &UsageEvent, missed_tokens: u64) -> f64 {
+    let Some(model) = event.model.as_deref() else {
+        return 0.0;
+    };
+    let Some(rates) = rates_for(event.provider.as_deref(), model) else {
+        return 0.0;
+    };
+    let cache_write_1h = event.tokens.cache_write_1h.min(event.tokens.cache_write);
+    let cache_write_5m = event.tokens.cache_write - cache_write_1h;
+    let paid_tokens = event
+        .tokens
+        .uncached_input
+        .saturating_add(event.tokens.cache_write);
+    if paid_tokens == 0 {
+        return 0.0;
+    }
+    // Rates are nano-USD per million tokens; dividing by a million yields nano-USD per token.
+    let paid_nanos = ((event.tokens.uncached_input as u128) * (rates.input as u128)
+        + (cache_write_5m as u128) * (rates.cache_write_5m as u128)
+        + (cache_write_1h as u128) * (rates.cache_write_1h as u128)) as f64
+        / 1_000_000.0;
+    let paid_per_token = paid_nanos / paid_tokens as f64;
+    let read_per_token = rates.cache_read as f64 / 1_000_000.0;
+    missed_tokens as f64 * (paid_per_token - read_per_token).max(0.0) / 1_000_000_000.0
 }
 
 struct UsageMemo {
@@ -2961,6 +3134,208 @@ mod tests {
         assert_eq!(tokens.uncached_input, 20);
         assert_eq!(tokens.cache_read, 80);
         assert_eq!(tokens.additive_total(), 110);
+    }
+
+    fn cache_event(
+        session: &str,
+        timestamp_ms: u64,
+        model: &str,
+        uncached: u64,
+        read: u64,
+        write: u64,
+    ) -> UsageEvent {
+        UsageEvent {
+            source: "claude",
+            source_path: Arc::from("log.jsonl"),
+            source_record_id: None,
+            session_id: Some(session.to_string()),
+            request_id: None,
+            message_id: None,
+            timestamp_ms,
+            project: None,
+            provider: Some("anthropic".to_string()),
+            model: Some(model.to_string()),
+            tokens: TokenBuckets {
+                raw_input: uncached,
+                uncached_input: uncached,
+                cache_read: read,
+                cache_write: write,
+                cache_write_1h: 0,
+                output: 10,
+                reasoning: 0,
+            },
+            source_cost_usd: None,
+            dedupe_confidence: "exact",
+            conservative_undercount: false,
+            sidechain: false,
+            source_order: 0,
+        }
+    }
+
+    fn waste_for(events: &[UsageEvent]) -> Option<CacheWaste> {
+        compute_cache_waste(events.iter()).remove("claude")
+    }
+
+    #[test]
+    fn cache_idle_gap_miss_is_counted_and_attributed() {
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            cache_event("s", 10 * 60 * 1000, "claude-sonnet-4-6", 0, 0, 100_500),
+        ];
+        let waste = waste_for(&events).expect("miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.missed_tokens, 100_000);
+        assert_eq!(waste.idle_misses, 1);
+        assert_eq!(waste.model_switch_misses, 0);
+        // 100k tokens re-billed at the 5m cache-write rate ($3.75/M) vs read ($0.30/M).
+        assert!((waste.missed_cost_usd - 0.345).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_warm_hit_is_not_a_miss() {
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 100_000, 500),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_model_switch_miss_is_attributed_to_the_switch() {
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            cache_event("s", 60_000, "claude-opus-4-8", 0, 0, 100_000),
+        ];
+        let waste = waste_for(&events).expect("miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.model_switch_misses, 1);
+        assert_eq!(waste.idle_misses, 0);
+    }
+
+    #[test]
+    fn cache_prompt_shrink_is_treated_as_context_reset() {
+        // A prompt below half of its predecessor stands in for compaction/clear: the first
+        // post-shrink request is exempt, and the chain rebases onto the shrunk prompt.
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 0, 20_000),
+            cache_event("s", 120_000, "claude-sonnet-4-6", 0, 0, 20_500),
+        ];
+        let waste = waste_for(&events).expect("post-reset miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.missed_tokens, 20_000);
+    }
+
+    #[test]
+    fn cache_miss_below_noise_floor_is_ignored() {
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 10_000),
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 9_500, 1_000),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_first_write_after_uncached_prompts_is_not_a_miss() {
+        // The chain's first cache write creates the cache; the earlier uncached prompt
+        // could not have been served from it. Once the chain has reported cache activity,
+        // a later write-only turn is a genuine full miss.
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 50_000, 0, 0),
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 0, 52_000),
+            cache_event("s", 120_000, "claude-sonnet-4-6", 0, 0, 53_000),
+        ];
+        let waste = waste_for(&events).expect("post-write miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.missed_tokens, 52_000);
+    }
+
+    #[test]
+    fn cache_never_reported_provider_is_not_counted() {
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 50_000, 0, 0),
+            cache_event("s", 60_000, "claude-sonnet-4-6", 50_500, 0, 0),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_read_only_provider_total_miss_counts_after_reported_cache() {
+        // OpenAI-style: reads reported, writes not. Once cache activity has been seen, a
+        // zero-cache request is a total miss.
+        let mut first = cache_event("s", 0, "gpt-5.4", 10_000, 40_000, 0);
+        first.provider = Some("openai".to_string());
+        let mut second = cache_event("s", 60_000, "gpt-5.4", 50_500, 0, 0);
+        second.provider = Some("openai".to_string());
+        let waste = waste_for(&[first, second]).expect("total miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.missed_tokens, 50_000);
+        // 50k tokens at gpt-5.4 input ($2.50/M) vs cached ($0.25/M).
+        assert!((waste.missed_cost_usd - 0.1125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_sidechain_events_are_excluded_from_chains() {
+        let mut sidechain = cache_event("s", 30_000, "claude-sonnet-4-6", 0, 0, 5_000);
+        sidechain.sidechain = true;
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            sidechain,
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 100_000, 500),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_conservative_events_break_the_chain() {
+        // Clamped dedupe deltas do not describe a real request's prompt; neither the
+        // conservative event nor its successor may be counted against the chain.
+        let mut clamped = cache_event("s", 30_000, "claude-sonnet-4-6", 0, 0, 40_000);
+        clamped.conservative_undercount = true;
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            clamped,
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 0, 100_500),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_sessions_chain_independently() {
+        let events = vec![
+            cache_event("a", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            cache_event("b", 60_000, "claude-sonnet-4-6", 0, 0, 100_000),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_parallel_threads_sharing_a_session_chain_per_file() {
+        // Codex spawned/resumed threads share a session id across rollout files; comparing
+        // across files fabricates misses.
+        let mut thread = cache_event("s", 30_000, "claude-sonnet-4-6", 0, 0, 90_000);
+        thread.source_path = Arc::from("thread.jsonl");
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000),
+            thread,
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 100_000, 500),
+        ];
+        assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_opencode_chains_across_per_message_files() {
+        let mut first = cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000);
+        first.source = "opencode";
+        first.source_path = Arc::from("msg-1.json");
+        let mut second = cache_event("s", 10 * 60 * 1000, "claude-sonnet-4-6", 0, 0, 100_500);
+        second.source = "opencode";
+        second.source_path = Arc::from("msg-2.json");
+        let waste = compute_cache_waste([&first, &second])
+            .remove("opencode")
+            .expect("miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.idle_misses, 1);
     }
 
     #[test]
