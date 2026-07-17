@@ -298,7 +298,11 @@ fn memoized_usage_events(query: &UsageQuery) -> (Arc<Vec<UsageEvent>>, Arc<Vec<S
     {
         return (memo.events.clone(), memo.warnings.clone());
     }
+    let assembly_start = Instant::now();
     let (events, warnings) = assemble_usage_events(query.source, query.cache_path.as_deref());
+    usage_timing(assembly_start, || {
+        format!("assemble total ({} events)", events.len())
+    });
     // Stamp the memo after assembly: an assembly slower than the TTL would otherwise be
     // expired the moment it finishes, and queued follow-up queries would reassemble.
     let built = Instant::now();
@@ -341,19 +345,26 @@ fn assemble_usage_events(
         (SourceFilter::Copilot, scan_copilot),
     ];
     for (filter, scanner) in SCANNERS {
-        if source.is_none_or(|selected| selected == filter)
-            && let Err(error) = scanner(&mut events, &mut warnings, cache.as_mut())
-        {
-            warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
+        if source.is_none_or(|selected| selected == filter) {
+            let scanner_start = Instant::now();
+            if let Err(error) = scanner(&mut events, &mut warnings, cache.as_mut()) {
+                warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
+            }
+            usage_timing(scanner_start, || format!("{} scanner", filter.as_str()));
         }
     }
     publish_scan_progress(None);
 
+    let reconcile_start = Instant::now();
     reconcile_claude(&mut events);
     reconcile_codex_copies(&mut events);
     reconcile_cursor_copies(&mut events);
     reconcile_copilot_copies(&mut events);
     reconcile_opencode_copies(&mut events);
+    usage_timing(reconcile_start, || {
+        format!("reconcile ({} events kept)", events.len())
+    });
+    let sort_start = Instant::now();
     events.par_sort_by(|a, b| {
         (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
             b.timestamp_ms,
@@ -361,7 +372,23 @@ fn assemble_usage_events(
             b.source_order,
         ))
     });
+    usage_timing(sort_start, || "sort".to_string());
     (events, warnings)
+}
+
+/// When `MEMEX_USAGE_TIMING` is set (and not "0"), prints per-phase scan timings to
+/// stderr. In the TUI, redirect stderr to a file (`MEMEX_USAGE_TIMING=1 memex 2>/tmp/t.log`)
+/// so the lines don't corrupt the terminal.
+fn usage_timing(start: Instant, message: impl FnOnce() -> String) {
+    static ENABLED: Lazy<bool> =
+        Lazy::new(|| std::env::var_os("MEMEX_USAGE_TIMING").is_some_and(|value| value != "0"));
+    if *ENABLED {
+        eprintln!(
+            "usage-timing {} {}ms",
+            message(),
+            start.elapsed().as_millis()
+        );
+    }
 }
 
 fn home() -> PathBuf {
@@ -964,6 +991,7 @@ fn scan_files_cached_with(
         volatile_reuse_ms,
     } = scan;
     let now_ms = epoch_ms_now();
+    let load_start = Instant::now();
     let mut rows = match cache.as_deref() {
         Some(cache) => match cache.load_source(source, parser_version) {
             Ok(rows) => rows,
@@ -974,6 +1002,10 @@ fn scan_files_cached_with(
         },
         None => HashMap::new(),
     };
+    usage_timing(load_start, || {
+        format!("{source} cache load ({} rows)", rows.len())
+    });
+    let stat_start = Instant::now();
     let mut slots: Vec<Option<Vec<UsageEvent>>> = (0..files.len()).map(|_| None).collect();
     let mut hits: Vec<(usize, String, Vec<u8>)> = Vec::new();
     let mut missing: Vec<(usize, PathBuf, (u64, i64))> = Vec::new();
@@ -1006,6 +1038,11 @@ fn scan_files_cached_with(
             _ => missing.push((index, path.clone(), metadata)),
         }
     }
+    usage_timing(stat_start, || {
+        format!("{source} stat ({} files)", files.len())
+    });
+    let decode_start = Instant::now();
+    let hit_count = hits.len();
     let decoded = hits
         .into_par_iter()
         .map(|(index, key, blob)| {
@@ -1035,6 +1072,9 @@ fn scan_files_cached_with(
             }
         }
     }
+    usage_timing(decode_start, || {
+        format!("{source} decode ({hit_count} cached files)")
+    });
     let mut cache = cache;
     let stale_paths: Vec<String> = rows.into_keys().collect();
     if let Some(cache) = cache.as_deref_mut()
@@ -1052,6 +1092,8 @@ fn scan_files_cached_with(
     }
     // Parse and persist in chunks so an interrupted cold scan keeps the chunks it finished;
     // the next scan resumes from there instead of re-parsing the whole source.
+    let parse_start = Instant::now();
+    let missing_count = missing.len();
     let mut save_warned = false;
     for chunk in missing.chunks(PARSE_SAVE_CHUNK) {
         let parsed = parse_missing_usage_files(source, chunk, warnings, &parse);
@@ -1069,6 +1111,11 @@ fn scan_files_cached_with(
         for file in parsed {
             slots[file.index] = Some(file.events);
         }
+    }
+    if missing_count > 0 {
+        usage_timing(parse_start, || {
+            format!("{source} parse ({missing_count} changed files)")
+        });
     }
     for events in slots.into_iter().flatten() {
         out.extend(events);
