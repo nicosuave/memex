@@ -14,6 +14,7 @@ use crate::vector::VectorIndex;
 use anyhow::{Result, anyhow};
 use chrono::SecondsFormat;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::RegexBuilder;
 use serde::Serialize;
 use serde_json::Value;
@@ -1439,24 +1440,51 @@ fn run_usage(
         memo_ttl_ms: 0,
     };
     // A cold usage cache re-parses whole log corpora, which can take minutes; narrate the
-    // parse phase on stderr so the scan doesn't read as a hang.
+    // parse phase on stderr so the scan doesn't read as a hang. Rendered with the same
+    // spinner grammar as `memex index`: one persistent line per source as it completes.
     let scan_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reporter = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(|| {
         let scan_finished = scan_finished.clone();
         std::thread::spawn(move || {
-            let mut printed = false;
-            while !scan_finished.load(std::sync::atomic::Ordering::Relaxed) {
+            let style = ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                .expect("static template")
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
+            let multi = MultiProgress::new();
+            let mut active: Option<(&'static str, usize, ProgressBar)> = None;
+            loop {
                 if let Some(progress) = crate::usage::usage_scan_progress() {
-                    eprint!(
-                        "\rscanning {} logs {}/{}…   ",
-                        progress.source, progress.done, progress.total
-                    );
-                    printed = true;
+                    if active
+                        .as_ref()
+                        .is_none_or(|(source, ..)| *source != progress.source)
+                    {
+                        if let Some((source, total, bar)) = active.take() {
+                            finish_scan_bar(&bar, source, total);
+                        }
+                        let bar = multi.add(ProgressBar::new_spinner());
+                        bar.set_style(style.clone());
+                        bar.enable_steady_tick(Duration::from_millis(80));
+                        active = Some((progress.source, progress.total, bar));
+                    }
+                    if let Some((source, total, bar)) = &mut active {
+                        *total = progress.total;
+                        bar.set_message(format!(
+                            "{} parsed {}/{} files",
+                            source,
+                            crate::progress::format_count(progress.done as u64),
+                            crate::progress::format_count(progress.total as u64),
+                        ));
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                if scan_finished.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            if printed {
-                eprint!("\r{:<60}\r", "");
+            if let Some((source, total, bar)) = active {
+                finish_scan_bar(&bar, source, total);
+                // Leave the draw region on a fresh line so the report doesn't append to
+                // the frozen spinner line.
+                eprintln!();
             }
         })
     });
@@ -1470,61 +1498,27 @@ fn run_usage(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("local reconstructed usage (not subscription quota)");
-        for row in &report.by_source {
-            println!(
-                "{:<10} {:>12} tokens  {:>9} input  {:>9} cache read  {:>9} cache write  {:>9} output  {:>5} events",
-                row.source,
-                row.total_tokens,
-                row.uncached_input,
-                row.cache_read,
-                row.cache_write,
-                row.output,
-                row.events,
-            );
-            if row.priced_events > 0 {
-                println!(
-                    "             ${:.4} API-equivalent cost ({} priced, {} unpriced)",
-                    row.known_cost_usd, row.priced_events, row.unpriced_events
-                );
-            }
-            let prompt_tokens = row.uncached_input + row.cache_read + row.cache_write;
-            if prompt_tokens > 0 && row.cache_read + row.cache_write > 0 {
-                let hit_rate = row.cache_read as f64 / prompt_tokens as f64 * 100.0;
-                if row.cache_waste.miss_count > 0 {
-                    println!(
-                        "             cache: {:.1}% hit rate; ${:.4} re-billed across {}",
-                        hit_rate,
-                        row.cache_waste.missed_cost_usd,
-                        format_cache_misses(&row.cache_waste),
-                    );
-                } else {
-                    println!("             cache: {hit_rate:.1}% hit rate");
-                }
-            }
-        }
+        print_usage_table(&report);
         println!(
-            "total      {:>12} tokens  {} events",
-            report.total_tokens, report.events
-        );
-        println!(
-            "cost       ${:.4} known API-equivalent ({} priced, {} unpriced; {:?}, {})",
-            report.known_cost_usd,
-            report.priced_events,
-            report.unpriced_events,
-            report.cost_mode,
-            report.price_catalog
+            "cost: API-equivalent at {} pricing, catalog {} ({} priced, {} unpriced events)",
+            format!("{:?}", report.cost_mode).to_lowercase(),
+            report.price_catalog,
+            format_count(report.priced_events),
+            format_count(report.unpriced_events),
         );
         if report.cache_waste.miss_count > 0 {
             println!(
-                "cache      ${:.4} re-billed across {}",
-                report.cache_waste.missed_cost_usd,
-                format_cache_misses(&report.cache_waste),
+                "cache: re-billed estimates prompt tokens lost to cache misses, at catalog rates ({} misses: {} idle, {} model-switch)",
+                format_count(report.cache_waste.miss_count),
+                format_count(report.cache_waste.idle_misses),
+                format_count(report.cache_waste.model_switch_misses),
             );
         }
         if report.unknown_model_events > 0 || report.conservative_events > 0 {
             println!(
                 "quality: {} unknown-model events, {} conservatively undercounted events",
-                report.unknown_model_events, report.conservative_events
+                format_count(report.unknown_model_events),
+                format_count(report.conservative_events),
             );
         }
         for warning in &report.warnings {
@@ -1534,25 +1528,131 @@ fn run_usage(
     Ok(())
 }
 
-fn format_cache_misses(waste: &crate::usage::CacheWaste) -> String {
-    let misses = if waste.miss_count == 1 {
-        "1 miss".to_string()
-    } else {
-        format!("{} misses", waste.miss_count)
+fn print_usage_table(report: &crate::usage::UsageReport) {
+    const HEADERS: [&str; 10] = [
+        "source",
+        "events",
+        "input",
+        "cache read",
+        "cache write",
+        "output",
+        "total",
+        "cost",
+        "hit",
+        "re-billed",
+    ];
+    let mut totals = crate::usage::UsageSummary {
+        source: "total".to_string(),
+        events: report.events,
+        total_tokens: report.total_tokens,
+        known_cost_usd: report.known_cost_usd,
+        priced_events: report.priced_events,
+        unpriced_events: report.unpriced_events,
+        cache_waste: report.cache_waste.clone(),
+        ..Default::default()
     };
-    let mut causes = Vec::new();
-    if waste.idle_misses > 0 {
-        causes.push(format!("{} idle", waste.idle_misses));
+    for row in &report.by_source {
+        totals.uncached_input += row.uncached_input;
+        totals.cache_read += row.cache_read;
+        totals.cache_write += row.cache_write;
+        totals.output += row.output;
     }
-    if waste.model_switch_misses > 0 {
-        causes.push(format!("{} model-switch", waste.model_switch_misses));
-    }
-    let causes = if causes.is_empty() {
-        String::new()
-    } else {
-        format!("; {}", causes.join(", "))
+    let cells = |row: &crate::usage::UsageSummary| -> [String; 10] {
+        let prompt_tokens = row.uncached_input + row.cache_read + row.cache_write;
+        let cache_active = row.cache_read > 0 || row.cache_write > 0;
+        [
+            row.source.clone(),
+            format_count(row.events),
+            format_count(row.uncached_input),
+            format_count(row.cache_read),
+            format_count(row.cache_write),
+            format_count(row.output),
+            format_count(row.total_tokens),
+            if row.priced_events > 0 {
+                format_usd(row.known_cost_usd)
+            } else {
+                "-".to_string()
+            },
+            if cache_active && prompt_tokens > 0 {
+                format!(
+                    "{:.1}%",
+                    row.cache_read as f64 / prompt_tokens as f64 * 100.0
+                )
+            } else {
+                "-".to_string()
+            },
+            if row.cache_waste.miss_count > 0 {
+                format_usd(row.cache_waste.missed_cost_usd)
+            } else if cache_active {
+                "$0.00".to_string()
+            } else {
+                "-".to_string()
+            },
+        ]
     };
-    format!("{misses} ({} tokens{causes})", waste.missed_tokens)
+    let mut table: Vec<[String; 10]> = vec![HEADERS.map(str::to_string)];
+    table.extend(report.by_source.iter().map(cells));
+    table.push(cells(&totals));
+    let mut widths = [0usize; 10];
+    for row in &table {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    for row in &table {
+        let mut line = String::new();
+        for (index, (cell, width)) in row.iter().zip(&widths).enumerate() {
+            if index > 0 {
+                line.push_str("  ");
+            }
+            if index == 0 {
+                line.push_str(&format!("{cell:<width$}"));
+            } else {
+                line.push_str(&format!("{cell:>width$}"));
+            }
+        }
+        println!("{}", line.trim_end());
+    }
+}
+
+/// Freeze a scan spinner line in place, mirroring the `memex index` finish style. A source
+/// only leaves the active slot once its scan completed, so the frozen line reports the
+/// file total rather than the last polled position.
+fn finish_scan_bar(bar: &ProgressBar, source: &str, total: usize) {
+    bar.finish_with_message(format!(
+        "{source} parsed {} files done",
+        crate::progress::format_count(total as u64)
+    ));
+}
+
+/// Humanized count with three significant digits; small values stay exact.
+fn format_count(value: u64) -> String {
+    const UNITS: [(f64, &str); 4] = [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "k")];
+    if value < 10_000 {
+        return value.to_string();
+    }
+    let value = value as f64;
+    for (scale, suffix) in UNITS {
+        if value >= scale {
+            let scaled = value / scale;
+            return if scaled >= 100.0 {
+                format!("{scaled:.0}{suffix}")
+            } else if scaled >= 10.0 {
+                format!("{scaled:.1}{suffix}")
+            } else {
+                format!("{scaled:.2}{suffix}")
+            };
+        }
+    }
+    unreachable!("values below 10k return early")
+}
+
+fn format_usd(value: f64) -> String {
+    if value > 0.0 && value < 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.2}")
+    }
 }
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {

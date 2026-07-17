@@ -248,7 +248,7 @@ fn progress_label(source: SourceKind) -> &'static str {
     }
 }
 
-fn format_count(value: u64) -> String {
+pub(crate) fn format_count(value: u64) -> String {
     if value < 1000 {
         return value.to_string();
     }
