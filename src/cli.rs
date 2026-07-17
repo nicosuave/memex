@@ -1487,6 +1487,20 @@ fn run_usage(
                     row.known_cost_usd, row.priced_events, row.unpriced_events
                 );
             }
+            let prompt_tokens = row.uncached_input + row.cache_read + row.cache_write;
+            if prompt_tokens > 0 && row.cache_read + row.cache_write > 0 {
+                let hit_rate = row.cache_read as f64 / prompt_tokens as f64 * 100.0;
+                if row.cache_waste.miss_count > 0 {
+                    println!(
+                        "             cache: {:.1}% hit rate; ${:.4} re-billed across {}",
+                        hit_rate,
+                        row.cache_waste.missed_cost_usd,
+                        format_cache_misses(&row.cache_waste),
+                    );
+                } else {
+                    println!("             cache: {hit_rate:.1}% hit rate");
+                }
+            }
         }
         println!(
             "total      {:>12} tokens  {} events",
@@ -1500,6 +1514,13 @@ fn run_usage(
             report.cost_mode,
             report.price_catalog
         );
+        if report.cache_waste.miss_count > 0 {
+            println!(
+                "cache      ${:.4} re-billed across {}",
+                report.cache_waste.missed_cost_usd,
+                format_cache_misses(&report.cache_waste),
+            );
+        }
         if report.unknown_model_events > 0 || report.conservative_events > 0 {
             println!(
                 "quality: {} unknown-model events, {} conservatively undercounted events",
@@ -1511,6 +1532,27 @@ fn run_usage(
         }
     }
     Ok(())
+}
+
+fn format_cache_misses(waste: &crate::usage::CacheWaste) -> String {
+    let misses = if waste.miss_count == 1 {
+        "1 miss".to_string()
+    } else {
+        format!("{} misses", waste.miss_count)
+    };
+    let mut causes = Vec::new();
+    if waste.idle_misses > 0 {
+        causes.push(format!("{} idle", waste.idle_misses));
+    }
+    if waste.model_switch_misses > 0 {
+        causes.push(format!("{} model-switch", waste.model_switch_misses));
+    }
+    let causes = if causes.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", causes.join(", "))
+    };
+    format!("{misses} ({} tokens{causes})", waste.missed_tokens)
 }
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
