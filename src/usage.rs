@@ -381,7 +381,11 @@ fn compute_cache_waste<'a>(
         let mut reported_cache = cached > 0;
         if let Some(prev) = chains.get(&key) {
             reported_cache |= prev.reported_cache;
-            if (cached > 0 || prev.reported_cache)
+            // A current cache write alone doesn't qualify: the chain's first write creates
+            // the cache, so the previous prompt could not have been served from it. A read
+            // proves a cache already existed (OpenAI-style writes are unreported), as does
+            // earlier reported activity.
+            if (tokens.cache_read > 0 || prev.reported_cache)
                 && prompt_tokens.saturating_mul(2) >= prev.prompt_tokens
             {
                 let missed = prev
@@ -3182,6 +3186,21 @@ mod tests {
             cache_event("s", 60_000, "claude-sonnet-4-6", 0, 9_500, 1_000),
         ];
         assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn cache_first_write_after_uncached_prompts_is_not_a_miss() {
+        // The chain's first cache write creates the cache; the earlier uncached prompt
+        // could not have been served from it. Once the chain has reported cache activity,
+        // a later write-only turn is a genuine full miss.
+        let events = vec![
+            cache_event("s", 0, "claude-sonnet-4-6", 50_000, 0, 0),
+            cache_event("s", 60_000, "claude-sonnet-4-6", 0, 0, 52_000),
+            cache_event("s", 120_000, "claude-sonnet-4-6", 0, 0, 53_000),
+        ];
+        let waste = waste_for(&events).expect("post-write miss counted");
+        assert_eq!(waste.miss_count, 1);
+        assert_eq!(waste.missed_tokens, 52_000);
     }
 
     #[test]
