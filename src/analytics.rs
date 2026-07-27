@@ -2,12 +2,13 @@ use crate::types::{Record, SourceFilter, SourceKind};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
+const CATALOG_BATCH_RECORDS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,7 @@ pub struct SessionRow {
     pub project: String,
     pub display_project: String,
     pub cwd: Option<String>,
+    pub started_at: u64,
     pub last_at: u64,
     pub message_count: u64,
 }
@@ -38,10 +40,15 @@ pub struct AnalyticsWriter {
     sessions: HashMap<SessionKey, SessionAccumulator>,
     metadata_cache: HashMap<SessionKey, SessionMetadata>,
     git_cache: HashMap<String, GitMetadata>,
+    catalog_batch_open: bool,
+    catalog_batch_records: usize,
+    affected_session_keys: HashSet<String>,
+    bulk_load: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct SessionKey {
+    stable_key: String,
     source: SourceKind,
     session_id: String,
     source_path: String,
@@ -54,6 +61,21 @@ struct SessionAccumulator {
     started_at: u64,
     last_at: u64,
     message_count: u64,
+}
+
+struct LegacySessionRow {
+    source: String,
+    session_id: String,
+    source_path: String,
+    project: String,
+    cwd: Option<String>,
+    git_root: Option<String>,
+    git_common_dir: Option<String>,
+    repo_project: Option<String>,
+    started_at: i64,
+    last_at: i64,
+    message_count: i64,
+    resolution_status: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,7 +95,7 @@ impl AnalyticsStore {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(2))?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.init()?;
         Ok(store)
     }
@@ -88,16 +110,22 @@ impl AnalyticsStore {
         Ok(Self { conn })
     }
 
-    fn init(&self) -> Result<()> {
+    fn init(&mut self) -> Result<()> {
+        crate::catalog::init_connection(&self.conn)?;
+        self.migrate_legacy_sessions()?;
         self.conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -131072;
+            PRAGMA mmap_size = 268435456;
+            PRAGMA temp_store = MEMORY;
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sessions (
+                session_key TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 source_path TEXT NOT NULL,
@@ -109,15 +137,32 @@ impl AnalyticsStore {
                 started_at INTEGER NOT NULL,
                 last_at INTEGER NOT NULL,
                 message_count INTEGER NOT NULL DEFAULT 0,
-                resolution_status TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (source, session_id, source_path)
+                resolution_status TEXT NOT NULL DEFAULT ''
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS sessions_source_identity_idx
+                ON sessions(source, session_id) WHERE session_id != '';
             CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
             CREATE INDEX IF NOT EXISTS sessions_project_last_at_idx ON sessions(project, last_at);
             CREATE INDEX IF NOT EXISTS sessions_repo_project_last_at_idx ON sessions(repo_project, last_at);
             CREATE INDEX IF NOT EXISTS sessions_display_project_last_at_idx
                 ON sessions(COALESCE(NULLIF(repo_project, ''), project), last_at);
             CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
+            CREATE TABLE IF NOT EXISTS source_projections (
+                source TEXT NOT NULL,
+                source_path TEXT PRIMARY KEY,
+                source_identity TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                parser_version INTEGER NOT NULL,
+                committed_offset INTEGER NOT NULL DEFAULT 0,
+                projection_epoch INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                record_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS source_projections_status_idx
+                ON source_projections(status);
+            CREATE INDEX IF NOT EXISTS source_projections_source_idx
+                ON source_projections(source);
             "#,
         )?;
         let previous_schema_version: Option<i64> = self
@@ -138,6 +183,144 @@ impl AnalyticsStore {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_legacy_sessions(&mut self) -> Result<()> {
+        let sessions_exists = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !sessions_exists {
+            return Ok(());
+        }
+
+        let has_session_key = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'session_key'
+            )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_session_key {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        let legacy_rows = {
+            let mut stmt = tx.prepare(
+                "SELECT source, session_id, source_path, project, cwd, git_root,
+                        git_common_dir, repo_project, started_at, last_at, message_count,
+                        resolution_status
+                 FROM sessions",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(LegacySessionRow {
+                    source: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source_path: row.get(2)?,
+                    project: row.get(3)?,
+                    cwd: row.get(4)?,
+                    git_root: row.get(5)?,
+                    git_common_dir: row.get(6)?,
+                    repo_project: row.get(7)?,
+                    started_at: row.get(8)?,
+                    last_at: row.get(9)?,
+                    message_count: row.get(10)?,
+                    resolution_status: row.get(11)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        tx.execute_batch(
+            r#"
+            CREATE TABLE sessions_v4 (
+                session_key TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                project TEXT NOT NULL,
+                cwd TEXT,
+                git_root TEXT,
+                git_common_dir TEXT,
+                repo_project TEXT,
+                started_at INTEGER NOT NULL,
+                last_at INTEGER NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                resolution_status TEXT NOT NULL DEFAULT ''
+            );
+            "#,
+        )?;
+        {
+            let mut insert = tx.prepare(
+                r#"
+                INSERT INTO sessions_v4(
+                    session_key, source, session_id, source_path, project, cwd, git_root,
+                    git_common_dir, repo_project, started_at, last_at, message_count,
+                    resolution_status
+                )
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    source_path = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.source_path ELSE sessions_v4.source_path END,
+                    project = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.project ELSE sessions_v4.project END,
+                    cwd = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.cwd ELSE sessions_v4.cwd END,
+                    git_root = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.git_root ELSE sessions_v4.git_root END,
+                    git_common_dir = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.git_common_dir ELSE sessions_v4.git_common_dir END,
+                    repo_project = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.repo_project ELSE sessions_v4.repo_project END,
+                    started_at = MIN(sessions_v4.started_at, excluded.started_at),
+                    last_at = MAX(sessions_v4.last_at, excluded.last_at),
+                    message_count = MAX(sessions_v4.message_count, excluded.message_count),
+                    resolution_status = CASE
+                        WHEN excluded.last_at >= sessions_v4.last_at
+                        THEN excluded.resolution_status ELSE sessions_v4.resolution_status END
+                "#,
+            )?;
+            for row in legacy_rows {
+                let session_key = crate::catalog::session_key_from_label(
+                    &row.source,
+                    &row.session_id,
+                    &row.source_path,
+                );
+                insert.execute(params![
+                    session_key,
+                    row.source,
+                    row.session_id,
+                    row.source_path,
+                    row.project,
+                    row.cwd,
+                    row.git_root,
+                    row.git_common_dir,
+                    row.repo_project,
+                    row.started_at,
+                    row.last_at,
+                    row.message_count,
+                    row.resolution_status,
+                ])?;
+            }
+        }
+        tx.execute_batch(
+            r#"
+            DROP TABLE sessions;
+            ALTER TABLE sessions_v4 RENAME TO sessions;
+            "#,
+        )?;
+        tx.commit().context("migrate legacy sessions schema")?;
         Ok(())
     }
 
@@ -187,9 +370,129 @@ impl AnalyticsStore {
         Ok(())
     }
 
+    pub fn clear_projection_manifest(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM source_projections", [])?;
+        Ok(())
+    }
+
     pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
+        crate::catalog::delete_source_path(&self.conn, source_path)?;
         self.conn.execute(
-            "DELETE FROM sessions WHERE source_path = ?1",
+            "DELETE FROM sessions
+             WHERE session_key NOT IN (SELECT DISTINCT session_key FROM records)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn incomplete_source_paths(&self) -> Result<HashSet<String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT source_path FROM source_projections WHERE status != 'committed'")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn projection_sources(&self) -> Result<HashMap<String, SourceKind>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT source_path, source FROM source_projections")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut sources = HashMap::new();
+        for row in rows {
+            let (path, source) = row?;
+            if let Some(source) = SourceKind::from_label(&source) {
+                sources.insert(path, source);
+            }
+        }
+        Ok(sources)
+    }
+
+    pub fn begin_projection(
+        &self,
+        source: SourceKind,
+        source_path: &str,
+        source_identity: &str,
+        source_fingerprint: &str,
+        parser_version: u32,
+        committed_offset: u64,
+    ) -> Result<u64> {
+        let previous_epoch: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT projection_epoch FROM source_projections WHERE source_path = ?1",
+                params![source_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let epoch = previous_epoch.unwrap_or(0).saturating_add(1).max(1);
+        self.conn.execute(
+            r#"
+            INSERT INTO source_projections(
+                source, source_path, source_identity, source_fingerprint, parser_version,
+                committed_offset, projection_epoch, status, record_count, last_error
+            )
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'projecting', 0, NULL)
+            ON CONFLICT(source_path) DO UPDATE SET
+                source = excluded.source,
+                source_identity = excluded.source_identity,
+                source_fingerprint = excluded.source_fingerprint,
+                parser_version = excluded.parser_version,
+                projection_epoch = excluded.projection_epoch,
+                status = 'projecting',
+                last_error = NULL
+            "#,
+            params![
+                source.storage_label(),
+                source_path,
+                source_identity,
+                source_fingerprint,
+                parser_version as i64,
+                committed_offset.min(i64::MAX as u64) as i64,
+                epoch,
+            ],
+        )?;
+        Ok(epoch as u64)
+    }
+
+    pub fn complete_projection(
+        &self,
+        source_path: &str,
+        source_identity: &str,
+        committed_offset: u64,
+        projection_epoch: u64,
+        record_count: usize,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            r#"
+            UPDATE source_projections
+            SET source_identity = ?2,
+                committed_offset = ?3,
+                status = 'committed',
+                record_count = ?4,
+                last_error = NULL
+            WHERE source_path = ?1 AND projection_epoch = ?5
+            "#,
+            params![
+                source_path,
+                source_identity,
+                committed_offset.min(i64::MAX as u64) as i64,
+                record_count.min(i64::MAX as usize) as i64,
+                projection_epoch.min(i64::MAX as u64) as i64,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("projection epoch changed before commit for source path {source_path}");
+        }
+        Ok(())
+    }
+
+    pub fn delete_projection(&self, source_path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM source_projections WHERE source_path = ?1",
             params![source_path],
         )?;
         Ok(())
@@ -206,7 +509,7 @@ impl AnalyticsStore {
         let mut sql = String::from(
             "SELECT source, session_id, source_path, project,
                     COALESCE(NULLIF(repo_project, ''), project) AS display_project,
-                    cwd, last_at, message_count
+                    cwd, started_at, last_at, message_count
              FROM sessions",
         );
         let mut clauses = Vec::new();
@@ -264,8 +567,9 @@ impl AnalyticsStore {
                 project,
                 display_project,
                 cwd: row.get(5)?,
-                last_at: row.get::<_, i64>(6)?.max(0) as u64,
-                message_count: row.get::<_, i64>(7)?.max(0) as u64,
+                started_at: row.get::<_, i64>(6)?.max(0) as u64,
+                last_at: row.get::<_, i64>(7)?.max(0) as u64,
+                message_count: row.get::<_, i64>(8)?.max(0) as u64,
             })
         })?;
 
@@ -473,57 +777,159 @@ impl AnalyticsStore {
         }
         Ok(projects)
     }
+
+    pub fn session_by_key(&self, session_key: &str) -> Result<Option<SessionRow>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT source, session_id, source_path, project, cwd,
+                       started_at, last_at, message_count
+                FROM sessions
+                WHERE session_key = ?1
+                "#,
+                params![session_key],
+                |row| {
+                    let source_label: String = row.get(0)?;
+                    let source = SourceKind::from_label(&source_label).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            format!("unknown source label: {source_label}").into(),
+                        )
+                    })?;
+                    let project: String = row.get(3)?;
+                    Ok(SessionRow {
+                        source,
+                        session_id: row.get(1)?,
+                        source_path: row.get(2)?,
+                        display_project: display_project_name(&project),
+                        project,
+                        cwd: row.get(4)?,
+                        started_at: row.get::<_, i64>(5)?.max(0) as u64,
+                        last_at: row.get::<_, i64>(6)?.max(0) as u64,
+                        message_count: row.get::<_, i64>(7)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
 }
 
 impl AnalyticsWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_mode(path, false)
+    }
+
+    pub fn open_bulk(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_mode(path, true)
+    }
+
+    fn open_with_mode(path: impl AsRef<Path>, bulk_load: bool) -> Result<Self> {
+        let store = AnalyticsStore::open(path)?;
+        store.conn.set_prepared_statement_cache_capacity(64);
+        store.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        if bulk_load {
+            crate::catalog::begin_bulk_load(&store.conn)?;
+        }
         Ok(Self {
-            store: AnalyticsStore::open(path)?,
+            store,
             sessions: HashMap::new(),
             metadata_cache: HashMap::new(),
             git_cache: HashMap::new(),
+            catalog_batch_open: false,
+            catalog_batch_records: 0,
+            affected_session_keys: HashSet::new(),
+            bulk_load,
         })
     }
 
     pub fn clear(&self) -> Result<()> {
-        self.store.clear()
+        self.store.clear()?;
+        crate::catalog::clear(&self.store.conn)
     }
 
-    pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
+    pub fn affected_session_keys(&self) -> Vec<String> {
+        self.affected_session_keys.iter().cloned().collect()
+    }
+
+    pub fn delete_source_path(&mut self, source_path: &str) -> Result<()> {
+        self.begin_catalog_batch()?;
+        {
+            let mut statement = self.store.conn.prepare_cached(
+                "SELECT DISTINCT session_key FROM records WHERE source_path = ?1",
+            )?;
+            let rows = statement.query_map(params![source_path], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                self.affected_session_keys.insert(row?);
+            }
+        }
         self.store.delete_source_path(source_path)
     }
 
     pub fn record(&mut self, record: &Record) -> Result<()> {
+        let mut canonical_record = record.clone();
+        canonical_record.ensure_record_key();
+        self.begin_catalog_batch()?;
+        if self.bulk_load {
+            crate::catalog::bulk_insert_record(&self.store.conn, &canonical_record)?;
+        } else {
+            crate::catalog::upsert_record(&self.store.conn, &canonical_record)?;
+        }
+        self.catalog_batch_records += 1;
+        if self.catalog_batch_records >= CATALOG_BATCH_RECORDS {
+            self.commit_catalog_batch()?;
+        }
+
         let key = SessionKey {
-            source: record.source,
-            session_id: record.session_id.clone(),
-            source_path: record.source_path.clone(),
+            stable_key: crate::catalog::session_key(
+                canonical_record.source,
+                &canonical_record.session_id,
+                &canonical_record.source_path,
+            ),
+            source: canonical_record.source,
+            session_id: canonical_record.session_id.clone(),
+            source_path: canonical_record.source_path.clone(),
         };
+        self.affected_session_keys.insert(key.stable_key.clone());
         let entry = self
             .sessions
             .entry(key.clone())
             .or_insert_with(|| SessionAccumulator {
                 key,
-                project: record.project.clone(),
-                started_at: record.ts,
-                last_at: record.ts,
+                project: canonical_record.project.clone(),
+                started_at: canonical_record.ts,
+                last_at: canonical_record.ts,
                 message_count: 0,
             });
-        if record.ts < entry.started_at {
-            entry.started_at = record.ts;
+        if canonical_record.ts < entry.started_at {
+            entry.started_at = canonical_record.ts;
         }
-        if record.ts >= entry.last_at {
-            entry.last_at = record.ts;
-            if !record.project.is_empty() {
-                entry.project = record.project.clone();
+        if canonical_record.ts >= entry.last_at {
+            entry.last_at = canonical_record.ts;
+            if !canonical_record.project.is_empty() {
+                entry.project = canonical_record.project.clone();
             }
         }
-        entry.message_count = entry.message_count.saturating_add(1);
+        if matches!(canonical_record.role.as_str(), "user" | "assistant") {
+            entry.message_count = entry.message_count.saturating_add(1);
+        }
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.commit_catalog_batch()?;
+        if self.bulk_load {
+            // Bulk inserts leave the canonical tables in a large WAL. Checkpoint before
+            // index construction and relationship joins so those read-heavy passes do
+            // not pay a WAL-frame lookup for nearly every B-tree page.
+            self.checkpoint_catalog()?;
+            crate::catalog::finish_bulk_load(&self.store.conn)?;
+        } else {
+            self.link_catalog_relations()?;
+        }
         if self.sessions.is_empty() {
+            self.checkpoint_catalog()?;
             return Ok(());
         }
         let pending_sessions: Vec<SessionAccumulator> = self.sessions.values().cloned().collect();
@@ -539,11 +945,13 @@ impl AnalyticsWriter {
             let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO sessions(
-                    source, session_id, source_path, project, cwd, git_root, git_common_dir,
-                    repo_project, started_at, last_at, message_count, resolution_status
+                    session_key, source, session_id, source_path, project, cwd, git_root,
+                    git_common_dir, repo_project, started_at, last_at, message_count,
+                    resolution_status
                 )
-                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(source, session_id, source_path) DO UPDATE SET
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    source_path = excluded.source_path,
                     project = excluded.project,
                     cwd = excluded.cwd,
                     git_root = excluded.git_root,
@@ -557,6 +965,7 @@ impl AnalyticsWriter {
             )?;
             for (session, metadata) in sessions {
                 stmt.execute(params![
+                    session.key.stable_key,
                     session.key.source.storage_label(),
                     session.key.session_id,
                     session.key.source_path,
@@ -574,6 +983,45 @@ impl AnalyticsWriter {
         }
         tx.commit()?;
         self.sessions.clear();
+        self.checkpoint_catalog()?;
+        Ok(())
+    }
+
+    fn begin_catalog_batch(&mut self) -> Result<()> {
+        if !self.catalog_batch_open {
+            self.store.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.catalog_batch_open = true;
+        }
+        Ok(())
+    }
+
+    fn commit_catalog_batch(&mut self) -> Result<()> {
+        if self.catalog_batch_open {
+            self.store.conn.execute_batch("COMMIT")?;
+            self.catalog_batch_open = false;
+            self.catalog_batch_records = 0;
+        }
+        Ok(())
+    }
+
+    fn checkpoint_catalog(&self) -> Result<()> {
+        self.store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    fn link_catalog_relations(&mut self) -> Result<()> {
+        if self.affected_session_keys.is_empty() {
+            return Ok(());
+        }
+        let tx = self.store.conn.transaction()?;
+        crate::catalog::link_relations_for_sessions(
+            &tx,
+            self.affected_session_keys.iter().map(String::as_str),
+        )?;
+        tx.commit()?;
+        self.affected_session_keys.clear();
         Ok(())
     }
 
@@ -889,7 +1337,7 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 }
 
 pub fn analytics_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("analytics.sqlite")
+    state_dir.join("catalog.sqlite")
 }
 
 pub fn rebuild_from_records(
@@ -909,16 +1357,25 @@ pub fn backfill_from_index(
     path: impl AsRef<Path>,
     index: &crate::index::SearchIndex,
 ) -> Result<()> {
-    let mut writer = AnalyticsWriter::open(path)?;
-    writer.clear()?;
+    let path = path.as_ref();
+    let catalog_count = crate::catalog::CatalogStore::open_read_only(path)
+        .and_then(|catalog| catalog.record_count())
+        .context("canonical catalog is unavailable; run `memex index` to replay source logs")?;
+    let index_count = index.doc_count()? as u64;
+    if catalog_count != index_count {
+        anyhow::bail!(
+            "canonical catalog has {catalog_count} records but the search index has \
+             {index_count}; run `memex index` to replay source logs"
+        );
+    }
+    let mut records = Vec::with_capacity(index_count as usize);
     index
         .for_each_record(|record| {
-            writer.record(&record)?;
+            records.push(record);
             Ok(())
         })
-        .context("read records for analytics backfill")?;
-    writer.flush()?;
-    writer.store.mark_complete()
+        .context("hydrate records from canonical catalog")?;
+    rebuild_from_records(path, records)
 }
 
 #[cfg(test)]
@@ -930,6 +1387,7 @@ mod tests {
     fn record(project: &str, session_id: &str, source_path: &Path, ts: u64) -> Record {
         Record {
             source: SourceKind::Codex,
+            record_key: String::new(),
             doc_id: ts,
             ts,
             project: project.to_string(),
@@ -996,6 +1454,51 @@ mod tests {
         let store = AnalyticsStore::open_read_only(&db).expect("open read only");
 
         assert!(store.mark_complete().is_err());
+    }
+
+    #[test]
+    fn projection_manifest_exposes_only_incomplete_epochs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        let store = AnalyticsStore::open(&db).expect("open store");
+        let path = "/logs/session.jsonl";
+
+        let first_epoch = store
+            .begin_projection(SourceKind::Codex, path, "fs:1:2", "fingerprint-a", 3, 10)
+            .expect("begin projection");
+        assert_eq!(first_epoch, 1);
+        assert!(
+            store
+                .incomplete_source_paths()
+                .expect("incomplete")
+                .contains(path)
+        );
+
+        store
+            .complete_projection(path, "session-1", 20, first_epoch, 4)
+            .expect("complete projection");
+        assert!(
+            !store
+                .incomplete_source_paths()
+                .expect("incomplete")
+                .contains(path)
+        );
+
+        let second_epoch = store
+            .begin_projection(SourceKind::Codex, path, "session-1", "fingerprint-b", 3, 20)
+            .expect("begin next projection");
+        assert_eq!(second_epoch, 2);
+        assert!(
+            store
+                .complete_projection(path, "session-1", 30, first_epoch, 5)
+                .is_err()
+        );
+        assert!(
+            store
+                .incomplete_source_paths()
+                .expect("incomplete")
+                .contains(path)
+        );
     }
 
     #[test]
@@ -1070,6 +1573,63 @@ mod tests {
 
         let store = AnalyticsStore::open(&db).expect("open store");
 
+        assert!(!store.complete().expect("complete"));
+    }
+
+    #[test]
+    fn legacy_sessions_schema_is_migrated_before_writes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "").expect("write transcript");
+        let db = tmp.path().join("analytics.sqlite");
+        {
+            let conn = Connection::open(&db).expect("open sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '2');
+                INSERT INTO meta(key, value) VALUES('analytics_complete', '1');
+                CREATE TABLE sessions (
+                    source TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    cwd TEXT,
+                    git_root TEXT,
+                    git_common_dir TEXT,
+                    repo_project TEXT,
+                    started_at INTEGER NOT NULL,
+                    last_at INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    resolution_status TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (source, session_id, source_path)
+                );
+                "#,
+            )
+            .expect("seed legacy schema");
+            conn.execute(
+                "INSERT INTO sessions(
+                    source, session_id, source_path, project, started_at, last_at, message_count
+                 ) VALUES('codex', 's1', ?1, 'memex', 10, 10, 3)",
+                params![transcript.to_string_lossy().as_ref()],
+            )
+            .expect("seed legacy session");
+        }
+
+        let mut writer = AnalyticsWriter::open(&db).expect("open analytics");
+        writer
+            .record(&record("memex", "s1", &transcript, 20))
+            .expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open(&db).expect("open store");
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "s1");
+        assert_eq!(rows[0].last_at, 20);
+        assert_eq!(rows[0].message_count, 4);
         assert!(!store.complete().expect("complete"));
     }
 

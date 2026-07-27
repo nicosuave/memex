@@ -1,7 +1,9 @@
 pub mod analytics;
+pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod embed;
+pub mod embedding_documents;
 pub mod index;
 pub mod ingest;
 pub mod lease;

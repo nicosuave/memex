@@ -3,6 +3,7 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
+use sha2::{Digest, Sha256};
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,7 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    index: 4,
     usage: 3,
 };
 
@@ -48,6 +49,96 @@ pub fn message_root() -> PathBuf {
 
 pub fn parts_root() -> PathBuf {
     storage_root().join("part")
+}
+
+fn parts_root_for_session(session_dir: &Path) -> PathBuf {
+    session_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(|storage| storage.join("part"))
+        .unwrap_or_else(parts_root)
+}
+
+/// Fingerprint every file that contributes to one OpenCode session projection. OpenCode stores
+/// messages and their mutable tool state in separate trees, so watching only the message
+/// directory misses status/output-only updates.
+pub(crate) fn session_dependency_fingerprint(
+    session_dir: &Path,
+) -> Result<(u64, i64, i64, String)> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    let mut dependencies = Vec::new();
+    let parts_root = parts_root_for_session(session_dir);
+    for entry in std::fs::read_dir(session_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let mut message_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string);
+        if let Ok(mut bytes) = std::fs::read(&path)
+            && let Ok(message) = simd_json::to_borrowed_value(&mut bytes)
+        {
+            message_id = message
+                .get("id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .or(message_id);
+        }
+        dependencies.push(path);
+        if let Some(message_id) = message_id {
+            let part_dir = parts_root.join(message_id);
+            if let Ok(entries) = std::fs::read_dir(part_dir) {
+                dependencies.extend(
+                    entries.flatten().map(|entry| entry.path()).filter(|path| {
+                        path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    }),
+                );
+            }
+        }
+    }
+    dependencies.sort();
+
+    let mut total_size = 0u64;
+    let mut newest_seconds = 0i64;
+    let mut newest_ns = 0i64;
+    let mut hasher = Sha256::new();
+    for path in dependencies {
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        total_size = total_size.saturating_add(metadata.len());
+        newest_ns = newest_ns.max(modified_ns);
+        newest_seconds = newest_seconds.max(modified_ns / 1_000_000_000);
+        let path = path.to_string_lossy();
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update(modified_ns.to_le_bytes());
+        #[cfg(unix)]
+        {
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+        }
+    }
+    Ok((
+        total_size,
+        newest_seconds,
+        newest_ns,
+        format!("{:x}", hasher.finalize()),
+    ))
 }
 
 pub fn discover_sessions() -> anyhow::Result<Vec<SourceFile>> {
@@ -187,6 +278,23 @@ pub(crate) fn parse_index_records(
         else {
             continue;
         };
+        let mut message_facts = RecordLinks {
+            model: message
+                .get("modelID")
+                .or_else(|| message.get("model"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            ..RecordLinks::default()
+        };
+        if let Some(tokens) = message.get("tokens").and_then(|value| value.as_object()) {
+            message_facts.input_tokens = super::common::borrowed_u64(tokens, "input");
+            message_facts.output_tokens = super::common::borrowed_u64(tokens, "output");
+            message_facts.reasoning_tokens = super::common::borrowed_u64(tokens, "reasoning");
+            if let Some(cache) = tokens.get("cache").and_then(|value| value.as_object()) {
+                message_facts.cache_read_tokens = super::common::borrowed_u64(cache, "read");
+                message_facts.cache_write_tokens = super::common::borrowed_u64(cache, "write");
+            }
+        }
         messages.push((
             message_id.to_string(),
             message
@@ -199,14 +307,16 @@ pub(crate) fn parse_index_records(
                 .and_then(|value| value.as_str())
                 .unwrap_or("user")
                 .to_string(),
+            message_facts,
         ));
     }
-    messages.sort_by_key(|message| message.1);
+    messages.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
     let source_path = session_dir.to_string_lossy().to_string();
     let project = SourceKind::Opencode.label().to_string();
     let mut turn_id = state.turn_id;
-    for (message_id, timestamp, role) in messages {
-        let part_dir = parts_root().join(&message_id);
+    for (message_id, timestamp, role, message_facts) in messages {
+        let message_ordinal = turn_id;
+        let part_dir = parts_root_for_session(session_dir).join(&message_id);
         if !part_dir.exists() {
             continue;
         }
@@ -219,6 +329,7 @@ pub(crate) fn parse_index_records(
             .collect::<Vec<_>>();
         part_files.sort();
         let mut text_parts = Vec::new();
+        let mut tool_call_index = 0u32;
         for path in part_files {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
@@ -232,14 +343,111 @@ pub(crate) fn parse_index_records(
             if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
                 text_parts.push(text.to_string());
             }
+            if part.get("type").and_then(|value| value.as_str()) != Some("tool") {
+                continue;
+            }
+            let call_id = part
+                .get("callID")
+                .or_else(|| part.get("callId"))
+                .or_else(|| part.get("id"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let tool_name = part
+                .get("tool")
+                .or_else(|| part.get("toolName"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let state = part.get("state");
+            let tool_input = state.and_then(|value| value.get("input")).map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            });
+            let source_status = state
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let tool_output = state.and_then(|value| value.get("output")).map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            });
+
+            let mut call_links = links.record_links();
+            call_links.message_ordinal = Some(message_ordinal);
+            call_links.parent_event_id = Some(message_id.clone());
+            call_links.event_id = call_id.clone();
+            call_links.call_index = Some(tool_call_index);
+            call_links.model = message_facts.model.clone();
+            call_links.status =
+                super::common::normalized_tool_status(source_status.as_deref(), None);
+            call_links.source_status = source_status.clone();
+            tool_call_index += 1;
+            emit(Record {
+                source: SourceKind::Opencode,
+                record_key: String::new(),
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: "tool_use".to_string(),
+                text: tool_input.clone().unwrap_or_default(),
+                tool_name: tool_name.clone(),
+                tool_input,
+                tool_output: None,
+                links: call_links,
+                source_path: source_path.clone(),
+            })?;
+            turn_id += 1;
+
+            if tool_output.is_some() || source_status.is_some() {
+                let tool_output = tool_output.unwrap_or_default();
+                let mut result_links = links.record_links();
+                result_links.message_ordinal = Some(message_ordinal);
+                result_links.parent_tool_use_id = call_id.clone();
+                result_links.parent_event_id = call_id;
+                result_links.event_index = Some(0);
+                result_links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), None);
+                result_links.source_status = source_status;
+                result_links.model = message_facts.model.clone();
+                emit(Record {
+                    source: SourceKind::Opencode,
+                    record_key: String::new(),
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "tool_result".to_string(),
+                    text: tool_output.clone(),
+                    tool_name,
+                    tool_input: None,
+                    tool_output: Some(tool_output),
+                    links: result_links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+            }
         }
-        if text_parts.is_empty() {
+        if text_parts.is_empty() && tool_call_index == 0 {
             continue;
         }
         let mut record_links = links.record_links();
         record_links.event_id = Some(message_id);
+        record_links.message_ordinal = Some(message_ordinal);
+        record_links.model = message_facts.model;
+        record_links.input_tokens = message_facts.input_tokens;
+        record_links.cache_read_tokens = message_facts.cache_read_tokens;
+        record_links.cache_write_tokens = message_facts.cache_write_tokens;
+        record_links.output_tokens = message_facts.output_tokens;
+        record_links.reasoning_tokens = message_facts.reasoning_tokens;
         emit(Record {
             source: SourceKind::Opencode,
+            record_key: String::new(),
             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
             ts: timestamp,
             project: project.clone(),
@@ -259,6 +467,7 @@ pub(crate) fn parse_index_records(
         offset: 0,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
+        parser_stream: state.parser_stream,
         session_id: Some(session_id),
         diagnostics: Default::default(),
     })
@@ -454,6 +663,96 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_projection_preserves_tool_parts_and_message_facts() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("message/ses_test");
+        let part_dir = storage.join("part/msg_test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(
+            session_dir.join("msg_test.json"),
+            r#"{"id":"msg_test","role":"assistant","modelID":"opencode-test","tokens":{"input":15,"output":4,"reasoning":2,"cache":{"read":5,"write":1}},"time":{"created":10}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            part_dir.join("01-tool.json"),
+            r#"{"id":"part-tool","type":"tool","callID":"call-1","tool":"Read","state":{"status":"completed","input":{"file_path":"README.md"},"output":"done"}}"#,
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(temp.path().as_os_str()))]);
+
+        let mut records = Vec::new();
+        parse_index_records(
+            &session_dir,
+            IndexParseState::default(),
+            &HashMap::new(),
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].role, "tool_use");
+        assert_eq!(records[1].role, "tool_result");
+        assert_eq!(records[2].role, "assistant");
+        assert_eq!(
+            records[0].links.message_ordinal,
+            records[2].links.message_ordinal
+        );
+        assert_eq!(records[0].links.call_index, Some(0));
+        assert_eq!(records[0].links.status.as_deref(), Some("success"));
+        assert_eq!(records[0].links.source_status.as_deref(), Some("completed"));
+        assert_eq!(records[1].links.status.as_deref(), Some("success"));
+        assert!(records[2].text.is_empty());
+        assert_eq!(records[2].links.input_tokens, Some(15));
+        assert_eq!(records[2].links.cache_read_tokens, Some(5));
+        assert_eq!(records[2].links.cache_write_tokens, Some(1));
+        assert_eq!(records[2].links.output_tokens, Some(4));
+        assert_eq!(records[2].links.reasoning_tokens, Some(2));
+        assert_eq!(records[1].links.event_index, Some(0));
+        assert_eq!(records[2].links.model.as_deref(), Some("opencode-test"));
+    }
+
+    #[test]
+    fn session_fingerprint_changes_when_only_a_tool_part_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("message/ses_test");
+        let part_dir = storage.join("part/msg_test");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&part_dir).unwrap();
+        std::fs::write(
+            session_dir.join("msg_test.json"),
+            r#"{"id":"msg_test","role":"assistant","time":{"created":10}}"#,
+        )
+        .unwrap();
+        let part = part_dir.join("01-tool.json");
+        std::fs::write(
+            &part,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"running"}}"#,
+        )
+        .unwrap();
+        let before = session_dependency_fingerprint(&session_dir).unwrap();
+
+        std::fs::write(
+            &part,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"completed","output":"done"}}"#,
+        )
+        .unwrap();
+        let after = session_dependency_fingerprint(&session_dir).unwrap();
+
+        assert_ne!(before.3, after.3);
+        assert!(after.0 > before.0);
+    }
 
     #[test]
     fn reasoning_is_included_in_output_and_total() {

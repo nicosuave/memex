@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 4,
+    index: 6,
     usage: 4,
 };
 
@@ -120,6 +120,7 @@ struct SessionMeta {
     session_id: String,
     project: String,
     cwd: Option<PathBuf>,
+    model: Option<String>,
     links: SessionLinks,
 }
 
@@ -128,6 +129,7 @@ fn fallback_meta(path: &Path) -> SessionMeta {
         session_id: session_id_from_path(path).unwrap_or_else(|| "unknown".to_string()),
         project: SourceKind::Codex.label().to_string(),
         cwd: None,
+        model: None,
         links: SessionLinks {
             conversation_kind: Some(ConversationKind::Main.as_str().to_string()),
             ..SessionLinks::default()
@@ -198,14 +200,65 @@ fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
         }
         buffer.clear();
         buffer.extend_from_slice(line);
-        if let Ok(value) = simd_json::to_borrowed_value(&mut buffer)
-            && value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
-            && let Some(payload) = value.get("payload").and_then(|value| value.as_object())
-        {
-            apply_meta(payload, &mut metadata);
+        if let Ok(value) = simd_json::to_borrowed_value(&mut buffer) {
+            match value.get("type").and_then(|value| value.as_str()) {
+                Some("session_meta") => {
+                    if let Some(payload) = value.get("payload").and_then(|value| value.as_object())
+                    {
+                        apply_meta(payload, &mut metadata);
+                    }
+                }
+                Some("turn_context") => {
+                    metadata.model = value
+                        .get("payload")
+                        .and_then(|value| value.as_object())
+                        .and_then(|payload| super::common::borrowed_string(payload, "model"));
+                }
+                _ => {}
+            }
         }
     }
     Ok(metadata)
+}
+
+fn read_interaction_until(path: &Path, limit: u64) -> Result<Option<String>> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let limit = (limit as usize).min(mmap.len());
+    let mut start = 0usize;
+    let mut buffer = Vec::new();
+    let mut interaction_id = None;
+    while start < limit {
+        let slice = &mmap[start..limit];
+        let relative = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..relative];
+        start += relative + 1;
+        if line.is_empty() {
+            continue;
+        }
+        buffer.clear();
+        buffer.extend_from_slice(line);
+        let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
+            continue;
+        };
+        if value.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match payload.get("type").and_then(|value| value.as_str()) {
+            Some("task_started") => {
+                interaction_id = borrowed_string(payload, &["turn_id", "turnId"]);
+            }
+            Some("task_complete") => interaction_id = None,
+            _ => {}
+        }
+    }
+    Ok(interaction_id)
 }
 
 pub fn probe(path: &Path) -> Result<SourceMetadata> {
@@ -242,8 +295,12 @@ pub(crate) fn parse_index_records(
     let mut start = state.offset as usize;
     let mut turn_id = state.turn_id;
     let mut pending_tool_calls = state.pending_tool_calls;
+    let mut parser_stream = state.parser_stream;
     let source_path = path.to_string_lossy().to_string();
     let mut metadata = read_meta_until(path, state.offset)?;
+    let mut interaction_id = read_interaction_until(path, state.offset)?;
+    let mut last_assistant_ordinal = parser_stream.last_assistant_message_ordinal;
+    let mut next_call_index = parser_stream.next_tool_call_index;
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
 
@@ -284,13 +341,33 @@ pub(crate) fn parse_index_records(
             continue;
         }
         if entry_type == "turn_context" {
+            metadata.model = object
+                .get("payload")
+                .and_then(|value| value.as_object())
+                .and_then(|payload| super::common::borrowed_string(payload, "model"));
             continue;
         }
         if entry_type == "event_msg" {
             let Some(payload) = object.get("payload").and_then(|value| value.as_object()) else {
                 continue;
             };
-            if payload.get("type").and_then(|value| value.as_str()) == Some("agent_reasoning")
+            let event_type = payload.get("type").and_then(|value| value.as_str());
+            if event_type == Some("task_started") {
+                interaction_id = borrowed_string(
+                    object.get("payload").expect("payload exists"),
+                    &["turn_id", "turnId"],
+                );
+                last_assistant_ordinal = None;
+                next_call_index = 0;
+                continue;
+            }
+            if event_type == Some("task_complete") {
+                interaction_id = None;
+                last_assistant_ordinal = None;
+                next_call_index = 0;
+                continue;
+            }
+            if event_type == Some("agent_reasoning")
                 && include_reasoning
                 && let Some(text) = payload
                     .get("text")
@@ -299,9 +376,13 @@ pub(crate) fn parse_index_records(
                     .filter(|text| !text.is_empty())
             {
                 let mut links = metadata.links.record_links();
+                links.interaction_id = interaction_id.clone();
                 links.event_id = super::common::borrowed_string(payload, "id");
+                links.message_ordinal = last_assistant_ordinal;
+                links.model = metadata.model.clone();
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -333,6 +414,7 @@ pub(crate) fn parse_index_records(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         let mut links = metadata.links.record_links();
+        links.interaction_id = interaction_id.clone();
         links.event_id = super::common::borrowed_string(payload, "id");
         match payload_type {
             "message" => {
@@ -360,8 +442,18 @@ pub(crate) fn parse_index_records(
                 if text.is_empty() || is_system_instruction(&text) {
                     continue;
                 }
+                links.message_ordinal = Some(turn_id);
+                links.model = metadata.model.clone();
+                if role == "assistant" {
+                    last_assistant_ordinal = Some(turn_id);
+                    next_call_index = 0;
+                } else {
+                    last_assistant_ordinal = None;
+                    next_call_index = 0;
+                }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -378,6 +470,20 @@ pub(crate) fn parse_index_records(
                 turn_id += 1;
             }
             "function_call" => {
+                ensure_assistant_owner(
+                    &metadata,
+                    &source_path,
+                    timestamp,
+                    interaction_id.as_deref(),
+                    &mut turn_id,
+                    &mut last_assistant_ordinal,
+                    &mut next_call_index,
+                    next_doc_id,
+                    &mut emit,
+                )?;
+                links.message_ordinal = last_assistant_ordinal;
+                links.call_index = Some(next_call_index);
+                next_call_index += 1;
                 let tool_name = payload
                     .get("name")
                     .and_then(|value| value.as_str())
@@ -413,6 +519,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -442,15 +549,26 @@ pub(crate) fn parse_index_records(
                 let tool_name = pending.and_then(|call| call.tool_name);
                 let tool_output = payload.get("output").and_then(value_text);
                 let text = tool_output.clone().unwrap_or_default();
-                if text.is_empty() {
-                    continue;
-                }
                 if !call_id.is_empty() {
                     links.parent_event_id = Some(call_id.to_string());
                     links.parent_tool_use_id = Some(call_id.to_string());
                 }
+                let source_status = payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let is_error = payload.get("is_error").and_then(|value| value.as_bool());
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), is_error);
+                links.source_status = source_status;
+                links.event_index = Some(0);
+                links.subagent_session_id = borrowed_string(
+                    object.get("payload").expect("payload exists"),
+                    &["subagent_session_id", "subagentSessionId", "agent_id"],
+                );
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -465,8 +583,23 @@ pub(crate) fn parse_index_records(
                     source_path: source_path.clone(),
                 })?;
                 turn_id += 1;
+                last_assistant_ordinal = None;
             }
             "custom_tool_call" => {
+                ensure_assistant_owner(
+                    &metadata,
+                    &source_path,
+                    timestamp,
+                    interaction_id.as_deref(),
+                    &mut turn_id,
+                    &mut last_assistant_ordinal,
+                    &mut next_call_index,
+                    next_doc_id,
+                    &mut emit,
+                )?;
+                links.message_ordinal = last_assistant_ordinal;
+                links.call_index = Some(next_call_index);
+                next_call_index += 1;
                 let tool_name = payload
                     .get("name")
                     .and_then(|value| value.as_str())
@@ -499,6 +632,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -515,6 +649,20 @@ pub(crate) fn parse_index_records(
                 turn_id += 1;
             }
             "web_search_call" | "tool_search_call" => {
+                ensure_assistant_owner(
+                    &metadata,
+                    &source_path,
+                    timestamp,
+                    interaction_id.as_deref(),
+                    &mut turn_id,
+                    &mut last_assistant_ordinal,
+                    &mut next_call_index,
+                    next_doc_id,
+                    &mut emit,
+                )?;
+                links.message_ordinal = last_assistant_ordinal;
+                links.call_index = Some(next_call_index);
+                next_call_index += 1;
                 let tool_name = if payload_type == "web_search_call" {
                     "web_search"
                 } else {
@@ -535,6 +683,13 @@ pub(crate) fn parse_index_records(
                 if let Some(call_id) = &call_id {
                     links.event_id = Some(call_id.clone());
                 }
+                let source_status = payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), None);
+                links.source_status = source_status;
                 let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                 if let Some(call_id) = call_id {
                     let replaced = pending_tool_calls.insert(
@@ -555,6 +710,7 @@ pub(crate) fn parse_index_records(
                 }
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -590,15 +746,26 @@ pub(crate) fn parse_index_records(
                     payload.get("output").and_then(value_text)
                 };
                 let text = tool_output.clone().unwrap_or_default();
-                if text.is_empty() {
-                    continue;
-                }
                 if !call_id.is_empty() {
                     links.parent_event_id = Some(call_id.to_string());
                     links.parent_tool_use_id = Some(call_id.to_string());
                 }
+                let source_status = payload
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let is_error = payload.get("is_error").and_then(|value| value.as_bool());
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), is_error);
+                links.source_status = source_status;
+                links.event_index = Some(0);
+                links.subagent_session_id = borrowed_string(
+                    object.get("payload").expect("payload exists"),
+                    &["subagent_session_id", "subagentSessionId", "agent_id"],
+                );
                 emit(Record {
                     source: SourceKind::Codex,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: metadata.project.clone(),
@@ -613,6 +780,7 @@ pub(crate) fn parse_index_records(
                     source_path: source_path.clone(),
                 })?;
                 turn_id += 1;
+                last_assistant_ordinal = None;
             }
             "reasoning" => {
                 if payload.contains_key("encrypted_content") {
@@ -623,13 +791,58 @@ pub(crate) fn parse_index_records(
         }
     }
 
+    parser_stream.last_assistant_message_ordinal = last_assistant_ordinal;
+    parser_stream.next_tool_call_index = next_call_index;
     Ok(IndexParseOutput {
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls,
+        parser_stream,
         session_id: Some(metadata.session_id),
         diagnostics,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_assistant_owner(
+    metadata: &SessionMeta,
+    source_path: &str,
+    timestamp: u64,
+    interaction_id: Option<&str>,
+    turn_id: &mut u32,
+    last_assistant_ordinal: &mut Option<u32>,
+    next_call_index: &mut u32,
+    next_doc_id: &AtomicU64,
+    emit: &mut impl FnMut(Record) -> Result<()>,
+) -> Result<()> {
+    if last_assistant_ordinal.is_some() {
+        return Ok(());
+    }
+    let ordinal = *turn_id;
+    let mut links = metadata.links.record_links();
+    links.interaction_id = interaction_id.map(str::to_string);
+    links.message_ordinal = Some(ordinal);
+    links.model = metadata.model.clone();
+    emit(Record {
+        source: SourceKind::Codex,
+        record_key: String::new(),
+        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+        ts: timestamp,
+        project: metadata.project.clone(),
+        session_id: metadata.session_id.clone(),
+        turn_id: ordinal,
+        role: "assistant".to_string(),
+        text: String::new(),
+        tool_name: None,
+        tool_input: None,
+        tool_output: None,
+        links,
+        source_path: source_path.to_string(),
+    })?;
+    *turn_id += 1;
+    *last_assistant_ordinal = Some(ordinal);
+    *next_call_index = 0;
+    Ok(())
 }
 
 fn value_text(value: &BorrowedValue<'_>) -> Option<String> {
@@ -705,6 +918,7 @@ pub(crate) fn parse_history_records(
             * 1000;
         emit(Record {
             source: SourceKind::Codex,
+            record_key: String::new(),
             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
             ts: timestamp,
             project: SourceKind::Codex.label().to_string(),
@@ -727,6 +941,7 @@ pub(crate) fn parse_history_records(
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
+        parser_stream: state.parser_stream,
         session_id: None,
         diagnostics: Default::default(),
     })
@@ -1499,5 +1714,191 @@ mod tests {
                 .iter()
                 .any(|record| { record.text.contains("ciphertext-must-never-be-indexed") })
         );
+    }
+
+    #[test]
+    fn source_turn_id_groups_sibling_messages_and_tool_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/repo\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-test\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"progress\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"Read\",\"call_id\":\"call-1\",\"arguments\":\"{}\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"next\"}}\n",
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].links.interaction_id.as_deref(), Some("turn-1"));
+        assert_eq!(records[1].links.interaction_id.as_deref(), Some("turn-1"));
+        assert_eq!(records[2].links.interaction_id, None);
+        assert_eq!(records[0].links.message_ordinal, Some(records[0].turn_id));
+        assert_eq!(records[0].links.model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            records[1].links.message_ordinal,
+            records[0].links.message_ordinal
+        );
+        assert_eq!(records[2].links.message_ordinal, Some(records[2].turn_id));
+    }
+
+    #[test]
+    fn tool_only_response_gets_a_message_owner_and_dense_call_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/repo\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-test\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"Read\",\"call_id\":\"call-1\",\"arguments\":\"{}\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"Grep\",\"call_id\":\"call-2\",\"arguments\":\"{}\"}}\n",
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].role, "assistant");
+        assert!(records[0].text.is_empty());
+        assert_eq!(records[0].links.model.as_deref(), Some("gpt-test"));
+        assert_eq!(
+            records[1].links.message_ordinal,
+            records[0].links.message_ordinal
+        );
+        assert_eq!(
+            records[2].links.message_ordinal,
+            records[0].links.message_ordinal
+        );
+        assert_eq!(records[1].links.call_index, Some(0));
+        assert_eq!(records[2].links.call_index, Some(1));
+    }
+
+    #[test]
+    fn incremental_tool_call_reuses_the_persisted_assistant_owner() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/repo\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"working\"}}\n",
+            ),
+        )
+        .unwrap();
+        let mut first_records = Vec::new();
+        let first = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                first_records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                b"{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"Read\",\"call_id\":\"call-1\",\"arguments\":\"{}\"}}\n",
+            )
+            .unwrap();
+
+        let mut second_records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState {
+                offset: first.offset,
+                turn_id: first.turn_id,
+                pending_tool_calls: first.pending_tool_calls,
+                parser_stream: first.parser_stream,
+            },
+            false,
+            &AtomicU64::new(10),
+            |record| {
+                second_records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second_records.len(), 1);
+        assert_eq!(second_records[0].role, "tool_use");
+        assert_eq!(
+            second_records[0].links.message_ordinal,
+            first_records[0].links.message_ordinal
+        );
+        assert_eq!(second_records[0].links.call_index, Some(0));
+    }
+
+    #[test]
+    fn search_call_lifecycle_status_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/repo\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"web_search_call\",\"call_id\":\"search-1\",\"status\":\"in_progress\",\"query\":\"rust\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"tool_search_call\",\"call_id\":\"search-2\",\"status\":\"completed\",\"arguments\":{\"q\":\"sqlite\"}}}\n",
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let calls: Vec<_> = records
+            .iter()
+            .filter(|record| record.role == "tool_use")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].links.status.as_deref(), Some("pending"));
+        assert_eq!(calls[0].links.source_status.as_deref(), Some("in_progress"));
+        assert_eq!(calls[1].links.status.as_deref(), Some("success"));
+        assert_eq!(calls[1].links.source_status.as_deref(), Some("completed"));
     }
 }

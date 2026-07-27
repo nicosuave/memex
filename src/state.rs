@@ -49,6 +49,14 @@ pub struct PendingToolCall {
     pub source_tool_assistant_uuid: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParserStreamState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message_ordinal: Option<u32>,
+    #[serde(default)]
+    pub next_tool_call_index: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileState {
     pub size: u64,
@@ -59,6 +67,8 @@ pub struct FileState {
     pub parser_version: u32,
     #[serde(default)]
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
+    #[serde(default)]
+    pub parser_stream: ParserStreamState,
     #[serde(default)]
     pub identity: FileIdentity,
 }

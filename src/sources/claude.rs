@@ -18,7 +18,7 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    index: 4,
     usage: 4,
 };
 
@@ -310,7 +310,9 @@ pub(crate) fn parse_index_records(
             ConversationKind::Sidechain => Some("sidechain".to_string()),
             _ => None,
         };
-        let entry_links = RecordLinks {
+        let mut entry_links = RecordLinks {
+            interaction_id: super::common::borrowed_string(object, "requestId")
+                .or_else(|| super::common::borrowed_string(object, "request_id")),
             event_id: entry_uuid.clone(),
             parent_event_id: entry_parent_uuid,
             logical_parent_event_id: super::common::borrowed_string(object, "logicalParentUuid"),
@@ -325,6 +327,7 @@ pub(crate) fn parse_index_records(
                 object,
                 "sourceToolAssistantUUID",
             ),
+            ..RecordLinks::default()
         };
         let timestamp = object
             .get("timestamp")
@@ -334,9 +337,21 @@ pub(crate) fn parse_index_records(
         let Some(message) = object.get("message").and_then(|value| value.as_object()) else {
             continue;
         };
+        entry_links.message_ordinal = Some(turn_id);
+        entry_links.model = super::common::borrowed_string(message, "model");
+        if let Some(usage) = message.get("usage").and_then(|value| value.as_object()) {
+            entry_links.input_tokens = super::common::borrowed_u64(usage, "input_tokens");
+            entry_links.cache_read_tokens =
+                super::common::borrowed_u64(usage, "cache_read_input_tokens");
+            entry_links.cache_write_tokens =
+                super::common::borrowed_u64(usage, "cache_creation_input_tokens");
+            entry_links.output_tokens = super::common::borrowed_u64(usage, "output_tokens");
+        }
         let content = message.get("content");
         let mut text_parts = Vec::new();
         let mut content_index = 0usize;
+        let mut tool_call_index = 0u32;
+        let mut assistant_has_children = false;
         if let Some(content) = content {
             if let Some(text) = content.as_str() {
                 text_parts.push(text);
@@ -358,6 +373,7 @@ pub(crate) fn parse_index_records(
                             }
                         }
                         "tool_use" => {
+                            assistant_has_children = true;
                             let tool_name = block_object
                                 .get("name")
                                 .and_then(|value| value.as_str())
@@ -374,6 +390,19 @@ pub(crate) fn parse_index_records(
                                 links.event_id = Some(tool_id.clone());
                                 links.parent_event_id = entry_uuid.clone();
                             }
+                            links.call_index = Some(tool_call_index);
+                            links.subagent_session_id =
+                                super::common::borrowed_string(block_object, "subagent_session_id")
+                                    .or_else(|| {
+                                        super::common::borrowed_string(
+                                            block_object,
+                                            "subagentSessionId",
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        super::common::borrowed_string(block_object, "agent_id")
+                                    });
+                            tool_call_index += 1;
                             let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                             if let Some(tool_id) = tool_id {
                                 let replaced = pending_tool_calls.insert(
@@ -394,6 +423,7 @@ pub(crate) fn parse_index_records(
                             }
                             emit(Record {
                                 source: SourceKind::Claude,
+                                record_key: String::new(),
                                 doc_id,
                                 ts: timestamp,
                                 project: project.clone(),
@@ -417,12 +447,14 @@ pub(crate) fn parse_index_records(
                                 .filter(|text| !text.is_empty());
                             if let Some(thinking) = thinking {
                                 if include_reasoning {
+                                    assistant_has_children = true;
                                     let mut links = entry_links.clone();
                                     links.event_id = entry_uuid
                                         .as_ref()
                                         .map(|uuid| format!("{uuid}:reasoning:{content_index}"));
                                     emit(Record {
                                         source: SourceKind::Claude,
+                                        record_key: String::new(),
                                         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                                         ts: timestamp,
                                         project: project.clone(),
@@ -492,8 +524,26 @@ pub(crate) fn parse_index_records(
                     links.parent_event_id = Some(tool_use_id.clone());
                     links.parent_tool_use_id = Some(tool_use_id.clone());
                 }
+                links.event_index = Some(0);
+                links.subagent_session_id =
+                    super::common::borrowed_string(block_object, "subagent_session_id")
+                        .or_else(|| {
+                            super::common::borrowed_string(block_object, "subagentSessionId")
+                        })
+                        .or_else(|| super::common::borrowed_string(block_object, "agent_id"));
+                let source_status = block_object
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let is_error = block_object
+                    .get("is_error")
+                    .and_then(|value| value.as_bool());
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), is_error);
+                links.source_status = source_status;
                 emit(Record {
                     source: SourceKind::Claude,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -512,9 +562,10 @@ pub(crate) fn parse_index_records(
         }
 
         let text = text_parts.join(" ").trim().to_string();
-        if !text.is_empty() {
+        if !text.is_empty() || (entry_type == "assistant" && assistant_has_children) {
             emit(Record {
                 source: SourceKind::Claude,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -536,6 +587,7 @@ pub(crate) fn parse_index_records(
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls,
+        parser_stream: state.parser_stream,
         session_id: Some(session_id),
         diagnostics,
     })
@@ -737,6 +789,39 @@ fn choose_usage(left: &UsageEvent, right: &UsageEvent) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn tool_only_assistant_entry_keeps_its_message_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"uuid\":\"message-1\",\"sessionId\":\"session\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"Read\",\"input\":{\"file_path\":\"README.md\"}}]}}\n",
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].role, "tool_use");
+        assert_eq!(records[1].role, "assistant");
+        assert!(records[1].text.is_empty());
+        assert_eq!(
+            records[0].links.message_ordinal,
+            records[1].links.message_ordinal
+        );
+        assert_eq!(records[0].links.call_index, Some(0));
+    }
 
     #[test]
     fn discovery_includes_subagents_only_when_requested() {

@@ -568,6 +568,24 @@ body {
   padding: 10px 18px;
 }
 
+.interaction-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 18px;
+  color: var(--muted-foreground);
+  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.interaction-divider::after {
+  height: 1px;
+  flex: 1;
+  background: var(--border);
+  content: "";
+}
+
 .message {
   padding: 16px 2px 20px;
   border-bottom: 1px solid var(--border);

@@ -91,6 +91,46 @@ pub(crate) fn borrowed_string(
         .map(str::to_string)
 }
 
+pub(crate) fn borrowed_u64(object: &simd_json::borrowed::Object<'_>, key: &str) -> Option<u64> {
+    use simd_json::prelude::*;
+    object.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().map(|value| value.max(0) as u64))
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+pub(crate) fn normalized_tool_status(
+    source_status: Option<&str>,
+    is_error: Option<bool>,
+) -> Option<String> {
+    if is_error == Some(true) {
+        return Some("error".to_string());
+    }
+    let Some(source_status) = source_status else {
+        return is_error.map(|is_error| if is_error { "error" } else { "success" }.to_string());
+    };
+    let source_status = source_status.trim();
+    if source_status.is_empty() {
+        return is_error.map(|_| "success".to_string());
+    }
+    let normalized = source_status.to_ascii_lowercase();
+    let status =
+        if ["success", "succeeded", "completed", "complete", "ok"].contains(&normalized.as_str()) {
+            "success"
+        } else if ["error", "failed", "failure"].contains(&normalized.as_str()) {
+            "error"
+        } else if ["cancelled", "canceled", "aborted"].contains(&normalized.as_str()) {
+            "cancelled"
+        } else if ["pending", "running", "in_progress", "progress"].contains(&normalized.as_str()) {
+            "pending"
+        } else {
+            "unknown"
+        };
+    Some(status.to_string())
+}
+
 pub(crate) fn tool_result_text(block: &simd_json::BorrowedValue<'_>) -> Option<String> {
     use simd_json::prelude::*;
     let object = block.as_object()?;

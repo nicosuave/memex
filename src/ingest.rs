@@ -1,10 +1,12 @@
-use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index};
+use crate::analytics::{AnalyticsStore, AnalyticsWriter, analytics_path};
 use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
-use crate::state::{FileIdentity, FileState, IngestState, PendingToolCall, ScanCache};
+use crate::state::{
+    FileIdentity, FileState, IngestState, ParserStreamState, PendingToolCall, ScanCache,
+};
 #[cfg(test)]
 use crate::types::RecordLinks;
 use crate::types::{Record, SourceKind};
@@ -19,8 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-const EMBED_BATCH_SIZE: usize = 64;
-const EMBED_MAX_CHARS: usize = 8192;
 const RETAINED_HEAD_PERCENT: usize = 75;
 const INDEX_PROGRESS_BATCH: u64 = 1;
 // Keep a small amount of parser/writer overlap without retaining an unbounded transcript backlog.
@@ -64,8 +64,10 @@ struct FileTask {
     delete_first: bool,
     parser_version_invalidated: bool,
     pending_tool_calls: HashMap<String, PendingToolCall>,
+    parser_stream: ParserStreamState,
     identity: FileIdentity,
     parser_version: u32,
+    projection_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -133,6 +135,7 @@ fn prepare_file_task(
     include_reasoning: bool,
     metadata: &std::fs::Metadata,
     previous: Option<&FileState>,
+    force_replay: bool,
 ) -> (FileTask, bool) {
     let size = metadata.len();
     let mtime = metadata
@@ -152,11 +155,49 @@ fn prepare_file_task(
         .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
         .min(size) as usize;
     let identity = file_identity(&path, metadata, prefix_bytes);
+    prepare_file_task_from_snapshot(
+        path,
+        source,
+        include_reasoning,
+        size,
+        mtime,
+        identity,
+        previous,
+        force_replay,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_file_task_from_snapshot(
+    path: PathBuf,
+    source: SourceKind,
+    include_reasoning: bool,
+    size: u64,
+    mtime: i64,
+    identity: FileIdentity,
+    previous: Option<&FileState>,
+    force_replay: bool,
+) -> (FileTask, bool) {
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
-    let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
-        None => (0, 0, false, HashMap::new(), false),
+    let (offset, turn_id, delete_first, pending_tool_calls, parser_stream, skip) = match previous {
+        None => (
+            0,
+            0,
+            false,
+            HashMap::new(),
+            ParserStreamState::default(),
+            false,
+        ),
+        Some(_) if force_replay => (
+            0,
+            0,
+            true,
+            HashMap::new(),
+            ParserStreamState::default(),
+            false,
+        ),
         Some(previous)
             if size < previous.size
                 || mtime < previous.mtime
@@ -170,13 +211,21 @@ fn prepare_file_task(
                         .is_some_and(|(old, new)| old != new))
                 || (size == previous.size && mtime != previous.mtime) =>
         {
-            (0, 0, true, HashMap::new(), false)
+            (
+                0,
+                0,
+                true,
+                HashMap::new(),
+                ParserStreamState::default(),
+                false,
+            )
         }
         Some(previous) if size == previous.size && mtime == previous.mtime => (
             previous.offset,
             previous.turn_id,
             false,
             previous.pending_tool_calls.clone(),
+            previous.parser_stream.clone(),
             true,
         ),
         Some(previous) => (
@@ -184,6 +233,7 @@ fn prepare_file_task(
             previous.turn_id,
             false,
             previous.pending_tool_calls.clone(),
+            previous.parser_stream.clone(),
             false,
         ),
     };
@@ -199,11 +249,42 @@ fn prepare_file_task(
             delete_first,
             parser_version_invalidated,
             pending_tool_calls,
+            parser_stream,
             identity,
             parser_version,
+            projection_epoch: 0,
         },
         skip,
     )
+}
+
+fn prepare_opencode_task(
+    path: PathBuf,
+    include_reasoning: bool,
+    previous: Option<&FileState>,
+    force_replay: bool,
+) -> Result<(FileTask, bool)> {
+    let (size, mtime, modified_ns, fingerprint) =
+        crate::sources::opencode::session_dependency_fingerprint(&path)?;
+    let identity = FileIdentity {
+        device: None,
+        inode: None,
+        prefix_sha256: Some(fingerprint),
+        // A sentinel keeps aggregate dependency fingerprints comparable even when total bytes
+        // change; this is not a literal file prefix length.
+        prefix_bytes: u64::MAX,
+        modified_ns: Some(modified_ns),
+    };
+    Ok(prepare_file_task_from_snapshot(
+        path,
+        SourceKind::Opencode,
+        include_reasoning,
+        size,
+        mtime,
+        identity,
+        previous,
+        force_replay,
+    ))
 }
 
 fn discovered_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -252,6 +333,7 @@ fn completed_file_state(
     offset: u64,
     turn_id: u32,
     pending_tool_calls: HashMap<String, PendingToolCall>,
+    parser_stream: ParserStreamState,
 ) -> FileState {
     FileState {
         size: task.size,
@@ -260,8 +342,46 @@ fn completed_file_state(
         turn_id,
         parser_version: task.parser_version,
         pending_tool_calls,
+        parser_stream,
         identity: task.identity.clone(),
     }
+}
+
+fn source_identity_from_file(identity: &FileIdentity) -> String {
+    match (identity.device, identity.inode) {
+        (Some(device), Some(inode)) => format!("fs:{device}:{inode}"),
+        _ => identity
+            .prefix_sha256
+            .as_deref()
+            .map(|hash| format!("prefix:{hash}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+fn source_fingerprint(task: &FileTask) -> String {
+    format!(
+        "size={};mtime={};prefix={}",
+        task.size,
+        task.mtime,
+        task.identity.prefix_sha256.as_deref().unwrap_or("")
+    )
+}
+
+fn active_source_kinds(options: &IngestOptions) -> HashSet<SourceKind> {
+    let mut sources = HashSet::from([SourceKind::Claude]);
+    for (enabled, source) in [
+        (options.include_codex, SourceKind::Codex),
+        (options.include_opencode, SourceKind::Opencode),
+        (options.include_cursor, SourceKind::Cursor),
+        (options.include_pi, SourceKind::Pi),
+        (options.include_openclaw, SourceKind::OpenClaw),
+        (options.include_copilot, SourceKind::Copilot),
+    ] {
+        if enabled {
+            sources.insert(source);
+        }
+    }
+    sources
 }
 
 #[derive(Clone)]
@@ -294,6 +414,7 @@ impl RecordSender {
     }
 
     fn send(&self, mut record: Record) -> Result<()> {
+        record.ensure_record_key();
         let (input_truncated, output_truncated) =
             limit_record_tool_content(&mut record, self.limits);
         if input_truncated || output_truncated {
@@ -307,8 +428,8 @@ impl RecordSender {
 }
 
 struct WriterContext {
+    bulk_load: bool,
     embeddings: bool,
-    do_backfill_embeddings: bool,
     reset_vector_store: bool,
     vector_dir: PathBuf,
     analytics_path: PathBuf,
@@ -377,11 +498,17 @@ pub fn ingest_all(
     _lease: &IngestLease,
 ) -> Result<IngestReport> {
     // Apply additive analytics migrations even when the scan finds no changed files.
-    drop(AnalyticsStore::open(analytics_path(&paths.state))?);
+    let analytics_db = analytics_path(&paths.state);
+    let projection_store = AnalyticsStore::open(&analytics_db)?;
+    let catalog_needs_rebuild = !projection_store.complete()? && index.doc_count()? > 0;
+    let incomplete_paths = projection_store.incomplete_source_paths()?;
+    let projection_sources = projection_store.projection_sources()?;
     let state_path = paths.state.join("ingest.json");
     let mut state = IngestState::load(&state_path)?;
     if index.doc_count()? == 0 && !state.files.is_empty() {
         state = IngestState::default();
+        projection_store.clear()?;
+        projection_store.clear_projection_manifest()?;
         if paths.vectors.exists() {
             std::fs::remove_dir_all(&paths.vectors)?;
             std::fs::create_dir_all(&paths.vectors)?;
@@ -393,6 +520,7 @@ pub fn ingest_all(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
+    let mut discovered_paths = HashSet::new();
 
     if options.claude_source.exists() {
         let claude_files =
@@ -406,12 +534,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Claude,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -436,12 +566,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Codex,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -460,12 +592,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = history_path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 history_path,
                 SourceKind::Codex,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -486,13 +620,13 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) = prepare_file_task(
+            discovered_paths.insert(key.clone());
+            let (task, skip) = prepare_opencode_task(
                 path,
-                SourceKind::Opencode,
                 options.include_reasoning,
-                &meta,
                 state.files.get(&key),
-            );
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
+            )?;
             if skip {
                 files_skipped += 1;
                 continue;
@@ -512,12 +646,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Cursor,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -538,12 +674,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Pi,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -563,12 +701,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::OpenClaw,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -589,12 +729,14 @@ pub fn ingest_all(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
+            discovered_paths.insert(key.clone());
             let (task, skip) = prepare_file_task(
                 path,
                 SourceKind::Copilot,
                 options.include_reasoning,
                 &meta,
                 state.files.get(&key),
+                catalog_needs_rebuild || incomplete_paths.contains(&key),
             );
             if skip {
                 files_skipped += 1;
@@ -604,6 +746,21 @@ pub fn ingest_all(
         }
     }
 
+    let active_sources = active_source_kinds(options);
+    let mut known_paths: HashSet<String> = state.files.keys().cloned().collect();
+    known_paths.extend(projection_sources.keys().cloned());
+    let vanished_sources: Vec<(String, SourceKind)> = known_paths
+        .into_iter()
+        .filter(|path| !discovered_paths.contains(path))
+        .filter_map(|path| {
+            let source = projection_sources
+                .get(&path)
+                .copied()
+                .unwrap_or_else(|| SourceKind::from_path(&path));
+            active_sources.contains(&source).then_some((path, source))
+        })
+        .collect();
+
     let opencode_session_links = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
         crate::sources::opencode::session_links_by_id()
     } else {
@@ -612,13 +769,10 @@ pub fn ingest_all(
 
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
-    let analytics_db = analytics_path(&paths.state);
-    let analytics_needs_backfill =
-        !AnalyticsStore::is_complete(&analytics_db) && index.doc_count()? > 0;
-    if tasks.is_empty() && can_skip_noop_index(paths, index, options)? {
-        if analytics_needs_backfill {
-            backfill_from_index(&analytics_db, index)?;
-        }
+    if tasks.is_empty()
+        && vanished_sources.is_empty()
+        && can_skip_noop_index(paths, index, options)?
+    {
         update_scan_cache(paths, files_scanned, total_bytes)?;
         return Ok(IngestReport {
             records_added: 0,
@@ -629,8 +783,24 @@ pub fn ingest_all(
         });
     }
 
+    for task in &mut tasks {
+        let source_path = task.path.to_string_lossy().to_string();
+        let source_identity = source_identity_from_file(&task.identity);
+        let source_fingerprint = source_fingerprint(task);
+        task.projection_epoch = projection_store.begin_projection(
+            task.source,
+            &source_path,
+            &source_identity,
+            &source_fingerprint,
+            task.parser_version,
+            task.offset,
+        )?;
+    }
+
     let vector_migration = vector_migration(&paths.vectors, &tasks, options.model);
     let embeddings = options.embeddings || vector_migration.rebuild;
+    let bulk_load = (index.doc_count()? == 0 || catalog_needs_rebuild)
+        && crate::catalog::CatalogStore::open_read_only(&analytics_db)?.record_count()? == 0;
     let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
@@ -642,18 +812,21 @@ pub fn ingest_all(
     );
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
-    let delete_paths: Vec<String> = tasks
+    let mut delete_paths: HashSet<String> = tasks
         .iter()
         .filter(|t| t.delete_first)
         .map(|t| t.path.to_string_lossy().to_string())
         .collect();
+    delete_paths.extend(vanished_sources.iter().map(|(path, _)| path.clone()));
+    let delete_paths: Vec<String> = delete_paths.into_iter().collect();
+    remove_vectors_for_source_paths(&analytics_db, &paths.vectors, &delete_paths)?;
     let writer = index
         .writer()
         .context("failed to initialize the Tantivy index writer")?;
     let writer_index = index.clone();
     let writer_ctx = WriterContext {
+        bulk_load,
         embeddings,
-        do_backfill_embeddings: options.backfill_embeddings || vector_migration.rebuild,
         reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
@@ -743,25 +916,50 @@ pub fn ingest_all(
     let (records_added, records_embedded) =
         writer_result.context("index writer stopped before ingestion completed")?;
     parser_result?;
-    if analytics_needs_backfill {
-        backfill_from_index(&analytics_db, index)?;
-    } else {
-        AnalyticsStore::open(&analytics_db)?.mark_complete()?;
-    }
+    reconcile_vector_store(&analytics_db, &paths.vectors)?;
+    AnalyticsStore::open(&analytics_db)?.mark_complete()?;
 
     let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
     let mut updated_files = HashMap::new();
     while let Ok(update) = rx_update.recv() {
-        updated_files.insert(update.path.clone(), update.state.clone());
-        diagnostics.merge(update.diagnostics);
-        let _ = update.session_id;
+        updated_files.insert(update.path.clone(), update);
+    }
+    for update in updated_files.values() {
+        diagnostics.merge(update.diagnostics.clone());
     }
 
-    for (path, update) in updated_files {
-        state.files.insert(path, update);
+    for (path, update) in &updated_files {
+        state.files.insert(path.clone(), update.state.clone());
+    }
+    for (path, source) in &vanished_sources {
+        crate::usage::remove_cached_source_path(&analytics_db, *source, path)?;
+        state.files.remove(path);
     }
     state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
     state.save(&state_path)?;
+
+    for task in tasks_arc.iter() {
+        let path = task.path.to_string_lossy().to_string();
+        let update = updated_files
+            .get(&path)
+            .ok_or_else(|| anyhow!("missing completed projection state for {path}"))?;
+        let source_identity = update
+            .session_id
+            .as_deref()
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| source_identity_from_file(&task.identity));
+        projection_store.complete_projection(
+            &path,
+            &source_identity,
+            update.state.offset,
+            task.projection_epoch,
+            index.count_by_source_path(&path)?,
+        )?;
+    }
+    for (path, _) in &vanished_sources {
+        projection_store.delete_projection(path)?;
+    }
 
     update_scan_cache(paths, files_scanned, total_bytes)?;
 
@@ -821,25 +1019,63 @@ fn can_skip_noop_index(
     {
         return Ok(false);
     }
-    vector_index_covers_embeddable_records(index, &vector_index)
+    vector_index_covers_embedding_documents(index, &vector_index)
 }
 
-fn vector_index_covers_embeddable_records(
+fn vector_index_covers_embedding_documents(
     index: &SearchIndex,
     vector_index: &crate::vector::VectorIndex,
 ) -> Result<bool> {
-    let mut covers_all = true;
-    index.for_each_record(|record| {
-        if record_needs_embedding(&record) && !vector_index.contains(record.doc_id) {
-            covers_all = false;
-        }
-        Ok(())
-    })?;
-    Ok(covers_all)
+    if !index.catalog_path().exists() {
+        return Ok(false);
+    }
+    let catalog = crate::catalog::CatalogStore::open_read_only(index.catalog_path())?;
+    let vector_ids = catalog.embedding_vector_ids()?;
+    if vector_ids.is_empty() {
+        return Ok(!catalog.has_embeddable_records()?);
+    }
+    Ok(vector_ids
+        .into_iter()
+        .all(|vector_id| vector_index.contains(vector_id)))
 }
 
-fn record_needs_embedding(record: &Record) -> bool {
-    is_embedding_role(&record.role) && !record.text.is_empty()
+fn remove_vectors_for_source_paths(
+    catalog_path: &Path,
+    vector_dir: &Path,
+    source_paths: &[String],
+) -> Result<usize> {
+    if source_paths.is_empty() || !vector_dir.join("usearch.index").exists() {
+        return Ok(0);
+    }
+    let catalog = crate::catalog::CatalogStore::open_read_only(catalog_path)?;
+    let vector_ids = catalog.embedding_vector_ids_for_source_paths(source_paths)?;
+    if vector_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut vector_index = crate::vector::VectorIndex::open(vector_dir)?;
+    let removed = vector_index.remove_many(vector_ids)?;
+    if removed > 0 {
+        vector_index.save()?;
+    }
+    Ok(removed)
+}
+
+fn reconcile_vector_store(catalog_path: &Path, vector_dir: &Path) -> Result<usize> {
+    if !vector_dir.join("usearch.index").exists() {
+        return Ok(0);
+    }
+    let catalog = crate::catalog::CatalogStore::open_read_only(catalog_path)?;
+    let live_vector_ids: HashSet<u64> = catalog.embedding_vector_ids()?.into_iter().collect();
+    let mut vector_index = crate::vector::VectorIndex::open(vector_dir)?;
+    let stale_vector_ids: Vec<u64> = vector_index
+        .vector_ids()
+        .filter(|vector_id| !live_vector_ids.contains(vector_id))
+        .collect();
+    let removed = vector_index.remove_many(stale_vector_ids)?;
+    if removed > 0 {
+        vector_index.save()?;
+    }
+    Ok(removed)
 }
 
 fn writer_loop(
@@ -850,8 +1086,8 @@ fn writer_loop(
     ctx: WriterContext,
 ) -> Result<(usize, usize)> {
     let WriterContext {
+        bulk_load,
         embeddings,
-        do_backfill_embeddings,
         reset_vector_store,
         vector_dir,
         analytics_path,
@@ -860,7 +1096,11 @@ fn writer_loop(
         embed_runtime,
         tool_content_limits,
     } = ctx;
-    let mut analytics = AnalyticsWriter::open(&analytics_path)?;
+    let mut analytics = if bulk_load {
+        AnalyticsWriter::open_bulk(&analytics_path)?
+    } else {
+        AnalyticsWriter::open(&analytics_path)?
+    };
     for path in delete_paths {
         index.delete_by_source_path(&mut writer, &path);
         analytics.delete_source_path(&path)?;
@@ -870,7 +1110,6 @@ fn writer_loop(
     let mut embedded_count = 0usize;
     let mut vector_index = None;
     let mut embedder: Option<EmbedderHandle> = None;
-    let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     let mut index_pending = [0u64; SOURCE_COUNT];
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
@@ -898,30 +1137,6 @@ fn writer_loop(
             progress.add_indexed(record.source, index_pending[source_idx]);
             index_pending[source_idx] = 0;
         }
-        if embeddings
-            && !reset_vector_store
-            && is_embedding_role(&record.role)
-            && !record.text.is_empty()
-        {
-            let text = truncate_for_embedding(std::mem::take(&mut record.text));
-            if let Some(vindex) = vector_index.as_ref()
-                && !vindex.contains(record.doc_id)
-            {
-                progress.add_embed_total(record.source, 1);
-                progress.add_embed_pending(record.source, 1);
-                embed_buffer.push((record.doc_id, text, record.source));
-            }
-            if let Some(emb) = embedder.as_mut()
-                && embed_buffer.len() >= EMBED_BATCH_SIZE
-            {
-                embedded_count += flush_embeddings(
-                    &mut embed_buffer,
-                    emb,
-                    vector_index.as_mut().unwrap(),
-                    &progress,
-                )?;
-            }
-        }
         count += 1;
     }
 
@@ -934,76 +1149,23 @@ fn writer_loop(
         }
     }
 
+    let affected_session_keys = analytics.affected_session_keys();
     analytics.flush()?;
     writer.commit()?;
     if embeddings {
-        if !embed_buffer.is_empty() {
-            embedded_count += flush_embeddings(
-                &mut embed_buffer,
-                embedder.as_mut().unwrap(),
-                vector_index.as_mut().unwrap(),
-                &progress,
-            )?;
-        }
-
-        let needs_vector_backfill = match vector_index.as_ref() {
-            Some(vindex) => {
-                vindex.needs_backfill() || !vector_index_covers_embeddable_records(&index, vindex)?
-            }
-            None => false,
-        };
-        if do_backfill_embeddings || needs_vector_backfill {
-            embedded_count += backfill_embeddings(
-                &index,
-                embedder.as_mut().unwrap(),
-                vector_index.as_mut().unwrap(),
-                &progress,
-            )?;
-        }
-        if let Some(vindex) = vector_index.as_mut() {
-            vindex.save()?;
-        }
+        let report = crate::embedding_documents::synchronize_sessions(
+            &analytics_path,
+            &affected_session_keys,
+            vector_index.as_mut().unwrap(),
+            embedder.as_mut().unwrap(),
+            Some(&progress),
+        )?;
+        embedded_count = report.embedded;
         if let Some(handle) = embedder.take() {
             std::mem::forget(handle);
         }
     }
     Ok((count, embedded_count))
-}
-
-fn backfill_embeddings(
-    index: &SearchIndex,
-    embedder: &mut EmbedderHandle,
-    vector_index: &mut crate::vector::VectorIndex,
-    progress: &Arc<Progress>,
-) -> Result<usize> {
-    use std::cell::Cell;
-    let embedded_count = Cell::new(0usize);
-    let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
-    index.for_each_record(|record| {
-        if record.text.is_empty()
-            || !is_embedding_role(&record.role)
-            || vector_index.contains(record.doc_id)
-        {
-            return Ok(());
-        }
-        progress.add_embed_total(record.source, 1);
-        progress.add_embed_pending(record.source, 1);
-        embed_buffer.push((
-            record.doc_id,
-            truncate_for_embedding(record.text),
-            record.source,
-        ));
-        if embed_buffer.len() >= EMBED_BATCH_SIZE {
-            let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
-            embedded_count.set(embedded_count.get() + n);
-        }
-        Ok(())
-    })?;
-    if !embed_buffer.is_empty() {
-        let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
-        embedded_count.set(embedded_count.get() + n);
-    }
-    Ok(embedded_count.get())
 }
 
 fn parse_claude_file(
@@ -1021,6 +1183,7 @@ fn parse_claude_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1054,6 +1217,7 @@ fn parse_codex_session(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1087,6 +1251,7 @@ fn parse_codex_history(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         session_ids,
         next_doc_id,
@@ -1120,6 +1285,7 @@ fn finish_source_parse(
         parsed.offset,
         parsed.turn_id,
         parsed.pending_tool_calls,
+        parsed.parser_stream,
     );
     tx_update.send(FileUpdate {
         path: source_path,
@@ -1144,6 +1310,7 @@ fn parse_opencode_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         opencode_session_links,
         next_doc_id,
@@ -1177,6 +1344,7 @@ fn parse_cursor_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         next_doc_id,
         |record| {
@@ -1208,6 +1376,7 @@ fn parse_pi_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1240,6 +1409,7 @@ fn parse_openclaw_file(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         include_reasoning,
         next_doc_id,
@@ -1271,6 +1441,7 @@ fn parse_copilot_session(
             offset: task.offset,
             turn_id: task.turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
+            parser_stream: task.parser_stream.clone(),
         },
         next_doc_id,
         |record| {
@@ -1287,42 +1458,6 @@ fn parse_copilot_session(
         parsed,
     )
 }
-fn flush_embeddings(
-    buffer: &mut Vec<(u64, String, SourceKind)>,
-    embedder: &mut EmbedderHandle,
-    vindex: &mut crate::vector::VectorIndex,
-    progress: &Arc<Progress>,
-) -> Result<usize> {
-    if buffer.is_empty() {
-        return Ok(0);
-    }
-
-    // Prepare texts for batch embedding
-    let items: Vec<(u64, String, SourceKind)> = buffer
-        .drain(..)
-        .map(|(doc_id, text, source)| (doc_id, truncate_for_embedding(text), source))
-        .filter(|(_, text, _)| !text.is_empty())
-        .collect();
-
-    if items.is_empty() {
-        return Ok(0);
-    }
-
-    // Batch embed all texts at once (ONNX Runtime handles internal parallelism)
-    let texts: Vec<&str> = items.iter().map(|(_, text, _)| text.as_str()).collect();
-    let embeddings = embedder.embed_texts(&texts)?;
-
-    // Add embeddings to index
-    let mut count = 0;
-    for ((doc_id, _, source), vec) in items.iter().zip(embeddings.iter()) {
-        vindex.add(*doc_id, vec)?;
-        progress.sub_embed_pending(*source, 1);
-        progress.add_embedded(*source, 1);
-        count += 1;
-    }
-    Ok(count)
-}
-
 fn compute_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
     let mut totals = [0u64; SOURCE_COUNT];
     for task in tasks {
@@ -1338,18 +1473,6 @@ fn compute_file_totals(tasks: &[FileTask]) -> [u64; SOURCE_COUNT] {
         totals[task.source.idx()] += 1;
     }
     totals
-}
-
-fn truncate_for_embedding(mut text: String) -> String {
-    if text.len() <= EMBED_MAX_CHARS {
-        return text;
-    }
-    let mut end = EMBED_MAX_CHARS.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
 }
 
 fn limit_record_tool_content(
@@ -1432,10 +1555,6 @@ fn truncation_marker(omitted_bytes: usize) -> String {
     format!("\n\n[... {omitted_bytes} bytes truncated ...]\n\n")
 }
 
-fn is_embedding_role(role: &str) -> bool {
-    role == "user" || role == "assistant"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1592,35 @@ mod tests {
         vector.save().unwrap();
     }
 
+    fn save_embedding_vectors(
+        paths: &Paths,
+        index: &SearchIndex,
+        model: &str,
+        dimensions: usize,
+        limit: Option<usize>,
+    ) {
+        let mut records = Vec::new();
+        index
+            .for_each_record(|record| {
+                records.push(record);
+                Ok(())
+            })
+            .expect("read records");
+        let documents = crate::embedding_documents::build_embedding_documents(records);
+        crate::catalog::CatalogStore::open(analytics_path(&paths.state))
+            .expect("open catalog")
+            .replace_embedding_documents(&documents)
+            .expect("store embedding documents");
+        let mut vector = VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model))
+            .expect("open vector store");
+        for document in documents.iter().take(limit.unwrap_or(usize::MAX)) {
+            vector
+                .add(document.vector_id, &vec![0.0; dimensions])
+                .expect("add embedding vector");
+        }
+        vector.save().expect("save embedding vectors");
+    }
+
     fn open_search_index(paths: &Paths) -> SearchIndex {
         fs::create_dir_all(&paths.index).expect("create index dir");
         SearchIndex::open_or_create(&paths.index).expect("open search index")
@@ -1486,9 +1634,12 @@ mod tests {
     fn save_search_records(paths: &Paths, records: &[Record]) -> SearchIndex {
         let index = open_search_index(paths);
         let mut writer = index.writer().expect("open index writer");
+        let mut catalog = AnalyticsWriter::open(analytics_path(&paths.state)).expect("catalog");
         for record in records {
+            catalog.record(record).expect("catalog record");
             index.add_record(&mut writer, record).expect("add record");
         }
+        catalog.flush().expect("flush catalog");
         writer.commit().expect("commit records");
         index
     }
@@ -1523,12 +1674,14 @@ mod tests {
             delete_first: false,
             parser_version_invalidated: false,
             pending_tool_calls,
+            parser_stream: ParserStreamState::default(),
             identity: file_identity(
                 path,
                 &metadata,
                 metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
             ),
             parser_version: crate::sources::index_state_version(source),
+            projection_epoch: 0,
         }
     }
 
@@ -1551,6 +1704,7 @@ mod tests {
     fn record(doc_id: u64, role: &str, text: &str) -> Record {
         Record {
             source: SourceKind::Claude,
+            record_key: format!("rk-{doc_id}"),
             doc_id,
             ts: doc_id,
             project: "project".to_string(),
@@ -1589,8 +1743,14 @@ mod tests {
         let path = temp.path().join("removed.jsonl");
         fs::write(&path, "{}\n").expect("seed transcript");
         let metadata = path.metadata().expect("transcript metadata");
-        let (task, skip) =
-            prepare_file_task(path.clone(), SourceKind::Claude, false, &metadata, None);
+        let (task, skip) = prepare_file_task(
+            path.clone(),
+            SourceKind::Claude,
+            false,
+            &metadata,
+            None,
+            false,
+        );
         assert!(!skip);
         fs::remove_file(&path).expect("remove transcript after discovery");
         assert!(
@@ -1618,6 +1778,50 @@ mod tests {
             .expect("removed transcript should be skipped");
 
         assert_eq!(skipped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn opencode_part_only_update_forces_session_replay() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("message/ses_test");
+        let part_dir = storage.join("part/msg_test");
+        fs::create_dir_all(&session_dir).expect("message directory");
+        fs::create_dir_all(&part_dir).expect("part directory");
+        fs::write(
+            session_dir.join("msg_test.json"),
+            r#"{"id":"msg_test","role":"assistant","time":{"created":10}}"#,
+        )
+        .expect("message");
+        let part_path = part_dir.join("01-tool.json");
+        fs::write(
+            &part_path,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"running"}}"#,
+        )
+        .expect("running part");
+
+        let (first, skip) =
+            prepare_opencode_task(session_dir.clone(), false, None, false).expect("first task");
+        assert!(!skip);
+        let previous =
+            completed_file_state(&first, 0, 3, HashMap::new(), ParserStreamState::default());
+        let (_, unchanged) =
+            prepare_opencode_task(session_dir.clone(), false, Some(&previous), false)
+                .expect("unchanged task");
+        assert!(unchanged);
+
+        fs::write(
+            part_path,
+            r#"{"type":"tool","callID":"call-1","state":{"status":"completed","output":"done"}}"#,
+        )
+        .expect("completed part");
+        let (replay, skip) = prepare_opencode_task(session_dir, false, Some(&previous), false)
+            .expect("updated task");
+
+        assert!(!skip);
+        assert!(replay.delete_first);
+        assert_eq!(replay.offset, 0);
+        assert_eq!(replay.turn_id, 0);
     }
 
     #[test]
@@ -1939,7 +2143,12 @@ mod tests {
         .expect("parse calls");
         let first_records: Vec<_> = rx_record.try_iter().collect();
         let first_state = rx_update.try_recv().expect("first state").state;
-        assert_eq!(first_records.len(), 2);
+        assert_eq!(first_records.len(), 3);
+        assert_eq!(first_records[2].role, "assistant");
+        assert!(first_records[2].text.is_empty());
+        assert!(first_records[..2].iter().all(|record| {
+            record.links.message_ordinal == first_records[2].links.message_ordinal
+        }));
         assert_eq!(first_state.pending_tool_calls.len(), 2);
         let pending_a = first_state
             .pending_tool_calls
@@ -1958,13 +2167,14 @@ mod tests {
             .expect("open append")
             .write_all(results.as_bytes())
             .expect("append results");
-        let second = incremental_task(
+        let mut second = incremental_task(
             &path,
             SourceKind::Claude,
             first_state.offset,
             first_state.turn_id,
             first_state.pending_tool_calls,
         );
+        second.parser_stream = first_state.parser_stream;
         parse_claude_file(
             &second,
             false,
@@ -2024,8 +2234,22 @@ mod tests {
             &progress,
         )
         .expect("parse call");
-        let call_record = rx_record.try_recv().expect("call record");
+        let first_records: Vec<_> = rx_record.try_iter().collect();
+        let call_record = first_records
+            .iter()
+            .find(|record| record.role == "tool_use")
+            .expect("call record");
         let first_state = rx_update.try_recv().expect("first state").state;
+        assert_eq!(first_records.len(), 2);
+        let owner = first_records
+            .iter()
+            .find(|record| record.role == "assistant")
+            .expect("assistant owner");
+        assert!(owner.text.is_empty());
+        assert_eq!(
+            call_record.links.message_ordinal,
+            owner.links.message_ordinal
+        );
         assert_eq!(call_record.tool_name.as_deref(), Some("shell"));
         assert_eq!(
             first_state
@@ -2042,13 +2266,14 @@ mod tests {
             .expect("open append")
             .write_all(result.as_bytes())
             .expect("append result");
-        let second = incremental_task(
+        let mut second = incremental_task(
             &path,
             SourceKind::Codex,
             first_state.offset,
             first_state.turn_id,
             first_state.pending_tool_calls,
         );
+        second.parser_stream = first_state.parser_stream;
         parse_codex_session(
             &second,
             false,
@@ -2086,8 +2311,14 @@ mod tests {
         let path = tmp.path().join("session.jsonl");
         fs::write(&path, "original transcript with a pending call\n").expect("write original");
         let metadata = path.metadata().expect("original metadata");
-        let (mut original, _) =
-            prepare_file_task(path.clone(), SourceKind::Claude, false, &metadata, None);
+        let (mut original, _) = prepare_file_task(
+            path.clone(),
+            SourceKind::Claude,
+            false,
+            &metadata,
+            None,
+            false,
+        );
         original.pending_tool_calls.insert(
             "stale".to_string(),
             PendingToolCall {
@@ -2100,6 +2331,7 @@ mod tests {
             metadata.len(),
             1,
             original.pending_tool_calls.clone(),
+            original.parser_stream.clone(),
         );
 
         fs::write(&path, "short\n").expect("truncate");
@@ -2110,6 +2342,7 @@ mod tests {
             false,
             &truncated_meta,
             Some(&prior),
+            false,
         );
         assert!(!skip);
         assert!(truncated.delete_first);
@@ -2130,6 +2363,7 @@ mod tests {
             false,
             &replacement_meta,
             Some(&prior),
+            false,
         );
         assert!(!skip);
         assert!(replaced.delete_first);
@@ -2145,8 +2379,14 @@ mod tests {
         let path = temp.path().join("session.jsonl");
         fs::write(&path, "tool call\n").expect("write call");
         let metadata = path.metadata().expect("call metadata");
-        let (mut first, _) =
-            prepare_file_task(path.clone(), SourceKind::Claude, false, &metadata, None);
+        let (mut first, _) = prepare_file_task(
+            path.clone(),
+            SourceKind::Claude,
+            false,
+            &metadata,
+            None,
+            false,
+        );
         first.pending_tool_calls.insert(
             "call-1".to_string(),
             PendingToolCall {
@@ -2154,8 +2394,13 @@ mod tests {
                 ..PendingToolCall::default()
             },
         );
-        let previous =
-            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+        let previous = completed_file_state(
+            &first,
+            metadata.len(),
+            1,
+            first.pending_tool_calls.clone(),
+            first.parser_stream.clone(),
+        );
 
         fs::OpenOptions::new()
             .append(true)
@@ -2170,6 +2415,7 @@ mod tests {
             false,
             &appended_metadata,
             Some(&previous),
+            false,
         );
 
         assert!(!skip);
@@ -2214,10 +2460,17 @@ mod tests {
                     ..PendingToolCall::default()
                 },
             )]),
+            parser_stream: ParserStreamState::default(),
             identity,
         };
-        let (task, skip) =
-            prepare_file_task(path, SourceKind::Claude, false, &metadata, Some(&previous));
+        let (task, skip) = prepare_file_task(
+            path,
+            SourceKind::Claude,
+            false,
+            &metadata,
+            Some(&previous),
+            false,
+        );
         assert!(!skip);
         assert!(task.delete_first);
         assert!(task.parser_version_invalidated);
@@ -2257,6 +2510,186 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_projection_forces_full_source_replay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session.jsonl");
+        fs::write(&path, "unchanged\n").expect("write source");
+        let metadata = path.metadata().expect("metadata");
+        let (first, _) = prepare_file_task(
+            path.clone(),
+            SourceKind::Claude,
+            false,
+            &metadata,
+            None,
+            false,
+        );
+        let previous = completed_file_state(
+            &first,
+            metadata.len(),
+            7,
+            HashMap::from([(
+                "pending".to_string(),
+                PendingToolCall {
+                    tool_name: Some("Read".to_string()),
+                    ..PendingToolCall::default()
+                },
+            )]),
+            first.parser_stream.clone(),
+        );
+
+        let (replay, skip) = prepare_file_task(
+            path,
+            SourceKind::Claude,
+            false,
+            &metadata,
+            Some(&previous),
+            true,
+        );
+
+        assert!(!skip);
+        assert!(replay.delete_first);
+        assert_eq!(replay.offset, 0);
+        assert_eq!(replay.turn_id, 0);
+        assert!(replay.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn vector_reconciliation_removes_replaced_and_orphaned_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let mut first = record(1, "user", "first");
+        first.source_path = "/logs/first.jsonl".to_string();
+        let mut second = record(2, "assistant", "second");
+        second.source_path = "/logs/second.jsonl".to_string();
+        let _index = save_search_records(&paths, &[first.clone(), second.clone()]);
+        let documents = crate::embedding_documents::build_embedding_documents(vec![first, second]);
+        let first_vector_id = documents
+            .iter()
+            .find(|document| document.anchor_record_key == "rk-1")
+            .expect("first embedding document")
+            .vector_id;
+        let second_vector_id = documents
+            .iter()
+            .find(|document| document.anchor_record_key == "rk-2")
+            .expect("second embedding document")
+            .vector_id;
+        crate::catalog::CatalogStore::open(analytics_path(&paths.state))
+            .expect("open catalog")
+            .replace_embedding_documents(&documents)
+            .expect("store embedding documents");
+        let mut vectors =
+            VectorIndex::open_or_create(&paths.vectors, 64, Some("test")).expect("vectors");
+        vectors
+            .add(first_vector_id, &vec![0.1; 64])
+            .expect("first vector");
+        vectors
+            .add(second_vector_id, &vec![0.2; 64])
+            .expect("second vector");
+        vectors.add(999, &vec![0.3; 64]).expect("orphan vector");
+        vectors.save().expect("save vectors");
+
+        assert_eq!(
+            remove_vectors_for_source_paths(
+                &analytics_path(&paths.state),
+                &paths.vectors,
+                &["/logs/first.jsonl".to_string()],
+            )
+            .expect("remove replaced"),
+            1
+        );
+        assert_eq!(
+            reconcile_vector_store(&analytics_path(&paths.state), &paths.vectors)
+                .expect("reconcile"),
+            1
+        );
+
+        let vectors = VectorIndex::open(&paths.vectors).expect("reopen vectors");
+        assert!(!vectors.contains(first_vector_id));
+        assert!(vectors.contains(second_vector_id));
+        assert!(!vectors.contains(999));
+    }
+
+    #[test]
+    fn vanished_source_is_removed_from_every_projection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let vanished_path = tmp.path().join("vanished-session.jsonl");
+        let vanished_key = vanished_path.to_string_lossy().to_string();
+        let mut vanished_record = record(1, "user", "vanished");
+        vanished_record.source_path = vanished_key.clone();
+        let index = save_search_records(&paths, &[vanished_record]);
+
+        let state = IngestState {
+            next_doc_id: 2,
+            files: HashMap::from([(
+                vanished_key.clone(),
+                FileState {
+                    size: 10,
+                    mtime: 1,
+                    offset: 10,
+                    turn_id: 1,
+                    parser_version: crate::sources::index_state_version(SourceKind::Claude),
+                    pending_tool_calls: HashMap::new(),
+                    parser_stream: ParserStreamState::default(),
+                    identity: FileIdentity::default(),
+                },
+            )]),
+        };
+        state
+            .save(&paths.state.join("ingest.json"))
+            .expect("save ingest state");
+
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).expect("analytics");
+        let epoch = analytics
+            .begin_projection(
+                SourceKind::Claude,
+                &vanished_key,
+                "session",
+                "fingerprint",
+                crate::sources::index_state_version(SourceKind::Claude),
+                10,
+            )
+            .expect("begin projection");
+        analytics
+            .complete_projection(&vanished_key, "session", 10, epoch, 1)
+            .expect("complete projection");
+        analytics.mark_complete().expect("mark complete");
+
+        save_embedding_vectors(&paths, &index, "test", 64, None);
+        let vector_id = crate::catalog::CatalogStore::open_read_only(analytics_path(&paths.state))
+            .expect("catalog")
+            .embedding_vector_ids()
+            .expect("embedding vector ids")[0];
+
+        let options = ingest_options(false, ModelChoice::Gemma);
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+
+        assert_eq!(report.records_added, 0);
+        assert_eq!(index.doc_count().expect("doc count"), 0);
+        assert!(
+            !VectorIndex::open(&paths.vectors)
+                .expect("vectors")
+                .contains(vector_id)
+        );
+        assert!(
+            !IngestState::load(&paths.state.join("ingest.json"))
+                .expect("state")
+                .files
+                .contains_key(&vanished_key)
+        );
+        assert!(
+            !AnalyticsStore::open(analytics_path(&paths.state))
+                .expect("analytics")
+                .projection_sources()
+                .expect("projection sources")
+                .contains_key(&vanished_key)
+        );
+    }
+
+    #[test]
     fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let claude_root = tmp.path().join("claude-projects");
@@ -2266,8 +2699,8 @@ mod tests {
         fs::write(
             &session_file,
             r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"sess-claude","isSidechain":false,"timestamp":"2026-03-11T01:23:43.844Z","message":{"content":"question"}}
-{"type":"assistant","uuid":"a1","parentUuid":"u1","logicalParentUuid":"u0","sessionId":"sess-claude","isSidechain":true,"sourceToolUseID":"source-tool","sourceToolAssistantUUID":"source-assistant","timestamp":"2026-03-11T01:23:44.844Z","message":{"content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"tool-claude","name":"Read","input":{"file_path":"Cargo.toml"}}]}}
-{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"sess-claude","isSidechain":true,"timestamp":"2026-03-11T01:23:45.844Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-claude","content":"ok"}]}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","logicalParentUuid":"u0","sessionId":"sess-claude","isSidechain":true,"sourceToolUseID":"source-tool","sourceToolAssistantUUID":"source-assistant","timestamp":"2026-03-11T01:23:44.844Z","message":{"model":"claude-test","usage":{"input_tokens":100,"cache_read_input_tokens":40,"cache_creation_input_tokens":10,"output_tokens":20},"content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"tool-claude","name":"Read","input":{"file_path":"Cargo.toml"}}]}}
+{"type":"user","uuid":"r1","parentUuid":"a1","sessionId":"sess-claude","isSidechain":true,"timestamp":"2026-03-11T01:23:45.844Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-claude","content":"ok","is_error":false}]}}
 "#,
         )
         .expect("write claude fixture");
@@ -2309,6 +2742,11 @@ mod tests {
         assert_eq!(records[1].links.event_id.as_deref(), Some("tool-claude"));
         assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
         assert_eq!(
+            records[1].links.message_ordinal,
+            records[2].links.message_ordinal
+        );
+        assert_eq!(records[1].links.call_index, Some(0));
+        assert_eq!(
             records[1].links.logical_parent_event_id.as_deref(),
             Some("u0")
         );
@@ -2328,6 +2766,11 @@ mod tests {
         assert_eq!(records[2].role, "assistant");
         assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
+        assert_eq!(records[2].links.model.as_deref(), Some("claude-test"));
+        assert_eq!(records[2].links.input_tokens, Some(100));
+        assert_eq!(records[2].links.cache_read_tokens, Some(40));
+        assert_eq!(records[2].links.cache_write_tokens, Some(10));
+        assert_eq!(records[2].links.output_tokens, Some(20));
         assert_eq!(records[2].links.thread_source.as_deref(), Some("sidechain"));
         assert_eq!(
             records[2].links.conversation_kind.as_deref(),
@@ -2347,6 +2790,8 @@ mod tests {
             Some("tool-claude")
         );
         assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+        assert_eq!(records[3].links.event_index, Some(0));
+        assert_eq!(records[3].links.status.as_deref(), Some("success"));
     }
 
     #[test]
@@ -2398,8 +2843,8 @@ mod tests {
     fn can_skip_fresh_scan_with_compatible_vectors() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        save_vector_store(&paths, "bge", 384);
         let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        save_embedding_vectors(&paths, &index, "bge", 384, None);
         let options = ingest_options(true, ModelChoice::BGESmall);
         let cache = fresh_scan_cache();
         mark_analytics_complete(&paths);
@@ -2464,8 +2909,8 @@ mod tests {
     fn can_skip_noop_index_with_compatible_vectors() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        save_vector_store(&paths, "bge", 384);
         let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        save_embedding_vectors(&paths, &index, "bge", 384, None);
         let options = ingest_options(true, ModelChoice::BGESmall);
 
         assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
@@ -2475,7 +2920,6 @@ mod tests {
     fn cannot_skip_noop_index_with_partial_compatible_vectors() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        save_vector_store(&paths, "bge", 384);
         let index = save_search_records(
             &paths,
             &[
@@ -2483,6 +2927,18 @@ mod tests {
                 record(2, "assistant", "missing vector"),
             ],
         );
+        save_embedding_vectors(&paths, &index, "bge", 384, Some(1));
+        let options = ingest_options(true, ModelChoice::BGESmall);
+
+        assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+    }
+
+    #[test]
+    fn cannot_skip_noop_index_without_embedding_projection_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        let index = save_search_records(&paths, &[record(1, "user", "needs projection")]);
+        save_vector_store(&paths, "bge", 384);
         let options = ingest_options(true, ModelChoice::BGESmall);
 
         assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
@@ -2492,7 +2948,6 @@ mod tests {
     fn can_skip_noop_index_ignores_records_that_do_not_need_embeddings() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
-        save_vector_store(&paths, "bge", 384);
         let index = save_search_records(
             &paths,
             &[
@@ -2501,6 +2956,7 @@ mod tests {
                 record(3, "assistant", ""),
             ],
         );
+        save_embedding_vectors(&paths, &index, "bge", 384, None);
         let options = ingest_options(true, ModelChoice::BGESmall);
 
         assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
@@ -2650,7 +3106,7 @@ mod tests {
             &session_file,
             r#"{"type":"session","version":3,"id":"11111111-1111-1111-1111-111111111111","timestamp":"2026-07-03T01:02:03Z","cwd":"/Users/nico/Code/memex"}
 {"type":"message","id":"u1","timestamp":"2026-07-03T01:02:04Z","message":{"role":"user","content":[{"type":"text","text":"hello pi"}]}}
-{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"considering options"},{"type":"text","text":"I will run a command"},{"type":"toolCall","id":"tc1","name":"Read","arguments":{"file_path":"README.md"}}]}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-07-03T01:02:05Z","message":{"role":"assistant","model":"pi-test","usage":{"input":90,"cacheRead":30,"cacheWrite":5,"output":15,"reasoning":4},"content":[{"type":"thinking","thinking":"considering options"},{"type":"text","text":"I will run a command"},{"type":"toolCall","id":"tc1","name":"Read","arguments":{"file_path":"README.md"}}]}}
 {"type":"message","id":"tr1","parentId":"a1","timestamp":"2026-07-03T01:02:06Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"Read","content":[{"type":"text","text":"README contents"}],"isError":false}}
 {"type":"message","id":"b1","parentId":"tr1","timestamp":"2026-07-03T01:02:07Z","message":{"role":"bashExecution","command":"cargo test","output":"ok","exitCode":0,"cancelled":false,"truncated":false}}
 {"type":"message","id":"bh1","parentId":"b1","timestamp":"2026-07-03T01:02:07Z","message":{"role":"bashExecution","command":"echo secret","output":"secret output","exitCode":0,"excludeFromContext":true}}
@@ -2711,20 +3167,34 @@ mod tests {
         assert!(records[1].text.contains("README.md"));
         assert_eq!(records[1].links.event_id.as_deref(), Some("tc1"));
         assert_eq!(records[1].links.parent_event_id.as_deref(), Some("a1"));
+        assert_eq!(
+            records[1].links.message_ordinal,
+            records[2].links.message_ordinal
+        );
+        assert_eq!(records[1].links.call_index, Some(0));
         assert_eq!(records[2].role, "assistant");
         assert!(records[2].text.contains("I will run a command"));
         assert!(!records[2].text.contains("considering options"));
         assert_eq!(records[2].links.event_id.as_deref(), Some("a1"));
         assert_eq!(records[2].links.parent_event_id.as_deref(), Some("u1"));
+        assert_eq!(records[2].links.model.as_deref(), Some("pi-test"));
+        assert_eq!(records[2].links.input_tokens, Some(90));
+        assert_eq!(records[2].links.cache_read_tokens, Some(30));
+        assert_eq!(records[2].links.cache_write_tokens, Some(5));
+        assert_eq!(records[2].links.output_tokens, Some(15));
+        assert_eq!(records[2].links.reasoning_tokens, Some(4));
         assert_eq!(records[3].role, "tool_result");
         assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
         assert_eq!(records[3].text, "README contents");
         assert_eq!(records[3].links.event_id.as_deref(), Some("tr1"));
         assert_eq!(records[3].links.parent_event_id.as_deref(), Some("a1"));
         assert_eq!(records[3].links.parent_tool_use_id.as_deref(), Some("tc1"));
+        assert_eq!(records[3].links.event_index, Some(0));
+        assert_eq!(records[3].links.status.as_deref(), Some("success"));
         assert_eq!(records[4].role, "tool_result");
         assert_eq!(records[4].tool_name.as_deref(), Some("Bash"));
         assert!(records[4].text.contains("$ cargo test"));
+        assert_eq!(records[4].links.status.as_deref(), Some("success"));
         assert!(records[4].text.contains("exit code: 0"));
         assert_eq!(records[5].role, "assistant");
         assert_eq!(records[5].links.event_id.as_deref(), Some("c1"));
@@ -2797,8 +3267,10 @@ mod tests {
             delete_first: false,
             parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
+            parser_stream: ParserStreamState::default(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
+            projection_epoch: 0,
         };
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(1);
@@ -2859,8 +3331,7 @@ mod tests {
             concat!(
                 "{\"type\":\"session.start\",\"timestamp\":\"2026-06-01T12:00:00Z\",\"data\":{\"sessionId\":\"11111111-1111-4111-8111-111111111111\",\"context\":{\"cwd\":\"/Users/nico/Code/memex\",\"repository\":\"nicosuave/memex\"}}}\n",
                 "{\"type\":\"user.message\",\"timestamp\":\"2026-06-01T12:00:01Z\",\"data\":{\"content\":\"Find the parser\"}}\n",
-                "{\"type\":\"assistant.message\",\"timestamp\":\"2026-06-01T12:00:02Z\",\"data\":{\"content\":\"I will inspect ingestion.\"}}\n",
-                "{\"type\":\"tool.execution_start\",\"timestamp\":\"2026-06-01T12:00:03Z\",\"data\":{\"toolCallId\":\"call-1\",\"toolName\":\"grep\",\"arguments\":{\"pattern\":\"parse_copilot\"}}}\n",
+                "{\"type\":\"tool.execution_start\",\"timestamp\":\"2026-06-01T12:00:03Z\",\"data\":{\"toolCallId\":\"call-1\",\"toolName\":\"grep\",\"model\":\"copilot-test\",\"usage\":{\"inputTokens\":18,\"outputTokens\":2},\"arguments\":{\"pattern\":\"parse_copilot\"}}}\n",
                 "{\"type\":\"tool.execution_complete\",\"timestamp\":\"2026-06-01T12:00:04Z\",\"data\":{\"toolCallId\":\"call-1\",\"success\":true,\"result\":{\"content\":\"src/ingest.rs\"}}}\n"
             ),
         )
@@ -2876,18 +3347,20 @@ mod tests {
             delete_first: false,
             parser_version_invalidated: false,
             pending_tool_calls: HashMap::new(),
+            parser_stream: ParserStreamState::default(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Copilot),
+            projection_epoch: 0,
         };
         let (raw_tx_record, rx_record) = unbounded();
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
-        let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 1],
-            false,
-        ));
+        let mut total_bytes = [0; SOURCE_COUNT];
+        total_bytes[SourceKind::Copilot.idx()] = meta.len();
+        let mut total_files = [0; SOURCE_COUNT];
+        total_files[SourceKind::Copilot.idx()] = 1;
+        let progress = Arc::new(Progress::new(total_bytes, total_files, false));
 
         parse_copilot_session(&task, &tx_record, &tx_update, &next_doc_id, &progress)
             .expect("parse copilot session");
@@ -2910,10 +3383,19 @@ mod tests {
             records[1].links.event_id.as_deref(),
             Some("11111111-1111-4111-8111-111111111111:1")
         );
+        assert_eq!(records[1].links.model.as_deref(), Some("copilot-test"));
+        assert!(records[1].text.is_empty());
+        assert_eq!(records[1].links.input_tokens, Some(18));
+        assert_eq!(records[1].links.output_tokens, Some(2));
         assert_eq!(records[2].role, "tool_use");
         assert_eq!(records[2].tool_name.as_deref(), Some("grep"));
         assert!(records[2].text.contains("parse_copilot"));
         assert_eq!(records[2].links.event_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            records[2].links.message_ordinal,
+            records[1].links.message_ordinal
+        );
+        assert_eq!(records[2].links.call_index, Some(0));
         assert_eq!(records[3].role, "tool_result");
         assert_eq!(records[3].tool_name.as_deref(), Some("grep"));
         assert_eq!(records[3].tool_output.as_deref(), Some("src/ingest.rs"));
@@ -2922,6 +3404,8 @@ mod tests {
             records[3].links.parent_tool_use_id.as_deref(),
             Some("call-1")
         );
+        assert_eq!(records[3].links.event_index, Some(0));
+        assert_eq!(records[3].links.status.as_deref(), Some("success"));
 
         let update = rx_update.try_recv().expect("file update");
         assert_eq!(update.state.offset, meta.len());
@@ -2940,6 +3424,7 @@ mod tests {
         tx_record
             .send(Record {
                 source: SourceKind::Copilot,
+                record_key: String::new(),
                 doc_id: 1,
                 ts: 1_780_291_200_000,
                 project: "memex".to_string(),
@@ -2964,8 +3449,8 @@ mod tests {
 
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let ctx = WriterContext {
+            bulk_load: false,
             embeddings: false,
-            do_backfill_embeddings: false,
             reset_vector_store: false,
             vector_dir,
             analytics_path: tmp.path().join("state").join("analytics.sqlite"),

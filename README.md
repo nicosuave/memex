@@ -147,7 +147,7 @@ memex session <session_id>
 
 Single record:
 ```
-memex show <doc_id>
+memex show <record_key|doc_id>
 ```
 
 Human output:
@@ -226,6 +226,28 @@ Local token history is reconstructed usage. It is deliberately kept separate fro
 
 When token tracking is enabled, press `Ctrl+T` on the TUI home screen to toggle the 30-day activity chart between session count and token volume. Token activity is loaded lazily and cached when first shown.
 
+## Storage model
+
+Original agent logs remain the replay authority. Memex keeps one normalized canonical database at
+`~/.memex/state/catalog.sqlite` for sessions, messages, thinking blocks, tool calls, tool results,
+request-level usage events, stable identities, and embedding-document metadata.
+
+- Tantivy is a disposable lexical projection. It indexes each searchable body but does not store a
+  second copy; result keys are hydrated from the catalog.
+- Ordinary bodies are stored inline once. Payloads over 4 KiB are content-addressed and
+  Zstandard-compressed, so repeated large reads and tool output share storage.
+- Tool payloads keep typed content and only store an additional rendered/search body when those
+  representations differ.
+- Embeddings are a disposable projection over stable embedding documents: each user message is a
+  document, contiguous assistant messages form an assistant-run document, and long documents use
+  overlapping chunks with anchors back to canonical records.
+- Usage cache metadata remains per source file, while usage facts are ordinary indexed relational
+  rows rather than serialized event blobs.
+
+Indexes created by older Memex versions are replayed from the original logs on the next index run.
+The compact local `doc_id` remains available for compatibility, but `record_key` is the stable
+citation identifier.
+
 ## Build from source
 
 ```
@@ -273,11 +295,13 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--sort score|ts`
 - `--top-n-per-session <n>`
 - `--unique-session`
-- `--fields score,ts,doc_id,session_id,snippet`
+- `--fields score,ts,record_key,doc_id,session_id,snippet`
 - `--json-array`
 
-JSON output also includes `source` and, when available, tree/linkage metadata:
-`event_id`, `parent_event_id`, `logical_parent_event_id`,
+JSON output also includes the rebuild-stable `record_key`, `source`, and, when available,
+tree/linkage metadata:
+`interaction_id` (the source-native request/turn), `event_id`, `parent_event_id`,
+`logical_parent_event_id`,
 `parent_session_id`, `thread_source`, `conversation_kind`,
 `parent_tool_use_id`, `source_tool_use_id`, and
 `source_tool_assistant_uuid`.

@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    index: 3,
     usage: 3,
 };
 
@@ -100,6 +100,7 @@ pub(crate) fn parse_index_records(
     let mmap = unsafe { Mmap::map(&file)? };
     let mut start = state.offset as usize;
     let mut turn_id = state.turn_id;
+    let mut parser_stream = state.parser_stream;
 
     let source_path = path.to_string_lossy().to_string();
     let mut session_id = crate::sources::copilot::session_id_from_path(path)
@@ -107,6 +108,8 @@ pub(crate) fn parse_index_records(
     let mut workspace = read_copilot_workspace(path);
     let mut project = copilot_project(&workspace);
     let mut pending_tool_calls = state.pending_tool_calls;
+    let mut last_assistant_ordinal = parser_stream.last_assistant_message_ordinal;
+    let mut next_call_index = parser_stream.next_tool_call_index;
 
     while start < mmap.len() {
         let slice = &mmap[start..];
@@ -160,9 +163,12 @@ pub(crate) fn parse_index_records(
                 if text.trim().is_empty() {
                     continue;
                 }
-                let links = copilot_record_links(obj, data, &session_id, turn_id);
+                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
+                links.message_ordinal = Some(turn_id);
+                last_assistant_ordinal = None;
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -187,9 +193,13 @@ pub(crate) fn parse_index_records(
                 if text.trim().is_empty() {
                     continue;
                 }
-                let links = copilot_record_links(obj, data, &session_id, turn_id);
+                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
+                links.message_ordinal = Some(turn_id);
+                last_assistant_ordinal = Some(turn_id);
+                next_call_index = 0;
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -207,6 +217,30 @@ pub(crate) fn parse_index_records(
                 turn_id += 1;
             }
             "tool.execution_start" | "tool.user_requested" => {
+                if last_assistant_ordinal.is_none() {
+                    let ordinal = turn_id;
+                    let mut owner_links = copilot_record_links(obj, data, &session_id, ordinal);
+                    owner_links.message_ordinal = Some(ordinal);
+                    emit(Record {
+                        source: SourceKind::Copilot,
+                        record_key: String::new(),
+                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        ts: timestamp,
+                        project: project.clone(),
+                        session_id: session_id.clone(),
+                        turn_id: ordinal,
+                        role: "assistant".to_string(),
+                        text: String::new(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: owner_links,
+                        source_path: source_path.clone(),
+                    })?;
+                    turn_id += 1;
+                    last_assistant_ordinal = Some(ordinal);
+                    next_call_index = 0;
+                }
                 let tool_name = data
                     .get("toolName")
                     .or_else(|| data.get("name"))
@@ -218,6 +252,9 @@ pub(crate) fn parse_index_records(
                     .filter(|s| !s.is_empty());
                 let text = tool_input.clone().unwrap_or_default();
                 let mut links = copilot_record_links(obj, data, &session_id, turn_id);
+                links.message_ordinal = last_assistant_ordinal;
+                links.call_index = Some(next_call_index);
+                next_call_index += 1;
                 let call_id = data
                     .get("toolCallId")
                     .and_then(|v| v.as_str())
@@ -242,6 +279,7 @@ pub(crate) fn parse_index_records(
                 }
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id,
                     ts: timestamp,
                     project: project.clone(),
@@ -279,16 +317,30 @@ pub(crate) fn parse_index_records(
                 }
                 let tool_output = copilot_tool_output(data);
                 let text = tool_output.clone().unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
                 let mut links = copilot_record_links(obj, data, &session_id, turn_id);
                 if !call_id.is_empty() {
                     links.parent_event_id = Some(call_id.to_string());
                     links.parent_tool_use_id = Some(call_id.to_string());
                 }
+                let source_status = data
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let is_error = data
+                    .get("isError")
+                    .and_then(|value| value.as_bool())
+                    .or_else(|| {
+                        data.get("success")
+                            .and_then(|value| value.as_bool())
+                            .map(|success| !success)
+                    });
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), is_error);
+                links.source_status = source_status;
+                links.event_index = Some(0);
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -313,9 +365,13 @@ pub(crate) fn parse_index_records(
                 if text.trim().is_empty() {
                     continue;
                 }
-                let links = copilot_record_links(obj, data, &session_id, turn_id);
+                let mut links = copilot_record_links(obj, data, &session_id, turn_id);
+                links.message_ordinal = Some(turn_id);
+                last_assistant_ordinal = Some(turn_id);
+                next_call_index = 0;
                 let record = Record {
                     source: SourceKind::Copilot,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -336,10 +392,13 @@ pub(crate) fn parse_index_records(
         }
     }
 
+    parser_stream.last_assistant_message_ordinal = last_assistant_ordinal;
+    parser_stream.next_tool_call_index = next_call_index;
     Ok(IndexParseOutput {
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls,
+        parser_stream,
         session_id: Some(session_id),
         diagnostics: Default::default(),
     })
@@ -451,6 +510,52 @@ fn copilot_record_links(
     };
 
     RecordLinks {
+        model: copilot_string_field(
+            data,
+            obj,
+            &["model", "modelName", "model_name", "responseModel"],
+        ),
+        input_tokens: copilot_u64_field(
+            data,
+            obj,
+            &[
+                "inputTokens",
+                "input_tokens",
+                "promptTokens",
+                "prompt_tokens",
+            ],
+        ),
+        cache_read_tokens: copilot_u64_field(
+            data,
+            obj,
+            &["cacheReadTokens", "cache_read_tokens", "cachedInputTokens"],
+        ),
+        cache_write_tokens: copilot_u64_field(
+            data,
+            obj,
+            &["cacheWriteTokens", "cache_write_tokens"],
+        ),
+        output_tokens: copilot_u64_field(
+            data,
+            obj,
+            &[
+                "outputTokens",
+                "output_tokens",
+                "completionTokens",
+                "completion_tokens",
+            ],
+        ),
+        reasoning_tokens: copilot_u64_field(data, obj, &["reasoningTokens", "reasoning_tokens"]),
+        subagent_session_id: copilot_string_field(
+            data,
+            obj,
+            &[
+                "subagentSessionId",
+                "subagent_session_id",
+                "agentId",
+                "agent_id",
+            ],
+        ),
         event_id: copilot_string_field(data, obj, COPILOT_EVENT_KEYS)
             .or_else(|| Some(format!("{session_id}:{turn_id}"))),
         parent_event_id: copilot_string_field(data, obj, COPILOT_PARENT_EVENT_KEYS),
@@ -488,6 +593,28 @@ const COPILOT_PARENT_SESSION_KEYS: &[&str] = &[
     "forkedFromSessionId",
     "forked_from_session_id",
 ];
+
+fn copilot_u64_field(
+    data: &serde_json::Value,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<u64> {
+    let nested = ["usage", "tokenUsage", "token_usage", "tokens"];
+    keys.iter()
+        .find_map(|key| data.get(*key).and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_u64))
+        })
+        .or_else(|| {
+            nested.iter().find_map(|container| {
+                data.get(*container).and_then(|usage| {
+                    keys.iter()
+                        .find_map(|key| usage.get(*key).and_then(serde_json::Value::as_u64))
+                })
+            })
+        })
+}
 
 fn copilot_string_field(
     data: &serde_json::Value,
@@ -747,6 +874,66 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_tool_event_reuses_the_persisted_assistant_owner() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session.start\",\"data\":{\"sessionId\":\"session\"}}\n",
+                "{\"type\":\"assistant.message\",\"data\":{\"content\":\"working\"}}\n",
+            ),
+        )
+        .unwrap();
+        let mut first_records = Vec::new();
+        let first = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            &AtomicU64::new(1),
+            |record| {
+                first_records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                b"{\"type\":\"tool.execution_start\",\"data\":{\"toolCallId\":\"call-1\",\"toolName\":\"Read\",\"arguments\":{}}}\n",
+            )
+            .unwrap();
+
+        let mut second_records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState {
+                offset: first.offset,
+                turn_id: first.turn_id,
+                pending_tool_calls: first.pending_tool_calls,
+                parser_stream: first.parser_stream,
+            },
+            &AtomicU64::new(10),
+            |record| {
+                second_records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second_records.len(), 1);
+        assert_eq!(second_records[0].role, "tool_use");
+        assert_eq!(
+            second_records[0].links.message_ordinal,
+            first_records[0].links.message_ordinal
+        );
+        assert_eq!(second_records[0].links.call_index, Some(0));
+    }
 
     #[test]
     fn usage_decoder_reads_wrapped_otel_attributes() {

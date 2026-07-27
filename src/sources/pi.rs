@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    index: 4,
     usage: 4,
 };
 
@@ -136,6 +136,25 @@ fn base_links(object: &simd_json::borrowed::Object<'_>, conversation_kind: &str)
         thread_source: (conversation_kind != "main").then(|| conversation_kind.to_string()),
         conversation_kind: Some(conversation_kind.to_string()),
         ..RecordLinks::default()
+    }
+}
+
+fn apply_message_facts(links: &mut RecordLinks, message: &simd_json::borrowed::Object<'_>) {
+    links.model = super::common::borrowed_string(message, "model")
+        .or_else(|| super::common::borrowed_string(message, "modelId"));
+    links.subagent_session_id = super::common::borrowed_string(message, "subagentSessionId")
+        .or_else(|| super::common::borrowed_string(message, "agentId"));
+    if let Some(usage) = message.get("usage").and_then(|value| value.as_object()) {
+        links.input_tokens = super::common::borrowed_u64(usage, "input")
+            .or_else(|| super::common::borrowed_u64(usage, "input_tokens"));
+        links.cache_read_tokens = super::common::borrowed_u64(usage, "cacheRead")
+            .or_else(|| super::common::borrowed_u64(usage, "cache_read_tokens"));
+        links.cache_write_tokens = super::common::borrowed_u64(usage, "cacheWrite")
+            .or_else(|| super::common::borrowed_u64(usage, "cache_write_tokens"));
+        links.output_tokens = super::common::borrowed_u64(usage, "output")
+            .or_else(|| super::common::borrowed_u64(usage, "output_tokens"));
+        links.reasoning_tokens = super::common::borrowed_u64(usage, "reasoning")
+            .or_else(|| super::common::borrowed_u64(usage, "reasoning_tokens"));
     }
 }
 
@@ -300,6 +319,7 @@ pub(crate) fn parse_index_records_for(
             _ => "main",
         };
         let mut base_links = base_links(obj, conversation_kind);
+        base_links.message_ordinal = Some(turn_id);
 
         if entry_type == "session" {
             apply_session_header(obj, &mut session_id, &mut project);
@@ -317,6 +337,7 @@ pub(crate) fn parse_index_records_for(
             }
             let record = Record {
                 source,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -348,6 +369,7 @@ pub(crate) fn parse_index_records_for(
             };
             let record = Record {
                 source,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -379,6 +401,7 @@ pub(crate) fn parse_index_records_for(
             Some(m) => m,
             None => continue,
         };
+        apply_message_facts(&mut base_links, message);
         let timestamp = if timestamp == 0 {
             message.get("timestamp").map(timestamp_millis).unwrap_or(0)
         } else {
@@ -402,9 +425,11 @@ pub(crate) fn parse_index_records_for(
         match role {
             "user" | "assistant" => {
                 let content = message.get("content");
+                let mut assistant_has_children = false;
                 if role == "assistant"
                     && let Some(arr) = content.and_then(|v| v.as_array())
                 {
+                    let mut tool_call_index = 0u32;
                     for block in arr {
                         let Some(block_obj) = block.as_object() else {
                             continue;
@@ -421,6 +446,7 @@ pub(crate) fn parse_index_records_for(
                                 .filter(|text| !text.is_empty());
                             if let Some(thinking) = thinking {
                                 if include_reasoning {
+                                    assistant_has_children = true;
                                     let mut links = base_links.clone();
                                     links.event_id = base_links
                                         .event_id
@@ -428,6 +454,7 @@ pub(crate) fn parse_index_records_for(
                                         .map(|id| format!("{id}:reasoning"));
                                     emit(Record {
                                         source,
+                                        record_key: String::new(),
                                         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                                         ts: timestamp,
                                         project: project.clone(),
@@ -461,6 +488,7 @@ pub(crate) fn parse_index_records_for(
                             }
                             continue;
                         }
+                        assistant_has_children = true;
                         let tool_name = block_obj
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -475,6 +503,11 @@ pub(crate) fn parse_index_records_for(
                             links.event_id = Some(tool_call_id.clone());
                             links.parent_event_id = base_links.event_id.clone();
                         }
+                        links.call_index = Some(tool_call_index);
+                        links.subagent_session_id =
+                            super::common::borrowed_string(block_obj, "subagentSessionId")
+                                .or_else(|| super::common::borrowed_string(block_obj, "agentId"));
+                        tool_call_index += 1;
                         let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                         if let Some(tool_call_id) = tool_call_id {
                             let replaced = pending_tool_calls.insert(
@@ -495,6 +528,7 @@ pub(crate) fn parse_index_records_for(
                         }
                         let record = Record {
                             source,
+                            record_key: String::new(),
                             doc_id,
                             ts: timestamp,
                             project: project.clone(),
@@ -514,11 +548,12 @@ pub(crate) fn parse_index_records_for(
                 }
 
                 let text = content_text(content).trim().to_string();
-                if text.is_empty() {
+                if text.is_empty() && !assistant_has_children {
                     continue;
                 }
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -564,15 +599,22 @@ pub(crate) fn parse_index_records_for(
                 }
                 let tool_output = Some(output);
                 let text = tool_output.clone().unwrap_or_default();
-                if text.trim().is_empty() {
-                    continue;
-                }
                 let mut links = base_links;
                 if !tool_call_id.is_empty() {
                     links.parent_tool_use_id = Some(tool_call_id.to_string());
                 }
+                let source_status = message
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+                let is_error = message.get("isError").and_then(|value| value.as_bool());
+                links.status =
+                    super::common::normalized_tool_status(source_status.as_deref(), is_error);
+                links.source_status = source_status;
+                links.event_index = Some(0);
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -609,11 +651,14 @@ pub(crate) fn parse_index_records_for(
                     .to_string();
                 let exit_code = message.get("exitCode").and_then(|v| v.as_i64());
                 let text = bash_text(&command, &output, exit_code);
-                if text.trim().is_empty() {
-                    continue;
-                }
+                let mut links = base_links;
+                links.event_index = Some(0);
+                links.source_status = exit_code.map(|code| code.to_string());
+                links.status =
+                    exit_code.map(|code| if code == 0 { "success" } else { "error" }.to_string());
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -632,7 +677,7 @@ pub(crate) fn parse_index_records_for(
                     } else {
                         Some(output)
                     },
-                    links: base_links,
+                    links,
                     source_path: source_path.clone(),
                 };
                 emit(record)?;
@@ -645,6 +690,7 @@ pub(crate) fn parse_index_records_for(
                 }
                 let record = Record {
                     source,
+                    record_key: String::new(),
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                     ts: timestamp,
                     project: project.clone(),
@@ -669,6 +715,7 @@ pub(crate) fn parse_index_records_for(
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls,
+        parser_stream: state.parser_stream,
         session_id: Some(session_id),
         diagnostics,
     })
@@ -842,6 +889,42 @@ fn timestamp_millis(value: &BorrowedValue<'_>) -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn tool_only_assistant_entry_keeps_its_message_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pi.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"session\",\"cwd\":\"/repo\"}\n",
+                "{\"type\":\"message\",\"id\":\"message-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"call-1\",\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}}]}}\n",
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].role, "tool_use");
+        assert_eq!(records[1].role, "assistant");
+        assert!(records[1].text.is_empty());
+        assert_eq!(
+            records[0].links.message_ordinal,
+            records[1].links.message_ordinal
+        );
+        assert_eq!(records[0].links.call_index, Some(0));
+    }
 
     #[test]
     fn parity_fixture_supports_aliases_errors_numeric_timestamps_and_opt_in_reasoning() {

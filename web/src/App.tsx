@@ -62,6 +62,7 @@ import {
 import { cn } from "@/lib/utils"
 
 type SearchResult = {
+  session_key: string
   session_id: string
   project: string
   source: string
@@ -79,14 +80,23 @@ type SearchPayload = {
 }
 
 type Message = {
+  record_key: string
   role: string
   content: string
   ts: number
   tool_name?: string | null
+  interaction_id?: string | null
+  event_id?: string | null
+  parent_event_id?: string | null
+  parent_tool_use_id?: string | null
+  source_tool_use_id?: string | null
+  status?: string | null
+  source_status?: string | null
   provisional?: boolean
 }
 
 type SessionPayload = {
+  session_key: string
   session_id: string
   project: string
   source: string
@@ -100,6 +110,9 @@ type SessionPayload = {
 type PreviewMode = "matches" | "history"
 type ShellView = "home" | "transcript"
 type PreviewRow = { message: Message; index: number; context: boolean }
+
+const SESSION_HISTORY_PAGE_SIZE = 200
+const SESSION_HISTORY_CONCURRENCY = 6
 
 const paramsAtLoad = new URLSearchParams(window.location.search)
 const requestedMode = paramsAtLoad.get("mode")
@@ -295,6 +308,13 @@ function XmlMessage({ content }: { content: string }) {
 }
 
 function MessageContent({ message }: { message: Message }) {
+  if (!message.content.trim() && message.status) {
+    return (
+      <div className="tool-content">
+        {message.source_status || message.status}
+      </div>
+    )
+  }
   if (message.role === "tool_use")
     return <ToolCallContent content={message.content} />
 
@@ -606,28 +626,29 @@ function App() {
   }, [mode])
 
   const updateLocation = useCallback(
-    (nextSelectedId: string | null) => {
+    (nextSelectedKey: string | null) => {
       const next = new URLSearchParams()
       if (query.trim()) next.set("q", query.trim())
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
-      if (nextSelectedId) next.set("session", nextSelectedId)
-      if (nextSelectedId && mode !== "matches") next.set("mode", mode)
+      if (nextSelectedKey) next.set("session", nextSelectedKey)
+      if (nextSelectedKey && mode !== "matches") next.set("mode", mode)
       history.replaceState({}, "", next.size ? `?${next}` : location.pathname)
     },
     [mode, project, query, source],
   )
 
-  const fetchFirstPage = useCallback((id: string) => {
-    const cached = sessionCache.current.get(id)
+  const fetchFirstPage = useCallback((key: string) => {
+    const cached = sessionCache.current.get(key)
     if (cached) return cached
     const request = api<SessionPayload>(
-      `/api/session?id=${encodeURIComponent(id)}&limit=40`,
-    ).catch((requestError) => {
-      sessionCache.current.delete(id)
-      throw requestError
+      `/api/session?key=${encodeURIComponent(key)}&limit=40`,
+    ).finally(() => {
+      // Keep only in-flight prefetches. A later selection revalidates the first page so
+      // active sessions cannot remain permanently stale.
+      sessionCache.current.delete(key)
     })
-    sessionCache.current.set(id, request)
+    sessionCache.current.set(key, request)
     while (sessionCache.current.size > 8) {
       const oldest = sessionCache.current.keys().next().value
       if (oldest) sessionCache.current.delete(oldest)
@@ -660,19 +681,20 @@ function App() {
 
   const selectSession = useCallback(
     async (
-      id: string,
+      key: string,
       summary?: SearchResult,
       shouldUpdateLocation = true,
     ) => {
-      setSelectedId(id)
+      setSelectedId(key)
       setHistoryLimit(150)
       setError("")
-      if (shouldUpdateLocation) updateLocation(id)
+      if (shouldUpdateLocation) updateLocation(key)
 
       const generation = ++sessionGeneration.current
       if (summary) {
         setSession({
-          session_id: id,
+          session_key: key,
+          session_id: summary.session_id,
           project: summary.project,
           source: summary.source,
           started_at: summary.ts,
@@ -681,6 +703,7 @@ function App() {
           total: 1,
           messages: [
             {
+              record_key: `provisional:${key}`,
               role: summary.role,
               content: summary.snippet || "Loading transcript…",
               ts: summary.ts,
@@ -691,17 +714,40 @@ function App() {
       }
 
       try {
-        const firstPage = await fetchFirstPage(id)
+        const firstPage = await fetchFirstPage(key)
         if (generation !== sessionGeneration.current) return
         setSession(firstPage)
         const messages = [...firstPage.messages]
-        while (messages.length < firstPage.total) {
-          const page = await api<SessionPayload>(
-            `/api/session?id=${encodeURIComponent(id)}&offset=${messages.length}&limit=100`,
+        const remainingOffsets: number[] = []
+        for (
+          let offset = messages.length;
+          offset < firstPage.total;
+          offset += SESSION_HISTORY_PAGE_SIZE
+        ) {
+          remainingOffsets.push(offset)
+        }
+        for (
+          let start = 0;
+          start < remainingOffsets.length;
+          start += SESSION_HISTORY_CONCURRENCY
+        ) {
+          const offsets = remainingOffsets.slice(
+            start,
+            start + SESSION_HISTORY_CONCURRENCY,
+          )
+          const pages = await Promise.all(
+            offsets.map((offset) =>
+              api<SessionPayload>(
+                `/api/session?key=${encodeURIComponent(key)}&offset=${offset}&limit=${SESSION_HISTORY_PAGE_SIZE}`,
+              ),
+            ),
           )
           if (generation !== sessionGeneration.current) return
-          messages.push(...page.messages)
-          startTransition(() => setSession({ ...firstPage, messages }))
+          for (const page of pages) messages.push(...page.messages)
+          const loadedMessages = [...messages]
+          startTransition(() =>
+            setSession({ ...firstPage, messages: loadedMessages }),
+          )
         }
       } catch (requestError) {
         if (generation !== sessionGeneration.current) return
@@ -734,9 +780,9 @@ function App() {
         if (shellView === "transcript") {
           const currentId = selectedId
           const next =
-            data.results.find((item) => item.session_id === currentId) ||
+            data.results.find((item) => item.session_key === currentId) ||
             data.results[0]
-          if (next) void selectSession(next.session_id, next, false)
+          if (next) void selectSession(next.session_key, next, false)
           else {
             setSelectedId(null)
             setSession(null)
@@ -769,9 +815,9 @@ function App() {
         `/api/search?${searchParamsFor(offset)}`,
       )
       if (generation !== searchGeneration.current) return
-      const known = new Set(results.map((result) => result.session_id))
+      const known = new Set(results.map((result) => result.session_key))
       const additions = data.results.filter(
-        (result) => !known.has(result.session_id),
+        (result) => !known.has(result.session_key),
       )
       const nextCount = results.length + additions.length
       setResults((current) => [...current, ...additions])
@@ -811,6 +857,12 @@ function App() {
     const visible = session.messages
       .map((message, index) => ({ message, index, context: false }))
       .filter(({ message }) => {
+        if (
+          !message.provisional &&
+          !message.content.trim() &&
+          !message.status
+        )
+          return false
         const tool = ["tool_use", "tool_result", "system"].includes(message.role)
         const thinking = ["reasoning", "thinking"].includes(message.role)
         return (
@@ -866,7 +918,7 @@ function App() {
   const homeResults = useMemo(() => {
     const unique = new Map<string, SearchResult>()
     results.forEach((result) => {
-      if (!unique.has(result.session_id)) unique.set(result.session_id, result)
+      if (!unique.has(result.session_key)) unique.set(result.session_key, result)
     })
     return Array.from(unique.values()).slice(0, 12)
   }, [results])
@@ -896,7 +948,7 @@ function App() {
       const update = () => {
         setShellView("transcript")
         setSidebarOpen(true)
-        void selectSession(result.session_id, result)
+        void selectSession(result.session_key, result)
       }
       const startViewTransition = (
         document as Document & {
@@ -964,7 +1016,7 @@ function App() {
           ".session-button",
         )
         const result = results.find(
-          (item) => item.session_id === button?.dataset.sessionId,
+          (item) => item.session_key === button?.dataset.sessionKey,
         )
         if (!result) return
         event.preventDefault()
@@ -1001,7 +1053,7 @@ function App() {
         (button) => button === target || button.contains(target),
       )
       const selectedIndex = buttons.findIndex(
-        (button) => button.dataset.sessionId === selectedId,
+        (button) => button.dataset.sessionKey === selectedId,
       )
       const currentIndex =
         focusedIndex >= 0 ? focusedIndex : Math.max(0, selectedIndex)
@@ -1133,7 +1185,7 @@ function App() {
                   homeSelectedIndex === index && "is-selected",
                 )}
                 id={`home-result-${index}`}
-                key={result.session_id}
+                key={result.session_key}
                 onClick={() => openTranscript(result)}
                 onMouseEnter={() => setHomeSelectedIndex(index)}
                 role="option"
@@ -1174,18 +1226,40 @@ function App() {
             <div className="empty">No visible messages in this preview.</div>
           ) : (
             <>
-              {preview.rows.map(({ message, index, context }) => (
-                <article
-                  className={cn("message", context && "context")}
-                  key={`${message.ts}-${index}`}
-                >
-                  <div className="message-meta">
-                    <span>{message.tool_name || message.role || "event"}</span>
-                    <time>{formatDate(message.ts)}</time>
+              {preview.rows.map(({ message, index, context }, rowIndex) => {
+                const previous = preview.rows[rowIndex - 1]?.message
+                const startsInteraction =
+                  message.interaction_id &&
+                  message.interaction_id !== previous?.interaction_id
+
+                return (
+                  <div className="message-row" key={message.record_key || `${message.ts}-${index}`}>
+                    {startsInteraction && (
+                      <div
+                        className="interaction-divider"
+                        title={message.interaction_id ?? undefined}
+                      >
+                        <span>Interaction</span>
+                      </div>
+                    )}
+                    <article
+                      className={cn("message", context && "context")}
+                      data-interaction-id={message.interaction_id || undefined}
+                    >
+                      <div className="message-meta">
+                        <span>{message.tool_name || message.role || "event"}</span>
+                        {message.status && (
+                          <Badge variant="outline">
+                            {message.source_status || message.status}
+                          </Badge>
+                        )}
+                        <time>{formatDate(message.ts)}</time>
+                      </div>
+                      <MessageContent message={message} />
+                    </article>
                   </div>
-                  <MessageContent message={message} />
-                </article>
-              ))}
+                )
+              })}
               {preview.remaining > 0 && (
                 <Button
                   className="load-more shadow-none"
@@ -1231,14 +1305,14 @@ function App() {
             <SidebarGroupContent>
               <SidebarMenu onKeyDown={handleSidebarKeyDown}>
                 {results.map((result) => (
-                  <SidebarMenuItem key={result.session_id}>
+                  <SidebarMenuItem key={result.session_key}>
                     <SidebarMenuButton
                       className="session-button"
-                      data-session-id={result.session_id}
-                      isActive={selectedId === result.session_id}
+                      data-session-key={result.session_key}
+                      isActive={selectedId === result.session_key}
                       onClick={() => openTranscript(result)}
                       onPointerEnter={() =>
-                        void fetchFirstPage(result.session_id).catch(() => {})
+                        void fetchFirstPage(result.session_key).catch(() => {})
                       }
                       size="lg"
                       tooltip={result.project || "Untitled session"}

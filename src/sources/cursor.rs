@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    index: 3,
     usage: 3,
 };
 
@@ -145,7 +145,30 @@ pub(crate) fn parse_index_records(
         let Some(message) = object.get("message").and_then(|value| value.as_object()) else {
             continue;
         };
+        let message_ordinal = turn_id;
+        let mut message_links = record_links(path, &session_id, message_ordinal);
+        message_links.message_ordinal = Some(message_ordinal);
+        message_links.model = super::common::borrowed_string(message, "model")
+            .or_else(|| super::common::borrowed_string(message, "modelName"));
+        if let Some(usage) = ["usage", "tokenUsage", "token_usage"]
+            .iter()
+            .find_map(|key| message.get(*key).and_then(|value| value.as_object()))
+        {
+            message_links.input_tokens = super::common::borrowed_u64(usage, "inputTokens")
+                .or_else(|| super::common::borrowed_u64(usage, "input_tokens"));
+            message_links.cache_read_tokens = super::common::borrowed_u64(usage, "cacheReadTokens")
+                .or_else(|| super::common::borrowed_u64(usage, "cache_read_tokens"));
+            message_links.cache_write_tokens =
+                super::common::borrowed_u64(usage, "cacheWriteTokens")
+                    .or_else(|| super::common::borrowed_u64(usage, "cache_write_tokens"));
+            message_links.output_tokens = super::common::borrowed_u64(usage, "outputTokens")
+                .or_else(|| super::common::borrowed_u64(usage, "output_tokens"));
+            message_links.reasoning_tokens = super::common::borrowed_u64(usage, "reasoningTokens")
+                .or_else(|| super::common::borrowed_u64(usage, "reasoning_tokens"));
+        }
         let mut text_parts = Vec::new();
+        let mut tool_call_index = 0u32;
+        let mut assistant_has_children = false;
         if let Some(content) = message.get("content") {
             if let Some(text) = content.as_str() {
                 text_parts.push(text);
@@ -167,6 +190,7 @@ pub(crate) fn parse_index_records(
                             }
                         }
                         "tool_use" => {
+                            assistant_has_children = true;
                             let tool_name = super::common::borrowed_string(block_object, "name");
                             let tool_input = block_object.get("input").map(ToString::to_string);
                             let tool_id = ["id", "tool_use_id", "toolCallId"]
@@ -175,8 +199,11 @@ pub(crate) fn parse_index_records(
                                     block_object.get(*key).and_then(|value| value.as_str())
                                 })
                                 .map(str::to_string);
-                            let mut links = record_links(path, &session_id, turn_id);
+                            let mut links = message_links.clone();
                             links.event_id = tool_id.clone();
+                            links.parent_event_id = message_links.event_id.clone();
+                            links.call_index = Some(tool_call_index);
+                            tool_call_index += 1;
                             let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                             if let Some(tool_id) = tool_id {
                                 pending_tool_calls.insert(
@@ -194,6 +221,7 @@ pub(crate) fn parse_index_records(
                             }
                             emit(Record {
                                 source: SourceKind::Cursor,
+                                record_key: String::new(),
                                 doc_id,
                                 ts: timestamp,
                                 project: project.clone(),
@@ -216,9 +244,6 @@ pub(crate) fn parse_index_records(
                             if text.is_empty() {
                                 text = tool_output.clone().unwrap_or_default();
                             }
-                            if text.is_empty() {
-                                continue;
-                            }
                             let tool_use_id = ["tool_use_id", "toolCallId"]
                                 .iter()
                                 .find_map(|key| {
@@ -230,13 +255,27 @@ pub(crate) fn parse_index_records(
                                 .and_then(|id| pending_tool_calls.remove(id));
                             let tool_name = super::common::borrowed_string(block_object, "name")
                                 .or_else(|| pending.and_then(|call| call.tool_name));
-                            let mut links = record_links(path, &session_id, turn_id);
+                            let mut links = message_links.clone();
                             if let Some(tool_use_id) = tool_use_id {
                                 links.parent_event_id = Some(tool_use_id.clone());
                                 links.parent_tool_use_id = Some(tool_use_id);
                             }
+                            let source_status = block_object
+                                .get("status")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string);
+                            let is_error = block_object
+                                .get("is_error")
+                                .and_then(|value| value.as_bool());
+                            links.status = super::common::normalized_tool_status(
+                                source_status.as_deref(),
+                                is_error,
+                            );
+                            links.source_status = source_status;
+                            links.event_index = Some(0);
                             emit(Record {
                                 source: SourceKind::Cursor,
+                                record_key: String::new(),
                                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                                 ts: timestamp,
                                 project: project.clone(),
@@ -258,9 +297,10 @@ pub(crate) fn parse_index_records(
             }
         }
         let text = text_parts.join("\n").trim().to_string();
-        if !text.is_empty() {
+        if !text.is_empty() || (role == "assistant" && assistant_has_children) {
             emit(Record {
                 source: SourceKind::Cursor,
+                record_key: String::new(),
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
                 ts: timestamp,
                 project: project.clone(),
@@ -271,7 +311,7 @@ pub(crate) fn parse_index_records(
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
-                links: record_links(path, &session_id, turn_id),
+                links: message_links,
                 source_path: source_path.clone(),
             })?;
             turn_id += 1;
@@ -281,6 +321,7 @@ pub(crate) fn parse_index_records(
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls,
+        parser_stream: state.parser_stream,
         session_id: Some(session_id),
         diagnostics: Default::default(),
     })
@@ -570,6 +611,48 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_projection_preserves_message_ownership_and_result_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("composer.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"role\":\"assistant\",\"message\":{\"model\":\"cursor-test\",\"usage\":{\"inputTokens\":12,\"outputTokens\":3},\"content\":[{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"Read\",\"input\":{\"file_path\":\"README.md\"}}]}}\n",
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-1\",\"content\":\"done\",\"is_error\":false}]}}\n"
+            ),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            1,
+            IndexParseState::default(),
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].role, "tool_use");
+        assert_eq!(records[1].role, "assistant");
+        assert_eq!(
+            records[0].links.message_ordinal,
+            records[1].links.message_ordinal
+        );
+        assert_eq!(records[0].links.call_index, Some(0));
+        assert!(records[1].text.is_empty());
+        assert_eq!(records[1].links.model.as_deref(), Some("cursor-test"));
+        assert_eq!(records[1].links.input_tokens, Some(12));
+        assert_eq!(records[1].links.output_tokens, Some(3));
+        assert_eq!(records[2].role, "tool_result");
+        assert_eq!(records[2].links.event_index, Some(0));
+        assert_eq!(records[2].links.status.as_deref(), Some("success"));
+    }
 
     #[test]
     fn nested_token_containers_are_not_recounted() {

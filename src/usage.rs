@@ -4,12 +4,12 @@
 //! request-level accounting, but they are not authoritative subscription-limit telemetry.
 
 use crate::analytics::ProjectGrouping;
-use crate::types::SourceFilter;
+use crate::types::{SourceFilter, SourceKind};
 use anyhow::Result;
 use clap::ValueEnum;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -521,6 +521,16 @@ fn assemble_usage_events(
             usage_timing(scanner_start, || format!("{} scanner", filter.as_str()));
         }
     }
+    if let Some(cache) = cache.as_mut()
+        && let Err(error) = cache.finish_bulk_load()
+    {
+        warnings.push(format!("usage cache bulk finalization failed: {error:#}"));
+    }
+    if let Some(cache) = cache.as_ref()
+        && let Err(error) = crate::catalog::prune_orphan_interactions(&cache.connection)
+    {
+        warnings.push(format!("usage interaction cleanup failed: {error:#}"));
+    }
     publish_scan_progress(None);
 
     let reconcile_start = Instant::now();
@@ -603,7 +613,7 @@ fn usage_project_key(value: &str) -> String {
 const VOLATILE_DB_REUSE_MS: i64 = 60_000;
 /// Cache rows are persisted after every chunk of parsed files, not once per source, so an
 /// interrupted cold scan resumes from the last completed chunk instead of starting over.
-const PARSE_SAVE_CHUNK: usize = 128;
+const PARSE_SAVE_CHUNK: usize = 1_024;
 static USAGE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Parse-phase progress of the usage scan currently holding `USAGE_SCAN_LOCK`. Cache hits
@@ -659,25 +669,6 @@ struct CachedUsageEvent {
 }
 
 impl CachedUsageEvent {
-    fn from_event(event: &UsageEvent) -> Self {
-        Self {
-            source_record_id: event.source_record_id.clone(),
-            session_id: event.session_id.clone(),
-            request_id: event.request_id.clone(),
-            message_id: event.message_id.clone(),
-            timestamp_ms: event.timestamp_ms,
-            project: event.project.clone(),
-            provider: event.provider.clone(),
-            model: event.model.clone(),
-            tokens: event.tokens.clone(),
-            source_cost_usd: event.source_cost_usd,
-            dedupe_confidence: event.dedupe_confidence.to_string(),
-            conservative_undercount: event.conservative_undercount,
-            sidechain: event.sidechain,
-            source_order: event.source_order,
-        }
-    }
-
     fn into_event(self, source: &'static str, source_path: Arc<str>) -> UsageEvent {
         UsageEvent {
             source,
@@ -706,13 +697,14 @@ impl CachedUsageEvent {
 
 struct UsageCache {
     connection: Connection,
+    bulk_load: bool,
 }
 
 struct CachedFileRow {
     size: u64,
     mtime_ns: i64,
     scanned_at_ms: i64,
-    events_blob: Vec<u8>,
+    events: Vec<CachedUsageEvent>,
     deps: Vec<UsageFileDep>,
 }
 
@@ -731,26 +723,30 @@ struct ParsedUsageFile {
 
 impl UsageCache {
     fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        drop(crate::analytics::AnalyticsStore::open(path)?);
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
-        // Drop pre-postcard cache tables and any schema missing a required column: the
-        // JSON-era claude table, the pre-rename blob column, and the deps_blob column that
-        // records cross-file dependencies. A missing column means an older layout, so the
-        // table is rebuilt rather than migrated.
-        let current_columns: i64 = connection.query_row(
+        connection.set_prepared_statement_cache_capacity(64);
+        connection.pragma_update(None, "foreign_keys", true)?;
+        let blob_columns: i64 = connection.query_row(
             "SELECT count(*) FROM pragma_table_info('usage_file_cache')
-             WHERE name IN ('events_blob', 'deps_blob')",
+             WHERE name = 'events_blob'",
             [],
             |row| row.get(0),
         )?;
-        if current_columns < 2 {
-            connection.execute_batch("DROP TABLE IF EXISTS usage_file_cache;")?;
+        if blob_columns > 0 {
+            connection.execute_batch(
+                "DROP TABLE IF EXISTS usage_events;
+                 DROP TABLE IF EXISTS usage_file_cache;",
+            )?;
         }
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=-131072;
+             PRAGMA mmap_size=268435456;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA wal_autocheckpoint=0;
              DROP TABLE IF EXISTS claude_usage_file_cache;
              CREATE TABLE IF NOT EXISTS usage_file_cache (
                  source TEXT NOT NULL,
@@ -759,13 +755,84 @@ impl UsageCache {
                  size INTEGER NOT NULL,
                  mtime_ns INTEGER NOT NULL,
                  scanned_at_ms INTEGER NOT NULL,
-                 events_blob BLOB NOT NULL,
                  deps_blob BLOB NOT NULL,
                  PRIMARY KEY (source, path)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS usage_events (
+                 event_key TEXT PRIMARY KEY,
+                 source TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 session_key TEXT,
+                 interaction_id INTEGER REFERENCES interactions(interaction_id) ON DELETE SET NULL,
+                 source_record_key TEXT,
+                 source_record_id TEXT,
+                 session_id TEXT,
+                 request_id TEXT,
+                 message_id TEXT,
+                 occurred_at INTEGER NOT NULL,
+                 project_hint TEXT,
+                 provider TEXT,
+                 model TEXT,
+                 raw_input_tokens INTEGER NOT NULL,
+                 input_tokens INTEGER NOT NULL,
+                 cache_read_tokens INTEGER NOT NULL,
+                 cache_write_tokens INTEGER NOT NULL,
+                 cache_write_1h_tokens INTEGER NOT NULL,
+                 output_tokens INTEGER NOT NULL,
+                 reasoning_tokens INTEGER NOT NULL,
+                 source_cost REAL,
+                 cost_status TEXT NOT NULL,
+                 dedupe_confidence TEXT NOT NULL,
+                 conservative_undercount INTEGER NOT NULL,
+                 sidechain INTEGER NOT NULL,
+                 source_order INTEGER NOT NULL,
+                 FOREIGN KEY(source, path) REFERENCES usage_file_cache(source, path)
+                    ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS usage_events_time_idx ON usage_events(occurred_at);
+             CREATE INDEX IF NOT EXISTS usage_events_session_time_idx
+                ON usage_events(session_key, occurred_at);
+             CREATE INDEX IF NOT EXISTS usage_events_interaction_idx
+                ON usage_events(interaction_id);
+             CREATE INDEX IF NOT EXISTS usage_events_model_time_idx
+                ON usage_events(provider, model, occurred_at);
+             CREATE INDEX IF NOT EXISTS usage_events_source_path_idx
+                ON usage_events(source, path, source_order);",
         )?;
+        let interaction_columns: i64 = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('usage_events')
+             WHERE name = 'interaction_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if interaction_columns == 0 {
+            connection.execute(
+                "ALTER TABLE usage_events ADD COLUMN interaction_id INTEGER
+                 REFERENCES interactions(interaction_id) ON DELETE SET NULL",
+                [],
+            )?;
+        }
         Self::maybe_compact(&connection);
-        Ok(Self { connection })
+        let bulk_load = connection.query_row(
+            "SELECT
+                (SELECT count(*) FROM usage_file_cache) = 0
+                AND (SELECT count(*) FROM usage_events) = 0",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if bulk_load {
+            connection.execute_batch(
+                "DROP INDEX IF EXISTS usage_events_time_idx;
+                 DROP INDEX IF EXISTS usage_events_session_time_idx;
+                 DROP INDEX IF EXISTS usage_events_interaction_idx;
+                 DROP INDEX IF EXISTS usage_events_model_time_idx;
+                 DROP INDEX IF EXISTS usage_events_source_path_idx;",
+            )?;
+        }
+        Ok(Self {
+            connection,
+            bulk_load,
+        })
     }
 
     /// Chunked saves rewrite blob rows continuously and freed pages are never returned to
@@ -795,28 +862,86 @@ impl UsageCache {
         parser_version: i64,
     ) -> Result<HashMap<String, CachedFileRow>> {
         self.connection.execute(
+            "DELETE FROM usage_events
+             WHERE source = ?1
+               AND path IN (
+                   SELECT path FROM usage_file_cache
+                   WHERE source = ?1 AND parser_version != ?2
+               )",
+            params![source, parser_version],
+        )?;
+        self.connection.execute(
             "DELETE FROM usage_file_cache WHERE source = ?1 AND parser_version != ?2",
             params![source, parser_version],
         )?;
         let mut statement = self.connection.prepare(
-            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob, deps_blob FROM usage_file_cache
+            "SELECT path, size, mtime_ns, scanned_at_ms, deps_blob FROM usage_file_cache
              WHERE source = ?1 AND parser_version = ?2",
         )?;
         let rows = statement.query_map(params![source, parser_version], |row| {
-            let deps_blob: Vec<u8> = row.get(5)?;
+            let deps_blob: Vec<u8> = row.get(4)?;
             Ok((
                 row.get::<_, String>(0)?,
                 CachedFileRow {
                     size: row.get::<_, i64>(1)? as u64,
                     mtime_ns: row.get(2)?,
                     scanned_at_ms: row.get(3)?,
-                    events_blob: row.get(4)?,
+                    events: Vec::new(),
                     deps: postcard::from_bytes(&deps_blob).unwrap_or_default(),
                 },
             ))
         })?;
-        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(Into::into)
+        let mut files = rows.collect::<std::result::Result<HashMap<_, _>, _>>()?;
+        let mut events = self.connection.prepare(
+            r#"
+            SELECT ue.path, ue.source_record_id, ue.session_id, ue.request_id, ue.message_id,
+                   ue.occurred_at, COALESCE(s.project, ue.project_hint), ue.provider, ue.model,
+                   ue.raw_input_tokens, ue.input_tokens, ue.cache_read_tokens,
+                   ue.cache_write_tokens, ue.cache_write_1h_tokens, ue.output_tokens,
+                   ue.reasoning_tokens, ue.source_cost, ue.dedupe_confidence,
+                   ue.conservative_undercount, ue.sidechain, ue.source_order
+            FROM usage_events ue
+            LEFT JOIN sessions s ON s.session_key = ue.session_key
+            WHERE ue.source = ?1
+            ORDER BY ue.path, ue.source_order
+            "#,
+        )?;
+        let rows = events.query_map(params![source], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CachedUsageEvent {
+                    source_record_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    request_id: row.get(3)?,
+                    message_id: row.get(4)?,
+                    timestamp_ms: row.get::<_, i64>(5)?.max(0) as u64,
+                    project: row.get(6)?,
+                    provider: row.get(7)?,
+                    model: row.get(8)?,
+                    tokens: TokenBuckets {
+                        raw_input: row.get::<_, i64>(9)?.max(0) as u64,
+                        uncached_input: row.get::<_, i64>(10)?.max(0) as u64,
+                        cache_read: row.get::<_, i64>(11)?.max(0) as u64,
+                        cache_write: row.get::<_, i64>(12)?.max(0) as u64,
+                        cache_write_1h: row.get::<_, i64>(13)?.max(0) as u64,
+                        output: row.get::<_, i64>(14)?.max(0) as u64,
+                        reasoning: row.get::<_, i64>(15)?.max(0) as u64,
+                    },
+                    source_cost_usd: row.get(16)?,
+                    dedupe_confidence: row.get(17)?,
+                    conservative_undercount: row.get::<_, i64>(18)? != 0,
+                    sidechain: row.get::<_, i64>(19)? != 0,
+                    source_order: row.get::<_, i64>(20)?.max(0) as u64,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (path, event) = row?;
+            if let Some(file) = files.get_mut(&path) {
+                file.events.push(event);
+            }
+        }
+        Ok(files)
     }
 
     fn delete_stale(&mut self, source: &str, stale_paths: &[String]) -> Result<()> {
@@ -824,6 +949,10 @@ impl UsageCache {
         for path in stale_paths {
             transaction.execute(
                 "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
+                params![source, path],
+            )?;
+            transaction.execute(
+                "DELETE FROM usage_events WHERE source = ?1 AND path = ?2",
                 params![source, path],
             )?;
         }
@@ -838,52 +967,270 @@ impl UsageCache {
         scanned_at_ms: i64,
         parsed: &[ParsedUsageFile],
     ) -> Result<()> {
-        let prepared = parsed
-            .iter()
-            .filter(|file| file.cacheable)
-            .map(|file| {
-                let cached = file
-                    .events
-                    .iter()
-                    .map(CachedUsageEvent::from_event)
-                    .collect::<Vec<_>>();
-                Ok((
-                    file.path.to_string_lossy().to_string(),
-                    file.size,
-                    file.mtime_ns,
-                    postcard::to_stdvec(&cached)?,
-                    postcard::to_stdvec(&file.deps)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let resolve_source_record = !self.bulk_load;
         let transaction = self.connection.transaction()?;
-        for (path, size, mtime_ns, events_blob, deps_blob) in prepared {
-            transaction.execute(
-                "INSERT INTO usage_file_cache(
-                     source, path, parser_version, size, mtime_ns, scanned_at_ms, events_blob, deps_blob
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        for file in parsed.iter().filter(|file| file.cacheable) {
+            let path = file.path.to_string_lossy().to_string();
+            let deps_blob = postcard::to_stdvec(&file.deps)?;
+            transaction
+                .prepare_cached(
+                    "INSERT INTO usage_file_cache(
+                     source, path, parser_version, size, mtime_ns, scanned_at_ms, deps_blob
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(source, path) DO UPDATE SET
                      parser_version = excluded.parser_version,
                      size = excluded.size,
                      mtime_ns = excluded.mtime_ns,
                      scanned_at_ms = excluded.scanned_at_ms,
-                     events_blob = excluded.events_blob,
                      deps_blob = excluded.deps_blob",
-                params![
+                )?
+                .execute(params![
                     source,
                     path,
                     parser_version,
-                    size as i64,
-                    mtime_ns,
+                    file.size.min(i64::MAX as u64) as i64,
+                    file.mtime_ns,
                     scanned_at_ms,
-                    events_blob,
                     deps_blob
-                ],
-            )?;
+                ])?;
+            transaction
+                .prepare_cached("DELETE FROM usage_events WHERE source = ?1 AND path = ?2")?
+                .execute(params![source, path])?;
+            for event in &file.events {
+                insert_usage_event(&transaction, event, resolve_source_record)?;
+            }
         }
         transaction.commit()?;
         Ok(())
     }
+
+    fn finish_bulk_load(&mut self) -> Result<()> {
+        if self.bulk_load {
+            let threads = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .min(64);
+            self.connection.pragma_update(None, "threads", threads)?;
+            self.connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS usage_events_time_idx
+                    ON usage_events(occurred_at);
+                 CREATE INDEX IF NOT EXISTS usage_events_session_time_idx
+                    ON usage_events(session_key, occurred_at);
+                 CREATE INDEX IF NOT EXISTS usage_events_interaction_idx
+                    ON usage_events(interaction_id);
+                 CREATE INDEX IF NOT EXISTS usage_events_model_time_idx
+                    ON usage_events(provider, model, occurred_at);
+                 CREATE INDEX IF NOT EXISTS usage_events_source_path_idx
+                    ON usage_events(source, path, source_order);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )?;
+        }
+        self.connection.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS temp.usage_record_links;
+            CREATE TEMP TABLE usage_record_links (
+                usage_rowid INTEGER PRIMARY KEY,
+                record_key TEXT NOT NULL
+            );
+            INSERT INTO usage_record_links(usage_rowid, record_key)
+            SELECT usage.rowid, MIN(record.record_key)
+            FROM usage_events AS usage
+            JOIN records AS record
+              ON record.session_key = usage.session_key
+             AND record.event_id = usage.source_record_id
+            WHERE usage.source_record_key IS NULL
+              AND usage.source_record_id IS NOT NULL
+            GROUP BY usage.rowid;
+            INSERT OR IGNORE INTO usage_record_links(usage_rowid, record_key)
+            SELECT usage.rowid, MIN(record.record_key)
+            FROM usage_events AS usage
+            JOIN records AS record
+              ON record.session_key = usage.session_key
+             AND record.event_id = usage.message_id
+            WHERE usage.source_record_key IS NULL
+              AND usage.message_id IS NOT NULL
+            GROUP BY usage.rowid;
+            UPDATE usage_events AS usage
+            SET source_record_key = link.record_key
+            FROM usage_record_links AS link
+            WHERE usage.rowid = link.usage_rowid
+              AND usage.source_record_key IS NULL;
+            DROP TABLE temp.usage_record_links;
+
+            UPDATE usage_events AS usage
+            SET interaction_id = interaction.interaction_id
+            FROM interactions AS interaction
+            WHERE usage.interaction_id IS NULL
+              AND usage.request_id IS NOT NULL
+              AND interaction.session_key = usage.session_key
+              AND interaction.source_interaction_id = usage.request_id;
+            PRAGMA wal_checkpoint(TRUNCATE);
+            "#,
+        )?;
+        self.bulk_load = false;
+        Ok(())
+    }
+}
+
+fn insert_usage_event(
+    connection: &Connection,
+    event: &UsageEvent,
+    resolve_source_record: bool,
+) -> Result<()> {
+    let source_kind = SourceKind::from_label(event.source).unwrap_or_default();
+    let session_key = event.session_id.as_deref().map(|session_id| {
+        crate::catalog::session_key(source_kind, session_id, event.source_path.as_ref())
+    });
+    let interaction_id = if resolve_source_record
+        && let (Some(session_key), Some(request_id)) =
+            (session_key.as_deref(), event.request_id.as_deref())
+    {
+        connection
+            .prepare_cached(
+                "SELECT interaction_id FROM interactions
+                 WHERE session_key = ?1 AND source_interaction_id = ?2",
+            )?
+            .query_row(params![session_key, request_id], |row| row.get::<_, i64>(0))
+            .optional()?
+    } else {
+        None
+    };
+    let source_record_key =
+        if resolve_source_record && let Some(session_key) = session_key.as_deref() {
+            let candidate = event
+                .source_record_id
+                .as_deref()
+                .or(event.message_id.as_deref());
+            candidate
+                .map(|candidate| {
+                    connection
+                        .prepare_cached(
+                            "SELECT record_key FROM records
+                         WHERE session_key = ?1 AND event_id = ?2
+                         ORDER BY occurred_at LIMIT 1",
+                        )?
+                        .query_row(params![session_key, candidate], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .optional()
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+    connection
+        .prepare_cached(
+            r#"
+        INSERT INTO usage_events(
+            event_key, source, path, session_key, interaction_id, source_record_key, source_record_id,
+            session_id, request_id, message_id, occurred_at, project_hint, provider, model,
+            raw_input_tokens, input_tokens, cache_read_tokens, cache_write_tokens,
+            cache_write_1h_tokens, output_tokens, reasoning_tokens, source_cost, cost_status,
+            dedupe_confidence, conservative_undercount, sidechain, source_order
+        )
+        VALUES(
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+        )
+        ON CONFLICT(event_key) DO UPDATE SET
+            source_record_key = excluded.source_record_key,
+            session_key = excluded.session_key,
+            interaction_id = excluded.interaction_id,
+            project_hint = excluded.project_hint,
+            provider = excluded.provider,
+            model = excluded.model,
+            raw_input_tokens = excluded.raw_input_tokens,
+            input_tokens = excluded.input_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_write_tokens = excluded.cache_write_tokens,
+            cache_write_1h_tokens = excluded.cache_write_1h_tokens,
+            output_tokens = excluded.output_tokens,
+            reasoning_tokens = excluded.reasoning_tokens,
+            source_cost = excluded.source_cost,
+            cost_status = excluded.cost_status,
+            dedupe_confidence = excluded.dedupe_confidence,
+            conservative_undercount = excluded.conservative_undercount,
+            sidechain = excluded.sidechain,
+            source_order = excluded.source_order
+        "#,
+        )?
+        .execute(params![
+            usage_event_key(event),
+            event.source,
+            event.source_path.as_ref(),
+            session_key,
+            interaction_id,
+            source_record_key,
+            event.source_record_id,
+            event.session_id,
+            event.request_id,
+            event.message_id,
+            event.timestamp_ms.min(i64::MAX as u64) as i64,
+            event.project,
+            event.provider,
+            event.model,
+            event.tokens.raw_input.min(i64::MAX as u64) as i64,
+            event.tokens.uncached_input.min(i64::MAX as u64) as i64,
+            event.tokens.cache_read.min(i64::MAX as u64) as i64,
+            event.tokens.cache_write.min(i64::MAX as u64) as i64,
+            event.tokens.cache_write_1h.min(i64::MAX as u64) as i64,
+            event.tokens.output.min(i64::MAX as u64) as i64,
+            event.tokens.reasoning.min(i64::MAX as u64) as i64,
+            event.source_cost_usd,
+            if event.source_cost_usd.is_some() {
+                "source"
+            } else {
+                "unpriced"
+            },
+            event.dedupe_confidence,
+            i64::from(event.conservative_undercount),
+            i64::from(event.sidechain),
+            event.source_order.min(i64::MAX as u64) as i64,
+        ])?;
+    Ok(())
+}
+
+fn usage_event_key(event: &UsageEvent) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [
+        event.source,
+        event.source_path.as_ref(),
+        event.source_record_id.as_deref().unwrap_or(""),
+        event.session_id.as_deref().unwrap_or(""),
+        event.request_id.as_deref().unwrap_or(""),
+        event.message_id.as_deref().unwrap_or(""),
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(event.timestamp_ms.to_le_bytes());
+    hasher.update(event.source_order.to_le_bytes());
+    format!("ue1_{:x}", hasher.finalize())
+}
+
+pub(crate) fn remove_cached_source_path(
+    cache_path: &Path,
+    source: SourceKind,
+    source_path: &str,
+) -> Result<()> {
+    if !cache_path.exists() {
+        return Ok(());
+    }
+    let cache = UsageCache::open(cache_path)?;
+    let transaction = cache.connection.unchecked_transaction()?;
+    transaction.execute(
+        "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
+        params![source.storage_label(), source_path],
+    )?;
+    transaction.execute(
+        "DELETE FROM usage_events WHERE source = ?1 AND path = ?2",
+        params![source.storage_label(), source_path],
+    )?;
+    transaction.commit()?;
+    crate::catalog::prune_orphan_interactions(&cache.connection)?;
+    Ok(())
 }
 
 fn epoch_ms_now() -> i64 {
@@ -905,9 +1252,8 @@ struct SourceScan {
     volatile_reuse_ms: fn(&Path) -> Option<i64>,
 }
 
-/// Scan `files` through the per-file cache: unchanged files are served from cached blobs
-/// (decoded in parallel), changed or new files are re-parsed in parallel, and cache rows
-/// for vanished files are dropped. Events are appended to `out` in `files` order.
+/// Scan `files` through the relational per-file cache: unchanged files hydrate event rows,
+/// changed or new files are re-parsed in parallel, and vanished files are dropped.
 fn scan_files_cached(
     scan: SourceScan,
     files: &[PathBuf],
@@ -957,7 +1303,7 @@ fn scan_files_cached_with(
     });
     let stat_start = Instant::now();
     let mut slots: Vec<Option<Vec<UsageEvent>>> = (0..files.len()).map(|_| None).collect();
-    let mut hits: Vec<(usize, String, Vec<u8>)> = Vec::new();
+    let mut hits: Vec<(usize, String, Vec<CachedUsageEvent>)> = Vec::new();
     let mut missing: Vec<(usize, PathBuf, (u64, i64))> = Vec::new();
     for (index, path) in files.iter().enumerate() {
         let metadata = match usage_file_metadata(path) {
@@ -983,7 +1329,7 @@ fn scan_files_cached_with(
                     && row.deps.iter().all(UsageFileDep::is_current)
                     && deps_current(&row.deps) =>
             {
-                hits.push((index, key, row.events_blob));
+                hits.push((index, key, row.events));
             }
             _ => missing.push((index, path.clone(), metadata)),
         }
@@ -991,39 +1337,25 @@ fn scan_files_cached_with(
     usage_timing(stat_start, || {
         format!("{source} stat ({} files)", files.len())
     });
-    let decode_start = Instant::now();
     let hit_count = hits.len();
-    let decoded = hits
+    let hydrated = hits
         .into_par_iter()
-        .map(|(index, key, blob)| {
+        .map(|(index, key, events)| {
             let source_path: Arc<str> = Arc::from(key.as_str());
-            let events = postcard::from_bytes::<Vec<CachedUsageEvent>>(&blob).map(|events| {
+            (
+                index,
                 events
                     .into_iter()
                     .map(|event| event.into_event(source, source_path.clone()))
-                    .collect::<Vec<_>>()
-            });
-            (index, key, events)
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect::<Vec<_>>();
-    for (index, key, events) in decoded {
-        match events {
-            Ok(events) => slots[index] = Some(events),
-            // A corrupt cached blob demotes the file to a fresh parse.
-            Err(_) => {
-                let path = PathBuf::from(&key);
-                match usage_file_metadata(&path) {
-                    Ok(metadata) => missing.push((index, path, metadata)),
-                    Err(error) => warnings.push(format!(
-                        "{source} usage file skipped ({}): {error:#}",
-                        path.display()
-                    )),
-                }
-            }
-        }
+    for (index, events) in hydrated {
+        slots[index] = Some(events);
     }
-    usage_timing(decode_start, || {
-        format!("{source} decode ({hit_count} cached files)")
+    usage_timing(load_start, || {
+        format!("{source} hydrate ({hit_count} cached files)")
     });
     let mut cache = cache;
     let stale_paths: Vec<String> = rows.into_keys().collect();
@@ -1429,6 +1761,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vanished_source_path_is_removed_from_usage_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let source_path = "/tmp/session.jsonl";
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    deps_blob
+                 ) VALUES ('claude', ?1, 1, 10, 20, 30, ?2)",
+                params![
+                    source_path,
+                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
+                ],
+            )
+            .expect("seed cache row");
+        let session_key = crate::catalog::session_key(SourceKind::Claude, "session-1", source_path);
+        cache
+            .connection
+            .execute(
+                "INSERT INTO interactions(
+                    session_key, source_interaction_id, started_at, ended_at
+                 ) VALUES(?1, 'request-1', 1, 1)",
+                params![session_key],
+            )
+            .expect("seed interaction");
+        let event = UsageEvent {
+            source: "claude",
+            source_path: Arc::from(source_path),
+            source_record_id: Some("event-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            request_id: Some("request-1".to_string()),
+            message_id: None,
+            timestamp_ms: 1,
+            project: None,
+            provider: Some("anthropic".to_string()),
+            model: Some("claude".to_string()),
+            tokens: TokenBuckets::default(),
+            source_cost_usd: None,
+            dedupe_confidence: "strong",
+            conservative_undercount: false,
+            sidechain: false,
+            source_order: 0,
+        };
+        insert_usage_event(&cache.connection, &event, true).expect("seed usage event");
+        drop(cache);
+
+        remove_cached_source_path(&path, SourceKind::Claude, source_path)
+            .expect("remove vanished source");
+
+        let cache = UsageCache::open(&path).expect("reopen cache");
+        let counts: (i64, i64, i64) = cache
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM usage_file_cache),
+                    (SELECT count(*) FROM usage_events),
+                    (SELECT count(*) FROM interactions)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("count rows");
+        assert_eq!(counts, (0, 0, 0));
+    }
+
+    #[test]
     fn usage_parser_version_change_invalidates_cached_rows() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("usage-cache.sqlite3");
@@ -1438,14 +1838,30 @@ mod tests {
             .execute(
                 "INSERT INTO usage_file_cache(
                     source, path, parser_version, size, mtime_ns, scanned_at_ms,
-                    events_blob, deps_blob
-                 ) VALUES ('claude', '/tmp/session.jsonl', 1, 10, 20, 30, ?1, ?2)",
-                params![
-                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
-                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
-                ],
+                    deps_blob
+                 ) VALUES ('claude', '/tmp/session.jsonl', 1, 10, 20, 30, ?1)",
+                params![postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()],
             )
             .expect("seed stale cache row");
+        let event = UsageEvent {
+            source: "claude",
+            source_path: Arc::from("/tmp/session.jsonl"),
+            source_record_id: None,
+            session_id: Some("session-1".to_string()),
+            request_id: None,
+            message_id: None,
+            timestamp_ms: 1,
+            project: None,
+            provider: Some("anthropic".to_string()),
+            model: Some("claude".to_string()),
+            tokens: TokenBuckets::default(),
+            source_cost_usd: None,
+            dedupe_confidence: "strong",
+            conservative_undercount: false,
+            sidechain: false,
+            source_order: 0,
+        };
+        insert_usage_event(&cache.connection, &event, false).expect("seed stale usage event");
 
         assert!(
             cache
@@ -1453,15 +1869,93 @@ mod tests {
                 .expect("load new parser version")
                 .is_empty()
         );
-        let rows: i64 = cache
+        let rows: (i64, i64) = cache
             .connection
             .query_row(
-                "SELECT count(*) FROM usage_file_cache WHERE source = 'claude'",
+                "SELECT
+                    (SELECT count(*) FROM usage_file_cache WHERE source = 'claude'),
+                    (SELECT count(*) FROM usage_events WHERE source = 'claude')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (0, 0));
+    }
+
+    #[test]
+    fn bulk_usage_events_link_to_source_interactions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("catalog.sqlite");
+        let mut cache = UsageCache::open(&path).expect("open cache");
+        let source_path: Arc<str> = Arc::from("/tmp/session.jsonl");
+        let session_key =
+            crate::catalog::session_key(SourceKind::Codex, "session", source_path.as_ref());
+        cache
+            .connection
+            .execute(
+                "INSERT INTO interactions(
+                    session_key, source_interaction_id, started_at, ended_at
+                 ) VALUES(?1, 'turn-1', 1, 1)",
+                params![session_key],
+            )
+            .expect("insert interaction");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms, deps_blob
+                 ) VALUES('codex', ?1, 1, 1, 1, 1, ?2)",
+                params![
+                    source_path.as_ref(),
+                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
+                ],
+            )
+            .expect("insert cache file");
+        let event = UsageEvent {
+            source: "codex",
+            source_path,
+            source_record_id: Some("event:0".to_string()),
+            session_id: Some("session".to_string()),
+            request_id: Some("turn-1".to_string()),
+            message_id: None,
+            timestamp_ms: 1,
+            project: None,
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5".to_string()),
+            tokens: TokenBuckets::codex(10, 0, 1, 0),
+            source_cost_usd: None,
+            dedupe_confidence: "strong",
+            conservative_undercount: false,
+            sidechain: false,
+            source_order: 0,
+        };
+        insert_usage_event(&cache.connection, &event, false).expect("insert usage event");
+        cache.finish_bulk_load().expect("finish bulk load");
+
+        let linked: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_events WHERE interaction_id IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(rows, 0);
+            .expect("linked usage count");
+        assert_eq!(linked, 1);
+
+        cache
+            .connection
+            .execute("UPDATE usage_events SET interaction_id = NULL", [])
+            .expect("clear usage interaction");
+        cache.finish_bulk_load().expect("repair warm usage links");
+        let repaired: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_events WHERE interaction_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("repaired usage count");
+        assert_eq!(repaired, 1);
     }
 
     #[test]

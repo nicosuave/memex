@@ -1,8 +1,8 @@
 //! Source-owned transcript discovery, identity, and projection adapters.
 //!
 //! Indexing and usage reconstruction deliberately remain independent projections.  The
-//! adapters in this module make them share source identity, discovery, hierarchy, and
-//! parser-version rules without introducing a persisted normalized transcript store.
+//! adapters in this module make them share source identity, discovery, hierarchy,
+//! parser-version rules, and the relation facts persisted by the canonical catalog.
 
 pub mod audit;
 pub mod claude;
@@ -14,7 +14,7 @@ pub mod openclaw;
 pub mod opencode;
 pub mod pi;
 
-use crate::state::PendingToolCall;
+use crate::state::{ParserStreamState, PendingToolCall};
 use crate::types::SourceKind;
 use crate::usage::UsageEvent;
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,7 @@ pub(crate) struct IndexParseState {
     pub offset: u64,
     pub turn_id: u32,
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
+    pub parser_stream: ParserStreamState,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +91,7 @@ pub(crate) struct IndexParseOutput {
     pub offset: u64,
     pub turn_id: u32,
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
+    pub parser_stream: ParserStreamState,
     pub session_id: Option<String>,
     pub diagnostics: ParseDiagnostics,
 }
@@ -211,26 +213,6 @@ pub fn index_state_version(source: SourceKind) -> u32 {
     index_state_version_for(source, false)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reasoning_mode_is_part_of_index_state_version() {
-        for source in [
-            SourceKind::Claude,
-            SourceKind::Codex,
-            SourceKind::Pi,
-            SourceKind::OpenClaw,
-        ] {
-            assert_ne!(
-                index_state_version_for(source, false),
-                index_state_version_for(source, true)
-            );
-        }
-    }
-}
-
 pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u32 {
     let versions = versions(source);
     let reasoning_mode = include_reasoning
@@ -260,5 +242,25 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Copilot
     } else {
         SourceKind::Claude
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_mode_is_part_of_index_state_version() {
+        for source in [
+            SourceKind::Claude,
+            SourceKind::Codex,
+            SourceKind::Pi,
+            SourceKind::OpenClaw,
+        ] {
+            assert_ne!(
+                index_state_version_for(source, false),
+                index_state_version_for(source, true)
+            );
+        }
     }
 }

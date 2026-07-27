@@ -1,6 +1,6 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, analytics_path};
 use crate::config::{MachineConfig, Paths, UserConfig, default_claude_source};
-use crate::embed::EmbedderHandle;
+use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
@@ -11,7 +11,7 @@ use crate::usage::{
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -742,7 +742,7 @@ fn usage_query(paths: &Paths, spec: &UsageSpec) -> UsageQuery {
         until_ms: spec.until_ms,
         cost_mode: spec.cost_mode,
         include_events: spec.include_events,
-        cache_path: Some(paths.state.join("usage-cache.sqlite3")),
+        cache_path: Some(analytics_path(&paths.state)),
         memo_ttl_ms: spec.memo_ttl_ms,
     }
 }
@@ -850,7 +850,8 @@ fn search_local(
                 }
                 Err(err) => return Err(err),
             };
-            let model = config.resolve_model(None)?;
+            let model =
+                ModelChoice::from_vector_metadata(vector.model(), config.resolve_model(None)?)?;
             let runtime = config.resolve_embed_runtime()?;
             let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
             let embedding = embedder
@@ -858,12 +859,20 @@ fn search_local(
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
+            let catalog =
+                crate::catalog::CatalogStore::open_read_only(analytics_path(&paths.state))?;
             let mut records = Vec::new();
-            for (doc_id, distance) in vector.search(&embedding, spec.limit)? {
-                if let Some(record) = index.get_by_doc_id(doc_id)?
+            let mut seen = HashSet::new();
+            let candidate_limit = (spec.limit * 5).clamp(50, 500);
+            for (vector_id, distance) in vector.search(&embedding, candidate_limit)? {
+                if let Some(record) = record_for_embedding_vector(&index, &catalog, vector_id)?
                     && matches_filters(&record, &options)
+                    && seen.insert(record.record_key.clone())
                 {
                     records.push((1.0 / (1.0 + distance), record));
+                    if records.len() == spec.limit {
+                        break;
+                    }
                 }
             }
             records
@@ -881,7 +890,8 @@ fn search_local(
                 limit: candidate_limit,
                 ..options.clone()
             })?;
-            let model = config.resolve_model(None)?;
+            let model =
+                ModelChoice::from_vector_metadata(vector.model(), config.resolve_model(None)?)?;
             let runtime = config.resolve_embed_runtime()?;
             let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
             let embedding = embedder
@@ -890,6 +900,8 @@ fn search_local(
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
             let semantic = vector.search(&embedding, candidate_limit)?;
+            let catalog =
+                crate::catalog::CatalogStore::open_read_only(analytics_path(&paths.state))?;
             let mut records = HashMap::new();
             let mut scores = HashMap::<u64, f32>::new();
             for (rank, (_, record)) in lexical.into_iter().enumerate() {
@@ -898,10 +910,15 @@ fn search_local(
                     records.insert(record.doc_id, record);
                 }
             }
-            for (rank, (doc_id, _)) in semantic.into_iter().enumerate() {
-                if let Some(record) = index.get_by_doc_id(doc_id)?
+            let mut seen = HashSet::new();
+            for (rank, (vector_id, _)) in semantic.into_iter().enumerate() {
+                if let Some(record) = record_for_embedding_vector(&index, &catalog, vector_id)?
                     && matches_filters(&record, &options)
                 {
+                    let doc_id = record.doc_id;
+                    if !seen.insert(doc_id) {
+                        continue;
+                    }
                     *scores.entry(doc_id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
                     records.entry(doc_id).or_insert(record);
                 }
@@ -935,6 +952,17 @@ fn search_local(
     results.truncate(spec.limit);
     apply_project_grouping(paths, &mut results, spec.project_grouping);
     Ok(results)
+}
+
+fn record_for_embedding_vector(
+    index: &SearchIndex,
+    catalog: &crate::catalog::CatalogStore,
+    vector_id: u64,
+) -> Result<Option<Record>> {
+    let Some(record_key) = catalog.embedding_anchor_by_vector_id(vector_id)? else {
+        return Ok(None);
+    };
+    index.get_by_record_key(&record_key)
 }
 
 fn lexical_results(

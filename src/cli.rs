@@ -164,9 +164,9 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    machine, score, ts, doc_id, project, role, session_id, source, source_path, text, snippet, matches
+    machine, score, ts, record_key, doc_id, project, role, session_id, source, source_path, text, snippet, matches
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
-    parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
+    interaction_id, parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
@@ -269,10 +269,10 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Display a single document by its internal ID
+    /// Display a single record by its stable key or internal document ID
     Show {
-        /// Document ID (from search results)
-        doc_id: u64,
+        /// Stable record key or document ID (from search results)
+        record_id: String,
         /// Pretty-print JSON output
         #[arg(short, long)]
         verbose: bool,
@@ -633,11 +633,11 @@ pub fn run() -> Result<()> {
             run_session(session_id, verbose, root)?;
         }
         Commands::Show {
-            doc_id,
+            record_id,
             verbose,
             root,
         } => {
-            run_show(doc_id, verbose, root)?;
+            run_show(&record_id, verbose, root)?;
         }
         Commands::Stats { root } => {
             run_stats(root)?;
@@ -816,8 +816,6 @@ fn run_index(
 }
 
 fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
-    const BATCH_SIZE: usize = 256;
-
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let _lease = IngestLease::acquire(&paths, "embed", INGEST_LEASE_TIMEOUT)?;
@@ -837,83 +835,26 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
         true,
     ));
     progress.set_embed_ready();
-
-    let mut embedded_counts = [0u64; crate::progress::SOURCE_COUNT];
-    let mut embedded_total = 0u64;
-    let mut batch: Vec<(u64, String, crate::types::SourceKind)> = Vec::with_capacity(BATCH_SIZE);
-
-    let flush_batch = |batch: &mut Vec<(u64, String, crate::types::SourceKind)>,
-                       embedder: &mut EmbedderHandle,
-                       vector: &mut VectorIndex,
-                       progress: &crate::progress::Progress,
-                       embedded_counts: &mut [u64; crate::progress::SOURCE_COUNT],
-                       embedded_total: &mut u64| {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let texts: Vec<&str> = batch.iter().map(|(_, text, _)| text.as_str()).collect();
-        let embeddings = embedder.embed_texts(&texts)?;
-
-        for ((doc_id, _, source), vec) in batch.iter().zip(embeddings.iter()) {
-            vector.add(*doc_id, vec)?;
-            progress.sub_embed_pending(*source, 1);
-            progress.add_embedded(*source, 1);
-            embedded_counts[source.idx()] += 1;
-            *embedded_total += 1;
-        }
-        batch.clear();
-        Ok::<_, anyhow::Error>(())
-    };
-
-    index.for_each_record(|record| {
-        if record.text.is_empty() || !is_embedding_role(&record.role) {
-            return Ok(());
-        }
-        if vector.contains(record.doc_id) {
-            return Ok(());
-        }
-        let text = truncate_for_embedding(record.text);
-        if !text.is_empty() {
-            progress.add_embed_total(record.source, 1);
-            progress.add_embed_pending(record.source, 1);
-            batch.push((record.doc_id, text, record.source));
-
-            if batch.len() >= BATCH_SIZE {
-                flush_batch(
-                    &mut batch,
-                    &mut embedder,
-                    &mut vector,
-                    &progress,
-                    &mut embedded_counts,
-                    &mut embedded_total,
-                )?;
-            }
-        }
-        Ok(())
-    })?;
-
-    // Flush remaining
-    flush_batch(
-        &mut batch,
-        &mut embedder,
+    let report = crate::embedding_documents::synchronize(
+        &index,
+        &analytics_path(&paths.state),
         &mut vector,
-        &progress,
-        &mut embedded_counts,
-        &mut embedded_total,
+        &mut embedder,
+        Some(&progress),
     )?;
-
-    vector.save()?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
-        embedded_total,
-        embedded_counts[crate::types::SourceKind::Claude.idx()],
-        embedded_counts[crate::types::SourceKind::Codex.idx()],
-        embedded_counts[crate::types::SourceKind::Opencode.idx()],
-        embedded_counts[crate::types::SourceKind::Cursor.idx()],
-        embedded_counts[crate::types::SourceKind::Pi.idx()],
-        embedded_counts[crate::types::SourceKind::OpenClaw.idx()],
-        embedded_counts[crate::types::SourceKind::Copilot.idx()],
+        "synchronized {} embedding documents: embedded {}, removed {} stale vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {})",
+        report.documents,
+        report.embedded,
+        report.removed,
+        report.embedded_by_source[crate::types::SourceKind::Claude.idx()],
+        report.embedded_by_source[crate::types::SourceKind::Codex.idx()],
+        report.embedded_by_source[crate::types::SourceKind::Opencode.idx()],
+        report.embedded_by_source[crate::types::SourceKind::Cursor.idx()],
+        report.embedded_by_source[crate::types::SourceKind::Pi.idx()],
+        report.embedded_by_source[crate::types::SourceKind::OpenClaw.idx()],
+        report.embedded_by_source[crate::types::SourceKind::Copilot.idx()],
     );
 
     std::io::stdout().flush().ok();
@@ -1159,16 +1100,21 @@ fn run_semantic_search(
         }
         Err(err) => return Err(err),
     };
-    let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
+    let model_choice = ModelChoice::from_vector_metadata(vector.model(), ctx.model_choice)?;
+    let mut embedder = EmbedderHandle::with_model_and_runtime(model_choice, ctx.embed_runtime)?;
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
     let embedding = embeddings
         .first()
         .ok_or_else(|| anyhow!("embedding missing"))?;
     let mut results = Vec::new();
+    let catalog = crate::catalog::CatalogStore::open_read_only(analytics_path(&ctx.paths.state))?;
+    let mut seen_record_keys = HashSet::new();
     let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-    for (doc_id, distance) in vector.search(embedding, limit)? {
-        if let Some(record) = index.get_by_doc_id(doc_id)?
+    let vector_k = limit.saturating_mul(5).clamp(50, 500);
+    for (vector_id, distance) in vector.search(embedding, vector_k)? {
+        if let Some(record) = record_for_vector_id(index, &catalog, vector_id)?
             && matches_filters(&record, options)
+            && seen_record_keys.insert(record.record_key.clone())
         {
             let base = score_from_distance(distance);
             let score = apply_recency(
@@ -1179,6 +1125,9 @@ fn run_semantic_search(
                 ctx.recency_half_life_days,
             );
             results.push((score, record));
+            if results.len() == limit {
+                break;
+            }
         }
     }
     let results = apply_post_processing(results, ctx.render);
@@ -1206,7 +1155,8 @@ fn run_hybrid_search(
         }
         Err(err) => return Err(err),
     };
-    let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
+    let model_choice = ModelChoice::from_vector_metadata(vector.model(), ctx.model_choice)?;
+    let mut embedder = EmbedderHandle::with_model_and_runtime(model_choice, ctx.embed_runtime)?;
 
     let bm25_k = (limit * 5).clamp(50, 500);
     let vector_k = (limit * 5).clamp(50, 500);
@@ -1221,6 +1171,7 @@ fn run_hybrid_search(
         .first()
         .ok_or_else(|| anyhow!("embedding missing"))?;
     let vector_results = vector.search(embedding, vector_k)?;
+    let catalog = crate::catalog::CatalogStore::open_read_only(analytics_path(&ctx.paths.state))?;
 
     let mut records: HashMap<u64, crate::types::Record> = HashMap::new();
     let mut scores: HashMap<u64, f32> = HashMap::new();
@@ -1238,9 +1189,14 @@ fn run_hybrid_search(
         records.insert(record.doc_id, record);
     }
 
-    for (rank, (doc_id, _distance)) in vector_results.into_iter().enumerate() {
-        if let Some(record) = index.get_by_doc_id(doc_id)? {
+    let mut seen_vector_records = HashSet::new();
+    for (rank, (vector_id, _distance)) in vector_results.into_iter().enumerate() {
+        if let Some(record) = record_for_vector_id(index, &catalog, vector_id)? {
             if !matches_filters(&record, options) {
+                continue;
+            }
+            let doc_id = record.doc_id;
+            if !seen_vector_records.insert(doc_id) {
                 continue;
             }
             let r = rank as f32 + 1.0;
@@ -1273,6 +1229,17 @@ fn run_hybrid_search(
     let merged = apply_post_processing(merged, ctx.render);
     render_results(merged, ctx.render)?;
     Ok(())
+}
+
+fn record_for_vector_id(
+    index: &SearchIndex,
+    catalog: &crate::catalog::CatalogStore,
+    vector_id: u64,
+) -> Result<Option<crate::types::Record>> {
+    let Some(record_key) = catalog.embedding_anchor_by_vector_id(vector_id)? else {
+        return Ok(None);
+    };
+    index.get_by_record_key(&record_key)
 }
 
 fn run_lexical_search(
@@ -1381,6 +1348,7 @@ struct SearchHit {
     machine: String,
     score: f32,
     ts: String,
+    record_key: String,
     doc_id: u64,
     project: String,
     role: String,
@@ -1468,6 +1436,12 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
             if fields.contains("doc_id") {
                 map.insert("doc_id".to_string(), Value::from(record.doc_id));
             }
+            if fields.contains("record_key") {
+                map.insert(
+                    "record_key".to_string(),
+                    Value::from(record.record_key.clone()),
+                );
+            }
             if fields.contains("project") {
                 map.insert("project".to_string(), Value::from(record.project));
             }
@@ -1480,6 +1454,12 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
             if fields.contains("source") {
                 map.insert("source".to_string(), Value::from(record.source.label()));
             }
+            insert_optional_field(
+                &mut map,
+                fields,
+                "interaction_id",
+                &record.links.interaction_id,
+            );
             insert_optional_field(&mut map, fields, "event_id", &record.links.event_id);
             insert_optional_field(
                 &mut map,
@@ -1547,6 +1527,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
                 machine,
                 score,
                 ts,
+                record_key: record.record_key,
                 doc_id: record.doc_id,
                 project: record.project,
                 role: record.role,
@@ -1615,12 +1596,14 @@ fn run_session(session_id: String, verbose: bool, root: Option<PathBuf>) -> Resu
     Ok(())
 }
 
-fn run_show(doc_id: u64, verbose: bool, root: Option<PathBuf>) -> Result<()> {
+fn run_show(record_id: &str, verbose: bool, root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
-    let record = index
-        .get_by_doc_id(doc_id)?
-        .ok_or_else(|| anyhow!("doc_id not found"))?;
+    let record = match record_id.parse::<u64>() {
+        Ok(doc_id) => index.get_by_doc_id(doc_id)?,
+        Err(_) => index.get_by_record_key(record_id)?,
+    }
+    .ok_or_else(|| anyhow!("record not found"))?;
     if verbose {
         println!("{}", serde_json::to_string_pretty(&record)?);
         return Ok(());
@@ -1723,7 +1706,7 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
         until_ms,
         cost_mode,
         include_events,
-        cache_path: Some(paths.state.join("usage-cache.sqlite3")),
+        cache_path: Some(analytics_path(&paths.state)),
         memo_ttl_ms: 0,
     };
     // A cold usage cache re-parses whole log corpora, which can take minutes; narrate the
@@ -1988,16 +1971,16 @@ fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
     }
     let vector = VectorIndex::open(vectors_dir)?;
     let index_path = vectors_dir.join("usearch.index");
-    let ids_path = vectors_dir.join("doc_ids.bin");
+    let ids_path = vectors_dir.join("vector_ids.bin");
     let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
     let ids_bytes = std::fs::metadata(&ids_path).map(|m| m.len()).unwrap_or(0);
     let model = vector.model().unwrap_or("unknown");
     Ok(format!(
-        "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
+        "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, vector_ids.bin {})",
         vector.len(),
         vector.dimensions(),
         model,
-        vector.doc_id_count(),
+        vector.vector_id_count(),
         index_bytes,
         ids_bytes
     ))
@@ -3406,23 +3389,6 @@ fn take_first_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-fn is_embedding_role(role: &str) -> bool {
-    role == "user" || role == "assistant"
-}
-
-fn truncate_for_embedding(mut text: String) -> String {
-    const EMBED_MAX_CHARS: usize = 8192;
-    if text.len() <= EMBED_MAX_CHARS {
-        return text;
-    }
-    let mut end = EMBED_MAX_CHARS.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
-}
-
 fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Result<bool> {
     if enable && disable {
         return Err(anyhow!("--{name} and --no-{name} cannot be used together"));
@@ -3785,7 +3751,7 @@ mod tests {
 
         assert!(line.starts_with("vectors: 1 (dims 64, model bge, ids 1,"));
         assert!(line.contains("usearch.index"));
-        assert!(line.contains("doc_ids.bin"));
+        assert!(line.contains("vector_ids.bin"));
         assert!(!line.contains("vectors.f32"));
         assert!(!line.contains("doc_ids.u64"));
     }

@@ -110,6 +110,13 @@ impl ModelChoice {
     pub fn known_dimensions(self) -> Option<usize> {
         self.fastembed_config().map(|(_, dimensions)| dimensions)
     }
+
+    pub fn from_vector_metadata(stored_model: Option<&str>, fallback: Self) -> Result<Self> {
+        stored_model
+            .map(Self::parse)
+            .transpose()
+            .map(|model| model.unwrap_or(fallback))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -761,6 +768,19 @@ mod tests {
         assert!(matches!(choice, ModelChoice::Potion));
         let choice = ModelChoice::parse("model2vec").expect("parse model2vec");
         assert!(matches!(choice, ModelChoice::Potion));
+    }
+
+    #[test]
+    fn vector_metadata_overrides_the_configured_model() {
+        assert_eq!(
+            ModelChoice::from_vector_metadata(Some("minilm"), ModelChoice::Gemma)
+                .expect("stored model"),
+            ModelChoice::MiniLM
+        );
+        assert_eq!(
+            ModelChoice::from_vector_metadata(None, ModelChoice::Nomic).expect("fallback model"),
+            ModelChoice::Nomic
+        );
     }
 
     #[test]

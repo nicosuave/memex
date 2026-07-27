@@ -7,6 +7,8 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VectorMetadata {
+    #[serde(default)]
+    format_version: u32,
     dimensions: usize,
     model: Option<String>,
     index_file: String,
@@ -18,7 +20,7 @@ pub struct VectorIndex {
     model: Option<String>,
     path: PathBuf,
     index: Index,
-    doc_id_set: HashSet<u64>,
+    vector_id_set: HashSet<u64>,
     needs_backfill: bool,
 }
 
@@ -34,7 +36,7 @@ impl VectorIndex {
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let index_path = dir.join("usearch.index");
-        let ids_path = dir.join("doc_ids.bin");
+        let ids_path = dir.join("vector_ids.bin");
         let meta_path = dir.join("meta.json");
         let mut needs_backfill = false;
         let model = model.map(str::to_string);
@@ -44,12 +46,15 @@ impl VectorIndex {
             let existing = Index::new(&IndexOptions::default())?;
             existing.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
             let existing_meta = load_metadata_if_exists(&meta_path)?;
+            let format_mismatch = existing_meta
+                .as_ref()
+                .is_none_or(|meta| meta.format_version != 2);
             let model_mismatch = match (&existing_meta, &model) {
                 (Some(meta), Some(model)) => meta.model.as_deref() != Some(model),
                 (None, Some(_)) => true,
                 _ => false,
             };
-            if existing.dimensions() != dimensions || model_mismatch {
+            if existing.dimensions() != dimensions || model_mismatch || format_mismatch {
                 // Dimension or model mismatch; remove the old vector store and backfill.
                 let _ = fs::remove_file(&index_path);
                 let _ = fs::remove_file(&ids_path);
@@ -67,10 +72,10 @@ impl VectorIndex {
 
         let index = Index::new(&options)?;
 
-        let doc_id_set = if index_path.exists() {
+        let vector_id_set = if index_path.exists() {
             index.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
             if ids_path.exists() {
-                load_doc_ids(&ids_path)?
+                load_vector_ids(&ids_path)?
             } else {
                 HashSet::new()
             }
@@ -85,14 +90,14 @@ impl VectorIndex {
             model,
             path: dir.to_path_buf(),
             index,
-            doc_id_set,
+            vector_id_set,
             needs_backfill,
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
         let index_path = dir.join("usearch.index");
-        let ids_path = dir.join("doc_ids.bin");
+        let ids_path = dir.join("vector_ids.bin");
         let meta_path = dir.join("meta.json");
 
         if !index_path.exists() {
@@ -102,24 +107,31 @@ impl VectorIndex {
         let index = Index::new(&IndexOptions::default())?;
         index.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
 
-        let doc_id_set = if ids_path.exists() {
-            load_doc_ids(&ids_path)?
+        let metadata = load_metadata_if_exists(&meta_path)?;
+        if metadata
+            .as_ref()
+            .is_none_or(|meta| meta.format_version != 2)
+        {
+            return Err(anyhow!("vector index format is stale"));
+        }
+        let vector_id_set = if ids_path.exists() {
+            load_vector_ids(&ids_path)?
         } else {
             HashSet::new()
         };
-        let model = load_metadata_if_exists(&meta_path)?.and_then(|meta| meta.model);
+        let model = metadata.and_then(|meta| meta.model);
 
         Ok(Self {
             dims: index.dimensions(),
             model,
             path: dir.to_path_buf(),
             index,
-            doc_id_set,
+            vector_id_set,
             needs_backfill: false,
         })
     }
 
-    pub fn add(&mut self, doc_id: u64, embedding: &[f32]) -> Result<()> {
+    pub fn add(&mut self, vector_id: u64, embedding: &[f32]) -> Result<()> {
         if embedding.len() != self.dims {
             return Err(anyhow!(
                 "embedding dimensions mismatch: expected {}, got {}",
@@ -127,7 +139,7 @@ impl VectorIndex {
                 embedding.len()
             ));
         }
-        if !self.doc_id_set.insert(doc_id) {
+        if !self.vector_id_set.insert(vector_id) {
             return Ok(());
         }
 
@@ -137,8 +149,28 @@ impl VectorIndex {
             self.index.reserve(new_capacity)?;
         }
 
-        self.index.add(doc_id, embedding)?;
+        self.index.add(vector_id, embedding)?;
         Ok(())
+    }
+
+    pub fn remove(&mut self, vector_id: u64) -> Result<bool> {
+        if !self.vector_id_set.remove(&vector_id) {
+            return Ok(false);
+        }
+        self.index.remove(vector_id)?;
+        Ok(true)
+    }
+
+    pub fn remove_many(&mut self, vector_ids: impl IntoIterator<Item = u64>) -> Result<usize> {
+        let mut removed = 0;
+        for vector_id in vector_ids {
+            removed += usize::from(self.remove(vector_id)?);
+        }
+        Ok(removed)
+    }
+
+    pub fn vector_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.vector_id_set.iter().copied()
     }
 
     pub fn search(&self, embedding: &[f32], limit: usize) -> Result<Vec<(u64, f32)>> {
@@ -159,30 +191,30 @@ impl VectorIndex {
 
     pub fn save(&self) -> Result<()> {
         let index_path = self.path.join("usearch.index");
-        let ids_path = self.path.join("doc_ids.bin");
+        let ids_path = self.path.join("vector_ids.bin");
         let meta_path = self.path.join("meta.json");
 
         // Save index
         self.index
             .save(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
 
-        // Save doc_ids
-        save_doc_ids(&ids_path, &self.doc_id_set)?;
+        save_vector_ids(&ids_path, &self.vector_id_set)?;
         save_metadata(
             &meta_path,
             &VectorMetadata {
+                format_version: 2,
                 dimensions: self.dims,
                 model: self.model.clone(),
                 index_file: "usearch.index".to_string(),
-                ids_file: "doc_ids.bin".to_string(),
+                ids_file: "vector_ids.bin".to_string(),
             },
         )?;
 
         Ok(())
     }
 
-    pub fn contains(&self, doc_id: u64) -> bool {
-        self.doc_id_set.contains(&doc_id)
+    pub fn contains(&self, vector_id: u64) -> bool {
+        self.vector_id_set.contains(&vector_id)
     }
 
     pub fn len(&self) -> usize {
@@ -193,8 +225,8 @@ impl VectorIndex {
         self.index.size() == 0
     }
 
-    pub fn doc_id_count(&self) -> usize {
-        self.doc_id_set.len()
+    pub fn vector_id_count(&self) -> usize {
+        self.vector_id_set.len()
     }
 
     pub fn model(&self) -> Option<&str> {
@@ -230,7 +262,7 @@ fn save_metadata(path: &Path, metadata: &VectorMetadata) -> Result<()> {
     Ok(())
 }
 
-fn load_doc_ids(path: &Path) -> Result<HashSet<u64>> {
+fn load_vector_ids(path: &Path) -> Result<HashSet<u64>> {
     let bytes = fs::read(path)?;
     let ids: Vec<u64> = bytes
         .chunks_exact(8)
@@ -239,7 +271,7 @@ fn load_doc_ids(path: &Path) -> Result<HashSet<u64>> {
     Ok(ids.into_iter().collect())
 }
 
-fn save_doc_ids(path: &Path, ids: &HashSet<u64>) -> Result<()> {
+fn save_vector_ids(path: &Path, ids: &HashSet<u64>) -> Result<()> {
     let mut bytes = Vec::with_capacity(ids.len() * 8);
     for id in ids {
         bytes.extend_from_slice(&id.to_le_bytes());
@@ -285,6 +317,7 @@ mod tests {
         assert!(tmp.path().exists());
         assert!(!tmp.path().join("usearch.index").exists());
         assert!(!tmp.path().join("doc_ids.bin").exists());
+        assert!(!tmp.path().join("vector_ids.bin").exists());
         assert!(!tmp.path().join("meta.json").exists());
     }
 
@@ -298,6 +331,23 @@ mod tests {
         idx.add(1, &v1).unwrap(); // duplicate
 
         assert!(idx.contains(1));
+    }
+
+    #[test]
+    fn remove_deletes_vector_and_persisted_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
+        idx.add(1, &make_vector(64, 1.0)).unwrap();
+        idx.add(2, &make_vector(64, 2.0)).unwrap();
+
+        assert!(idx.remove(1).unwrap());
+        assert!(!idx.remove(1).unwrap());
+        idx.save().unwrap();
+
+        let reopened = VectorIndex::open(tmp.path()).unwrap();
+        assert!(!reopened.contains(1));
+        assert!(reopened.contains(2));
+        assert_eq!(reopened.len(), 1);
     }
 
     #[test]
@@ -384,9 +434,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(tmp.path().join("meta.json")).unwrap())
                 .unwrap();
         assert_eq!(metadata["dimensions"], 64);
+        assert_eq!(metadata["format_version"], 2);
         assert_eq!(metadata["model"], "bge");
         assert_eq!(metadata["index_file"], "usearch.index");
-        assert_eq!(metadata["ids_file"], "doc_ids.bin");
+        assert_eq!(metadata["ids_file"], "vector_ids.bin");
     }
 
     #[test]

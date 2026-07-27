@@ -1,5 +1,6 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -147,6 +148,18 @@ impl SourceFilter {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecordLinks {
+    /// Stable order of the source message within its session. Every record emitted from the
+    /// same source message carries the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_ordinal: Option<u32>,
+    /// Zero-based order of this tool call within its owning message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_index: Option<u32>,
+    /// Zero-based order of this result update within its owning tool call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,12 +178,39 @@ pub struct RecordLinks {
     pub source_tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_tool_assistant_uuid: Option<String>,
+    /// Normalized source-provided lifecycle status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Original status spelling when the source provides one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     #[serde(default)]
     pub source: SourceKind,
+    /// Stable source-derived identity. Unlike `doc_id`, this survives a full index rebuild.
+    #[serde(default)]
+    pub record_key: String,
     pub doc_id: u64,
     pub ts: u64,
     pub project: String,
@@ -189,9 +229,131 @@ pub struct Record {
     pub source_path: String,
 }
 
+impl Record {
+    pub fn ensure_record_key(&mut self) {
+        if self.record_key.is_empty() {
+            self.record_key = self.computed_record_key();
+        }
+    }
+
+    pub fn computed_record_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_identity_part(&mut hasher, "version", "2");
+        hash_identity_part(&mut hasher, "source", self.source.storage_label());
+        hash_identity_part(
+            &mut hasher,
+            "session",
+            if self.session_id.is_empty() {
+                &self.source_path
+            } else {
+                &self.session_id
+            },
+        );
+
+        // A parent tool ID identifies the relationship, not the result event itself. Falling
+        // back to it would collapse multiple lifecycle/result updates for one call.
+        let native_id = self.links.event_id.as_deref().or_else(|| {
+            (self.role == "tool_use")
+                .then_some(self.links.source_tool_use_id.as_deref())
+                .flatten()
+        });
+        if let Some(native_id) = native_id {
+            hash_identity_part(&mut hasher, "native", native_id);
+        } else {
+            hash_identity_part(&mut hasher, "path", &self.source_path);
+            hash_identity_part(&mut hasher, "turn", &self.turn_id.to_string());
+            hash_identity_part(
+                &mut hasher,
+                "source_tool_use_id",
+                self.links.source_tool_use_id.as_deref().unwrap_or(""),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "parent_tool_use_id",
+                self.links.parent_tool_use_id.as_deref().unwrap_or(""),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "message_ordinal",
+                &self
+                    .links
+                    .message_ordinal
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "call_index",
+                &self
+                    .links
+                    .call_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+            hash_identity_part(
+                &mut hasher,
+                "event_index",
+                &self
+                    .links
+                    .event_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+        }
+
+        hash_identity_part(&mut hasher, "role", &self.role);
+        hash_identity_part(
+            &mut hasher,
+            "subtype",
+            self.tool_name.as_deref().unwrap_or(""),
+        );
+        format!("rk2_{:x}", hasher.finalize())
+    }
+
+    pub fn computed_content_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hash_identity_part(&mut hasher, "version", "1");
+        hash_identity_part(&mut hasher, "role", &self.role);
+        hash_identity_part(&mut hasher, "text", &self.text);
+        hash_identity_part(
+            &mut hasher,
+            "tool_name",
+            self.tool_name.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "tool_input",
+            self.tool_input.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "tool_output",
+            self.tool_output.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "status",
+            self.links.status.as_deref().unwrap_or(""),
+        );
+        hash_identity_part(
+            &mut hasher,
+            "source_status",
+            self.links.source_status.as_deref().unwrap_or(""),
+        );
+        format!("ch1_{:x}", hasher.finalize())
+    }
+}
+
+fn hash_identity_part(hasher: &mut Sha256, label: &str, value: &str) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SourceFilter, SourceKind};
+    use super::{Record, RecordLinks, SourceFilter, SourceKind};
     use clap::ValueEnum;
     use std::collections::HashSet;
 
@@ -213,6 +375,65 @@ mod tests {
             assert_eq!(SourceKind::from_label(label), Some(SourceKind::Codex));
         }
         assert_eq!(SourceKind::Codex.storage_label(), "codex");
+    }
+
+    fn record(doc_id: u64, source_path: &str) -> Record {
+        Record {
+            source: SourceKind::Codex,
+            record_key: String::new(),
+            doc_id,
+            ts: 1,
+            project: "memex".to_string(),
+            session_id: "session-1".to_string(),
+            turn_id: 2,
+            role: "assistant".to_string(),
+            text: "same projected content".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks {
+                event_id: Some("event-1".to_string()),
+                ..RecordLinks::default()
+            },
+            source_path: source_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn record_key_survives_doc_id_and_source_path_changes_with_native_identity() {
+        let first = record(1, "/old/session.jsonl");
+        let rebuilt = record(999, "/moved/session.jsonl");
+
+        assert_eq!(first.computed_record_key(), rebuilt.computed_record_key());
+        assert!(first.computed_record_key().starts_with("rk2_"));
+    }
+
+    #[test]
+    fn record_key_is_independent_of_projection_content() {
+        let first = record(1, "/session.jsonl");
+        let mut changed = first.clone();
+        changed.text = "different projected content".to_string();
+        changed.tool_input = Some("corrected input".to_string());
+        changed.tool_output = Some("corrected output".to_string());
+
+        assert_eq!(first.computed_record_key(), changed.computed_record_key());
+        assert_ne!(
+            first.computed_content_hash(),
+            changed.computed_content_hash()
+        );
+    }
+
+    #[test]
+    fn result_updates_do_not_use_the_parent_call_as_their_identity() {
+        let mut first = record(1, "/session.jsonl");
+        first.role = "tool_result".to_string();
+        first.links.event_id = None;
+        first.links.parent_tool_use_id = Some("call-1".to_string());
+        first.turn_id = 4;
+        let mut second = first.clone();
+        second.turn_id = 5;
+
+        assert_ne!(first.computed_record_key(), second.computed_record_key());
     }
 
     #[test]

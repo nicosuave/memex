@@ -34,6 +34,7 @@ sha2 = "0.10"
 simd-json = { version = "0.13", features = ["serde"] }
 tantivy = "0.22"
 usearch = "2"
+zstd = "0.13"
 toml = "0.8"
 walkdir = "2.5"
 indicatif = "0.17"

@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicU64;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
     // OpenClaw delegates the SessionManager projection to the Pi parser.
-    index: 3,
+    index: 4,
     usage: 4,
 };
 
@@ -171,6 +171,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].source, SourceKind::OpenClaw);
         assert_eq!(records[0].text, "Mirrored assistant prose");
+        assert_eq!(records[0].links.message_ordinal, Some(records[0].turn_id));
 
         let usage = parse_usage_file(&path).unwrap();
         assert_eq!(usage.len(), 1);

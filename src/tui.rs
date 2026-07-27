@@ -1384,7 +1384,7 @@ impl App {
             local_session_keys,
             self.home_activity_range,
             now_ms(),
-            self.paths.state.join("usage-cache.sqlite3"),
+            analytics_path(&self.paths.state),
         );
         std::thread::spawn(move || {
             if !config.machines.is_empty() {
@@ -6739,6 +6739,7 @@ mod tests {
     fn record(role: &str, text: &str) -> Record {
         Record {
             source: SourceKind::Codex,
+            record_key: String::new(),
             doc_id: 1,
             ts: 0,
             project: "project".to_string(),
