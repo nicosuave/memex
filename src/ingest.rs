@@ -350,6 +350,18 @@ fn record_channel() -> (Sender<Record>, Receiver<Record>) {
     bounded(RECORD_CHANNEL_CAPACITY)
 }
 
+fn parser_thread_pool() -> Result<rayon::ThreadPool> {
+    build_parser_thread_pool(rayon::current_num_threads().max(1))
+}
+
+fn build_parser_thread_pool(num_threads: usize) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads.max(1))
+        .thread_name(|index| format!("memex-parser-{index}"))
+        .build()
+        .context("build parser thread pool")
+}
+
 /// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.
 /// Returns Ok(None) if skipped due to fresh cache, Ok(Some(report)) if indexing ran.
 pub fn ingest_if_stale(
@@ -668,69 +680,72 @@ pub fn ingest_all(
 
     let tasks_arc = Arc::new(tasks);
     let parse_skipped = AtomicUsize::new(0);
-    let parser_result = tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
-        let result = match task.source {
-            SourceKind::Claude => parse_claude_file(
-                task,
-                options.include_reasoning,
-                &tx_record,
-                &tx_update,
-                &next_doc_id,
-                &progress,
-            ),
-            SourceKind::Codex => {
-                if crate::sources::codex::is_history_path(&task.path) {
-                    parse_codex_history(
-                        task,
-                        &tx_record,
-                        &tx_update,
-                        &next_doc_id,
-                        &session_ids,
-                        &progress,
-                    )
-                } else {
-                    parse_codex_session(
-                        task,
-                        options.include_reasoning,
-                        &tx_record,
-                        &tx_update,
-                        &next_doc_id,
-                        &progress,
-                    )
+    let parser_pool = parser_thread_pool()?;
+    let parser_result = parser_pool.install(|| {
+        tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
+            let result = match task.source {
+                SourceKind::Claude => parse_claude_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Codex => {
+                    if crate::sources::codex::is_history_path(&task.path) {
+                        parse_codex_history(
+                            task,
+                            &tx_record,
+                            &tx_update,
+                            &next_doc_id,
+                            &session_ids,
+                            &progress,
+                        )
+                    } else {
+                        parse_codex_session(
+                            task,
+                            options.include_reasoning,
+                            &tx_record,
+                            &tx_update,
+                            &next_doc_id,
+                            &progress,
+                        )
+                    }
                 }
-            }
-            SourceKind::Opencode => parse_opencode_file(
-                task,
-                &tx_record,
-                &tx_update,
-                &next_doc_id,
-                &progress,
-                &opencode_session_links,
-            ),
-            SourceKind::Cursor => {
-                parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)
-            }
-            SourceKind::Pi => parse_pi_file(
-                task,
-                options.include_reasoning,
-                &tx_record,
-                &tx_update,
-                &next_doc_id,
-                &progress,
-            ),
-            SourceKind::OpenClaw => parse_openclaw_file(
-                task,
-                options.include_reasoning,
-                &tx_record,
-                &tx_update,
-                &next_doc_id,
-                &progress,
-            ),
-            SourceKind::Copilot => {
-                parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)
-            }
-        };
-        finish_file_task(task, &progress, &parse_skipped, result)
+                SourceKind::Opencode => parse_opencode_file(
+                    task,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                    &opencode_session_links,
+                ),
+                SourceKind::Cursor => {
+                    parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)
+                }
+                SourceKind::Pi => parse_pi_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::OpenClaw => parse_openclaw_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Copilot => {
+                    parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)
+                }
+            };
+            finish_file_task(task, &progress, &parse_skipped, result)
+        })
     });
 
     drop(tx_record);
@@ -1498,6 +1513,33 @@ mod tests {
             .expect("open analytics")
             .mark_complete()
             .expect("mark analytics complete");
+    }
+
+    #[test]
+    fn parser_pool_leaves_global_rayon_available_under_backpressure() {
+        let parser_pool = build_parser_thread_pool(2).expect("build parser pool");
+        let (tx, rx) = bounded::<usize>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let consumer = std::thread::spawn(move || {
+            let first = rx.recv().expect("receive first parser result");
+            let sum: usize = (0..1_000usize).into_par_iter().sum();
+            let count = 1 + rx.iter().count();
+            done_tx.send((first, sum, count)).expect("report result");
+        });
+
+        parser_pool.install(|| {
+            (0..4usize)
+                .into_par_iter()
+                .for_each(|value| tx.send(value).expect("send parser result"));
+        });
+        drop(tx);
+
+        let (_first, sum, count) = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("global Rayon work should not deadlock behind parser backpressure");
+        consumer.join().expect("join consumer");
+        assert_eq!(sum, (0..1_000usize).sum::<usize>());
+        assert_eq!(count, 4);
     }
 
     fn incremental_task(
