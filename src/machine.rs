@@ -1,6 +1,6 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, analytics_path};
 use crate::config::{MachineConfig, Paths, UserConfig, default_claude_source};
-use crate::embed::EmbedderHandle;
+use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
@@ -828,6 +828,19 @@ fn absorb_cache_waste(total: &mut CacheWaste, row: &CacheWaste) {
         .saturating_add(row.model_switch_misses);
 }
 
+pub(crate) fn resolve_vector_query_model(
+    vector: &VectorIndex,
+    configured_model: impl FnOnce() -> Result<ModelChoice>,
+) -> Result<Option<ModelChoice>> {
+    if vector.is_empty() {
+        return Ok(None);
+    }
+    match vector.model() {
+        Some(model) => Ok(Some(ModelChoice::parse(model)?)),
+        None => Ok(Some(configured_model()?)),
+    }
+}
+
 fn search_local(
     paths: &Paths,
     config: &UserConfig,
@@ -850,7 +863,10 @@ fn search_local(
                 }
                 Err(err) => return Err(err),
             };
-            let model = config.resolve_model(None)?;
+            let Some(model) = resolve_vector_query_model(&vector, || config.resolve_model(None))?
+            else {
+                return lexical_results(&index, &options, spec, now_ms);
+            };
             let runtime = config.resolve_embed_runtime()?;
             let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
             let embedding = embedder
@@ -876,12 +892,15 @@ fn search_local(
                 }
                 Err(err) => return Err(err),
             };
+            let Some(model) = resolve_vector_query_model(&vector, || config.resolve_model(None))?
+            else {
+                return lexical_results(&index, &options, spec, now_ms);
+            };
             let candidate_limit = (spec.limit * 5).clamp(50, 500);
             let lexical = index.search(&QueryOptions {
                 limit: candidate_limit,
                 ..options.clone()
             })?;
-            let model = config.resolve_model(None)?;
             let runtime = config.resolve_embed_runtime()?;
             let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
             let embedding = embedder
@@ -1296,6 +1315,8 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{ControlConfig, IndexBackendConfig, MultiMachineConfig};
+    use crate::types::{RecordLinks, SourceKind};
+    use tempfile::TempDir;
 
     fn machine(id: &str) -> MachineConfig {
         MachineConfig {
@@ -1314,6 +1335,103 @@ mod tests {
                 prefix: None,
                 cache: None,
             }),
+        }
+    }
+
+    fn search_spec(mode: SearchMode) -> SearchSpec {
+        SearchSpec {
+            query: "query readiness".to_string(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 10,
+            mode,
+            recency_weight: 0.0,
+            recency_half_life_days: 30.0,
+            min_score: None,
+            project_grouping: None,
+        }
+    }
+
+    #[test]
+    fn vector_query_model_prefers_metadata_and_uses_configured_fallback() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut with_metadata =
+            VectorIndex::open_or_create(&tmp.path().join("with-metadata"), 64, Some("bge"))
+                .unwrap();
+        with_metadata.add(1, &[0.0; 64]).unwrap();
+        let selected = resolve_vector_query_model(&with_metadata, || {
+            Err(anyhow!("configured fallback should not be resolved"))
+        })
+        .unwrap();
+        assert_eq!(selected, Some(ModelChoice::BGESmall));
+
+        let mut without_metadata =
+            VectorIndex::open_or_create(&tmp.path().join("without-metadata"), 64, None).unwrap();
+        without_metadata.add(1, &[0.0; 64]).unwrap();
+        let selected =
+            resolve_vector_query_model(&without_metadata, || Ok(ModelChoice::MiniLM)).unwrap();
+        assert_eq!(selected, Some(ModelChoice::MiniLM));
+    }
+
+    #[test]
+    fn empty_vector_index_falls_back_for_federated_semantic_and_hybrid_search() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(
+                &mut writer,
+                &Record {
+                    source: SourceKind::Codex,
+                    doc_id: 1,
+                    ts: 1,
+                    project: "memex".to_string(),
+                    session_id: "session".to_string(),
+                    turn_id: 1,
+                    role: "assistant".to_string(),
+                    text: "query readiness".to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: RecordLinks::default(),
+                    source_path: "session.jsonl".to_string(),
+                },
+            )
+            .unwrap();
+        writer.commit().unwrap();
+
+        let vector = VectorIndex::open_or_create(&paths.vectors, 64, Some("bge")).unwrap();
+        assert_eq!(
+            resolve_vector_query_model(&vector, || {
+                Err(anyhow!("configured fallback should not be resolved"))
+            })
+            .unwrap(),
+            None
+        );
+        vector.save().unwrap();
+
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let result = federated_search(
+                &paths,
+                &UserConfig::default(),
+                &[LOCAL_MACHINE_ID.to_string()],
+                &search_spec(mode),
+                false,
+            )
+            .unwrap();
+
+            assert!(result.failures.is_empty());
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0].record.doc_id, 1);
         }
     }
 

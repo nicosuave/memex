@@ -6,6 +6,7 @@ use crate::ingest::{IngestOptions, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt, LeaseHolder};
 use crate::machine::{
     LocatedRecord, SearchMode, SearchSpec, UsageSpec, federated_search, federated_usage,
+    resolve_vector_query_model,
 };
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
@@ -1251,7 +1252,7 @@ fn run_semantic_search(
     let vector = match VectorIndex::open(&ctx.paths.vectors) {
         Ok(vector) => vector,
         Err(err) if is_missing_vector_index_error(&err) => {
-            warn_vector_index_missing("semantic");
+            warn_vector_index_unavailable("semantic");
             return run_lexical_search(
                 index,
                 options,
@@ -1262,7 +1263,17 @@ fn run_semantic_search(
         }
         Err(err) => return Err(err),
     };
-    let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
+    let Some(query_model) = resolve_vector_query_model(&vector, || Ok(ctx.model_choice))? else {
+        warn_vector_index_unavailable("semantic");
+        return run_lexical_search(
+            index,
+            options,
+            ctx.render,
+            ctx.recency_weight,
+            ctx.recency_half_life_days,
+        );
+    };
+    let mut embedder = EmbedderHandle::with_model_and_runtime(query_model, ctx.embed_runtime)?;
     let embeddings = embedder.embed_texts(&[options.query.as_str()])?;
     let embedding = embeddings
         .first()
@@ -1298,7 +1309,7 @@ fn run_hybrid_search(
     let vector = match VectorIndex::open(&ctx.paths.vectors) {
         Ok(vector) => vector,
         Err(err) if is_missing_vector_index_error(&err) => {
-            warn_vector_index_missing("hybrid");
+            warn_vector_index_unavailable("hybrid");
             return run_lexical_search(
                 index,
                 options,
@@ -1309,7 +1320,17 @@ fn run_hybrid_search(
         }
         Err(err) => return Err(err),
     };
-    let mut embedder = EmbedderHandle::with_model_and_runtime(ctx.model_choice, ctx.embed_runtime)?;
+    let Some(query_model) = resolve_vector_query_model(&vector, || Ok(ctx.model_choice))? else {
+        warn_vector_index_unavailable("hybrid");
+        return run_lexical_search(
+            index,
+            options,
+            ctx.render,
+            ctx.recency_weight,
+            ctx.recency_half_life_days,
+        );
+    };
+    let mut embedder = EmbedderHandle::with_model_and_runtime(query_model, ctx.embed_runtime)?;
 
     let bm25_k = (limit * 5).clamp(50, 500);
     let vector_k = (limit * 5).clamp(50, 500);
@@ -1399,7 +1420,7 @@ fn is_missing_vector_index_error(err: &anyhow::Error) -> bool {
     err.to_string() == "vector index not found"
 }
 
-fn warn_vector_index_missing(mode: &str) {
+fn warn_vector_index_unavailable(mode: &str) {
     eprintln!(
         "Warning: {mode} search requested, but the local vector index is not available; falling back to lexical search. Run 'memex embed' to build embeddings."
     );
