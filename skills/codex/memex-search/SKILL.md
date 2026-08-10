@@ -124,7 +124,8 @@ index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
 ```
 
-`auto_index_on_search` runs an incremental index update before each search.
+When enabled, `auto_index_on_search` refreshes the index before each `memex search`;
+`memex sessions` reads the current index without triggering an update.
 `scan_cache_ttl` sets the maximum scan staleness for auto-indexing.
 `index-service` reads config defaults (mode, interval, log paths). Flags override.
 Service logs and the plist live under `~/.memex` by default.

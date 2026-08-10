@@ -35,6 +35,7 @@ If the vector index is unavailable, memex warns on stderr and falls back to lexi
 - Default mode is periodic indexing, typically every 3600 seconds; add `--interval <seconds>` to tune interval mode.
 - The service inherits indexing flags, so pass source and embedding options at install time when needed, e.g. `memex index-service enable --opencode --embeddings`.
 - On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
+- When enabled, `auto_index_on_search` refreshes the index before each `memex search`; `memex sessions` reads the current index without triggering an update.
 - macOS writes `~/.memex/index-service.plist`, `~/.memex/index-service.log`, and `~/.memex/index-service.err.log`. Linux writes systemd user units under `~/.config/systemd/user/`.
 - Use `memex index-service disable` to unload and remove the service.
 
