@@ -133,7 +133,7 @@ memex tui
 ```
 
 Notes:
-- Embeddings are enabled by default.
+- Embeddings are disabled by default. Pass `--embeddings` to generate them during indexing.
 - Searches run an incremental reindex by default (configurable).
 - Concurrent searches coalesce stale auto-index work: one process refreshes while other lexical
   searches query the last committed index. Semantic and hybrid searches wait for vector writes to
@@ -326,9 +326,9 @@ runtime to the daemon.
 
 ## Embeddings
 
-Disable:
+Enable during indexing:
 ```
-memex index --no-embeddings
+memex index --embeddings
 ```
 
 Recommended when embeddings are on (especially non-`potion` models): run the background

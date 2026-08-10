@@ -15,9 +15,9 @@ Use this skill to index local history and retrieve results in a structured way.
   - `memex index-service enable --continuous`
 - Full rebuild (clears index):
   - `memex reindex`
-- Embeddings are on by default.
-- Disable embeddings:
-  - `memex index --no-embeddings`
+- Embeddings are off by default.
+- Enable embeddings during indexing:
+  - `memex index --embeddings`
 - Backfill embeddings only:
   - `memex embed`
 - Common flags:
