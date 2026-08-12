@@ -3,6 +3,7 @@
   rustPlatform,
   pkg-config,
   openssl,
+  onnxruntime,
   stdenv,
   darwin,
 }:
@@ -23,6 +24,7 @@ rustPlatform.buildRustPackage {
   buildInputs =
     [
       openssl
+      onnxruntime
     ]
     ++ lib.optionals stdenv.isDarwin [
       darwin.apple_sdk.frameworks.Security
