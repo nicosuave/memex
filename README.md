@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, OpenClaw, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, OpenClaw, GitHub Copilot CLI, and Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -210,11 +210,12 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot logs:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, OpenClaw, Copilot, and Hermes records:
 
 ```
 memex usage
 memex usage --source codex --since 2026-07-01
+memex usage --source hermes --since 2026-07-01
 memex usage --json --events
 ```
 
@@ -222,7 +223,7 @@ memex usage --json --events
 
 Each source also reports prompt-cache efficiency: the cache hit rate, plus an estimate of cache waste — prompt tokens that were in the previous request's prompt but were re-billed at input rates instead of read from cache, priced at catalog rates and attributed to idle gaps past the cache TTL or model switches where those apply. Waste is estimated per transcript file chain and errs toward undercounting: subagent sidechains, ambiguous dedupe deltas, and prompts that shrink past compaction are not counted.
 
-Local token history is reconstructed usage. It is deliberately kept separate from authoritative subscription quota percentages and reset windows.
+Local token history is reconstructed usage. It is deliberately kept separate from authoritative subscription quota percentages and reset windows. Hermes usage is read from `state.db` in the Hermes root and immediate profile directories (`HERMES_PROFILE_ROOTS`, `HERMES_HOME`, or `HERMES_STATE_DIR`, with safe local defaults), opened read-only and WAL-compatible. The `sessions` aggregate is used for legacy databases; newer `session_model_usage` delta rows are emitted by model/task and reconciled against the session aggregate so historical seeded rows count once and positive residuals are retained. Snapshots, backups, arbitrary nested databases, JSON/JSONL transcripts, and auth, config, memory, skills, plugins, and cron paths are excluded. Hermes queries never read message, system-prompt, tool, reasoning-text, or credential tables. Usage output contains counters and metadata only. Any API-equivalent cost estimate is analytical and is not a Hermes subscription quota measurement; source-stored API costs are not quota percentages. Hermes parser-version changes invalidate only Hermes usage cache rows.
 
 When token tracking is enabled, press `Ctrl+T` on the TUI home screen to toggle the 30-day activity chart between session count and token volume. Token activity is loaded lazily and cached when first shown.
 
@@ -266,7 +267,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|openclaw|copilot`
+- `--source claude|codex|cursor|opencode|pi|openclaw|copilot|hermes`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

@@ -33,7 +33,7 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, Copilot, and Hermes",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -183,7 +183,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -301,7 +301,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -336,7 +336,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -452,7 +452,7 @@ enum HerdrCommand {
         /// Prefer sessions from this directory (falls back to the global latest)
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, copilot, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2544,6 +2544,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Pi => "pi",
         crate::types::SourceKind::OpenClaw => "openclaw",
         crate::types::SourceKind::Copilot => "copilot",
+        crate::types::SourceKind::Hermes => "hermes",
     };
     let source_path = &record.source_path;
 

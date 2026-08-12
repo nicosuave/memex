@@ -743,6 +743,7 @@ pub fn ingest_all(
                 SourceKind::Copilot => {
                     parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)
                 }
+                SourceKind::Hermes => Err(anyhow!("Hermes indexing is not supported")),
             };
             finish_file_task(task, &progress, &parse_skipped, result)
         })
@@ -2926,8 +2927,8 @@ mod tests {
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, meta.len(), 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
             false,
         ));
 

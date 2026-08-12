@@ -1534,6 +1534,7 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Opencode => cwd_from_opencode_session(Path::new(&first.source_path)),
         SourceKind::Pi => cwd_from_pi_session(Path::new(&first.source_path)),
         SourceKind::OpenClaw => cwd_from_pi_session(Path::new(&first.source_path)),
+        SourceKind::Hermes => None,
     }
     .filter(|path| path.is_dir())
 }

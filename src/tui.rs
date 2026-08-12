@@ -408,6 +408,7 @@ enum SourceChoice {
     Pi,
     OpenClaw,
     Copilot,
+    Hermes,
 }
 
 impl SourceChoice {
@@ -420,7 +421,8 @@ impl SourceChoice {
             SourceChoice::Cursor => SourceChoice::Pi,
             SourceChoice::Pi => SourceChoice::OpenClaw,
             SourceChoice::OpenClaw => SourceChoice::Copilot,
-            SourceChoice::Copilot => SourceChoice::All,
+            SourceChoice::Copilot => SourceChoice::Hermes,
+            SourceChoice::Hermes => SourceChoice::All,
         }
     }
 
@@ -434,6 +436,7 @@ impl SourceChoice {
             SourceChoice::Pi => Some(SourceFilter::Pi),
             SourceChoice::OpenClaw => Some(SourceFilter::OpenClaw),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
+            SourceChoice::Hermes => Some(SourceFilter::Hermes),
         }
     }
 
@@ -447,6 +450,7 @@ impl SourceChoice {
             SourceChoice::Pi => "pi",
             SourceChoice::OpenClaw => "openclaw",
             SourceChoice::Copilot => "copilot",
+            SourceChoice::Hermes => "hermes",
         }
     }
 
@@ -459,6 +463,7 @@ impl SourceChoice {
             SourceKind::Pi => SourceChoice::Pi,
             SourceKind::OpenClaw => SourceChoice::OpenClaw,
             SourceKind::Copilot => SourceChoice::Copilot,
+            SourceKind::Hermes => SourceChoice::Hermes,
         }
     }
 }
@@ -2428,6 +2433,7 @@ impl App {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "pi",
             SourceKind::Copilot => "copilot",
+            SourceKind::Hermes => "hermes",
         };
         let source_path = session.source_path.clone();
 
@@ -3858,6 +3864,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Pi => label == "pi",
         SourceChoice::OpenClaw => label == "openclaw",
         SourceChoice::Copilot => label == "copilot",
+        SourceChoice::Hermes => label == "hermes",
         SourceChoice::All => false,
     }
 }
@@ -3871,6 +3878,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Pi => Color::Rgb(120, 190, 190),
         SourceKind::OpenClaw => Color::Rgb(235, 160, 110),
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
+        SourceKind::Hermes => Color::Rgb(190, 150, 220),
     }
 }
 

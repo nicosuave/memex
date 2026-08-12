@@ -30,6 +30,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Pi => config.pi_resume_cmd.clone(),
         SourceKind::OpenClaw => return None,
         SourceKind::Copilot => config.copilot_resume_cmd.clone(),
+        SourceKind::Hermes => None,
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }

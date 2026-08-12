@@ -10,6 +10,7 @@ pub mod codex;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
+pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
@@ -154,6 +155,7 @@ pub(crate) struct UsageDependency {
     pub path: String,
     pub size: u64,
     pub mtime_ns: i64,
+    pub exists: bool,
 }
 
 impl UsageDependency {
@@ -169,12 +171,21 @@ impl UsageDependency {
             path: path.to_string_lossy().to_string(),
             size: metadata.len(),
             mtime_ns,
+            exists: true,
+        })
+    }
+
+    pub fn from_path_or_absent(path: &Path) -> Self {
+        Self::from_path(path).unwrap_or_else(|_| Self {
+            path: path.to_string_lossy().to_string(),
+            size: 0,
+            mtime_ns: 0,
+            exists: false,
         })
     }
 
     pub fn is_current(&self) -> bool {
-        Self::from_path(Path::new(&self.path))
-            .is_ok_and(|current| current.size == self.size && current.mtime_ns == self.mtime_ns)
+        Self::from_path_or_absent(Path::new(&self.path)) == *self
     }
 }
 
@@ -204,6 +215,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Pi => pi::VERSIONS,
         SourceKind::OpenClaw => openclaw::VERSIONS,
         SourceKind::Copilot => copilot::VERSIONS,
+        SourceKind::Hermes => hermes::VERSIONS,
     }
 }
 
@@ -258,6 +270,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::OpenClaw
     } else if copilot::matches_path(path) {
         SourceKind::Copilot
+    } else if hermes::matches_path(path) {
+        SourceKind::Hermes
     } else {
         SourceKind::Claude
     }

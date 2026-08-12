@@ -471,6 +471,7 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "pi" => Ok(SourceFilter::Pi),
         "openclaw" | "open-claw" => Ok(SourceFilter::OpenClaw),
         "copilot" => Ok(SourceFilter::Copilot),
+        "hermes" => Ok(SourceFilter::Hermes),
         _ => Err(anyhow!("unknown source: {value}")),
     }
 }
