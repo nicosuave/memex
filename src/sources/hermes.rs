@@ -150,15 +150,10 @@ fn is_state_db(path: &Path) -> bool {
 type Row = HashMap<String, Value>;
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParseOutput> {
-    let uri = format!(
-        "file:{}?mode=ro",
-        path.to_string_lossy().replace('?', "%3f")
-    );
-    let conn = Connection::open_with_flags(
-        &uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("open Hermes SQLite database {}", path.display()))?;
+    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    let wal_before = crate::sources::UsageDependency::from_path_or_absent(&wal);
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open Hermes SQLite database {}", path.display()))?;
     let tables = table_names(&conn)?;
     if !tables.contains("sessions") {
         return Err(anyhow!("Hermes database has no sessions table"));
@@ -242,7 +237,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                 events.push(event(
                     &source_path,
                     &id,
-                    None,
+                    Some(&id),
                     session,
                     aggregate,
                     cost(session),
@@ -253,10 +248,13 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
             continue;
         };
         let mut summed = TokenBuckets::default();
+        let mut invalid_model = false;
+        let model_event_start = events.len();
         for row in model_rows {
             let raw_current = buckets(row);
             let current = cap_to_remaining(raw_current.clone(), aggregate.clone(), summed.clone());
             let inconsistent = current != raw_current;
+            invalid_model |= inconsistent;
             summed = add(summed, &current);
             if !is_zero(&current) {
                 let model = text(row, "model").or_else(|| text(session, "model"));
@@ -284,26 +282,36 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
             }
         }
         let residual = subtract(aggregate, summed);
-        if !is_zero(&residual) {
+        if invalid_model {
+            for event in &mut events[model_event_start..] {
+                event.source_cost_usd = None;
+            }
+        }
+        let source_cost = if invalid_model {
+            cost(session)
+        } else {
+            residual_cost(session, model_rows)
+        };
+        if !is_zero(&residual) || invalid_model && source_cost.is_some() {
             events.push(event(
                 &source_path,
                 &format!("session:{id}:residual"),
                 Some(&id),
                 session,
                 residual,
-                residual_cost(session, model_rows),
+                source_cost,
                 true,
                 timestamp(session),
             ));
         }
     }
-    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    let wal_after = crate::sources::UsageDependency::from_path_or_absent(&wal);
     Ok(crate::sources::UsageParseOutput {
         events,
-        cacheable: true,
+        cacheable: cacheable_after_wal_read(&wal_before, &wal_after),
         // SQLite WAL pages can contain committed data not yet checkpointed into the main
         // database. The SHM file is coordination metadata and must not make scans stale.
-        deps: vec![crate::sources::UsageDependency::from_path_or_absent(&wal)],
+        deps: vec![wal_after],
     })
 }
 
@@ -485,6 +493,13 @@ fn residual_cost(session: &Row, rows: &[&Row]) -> Option<f64> {
     let used: f64 = rows.iter().filter_map(|row| cost(row)).sum();
     (total > used).then_some(total - used)
 }
+
+fn cacheable_after_wal_read(
+    wal_before: &crate::sources::UsageDependency,
+    wal_after: &crate::sources::UsageDependency,
+) -> bool {
+    wal_before == wal_after
+}
 #[allow(clippy::too_many_arguments)]
 fn event(
     path: &Arc<str>,
@@ -602,7 +617,30 @@ mod tests {
         assert_eq!(events.events[0].tokens.uncached_input, 100);
         assert_eq!(events.events[0].tokens.cache_read, 30);
         assert_eq!(events.events[0].tokens.reasoning, 5);
+        assert_eq!(events.events[0].session_id.as_deref(), Some("s"));
         assert_eq!(events.events[0].source_cost_usd, Some(1.25));
+    }
+
+    #[test]
+    fn database_paths_with_uri_metacharacters_open_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("profile#100%");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state?db");
+        db(&path, false);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','m',1000,1,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+
+        let parsed = parse_usage_file(&path).unwrap();
+        assert_eq!(parsed.events.len(), 1);
+        assert_eq!(parsed.events[0].tokens.raw_input, 1);
+        drop(conn);
     }
 
     #[test]
@@ -630,6 +668,73 @@ mod tests {
                 .iter()
                 .any(|event| event.conservative_undercount)
         );
+    }
+
+    #[test]
+    fn inconsistent_model_costs_use_one_authoritative_session_fallback() {
+        for (index, (aggregate_input, first_input, second_input, first_cost, residual)) in [
+            (10, 4, 10, 12.0, 0), // zero residual, retained model cost over aggregate
+            (10, 4, 10, 6.0, 0),  // zero residual, retained model cost under aggregate
+            (10, 4, 1, 12.0, 5),  // positive residual, retained model cost over aggregate
+            (10, 4, 1, 6.0, 5),   // positive residual, retained model cost under aggregate
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("cost-{index}.db"));
+            db(&path, true);
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s','fallback',1000,?1,0,0,0,0,'p',10.0,'/work','/repo','prof')",
+                [aggregate_input],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_model_usage VALUES ('s','m1','p','task-1',?1,0,0,0,0,?2,1000)",
+                rusqlite::params![first_input, first_cost],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_model_usage VALUES ('s','m2','p','task-2',?1,?2,0,0,0,3.0,1000)",
+                rusqlite::params![second_input, 1],
+            )
+            .unwrap();
+            drop(conn);
+
+            let events = parse_usage_file(&path).unwrap().events;
+            assert!(events.iter().all(|event| {
+                !event
+                    .source_record_id
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("model:")
+                    || event.source_cost_usd.is_none()
+            }));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.source_record_id.as_deref() == Some("session:s:residual"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|event| event.source_record_id.as_deref() == Some("session:s:residual"))
+                    .unwrap()
+                    .tokens
+                    .raw_input,
+                residual
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| event.source_cost_usd)
+                    .sum::<f64>(),
+                10.0
+            );
+        }
     }
 
     #[test]
@@ -664,6 +769,22 @@ mod tests {
                 .iter()
                 .any(|dependency| dependency.path == current.path && dependency.is_current())
         );
+    }
+
+    #[test]
+    fn wal_change_during_read_makes_parse_output_non_cacheable() {
+        let before = crate::sources::UsageDependency {
+            path: "state.db-wal".to_string(),
+            size: 10,
+            mtime_ns: 1,
+            exists: true,
+        };
+        let after = crate::sources::UsageDependency {
+            size: 20,
+            ..before.clone()
+        };
+        assert!(!cacheable_after_wal_read(&before, &after));
+        assert!(cacheable_after_wal_read(&before, &before));
     }
 
     #[test]
