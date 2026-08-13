@@ -233,7 +233,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
         };
         let aggregate = buckets(session);
         let Some(model_rows) = by_session.get(&id) else {
-            if !is_zero(&aggregate) {
+            if !is_zero(&aggregate) || cost(session).is_some() {
                 events.push(event(
                     &source_path,
                     &id,
@@ -242,6 +242,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                     aggregate,
                     cost(session),
                     true,
+                    timestamp(session),
                     0,
                 ));
             }
@@ -249,6 +250,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
         };
         let mut summed = TokenBuckets::default();
         let mut invalid_model = false;
+        let mut attributed_model_cost = 0.0;
         let model_event_start = events.len();
         for row in model_rows {
             let raw_current = buckets(row);
@@ -267,6 +269,10 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                 ))
                 .expect("tuple serialization cannot fail");
                 let id = format!("model:{identity}");
+                let source_cost = (!inconsistent).then(|| cost(row)).flatten();
+                if let Some(cost) = source_cost {
+                    attributed_model_cost += cost;
+                }
                 events.push(model_event(
                     &source_path,
                     &id,
@@ -275,24 +281,33 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                     session,
                     model,
                     current,
-                    (!inconsistent).then(|| cost(row)).flatten(),
+                    source_cost,
                     inconsistent,
+                    timestamp(row).max(timestamp(session)),
                     timestamp(row).max(timestamp(session)),
                 ));
             }
         }
         let residual = subtract(aggregate, summed);
-        if invalid_model {
+        let authoritative_cost = cost(session);
+        let model_cost_exceeds_authority =
+            authoritative_cost.is_some_and(|authoritative| attributed_model_cost > authoritative);
+        let reconcile_with_authority =
+            authoritative_cost.is_some() && (invalid_model || model_cost_exceeds_authority);
+        if reconcile_with_authority {
             for event in &mut events[model_event_start..] {
                 event.source_cost_usd = None;
             }
         }
-        let source_cost = if invalid_model {
-            cost(session)
+        let source_cost = if reconcile_with_authority {
+            authoritative_cost
         } else {
-            residual_cost(session, model_rows)
+            authoritative_cost.and_then(|authoritative| {
+                (authoritative > attributed_model_cost)
+                    .then_some(authoritative - attributed_model_cost)
+            })
         };
-        if !is_zero(&residual) || invalid_model && source_cost.is_some() {
+        if !is_zero(&residual) || source_cost.is_some() {
             events.push(event(
                 &source_path,
                 &format!("session:{id}:residual"),
@@ -301,6 +316,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                 residual,
                 source_cost,
                 true,
+                timestamp(session),
                 timestamp(session),
             ));
         }
@@ -488,12 +504,6 @@ fn cap_to_remaining(
         reasoning: cap(aggregate.reasoning, used.reasoning, value.reasoning),
     }
 }
-fn residual_cost(session: &Row, rows: &[&Row]) -> Option<f64> {
-    let total = cost(session)?;
-    let used: f64 = rows.iter().filter_map(|row| cost(row)).sum();
-    (total > used).then_some(total - used)
-}
-
 fn cacheable_after_wal_read(
     wal_before: &crate::sources::UsageDependency,
     wal_after: &crate::sources::UsageDependency,
@@ -509,6 +519,7 @@ fn event(
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
     conservative: bool,
+    timestamp_ms: u64,
     order: u64,
 ) -> UsageEvent {
     UsageEvent {
@@ -518,7 +529,7 @@ fn event(
         session_id: session_id.map(str::to_string),
         request_id: None,
         message_id: None,
-        timestamp_ms: timestamp(row),
+        timestamp_ms,
         project: text(row, "cwd").or_else(|| text(row, "git_repo_root")),
         provider: text(row, "billing_provider"),
         model: text(row, "model"),
@@ -541,6 +552,7 @@ fn model_event(
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
     conservative: bool,
+    timestamp_ms: u64,
     order: u64,
 ) -> UsageEvent {
     let mut event = event(
@@ -551,6 +563,7 @@ fn model_event(
         tokens,
         source_cost_usd,
         conservative,
+        timestamp_ms,
         order,
     );
     event.model = model;
@@ -738,6 +751,329 @@ mod tests {
     }
 
     #[test]
+    fn exact_model_tokens_emit_cost_only_residual_for_uncovered_source_cost() {
+        for (index, model_cost) in [None, Some(6.0)].into_iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("exact-cost-{index}.db"));
+            db(&path, true);
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',10.0,'/work','/repo','prof')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_model_usage VALUES ('s','m','p','task',10,0,0,0,0,?1,1000)",
+                [model_cost],
+            )
+            .unwrap();
+            drop(conn);
+
+            let events = parse_usage_file(&path).unwrap().events;
+            let residual = events
+                .iter()
+                .find(|event| event.source_record_id.as_deref() == Some("session:s:residual"))
+                .expect("cost-only residual");
+            assert!(is_zero(&residual.tokens));
+            assert_eq!(
+                residual.source_cost_usd,
+                Some(model_cost.map_or(10.0, |_| 4.0))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| event.source_cost_usd)
+                    .sum::<f64>(),
+                10.0
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_session_cost_reconciles_model_cost_matrix() {
+        for (index, (session_cost, model_cost, expected_model_cost, expected_residual)) in [
+            (None, Some(6.0), Some(6.0), None),
+            (Some(0.0), Some(6.0), None, Some(0.0)),
+            (Some(5.0), Some(6.0), None, Some(5.0)),
+            (Some(6.0), Some(6.0), Some(6.0), None),
+            (Some(10.0), Some(6.0), Some(6.0), Some(4.0)),
+            (Some(10.0), None, None, Some(10.0)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("cost-matrix-{index}.db"));
+            db(&path, true);
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',?1,'/work','/repo','prof')",
+                [session_cost],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_model_usage VALUES ('s','m','p','task',10,0,0,0,0,?1,1000)",
+                [model_cost],
+            )
+            .unwrap();
+            drop(conn);
+
+            let events = parse_usage_file(&path).unwrap().events;
+            let model = events
+                .iter()
+                .find(|event| {
+                    event
+                        .source_record_id
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("model:")
+                })
+                .unwrap();
+            let residual = events
+                .iter()
+                .find(|event| event.source_record_id.as_deref() == Some("session:s:residual"));
+            assert_eq!(model.tokens.raw_input, 10);
+            assert_eq!(model.source_cost_usd, expected_model_cost);
+            assert_eq!(
+                residual.and_then(|event| event.source_cost_usd),
+                expected_residual
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| event.source_cost_usd)
+                    .sum::<f64>(),
+                session_cost.or(model_cost).unwrap_or(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_model_without_authoritative_cost_preserves_valid_model_costs() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("uncosted-invalid-model.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','a-valid','p','valid',4,0,0,0,0,2.0,1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','z-capped','p','capped',10,0,0,0,0,3.0,1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = parse_usage_file(&path).unwrap().events;
+        let model_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event
+                    .source_record_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("model:"))
+            })
+            .collect();
+        assert_eq!(model_events.len(), 2);
+        let model_costs: Vec<_> = model_events
+            .iter()
+            .filter_map(|event| event.source_cost_usd)
+            .collect();
+        assert_eq!(model_costs, vec![2.0]);
+        assert!(
+            model_events
+                .iter()
+                .any(|event| event.tokens.raw_input == 6 && event.source_cost_usd.is_none())
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.tokens.raw_input)
+                .sum::<u64>(),
+            10
+        );
+    }
+
+    #[test]
+    fn zero_token_session_with_authoritative_cost_emits_cost_only_event() {
+        for (index, session_cost) in [Some(0.0), Some(3.0)].into_iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(format!("zero-token-cost-{index}.db"));
+            db(&path, false);
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s','fallback',1000,0,0,0,0,0,'p',?1,'/work','/repo','prof')",
+                [session_cost],
+            )
+            .unwrap();
+            drop(conn);
+
+            let events = parse_usage_file(&path).unwrap().events;
+            assert_eq!(events.len(), 1);
+            assert!(is_zero(&events[0].tokens));
+            assert_eq!(events[0].source_cost_usd, session_cost);
+        }
+    }
+
+    #[test]
+    fn cost_over_authority_preserves_positive_token_residual() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cost-over-authority-residual.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',5.0,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m','p','task',4,0,0,0,0,6.0,1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = parse_usage_file(&path).unwrap().events;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.tokens.raw_input)
+                .sum::<u64>(),
+            10
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.source_cost_usd)
+                .sum::<f64>(),
+            5.0
+        );
+    }
+
+    #[test]
+    fn zero_token_model_cost_is_not_attributed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("zero-token-model-cost.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',10.0,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m1','p','emitted',10,0,0,0,0,6.0,1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m2','p','zero',0,0,0,0,0,3.0,1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = parse_usage_file(&path).unwrap().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| event.source_cost_usd)
+                .sum::<f64>(),
+            10.0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.source_record_id.as_deref() == Some("session:s:residual"))
+                .unwrap()
+                .source_cost_usd,
+            Some(4.0)
+        );
+    }
+
+    #[test]
+    fn model_event_timestamp_falls_back_to_session_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model-timestamp.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1720000000,10,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m','p','task',10,0,0,0,0,NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let event = &parse_usage_file(&path).unwrap().events[0];
+        assert_eq!(event.timestamp_ms, 1_720_000_000_000);
+        assert_eq!(event.source_order, 1_720_000_000_000);
+    }
+
+    #[test]
+    fn model_event_timestamp_falls_back_when_first_and_last_seen_are_omitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model-timestamp-omitted.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, model TEXT, started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT, estimated_cost_usd REAL, cwd TEXT, git_repo_root TEXT, profile_name TEXT); CREATE TABLE session_model_usage (session_id TEXT, model TEXT, billing_provider TEXT, task TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd REAL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1720000000,10,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m','p','task',10,0,0,0,0,NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let event = &parse_usage_file(&path).unwrap().events[0];
+        assert_eq!(event.timestamp_ms, 1_720_000_000_000);
+        assert_eq!(event.source_order, 1_720_000_000_000);
+    }
+
+    #[test]
+    fn model_event_timestamp_falls_back_when_first_and_last_seen_are_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model-timestamp-null.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, model TEXT, started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT, estimated_cost_usd REAL, cwd TEXT, git_repo_root TEXT, profile_name TEXT); CREATE TABLE session_model_usage (session_id TEXT, model TEXT, billing_provider TEXT, task TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd REAL, first_seen INTEGER, last_seen INTEGER);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1720000000,10,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m','p','task',10,0,0,0,0,NULL,NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let event = &parse_usage_file(&path).unwrap().events[0];
+        assert_eq!(event.timestamp_ms, 1_720_000_000_000);
+        assert_eq!(event.source_order, 1_720_000_000_000);
+    }
+
+    #[test]
     fn malformed_database_is_an_error_and_jsonl_is_not_discovered() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
@@ -798,7 +1134,7 @@ mod tests {
         conn.execute("INSERT INTO session_model_usage VALUES ('s','model:a','p','task:a',5,1,0,0,0,1.0,1720000000)", []).unwrap();
         drop(conn);
         let events = parse_usage_file(&path).unwrap().events;
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(
             events[0]
                 .source_record_id
@@ -813,6 +1149,12 @@ mod tests {
                 .unwrap()
                 .contains("task:b")
         );
+        assert_eq!(
+            events[2].source_record_id.as_deref(),
+            Some("session:s:residual")
+        );
+        assert!(is_zero(&events[2].tokens));
+        assert_eq!(events[2].source_cost_usd, Some(1.0));
         assert_ne!(events[0].source_record_id, events[1].source_record_id);
     }
 

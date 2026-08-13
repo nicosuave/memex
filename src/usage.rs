@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::ValueEnum;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use rusqlite::{Connection, params, types::Type};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -799,28 +799,47 @@ impl UsageCache {
             "DELETE FROM usage_file_cache WHERE source = ?1 AND parser_version != ?2",
             params![source, parser_version],
         )?;
-        let mut statement = self.connection.prepare(
-            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob, deps_blob FROM usage_file_cache
-             WHERE source = ?1 AND parser_version = ?2",
-        )?;
-        let rows = statement.query_map(params![source, parser_version], |row| {
-            let deps_blob: Vec<u8> = row.get(5)?;
-            let deps = postcard::from_bytes(&deps_blob).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(5, Type::Blob, Box::new(error))
-            })?;
-            Ok((
-                row.get::<_, String>(0)?,
-                CachedFileRow {
-                    size: row.get::<_, i64>(1)? as u64,
-                    mtime_ns: row.get(2)?,
-                    scanned_at_ms: row.get(3)?,
-                    events_blob: row.get(4)?,
-                    deps,
-                },
-            ))
-        })?;
-        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(Into::into)
+        let mut cached = HashMap::new();
+        let mut invalid_paths = Vec::new();
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT path, size, mtime_ns, scanned_at_ms, events_blob, deps_blob FROM usage_file_cache
+                 WHERE source = ?1 AND parser_version = ?2",
+            )?;
+            let mut rows = statement.query(params![source, parser_version])?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let size = row.get::<_, i64>(1)? as u64;
+                let mtime_ns = row.get::<_, i64>(2)?;
+                let scanned_at_ms = row.get::<_, i64>(3)?;
+                let events_blob = row.get::<_, Vec<u8>>(4)?;
+                let Ok(deps_blob) = row.get::<_, Vec<u8>>(5) else {
+                    invalid_paths.push(path);
+                    continue;
+                };
+                let Ok(deps) = postcard::from_bytes(&deps_blob) else {
+                    invalid_paths.push(path);
+                    continue;
+                };
+                cached.insert(
+                    path,
+                    CachedFileRow {
+                        size,
+                        mtime_ns,
+                        scanned_at_ms,
+                        events_blob,
+                        deps,
+                    },
+                );
+            }
+        }
+        for path in invalid_paths {
+            self.connection.execute(
+                "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
+                params![source, path],
+            )?;
+        }
+        Ok(cached)
     }
 
     fn delete_stale(&mut self, source: &str, stale_paths: &[String]) -> Result<()> {
@@ -1673,6 +1692,111 @@ mod tests {
             },
         );
         assert_eq!(parses.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_dependency_row_does_not_discard_valid_cache_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let valid_path = temp.path().join("valid.jsonl");
+        fs::write(&valid_path, "valid").expect("write valid source");
+        let vanished_path = temp.path().join("vanished.jsonl");
+        let malformed_path = temp.path().join("malformed.jsonl");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        let metadata = usage_file_metadata(&valid_path).expect("metadata");
+        let empty_events = postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap();
+        let empty_deps = postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap();
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, ?3, ?4, 30, ?5, ?6)",
+                params![
+                    valid_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    metadata.0 as i64,
+                    metadata.1,
+                    empty_events,
+                    empty_deps
+                ],
+            )
+            .expect("seed valid row");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, 0, 0, 30, ?3, ?4)",
+                params![
+                    vanished_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    vec![0xff_u8, 0x00_u8]
+                ],
+            )
+            .expect("seed invalid row");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, 0, 0, 30, ?3, 7)",
+                params![
+                    malformed_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                ],
+            )
+            .expect("seed malformed dependency type row");
+
+        let mut cache = cache;
+        let mut warnings = Vec::new();
+        let mut events = Vec::new();
+        let parses = AtomicUsize::new(0);
+        scan_files_cached(
+            SourceScan {
+                source: "codex",
+                parser_version: crate::sources::codex::VERSIONS.usage,
+                volatile_reuse_ms: |_| None,
+            },
+            std::slice::from_ref(&valid_path),
+            Some(&mut cache),
+            &mut warnings,
+            &mut events,
+            |_| {
+                parses.fetch_add(1, Ordering::SeqCst);
+                Ok(FileParse::cacheable(Vec::new()))
+            },
+        );
+
+        assert_eq!(parses.load(Ordering::SeqCst), 0);
+        assert!(
+            cache
+                .load_source("codex", crate::sources::codex::VERSIONS.usage)
+                .is_ok()
+        );
+        let invalid_rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex' AND path = ?1",
+                [vanished_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_rows, 0);
+        let malformed_rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex' AND path = ?1",
+                [malformed_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(malformed_rows, 0);
     }
 
     #[test]
