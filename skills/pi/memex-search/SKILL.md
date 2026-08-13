@@ -1,9 +1,9 @@
 ---
 name: memex-search
-description: Search, filter, and retrieve Pi Coding Agent history via memex CLI. Use for context resumption, finding past code/decisions, and self-correction based on history.
+description: Search, filter, and retrieve Pi Coding Agent and Oh My Pi history via memex CLI. Use for context resumption, finding past code/decisions, and self-correction based on history.
 ---
 
-# Memex for Pi
+# Memex for Pi and Oh My Pi
 
 `memex` is the primary memory retrieval tool. Use it to access historical sessions and indexed code interactions.
 
@@ -35,6 +35,8 @@ If the vector index is unavailable, memex warns on stderr and falls back to lexi
 - On successful enable, memex writes `auto_index_on_search = false` to config when that setting is absent, so searches do not duplicate daemon work. Explicit user config is preserved.
 - macOS writes `~/.memex/index-service.plist`, `~/.memex/index-service.log`, and `~/.memex/index-service.err.log`. Linux writes systemd user units under `~/.config/systemd/user/`.
 - Use `memex index-service disable` to unload and remove the service.
+
+The `--pi` index option includes both Pi Coding Agent sessions and Oh My Pi sessions.
 
 ## Session Context
 

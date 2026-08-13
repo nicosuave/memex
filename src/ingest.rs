@@ -2684,6 +2684,7 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let pi_root = tmp.path().join("pi-agent");
+        let omp_root = tmp.path().join("omp");
         let sessions_root = pi_root.join("sessions").join("--Users-nico-Code-memex--");
         fs::create_dir_all(&sessions_root).expect("create pi sessions");
         let session_file =
@@ -2704,7 +2705,12 @@ mod tests {
 "#,
         )
         .expect("write pi fixture");
-        let _env = EnvVarGuard::set_os(&[("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str()))]);
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_DIR", Some(pi_root.as_os_str())),
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
+        ]);
 
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         paths.ensure_dirs().expect("ensure dirs");
@@ -2807,6 +2813,63 @@ mod tests {
             Some("branch")
         );
         assert!(!records.iter().any(|record| record.text.contains("secret")));
+    }
+
+    #[test]
+    fn ingest_omp_session_from_config_root() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let omp_root = tmp.path().join("omp");
+        let pi_sessions = tmp.path().join("pi-sessions");
+        let session_dir = omp_root
+            .join("agent/sessions")
+            .join("--Users-nico-Code-omp--");
+        fs::create_dir_all(&session_dir).expect("create omp session dir");
+        let session_file = session_dir.join("omp-session.jsonl");
+        fs::write(
+            &session_file,
+            include_str!("../fixtures/trajectory_parity/omp.jsonl"),
+        )
+        .expect("write omp fixture");
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("PI_CODING_AGENT_SESSION_DIR", Some(pi_sessions.as_os_str())),
+            ("PI_CODING_AGENT_DIR", None),
+            ("XDG_DATA_HOME", None),
+        ]);
+
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_pi = true;
+
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+        assert_eq!(report.files_scanned, 1);
+        assert_eq!(report.records_added, 4);
+
+        let records = index
+            .records_by_session_id("omp-session")
+            .expect("records by session");
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|record| record.source == SourceKind::Pi));
+        assert!(records.iter().all(|record| record.project == "omp-project"));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "Inspect the project")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "project contents")
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == session_file.to_string_lossy())
+        );
     }
 
     #[test]

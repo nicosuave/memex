@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Search, filter, and retrieve Claude/Codex/Cursor/OpenCode/Pi/Copilot history indexed by the memex CLI. Use when you want to search history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output.
+description: Search, filter, and retrieve Claude/Codex/Cursor/OpenCode/Pi/Oh My Pi/Copilot history indexed by the memex CLI. Use when you want to search history, run lexical/semantic/hybrid search, fetch full transcripts, or produce LLM-friendly JSON output.
 ---
 
 # Memex Search
@@ -25,7 +25,7 @@ Use this skill to index local history and retrieve results in a structured way.
   - `--include-agents` to include agent transcripts
   - `--codex/--no-codex` to include or skip Codex logs
   - `--opencode/--no-opencode` to include or skip OpenCode logs
-  - `--pi/--no-pi` to include or skip Pi logs
+  - `--pi/--no-pi` to include or skip Pi and Oh My Pi logs
   - `--copilot/--no-copilot` to include or skip GitHub Copilot CLI logs
   - `--model <minilm|bge|nomic|gemma|potion>` to select embedding model
   - `--root <path>` to change data root (default: `~/.memex`)

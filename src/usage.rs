@@ -2531,6 +2531,7 @@ mod tests {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let agent_root = tmp.path().join("pi-agent");
+        let omp_root = tmp.path().join("omp");
         let session_root = agent_root.join("custom/sessions/--C--Users-alice-Code-memex--");
         std::fs::create_dir_all(&session_root).expect("create session root");
         std::fs::write(
@@ -2549,6 +2550,8 @@ mod tests {
         let _env = EnvVarGuard::set_os(&[
             ("PI_CODING_AGENT_SESSION_DIR", None),
             ("PI_CODING_AGENT_DIR", Some(agent_root.as_os_str())),
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
         ]);
         let report = scan_usage(&UsageQuery {
             source: Some(SourceFilter::Pi),
@@ -2576,6 +2579,7 @@ mod tests {
 
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
+        let omp_root = tmp.path().join("omp");
         let session_root = tmp.path().join("--Users-nico-Code-other--");
         std::fs::create_dir_all(&session_root).expect("create session root");
 
@@ -2606,8 +2610,12 @@ mod tests {
         )
         .expect("write filename session");
 
-        let _env =
-            EnvVarGuard::set_os(&[("PI_CODING_AGENT_SESSION_DIR", Some(tmp.path().as_os_str()))]);
+        let _env = EnvVarGuard::set_os(&[
+            ("PI_CODING_AGENT_SESSION_DIR", Some(tmp.path().as_os_str())),
+            ("PI_CODING_AGENT_DIR", None),
+            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("XDG_DATA_HOME", None),
+        ]);
         let mut query = UsageQuery {
             source: Some(SourceFilter::Pi),
             include_events: true,

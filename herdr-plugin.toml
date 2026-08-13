@@ -1,8 +1,8 @@
 # memex as a herdr plugin: a session desk for your agent history.
 #
 # memex indexes the transcripts every coding agent on this machine leaves behind (Claude Code,
-# Codex, Cursor, OpenCode, Pi, OpenClaw, Copilot). Inside herdr it becomes a native pane: browse
-# and search past sessions, then resume one straight into a new herdr tab.
+# Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot). Inside herdr it becomes a native
+# pane: browse and search past sessions, then resume one straight into a new herdr tab.
 #
 # The version here must match Cargo.toml — herdr/install.sh downloads the release tarball tagged
 # with exactly this version.
@@ -11,7 +11,7 @@ name = "memex"
 version = "0.9.1"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
-description = "Session desk for your agent history: search every past Claude Code / Codex / Cursor session and resume one into a herdr tab."
+description = "Session desk for your agent history: search past Claude Code / Codex / Cursor / Pi / Oh My Pi sessions and resume one into a herdr tab."
 
 # On `herdr plugin install`, put a working memex binary under $HERDR_PLUGIN_ROOT/bin: reuse one
 # already on PATH if it speaks the herdr surface, else download the matching release tarball, else

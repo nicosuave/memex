@@ -75,10 +75,10 @@ struct IndexArgs {
     /// Index Cursor agent transcripts from ~/.cursor/projects [default: true]
     #[arg(long = "no-cursor", action = clap::ArgAction::SetFalse, default_value_t = true)]
     cursor: bool,
-    /// Index Pi sessions from ~/.pi/agent/sessions or $PI_CODING_AGENT_DIR/sessions [default: true]
+    /// Index Pi and Oh My Pi sessions, including $PI_CODING_AGENT_DIR [default: true]
     #[arg(long, default_value_t = true)]
     pi: bool,
-    /// Skip indexing Pi sessions
+    /// Skip indexing Pi and Oh My Pi sessions
     #[arg(long = "no-pi", default_value_t = false)]
     no_pi: bool,
     /// Index OpenClaw sessions from ~/.openclaw or ~/.clawdbot [default: true]
@@ -183,7 +183,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -301,7 +301,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -336,7 +336,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -452,7 +452,7 @@ enum HerdrCommand {
         /// Prefer sessions from this directory (falls back to the global latest)
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2293,11 +2293,16 @@ fn run_setup(force: bool) -> Result<()> {
     let codex_path = find_in_path("codex");
     let opencode_path = find_in_path("opencode");
     let pi_path = find_in_path("pi");
+    let omp_path = find_in_path("omp");
 
-    if claude_path.is_none() && codex_path.is_none() && opencode_path.is_none() && pi_path.is_none()
+    if claude_path.is_none()
+        && codex_path.is_none()
+        && opencode_path.is_none()
+        && pi_path.is_none()
+        && omp_path.is_none()
     {
         return Err(anyhow!(
-            "Neither claude, codex, opencode, nor pi found in PATH"
+            "Neither claude, codex, opencode, pi, nor omp found in PATH"
         ));
     }
 
@@ -2315,6 +2320,9 @@ fn run_setup(force: bool) -> Result<()> {
     }
     if pi_path.is_some() {
         println!("  Pi: memex-search skill");
+    }
+    if omp_path.is_some() {
+        println!("  Oh My Pi: memex-search skill");
     }
     if force {
         println!();
@@ -2340,6 +2348,10 @@ fn run_setup(force: bool) -> Result<()> {
     }
     if let Some(path) = &pi_path {
         items.push(("pi", format!("Pi ({})", path.display())));
+        defaults.push(true);
+    }
+    if let Some(path) = &omp_path {
+        items.push(("omp", format!("Oh My Pi ({})", path.display())));
         defaults.push(true);
     }
 
@@ -2373,6 +2385,7 @@ fn run_setup(force: bool) -> Result<()> {
         home.join(".codex/skills/memex-search.md"),
         home.join(".local/share/opencode/skills/memex-search.md"),
         pi_agent_root().join("skills/memex-search.md"),
+        omp_agent_root().join("skills/memex-search.md"),
     ];
     for path in &stale_paths {
         if path.is_dir() {
@@ -2487,12 +2500,17 @@ fn run_setup(force: bool) -> Result<()> {
                     println!("{verb} Opencode skill at {}.", dest.display());
                 }
             }
-            "pi" => {
-                let dest_dir = pi_agent_root().join("skills").join("memex-search");
+            "pi" | "omp" => {
+                let dest_dir = if *tool == "omp" {
+                    omp_agent_root().join("skills").join("memex-search")
+                } else {
+                    pi_agent_root().join("skills").join("memex-search")
+                };
                 let dest = dest_dir.join("SKILL.md");
                 if dest.exists() && !force {
                     println!(
-                        "Skipping Pi skill (already installed at {}). Use --force to overwrite.",
+                        "Skipping {} skill (already installed at {}). Use --force to overwrite.",
+                        if *tool == "omp" { "Oh My Pi" } else { "Pi" },
                         dest.display()
                     );
                 } else {
@@ -2503,7 +2521,11 @@ fn run_setup(force: bool) -> Result<()> {
                     } else {
                         "Installed"
                     };
-                    println!("{verb} Pi skill at {}.", dest.display());
+                    println!(
+                        "{verb} {} skill at {}.",
+                        if *tool == "omp" { "Oh My Pi" } else { "Pi" },
+                        dest.display()
+                    );
                 }
             }
             _ => {}
@@ -2511,7 +2533,7 @@ fn run_setup(force: bool) -> Result<()> {
     }
 
     println!();
-    println!("Done! Restart Claude Code, Codex, Opencode, or Pi to pick up changes.");
+    println!("Done! Restart Claude Code, Codex, Opencode, Pi, or Oh My Pi to pick up changes.");
 
     Ok(())
 }
@@ -2629,6 +2651,16 @@ fn pi_agent_root() -> PathBuf {
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
     home.join(".pi").join("agent")
+}
+
+fn omp_agent_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        return PathBuf::from(root);
+    }
+    let home = directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    home.join(".omp").join("agent")
 }
 
 #[cfg(unix)]

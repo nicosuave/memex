@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, OpenClaw, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, Oh My Pi, OpenClaw, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -109,7 +109,7 @@ Then run setup to install the skills:
 memex setup
 ```
 
-Restart Claude, Codex, OpenCode, or Pi after setup.
+Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after setup.
 
 ## Quickstart
 
@@ -117,6 +117,9 @@ Index (incremental):
 ```
 memex index
 ```
+
+The default Pi scan also includes Oh My Pi sessions from `~/.omp/agent/sessions` and named
+profile session directories.
 
 Plaintext reasoning is excluded by default because it is usually low-value search noise. Opt
 in with `memex index --include-reasoning`; reasoning records remain BM25-only. Encrypted and
@@ -210,7 +213,7 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot logs:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, and Copilot logs:
 
 ```
 memex usage
@@ -251,7 +254,7 @@ If you built from source, run setup to install:
 memex setup
 ```
 
-This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents an interactive menu to select which to configure.
+This detects which tools are installed (Claude/Codex/OpenCode/Pi/Oh My Pi) and presents an interactive menu to select which to configure.
 ## Search modes
 
 | Need | Command |
@@ -266,7 +269,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi) and presents a
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|openclaw|copilot`
+- `--source claude|codex|cursor|opencode|pi|openclaw|copilot` (`pi` includes Oh My Pi sessions)
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
