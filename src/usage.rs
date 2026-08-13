@@ -1497,7 +1497,6 @@ mod tests {
     #[test]
     fn hermes_disjoint_usage_parser_version_is_newer_than_repair_two() {
         assert_eq!(crate::sources::hermes::VERSIONS.usage, 4);
-        assert!(crate::sources::hermes::VERSIONS.usage > 3);
     }
 
     #[test]
@@ -1540,7 +1539,7 @@ mod tests {
                 parser_version: crate::sources::hermes::VERSIONS.usage,
                 volatile_reuse_ms: |_| None,
             },
-            &[db_path.clone()],
+            std::slice::from_ref(&db_path),
             Some(&mut cache),
             &mut warnings,
             &mut events,

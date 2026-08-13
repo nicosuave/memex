@@ -223,26 +223,6 @@ pub fn index_state_version(source: SourceKind) -> u32 {
     index_state_version_for(source, false)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reasoning_mode_is_part_of_index_state_version() {
-        for source in [
-            SourceKind::Claude,
-            SourceKind::Codex,
-            SourceKind::Pi,
-            SourceKind::OpenClaw,
-        ] {
-            assert_ne!(
-                index_state_version_for(source, false),
-                index_state_version_for(source, true)
-            );
-        }
-    }
-}
-
 pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u32 {
     let versions = versions(source);
     let reasoning_mode = include_reasoning
@@ -274,5 +254,25 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Hermes
     } else {
         SourceKind::Claude
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_mode_is_part_of_index_state_version() {
+        for source in [
+            SourceKind::Claude,
+            SourceKind::Codex,
+            SourceKind::Pi,
+            SourceKind::OpenClaw,
+        ] {
+            assert_ne!(
+                index_state_version_for(source, false),
+                index_state_version_for(source, true)
+            );
+        }
     }
 }
