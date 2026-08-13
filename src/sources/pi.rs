@@ -19,80 +19,7 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 
 pub fn matches_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
-    normalized.contains(".pi/agent/sessions")
-        || normalized.contains("pi/agent/sessions")
-        || normalized.contains(".omp/agent/sessions")
-        || (normalized.contains(".omp/profiles/") && normalized.contains("/agent/sessions"))
-        || normalized.contains("omp/sessions")
-}
-
-fn omp_sessions_roots() -> Vec<PathBuf> {
-    let home = super::common::home();
-    let config_dir = std::env::var_os("PI_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".omp"));
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    omp_sessions_roots_from(&home, &config_dir, data_home.as_deref())
-}
-
-fn omp_sessions_roots_from(
-    home: &Path,
-    config_dir: &Path,
-    data_home: Option<&Path>,
-) -> Vec<PathBuf> {
-    let config_root = if config_dir.is_absolute() {
-        config_dir.to_path_buf()
-    } else {
-        home.join(config_dir)
-    };
-    let mut roots = vec![config_root.join("agent/sessions")];
-    roots.extend(profile_session_roots(&config_root.join("profiles")));
-
-    if let Some(data_home) = data_home {
-        let data_root = data_home.join("omp");
-        roots.push(data_root.join("sessions"));
-        roots.extend(profile_session_roots(&data_root.join("profiles")));
-    }
-
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn profile_session_roots(profiles_root: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(profiles_root) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(|kind| kind.is_dir())
-                .map(|_| entry.path().join("agent/sessions"))
-        })
-        .collect()
-}
-
-fn discover_from_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<SourceFile> {
-    super::common::jsonl_files(roots)
-        .into_iter()
-        .map(|path| SourceFile {
-            source: SourceKind::Pi,
-            path,
-        })
-        .collect()
-}
-
-fn session_roots() -> Vec<PathBuf> {
-    let mut roots = vec![sessions_root()];
-    roots.extend(omp_sessions_roots());
-    roots.sort();
-    roots.dedup();
-    roots
+    normalized.contains(".pi/agent/sessions") || normalized.contains("pi/agent/sessions")
 }
 
 pub fn agent_root() -> PathBuf {
@@ -131,7 +58,13 @@ fn configured_session_root(agent: &Path) -> Option<PathBuf> {
 }
 
 pub fn discover() -> Vec<SourceFile> {
-    discover_from_roots(session_roots())
+    super::common::jsonl_files([sessions_root()])
+        .into_iter()
+        .map(|path| SourceFile {
+            source: SourceKind::Pi,
+            path,
+        })
+        .collect()
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -970,105 +903,5 @@ mod tests {
                 .iter()
                 .any(|record| record.text.contains("ciphertext-must-never-be-indexed"))
         );
-    }
-
-    #[test]
-    fn omp_discovery_scans_default_profile_and_xdg_session_roots() {
-        let temp = tempfile::tempdir().unwrap();
-        let config_root = temp.path().join(".omp");
-        let data_root = temp.path().join("xdg-data").join("omp");
-
-        let expected_roots = [
-            config_root.join("agent/sessions"),
-            config_root.join("profiles/work/agent/sessions"),
-            data_root.join("sessions"),
-            data_root.join("profiles/lab/agent/sessions"),
-        ];
-        fs::create_dir_all(&config_root.join("profiles/work/agent/sessions")).unwrap();
-        fs::create_dir_all(&data_root.join("profiles/lab/agent/sessions")).unwrap();
-        for (index, root) in expected_roots.iter().enumerate() {
-            fs::create_dir_all(root).unwrap();
-            fs::write(root.join(format!("session-{index}.jsonl")), "{}\n").unwrap();
-        }
-
-        let roots = omp_sessions_roots_from(
-            temp.path(),
-            Path::new(".omp"),
-            Some(&temp.path().join("xdg-data")),
-        );
-        assert!(expected_roots.iter().all(|root| roots.contains(root)));
-        let files = discover_from_roots(roots);
-        assert_eq!(files.len(), expected_roots.len());
-        assert!(files.iter().all(|file| file.source == SourceKind::Pi));
-    }
-
-    #[test]
-    fn omp_session_paths_are_classified_as_pi_compatible_history() {
-        assert!(matches_path(
-            "/Users/nico/.omp/agent/sessions/-workspace/20260813_session.jsonl"
-        ));
-        assert!(matches_path(
-            r"C:\Users\nico\.omp\profiles\work\agent\sessions\-workspace\session.jsonl"
-        ));
-        assert!(matches_path(
-            "/Users/nico/Library/Application Support/omp/sessions/session.jsonl"
-        ));
-    }
-
-    #[test]
-    fn omp_fixture_uses_the_pi_session_projection() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("omp.jsonl");
-        fs::write(
-            &path,
-            include_str!("../../fixtures/trajectory_parity/omp.jsonl"),
-        )
-        .unwrap();
-
-        let mut records = Vec::new();
-        let parsed = parse_index_records(
-            &path,
-            IndexParseState::default(),
-            false,
-            &AtomicU64::new(1),
-            |record| {
-                records.push(record);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(parsed.session_id.as_deref(), Some("omp-session"));
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record.role.as_str())
-                .collect::<Vec<_>>(),
-            ["user", "tool_use", "assistant", "tool_result"]
-        );
-        assert!(records.iter().all(|record| record.source == SourceKind::Pi));
-        assert!(records.iter().all(|record| record.project == "omp-project"));
-        assert_eq!(
-            records
-                .iter()
-                .find(|record| record.role == "tool_use")
-                .and_then(|record| record.tool_name.as_deref()),
-            Some("Read")
-        );
-        assert_eq!(
-            records[3].links.parent_tool_use_id.as_deref(),
-            Some("tool-1")
-        );
-
-        let usage = parse_usage_file(&path).unwrap();
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].source, "pi");
-        assert_eq!(usage[0].session_id.as_deref(), Some("omp-session"));
-        assert_eq!(usage[0].project.as_deref(), Some("omp-project"));
-        assert_eq!(usage[0].model.as_deref(), Some("gpt-5.6-luna"));
-        assert_eq!(usage[0].tokens.raw_input, 12);
-        assert_eq!(usage[0].tokens.cache_read, 2);
-        assert_eq!(usage[0].tokens.cache_write, 1);
-        assert_eq!(usage[0].tokens.output, 8);
     }
 }

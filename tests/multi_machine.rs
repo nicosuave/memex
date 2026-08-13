@@ -68,6 +68,7 @@ fn federated_search_uses_the_configured_ssh_rpc_backend() {
             "--no-opencode",
             "--no-cursor",
             "--no-pi",
+            "--no-omp",
             "--no-openclaw",
             "--no-copilot",
             "--no-embeddings",

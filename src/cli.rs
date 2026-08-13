@@ -75,12 +75,18 @@ struct IndexArgs {
     /// Index Cursor agent transcripts from ~/.cursor/projects [default: true]
     #[arg(long = "no-cursor", action = clap::ArgAction::SetFalse, default_value_t = true)]
     cursor: bool,
-    /// Index Pi and Oh My Pi sessions, including $PI_CODING_AGENT_DIR [default: true]
+    /// Index Pi sessions from ~/.pi/agent/sessions or $PI_CODING_AGENT_DIR/sessions [default: true]
     #[arg(long, default_value_t = true)]
     pi: bool,
-    /// Skip indexing Pi and Oh My Pi sessions
+    /// Skip indexing Pi sessions
     #[arg(long = "no-pi", default_value_t = false)]
     no_pi: bool,
+    /// Index Oh My Pi sessions from ~/.omp/agent/sessions [default: true]
+    #[arg(long, default_value_t = true)]
+    omp: bool,
+    /// Skip indexing Oh My Pi sessions
+    #[arg(long = "no-omp", default_value_t = false)]
+    no_omp: bool,
     /// Index OpenClaw sessions from ~/.openclaw or ~/.clawdbot [default: true]
     #[arg(long, default_value_t = true)]
     openclaw: bool,
@@ -827,6 +833,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
         index.opencode && !index.no_opencode,
         index.cursor,
         index.pi && !index.no_pi,
+        index.omp && !index.no_omp,
         index.openclaw && !index.no_openclaw,
         index.copilot && !index.no_copilot,
         index.embeddings,
@@ -847,6 +854,7 @@ fn run_index(
     opencode: bool,
     cursor: bool,
     pi: bool,
+    omp: bool,
     openclaw: bool,
     copilot: bool,
     embeddings_flag: bool,
@@ -886,6 +894,7 @@ fn run_index(
         include_opencode: opencode,
         include_cursor: cursor,
         include_pi: pi,
+        include_omp: omp,
         include_openclaw: openclaw,
         include_copilot: copilot,
         embeddings,
@@ -1132,6 +1141,7 @@ fn run_search(
             include_opencode: true,
             include_cursor: true,
             include_pi: true,
+            include_omp: true,
             include_openclaw: true,
             include_copilot: true,
             embeddings: config.embeddings_default(),
@@ -2566,6 +2576,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Pi => "pi",
         crate::types::SourceKind::OpenClaw => "openclaw",
         crate::types::SourceKind::Copilot => "copilot",
+        crate::types::SourceKind::Omp => "omp",
     };
     let source_path = &record.source_path;
 
@@ -3213,6 +3224,9 @@ fn build_index_command_args(
     }
     if !index.pi || index.no_pi {
         args.push("--no-pi".to_string());
+    }
+    if !index.omp || index.no_omp {
+        args.push("--no-omp".to_string());
     }
     if !index.openclaw || index.no_openclaw {
         args.push("--no-openclaw".to_string());
@@ -3970,11 +3984,13 @@ mod tests {
             opencode: false,
             cursor: false,
             pi: false,
+            omp: false,
             openclaw: false,
             copilot: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
+            no_omp: false,
             no_openclaw: false,
             no_copilot: false,
             embeddings: false,
@@ -3991,6 +4007,7 @@ mod tests {
         assert!(args.contains(&"--no-cursor".to_string()));
         assert!(args.contains(&"--no-pi".to_string()));
         assert!(args.contains(&"--no-openclaw".to_string()));
+        assert!(args.contains(&"--no-omp".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
     }
 
@@ -4004,11 +4021,13 @@ mod tests {
             opencode: true,
             cursor: true,
             pi: true,
+            omp: true,
             openclaw: true,
             copilot: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
+            no_omp: false,
             no_openclaw: false,
             no_copilot: false,
             embeddings: false,

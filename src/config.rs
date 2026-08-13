@@ -125,6 +125,8 @@ pub struct UserConfig {
     pub cursor_resume_cmd: Option<String>,
     /// Resume command template for Pi sessions.
     pub pi_resume_cmd: Option<String>,
+    /// Resume command template for Oh My Pi sessions.
+    pub omp_resume_cmd: Option<String>,
     /// Resume command template for GitHub Copilot CLI sessions.
     pub copilot_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".

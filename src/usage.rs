@@ -503,11 +503,12 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 7] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 8] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
         (SourceFilter::Pi, scan_pi),
+        (SourceFilter::Omp, scan_omp),
         (SourceFilter::OpenClaw, scan_openclaw),
         (SourceFilter::Cursor, scan_cursor),
         (SourceFilter::Copilot, scan_copilot),
@@ -1185,6 +1186,30 @@ fn scan_pi(
         warnings,
         out,
         |path| crate::sources::pi::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
+fn scan_omp(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::omp::discover()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    scan_files_cached(
+        SourceScan {
+            source: "omp",
+            parser_version: crate::sources::omp::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::omp::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }

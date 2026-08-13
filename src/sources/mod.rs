@@ -10,6 +10,7 @@ pub mod codex;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
+pub mod omp;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
@@ -202,6 +203,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Cursor => cursor::VERSIONS,
         SourceKind::Opencode => opencode::VERSIONS,
         SourceKind::Pi => pi::VERSIONS,
+        SourceKind::Omp => omp::VERSIONS,
         SourceKind::OpenClaw => openclaw::VERSIONS,
         SourceKind::Copilot => copilot::VERSIONS,
     }
@@ -252,6 +254,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Opencode
     } else if cursor::matches_path(path) {
         SourceKind::Cursor
+    } else if omp::matches_path(path) {
+        SourceKind::Omp
     } else if pi::matches_path(path) {
         SourceKind::Pi
     } else if openclaw::matches_path(path) {

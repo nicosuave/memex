@@ -406,6 +406,7 @@ enum SourceChoice {
     Opencode,
     Cursor,
     Pi,
+    Omp,
     OpenClaw,
     Copilot,
 }
@@ -418,7 +419,8 @@ impl SourceChoice {
             SourceChoice::Codex => SourceChoice::Opencode,
             SourceChoice::Opencode => SourceChoice::Cursor,
             SourceChoice::Cursor => SourceChoice::Pi,
-            SourceChoice::Pi => SourceChoice::OpenClaw,
+            SourceChoice::Pi => SourceChoice::Omp,
+            SourceChoice::Omp => SourceChoice::OpenClaw,
             SourceChoice::OpenClaw => SourceChoice::Copilot,
             SourceChoice::Copilot => SourceChoice::All,
         }
@@ -432,6 +434,7 @@ impl SourceChoice {
             SourceChoice::Opencode => Some(SourceFilter::Opencode),
             SourceChoice::Cursor => Some(SourceFilter::Cursor),
             SourceChoice::Pi => Some(SourceFilter::Pi),
+            SourceChoice::Omp => Some(SourceFilter::Omp),
             SourceChoice::OpenClaw => Some(SourceFilter::OpenClaw),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
         }
@@ -445,6 +448,7 @@ impl SourceChoice {
             SourceChoice::Opencode => "opencode",
             SourceChoice::Cursor => "cursor",
             SourceChoice::Pi => "pi",
+            SourceChoice::Omp => "omp",
             SourceChoice::OpenClaw => "openclaw",
             SourceChoice::Copilot => "copilot",
         }
@@ -457,6 +461,7 @@ impl SourceChoice {
             SourceKind::Opencode => SourceChoice::Opencode,
             SourceKind::Cursor => SourceChoice::Cursor,
             SourceKind::Pi => SourceChoice::Pi,
+            SourceKind::Omp => SourceChoice::Omp,
             SourceKind::OpenClaw => SourceChoice::OpenClaw,
             SourceKind::Copilot => SourceChoice::Copilot,
         }
@@ -1089,6 +1094,7 @@ impl App {
                     include_opencode: true,
                     include_cursor: true,
                     include_pi: true,
+                    include_omp: true,
                     include_openclaw: true,
                     include_copilot: true,
                     embeddings: embeddings_default,
@@ -2428,6 +2434,7 @@ impl App {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "pi",
             SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
         };
         let source_path = session.source_path.clone();
 
@@ -3852,10 +3859,11 @@ fn match_context_spans(
 fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> bool {
     match choice {
         SourceChoice::Claude => label == "claude",
-        SourceChoice::Codex => matches!(label, "codex" | "codex-session" | "codex-history"),
+        SourceChoice::Codex => SourceFilter::Codex.storage_labels().contains(&label),
         SourceChoice::Opencode => label == "opencode",
         SourceChoice::Cursor => label == "cursor",
         SourceChoice::Pi => label == "pi",
+        SourceChoice::Omp => label == "omp",
         SourceChoice::OpenClaw => label == "openclaw",
         SourceChoice::Copilot => label == "copilot",
         SourceChoice::All => false,
@@ -3869,6 +3877,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Opencode => Color::Rgb(150, 180, 150),
         SourceKind::Cursor => Color::Rgb(170, 150, 200),
         SourceKind::Pi => Color::Rgb(120, 190, 190),
+        SourceKind::Omp => Color::Rgb(100, 170, 170),
         SourceKind::OpenClaw => Color::Rgb(235, 160, 110),
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
     }

@@ -12,10 +12,11 @@ pub enum SourceKind {
     Pi,
     OpenClaw,
     Copilot,
+    Omp,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 7] = [
+    pub const ALL: [SourceKind; 8] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -23,6 +24,7 @@ impl SourceKind {
         SourceKind::Pi,
         SourceKind::OpenClaw,
         SourceKind::Copilot,
+        SourceKind::Omp,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -35,6 +37,7 @@ impl SourceKind {
             SourceKind::Pi => 4,
             SourceKind::OpenClaw => 5,
             SourceKind::Copilot => 6,
+            SourceKind::Omp => 7,
         }
     }
 
@@ -47,6 +50,7 @@ impl SourceKind {
             4 => Some(SourceKind::Pi),
             5 => Some(SourceKind::OpenClaw),
             6 => Some(SourceKind::Copilot),
+            7 => Some(SourceKind::Omp),
             _ => None,
         }
     }
@@ -60,19 +64,12 @@ impl SourceKind {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
         }
     }
 
     pub fn storage_label(self) -> &'static str {
-        match self {
-            SourceKind::Claude => "claude",
-            SourceKind::Codex => "codex",
-            SourceKind::Opencode => "opencode",
-            SourceKind::Cursor => "cursor",
-            SourceKind::Pi => "pi",
-            SourceKind::OpenClaw => "openclaw",
-            SourceKind::Copilot => "copilot",
-        }
+        self.label()
     }
 
     pub fn from_path(path: &str) -> Self {
@@ -88,6 +85,7 @@ impl SourceKind {
             "pi" => Some(SourceKind::Pi),
             "openclaw" => Some(SourceKind::OpenClaw),
             "copilot" => Some(SourceKind::Copilot),
+            "omp" => Some(SourceKind::Omp),
             _ => None,
         }
     }
@@ -105,19 +103,12 @@ pub enum SourceFilter {
     #[value(name = "openclaw", alias = "open-claw")]
     OpenClaw,
     Copilot,
+    Omp,
 }
 
 impl SourceFilter {
     pub fn matches(self, source: SourceKind) -> bool {
-        match self {
-            SourceFilter::Claude => source == SourceKind::Claude,
-            SourceFilter::Codex => source == SourceKind::Codex,
-            SourceFilter::Opencode => source == SourceKind::Opencode,
-            SourceFilter::Cursor => source == SourceKind::Cursor,
-            SourceFilter::Pi => source == SourceKind::Pi,
-            SourceFilter::OpenClaw => source == SourceKind::OpenClaw,
-            SourceFilter::Copilot => source == SourceKind::Copilot,
-        }
+        source.label() == self.as_str()
     }
 
     pub fn storage_labels(self) -> &'static [&'static str] {
@@ -129,6 +120,7 @@ impl SourceFilter {
             SourceFilter::Pi => &["pi"],
             SourceFilter::OpenClaw => &["openclaw"],
             SourceFilter::Copilot => &["copilot"],
+            SourceFilter::Omp => &["omp"],
         }
     }
 
@@ -141,6 +133,7 @@ impl SourceFilter {
             SourceFilter::Pi => "pi",
             SourceFilter::OpenClaw => "openclaw",
             SourceFilter::Copilot => "copilot",
+            SourceFilter::Omp => "omp",
         }
     }
 }

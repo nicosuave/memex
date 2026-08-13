@@ -28,6 +28,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Opencode => config.opencode_resume_cmd.clone(),
         SourceKind::Cursor => config.cursor_resume_cmd.clone(),
         SourceKind::Pi => config.pi_resume_cmd.clone(),
+        SourceKind::Omp => config.omp_resume_cmd.clone(),
         SourceKind::OpenClaw => return None,
         SourceKind::Copilot => config.copilot_resume_cmd.clone(),
     };
@@ -49,6 +50,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
             .then(|| "cursor-agent --resume {session_id}".to_string()),
         "pi" if remote || find_in_path("pi").is_some() => {
             Some("pi --session {source_path_shell}".to_string())
+        }
+        "omp" if remote || find_in_path("omp").is_some() => {
+            Some("omp --resume {source_path_shell}".to_string())
         }
         "copilot" if remote || find_in_path("copilot").is_some() => {
             Some("copilot --resume {session_id}".to_string())
@@ -135,11 +139,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_defaults_skip_path_probe() {
+    fn remote_omp_default_resumes_the_session_file() {
         assert_eq!(
-            default_resume_template("claude", true).as_deref(),
-            Some("cd {cwd_shell} && claude --resume {session_id}")
+            default_resume_template("omp", true).as_deref(),
+            Some("omp --resume {source_path_shell}")
         );
-        assert!(default_resume_template("openclaw", true).is_none());
     }
 }

@@ -1054,6 +1054,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         include_opencode: true,
         include_cursor: true,
         include_pi: true,
+        include_omp: true,
         include_openclaw: true,
         include_copilot: true,
         embeddings: config.embeddings_default(),

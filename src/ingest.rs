@@ -35,6 +35,7 @@ pub struct IngestOptions {
     pub include_opencode: bool,
     pub include_cursor: bool,
     pub include_pi: bool,
+    pub include_omp: bool,
     pub include_openclaw: bool,
     pub include_copilot: bool,
     pub embeddings: bool,
@@ -565,6 +566,32 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_omp {
+        let omp_files = crate::sources::omp::discover();
+        for source_file in omp_files {
+            let path = source_file.path;
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Omp,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     if options.include_openclaw {
         for source_file in crate::sources::openclaw::discover() {
             let path = source_file.path;
@@ -720,6 +747,14 @@ pub fn ingest_all(
                     &next_doc_id,
                     &progress,
                     &opencode_session_links,
+                ),
+                SourceKind::Omp => parse_omp_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
                 ),
                 SourceKind::Cursor => {
                     parse_cursor_file(task, &tx_record, &tx_update, &next_doc_id, &progress)
@@ -1240,6 +1275,38 @@ fn parse_pi_file(
         parsed,
     )
 }
+fn parse_omp_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::omp::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Omp, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Omp,
+        source_path,
+        parsed,
+    )
+}
 fn parse_openclaw_file(
     task: &FileTask,
     include_reasoning: bool,
@@ -1471,6 +1538,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_omp: false,
             include_openclaw: false,
             include_copilot: false,
             embeddings,
@@ -2325,6 +2393,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: false,
+            include_omp: false,
             include_openclaw: false,
             include_copilot: false,
             embeddings: false,
@@ -2723,6 +2792,7 @@ mod tests {
             include_opencode: false,
             include_cursor: false,
             include_pi: true,
+            include_omp: false,
             include_openclaw: false,
             include_copilot: false,
             embeddings: false,
@@ -2842,8 +2912,7 @@ mod tests {
         paths.ensure_dirs().expect("ensure dirs");
         let index = SearchIndex::open_or_create(&paths.index).expect("index");
         let mut options = ingest_options(false, ModelChoice::default());
-        options.include_pi = true;
-
+        options.include_omp = true;
         let lease = ingest_lease(&paths);
         let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
         assert_eq!(report.files_scanned, 1);
@@ -2853,7 +2922,11 @@ mod tests {
             .records_by_session_id("omp-session")
             .expect("records by session");
         assert_eq!(records.len(), 4);
-        assert!(records.iter().all(|record| record.source == SourceKind::Pi));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source == SourceKind::Omp)
+        );
         assert!(records.iter().all(|record| record.project == "omp-project"));
         assert!(
             records
@@ -2989,8 +3062,8 @@ mod tests {
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len()],
-            [0, 0, 0, 0, 0, 0, 1],
+            [0, 0, 0, 0, 0, 0, 0, meta.len()],
+            [0, 0, 0, 0, 0, 0, 0, 1],
             false,
         ));
 
