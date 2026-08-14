@@ -6,3 +6,4 @@ claude-code-transcripts/
 .claude/settings.local.json
 .claude/skills/memex-search/
 .DS_Store
+result

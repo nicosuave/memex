@@ -5,7 +5,6 @@
   openssl,
   onnxruntime,
   stdenv,
-  darwin,
 }:
 rustPlatform.buildRustPackage {
   pname = "memex";
@@ -25,11 +24,6 @@ rustPlatform.buildRustPackage {
     [
       openssl
       onnxruntime
-    ]
-    ++ lib.optionals stdenv.isDarwin [
-      darwin.apple_sdk.frameworks.Security
-      darwin.apple_sdk.frameworks.CoreFoundation
-      darwin.apple_sdk.frameworks.SystemConfiguration
     ];
 
   # Tests require network access to download embedding models
