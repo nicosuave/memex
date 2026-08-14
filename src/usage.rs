@@ -1534,12 +1534,12 @@ mod tests {
     }
 
     #[test]
-    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_two() {
-        assert_eq!(crate::sources::hermes::VERSIONS.usage, 5);
+    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_six() {
+        assert_eq!(crate::sources::hermes::VERSIONS.usage, 7);
     }
 
     #[test]
-    fn hermes_parser_version_change_reparses_a_repair_two_cache_row() {
+    fn hermes_parser_version_change_reparses_a_repair_six_cache_row() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("state.db");
         let conn = Connection::open(&db_path).expect("create db");
@@ -1556,7 +1556,7 @@ mod tests {
                 "INSERT INTO usage_file_cache(
                     source, path, parser_version, size, mtime_ns, scanned_at_ms,
                     events_blob, deps_blob
-                 ) VALUES ('hermes', ?1, 3, ?2, ?3, 30, ?4, ?5)",
+                 ) VALUES ('hermes', ?1, 6, ?2, ?3, 30, ?4, ?5)",
                 params![
                     db_path.to_string_lossy(),
                     fs::metadata(&db_path).unwrap().len() as i64,
@@ -1565,7 +1565,7 @@ mod tests {
                     postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
                 ],
             )
-            .expect("seed repair-two row");
+            .expect("seed repair-six row");
         drop(cache);
 
         let mut cache = UsageCache::open(&cache_path).expect("reopen cache");
@@ -1597,7 +1597,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("reparsed row");
-        assert_eq!(version, 5);
+        assert_eq!(version, 7);
     }
 
     #[derive(Serialize)]

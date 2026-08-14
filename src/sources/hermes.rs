@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
     index: 1,
-    usage: 5,
+    usage: 7,
 };
 
 pub fn matches_path(path: &str) -> bool {
@@ -124,7 +124,7 @@ fn add_profile_children(root: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn is_state_db(path: &Path) -> bool {
-    path.file_name().and_then(|v| v.to_str()) == Some("state.db")
+    path.is_file() && path.file_name().and_then(|v| v.to_str()) == Some("state.db")
 }
 
 type Row = HashMap<String, Value>;
@@ -653,17 +653,16 @@ mod tests {
         }
 
         let files = discover_from_roots(std::slice::from_ref(&root));
-        assert_eq!(files.len(), blocked_names.len() + 1);
+        assert_eq!(files.len(), blocked_names.len());
         assert!(files.iter().all(|file| {
             file.path.file_name().and_then(|name| name.to_str()) == Some("state.db")
-                && (file.path == root.join("state.db")
-                    || file
-                        .path
-                        .parent()
-                        .and_then(Path::parent)
-                        .and_then(Path::file_name)
-                        .and_then(|name| name.to_str())
-                        == Some("profiles"))
+                && file
+                    .path
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some("profiles")
         }));
     }
 
