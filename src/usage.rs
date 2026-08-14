@@ -1516,12 +1516,12 @@ mod tests {
     }
 
     #[test]
-    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_three() {
-        assert_eq!(crate::sources::hermes::VERSIONS.usage, 5);
+    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_four() {
+        assert_eq!(crate::sources::hermes::VERSIONS.usage, 6);
     }
 
     #[test]
-    fn hermes_parser_version_change_reparses_a_repair_three_cache_row() {
+    fn hermes_parser_version_change_reparses_a_repair_four_cache_row() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("state.db");
         let conn = Connection::open(&db_path).expect("create db");
@@ -1538,7 +1538,7 @@ mod tests {
                 "INSERT INTO usage_file_cache(
                     source, path, parser_version, size, mtime_ns, scanned_at_ms,
                     events_blob, deps_blob
-                 ) VALUES ('hermes', ?1, 4, ?2, ?3, 30, ?4, ?5)",
+                 ) VALUES ('hermes', ?1, 5, ?2, ?3, 30, ?4, ?5)",
                 params![
                     db_path.to_string_lossy(),
                     fs::metadata(&db_path).unwrap().len() as i64,
@@ -1547,7 +1547,7 @@ mod tests {
                     postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
                 ],
             )
-            .expect("seed repair-three row");
+            .expect("seed repair-four row");
         drop(cache);
 
         let mut cache = UsageCache::open(&cache_path).expect("reopen cache");
@@ -1579,7 +1579,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("reparsed row");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[derive(Serialize)]
@@ -1849,7 +1849,10 @@ mod tests {
 
     #[test]
     fn hermes_authoritative_cost_suppresses_auto_repricing() {
-        for (index, model_input) in [10, 12].into_iter().enumerate() {
+        for (index, (model_input, model_cost)) in [(10, None), (12, None), (6, Some(10.0))]
+            .into_iter()
+            .enumerate()
+        {
             let temp = tempfile::tempdir().expect("tempdir");
             let db_path = temp.path().join(format!("authoritative-cost-{index}.db"));
             let conn = Connection::open(&db_path).expect("create db");
@@ -1864,8 +1867,8 @@ mod tests {
             )
             .expect("insert session");
             conn.execute(
-                "INSERT INTO session_model_usage VALUES ('s','gpt-5','openai','task',?1,0,0,0,0,NULL,1000)",
-                [model_input],
+                "INSERT INTO session_model_usage VALUES ('s','gpt-5','openai','task',?1,0,0,0,0,?2,1000)",
+                rusqlite::params![model_input, model_cost],
             )
             .expect("insert model usage");
             drop(conn);
@@ -1878,13 +1881,11 @@ mod tests {
                 .filter_map(|event| event_cost_nanos(event, CostMode::Auto))
                 .sum::<u64>();
             assert_eq!(auto_cost, 10_000_000_000);
-            assert!(events.iter().any(|event| {
-                event
-                    .source_record_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with("model:"))
-                    && event.source_cost_usd == Some(0.0)
-            }));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.source_cost_usd == Some(0.0))
+            );
         }
     }
 

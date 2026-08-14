@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
     index: 1,
-    usage: 5,
+    usage: 6,
 };
 
 pub fn matches_path(path: &str) -> bool {
@@ -124,7 +124,7 @@ fn add_profile_children(root: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn is_state_db(path: &Path) -> bool {
-    path.file_name().and_then(|v| v.to_str()) == Some("state.db")
+    path.is_file() && path.file_name().and_then(|v| v.to_str()) == Some("state.db")
 }
 
 type Row = HashMap<String, Value>;
@@ -292,8 +292,13 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
             authoritative_cost
         } else {
             authoritative_cost.and_then(|authoritative| {
-                (authoritative > attributed_model_cost)
-                    .then_some(authoritative - attributed_model_cost)
+                if authoritative > attributed_model_cost {
+                    Some(authoritative - attributed_model_cost)
+                } else {
+                    // A positive token residual is still covered by the authoritative session
+                    // cost. Preserve an explicit zero so Auto mode does not reprice it.
+                    (!is_zero(&residual)).then_some(0.0)
+                }
             })
         };
         if !is_zero(&residual) || source_cost.is_some() {
@@ -626,6 +631,15 @@ mod tests {
                 PathBuf::from("state.db")
             ]
         );
+    }
+
+    #[test]
+    fn discovery_ignores_roots_and_profiles_without_state_databases() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".hermes");
+        fs::create_dir_all(root.join("profiles/empty")).unwrap();
+
+        assert!(discover_from_roots(&[root]).is_empty());
     }
 
     #[test]
