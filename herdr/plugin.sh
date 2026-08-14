@@ -203,7 +203,7 @@ resume-last)
     refuse "cannot read pane context ($ctx_state); refusing to resume without directory scoping"
   # memex resolves the most recent resumable session and opens it in a new herdr tab itself,
   # driving the herdr CLI with the HERDR_* env this action already carries.
-  args=(herdr resume-last)
+  args=(herdr resume-last --strict-cwd)
   [ -n "$ctx_cwd" ] && args+=(--cwd "$ctx_cwd")
   # MEMEX_ROOT (matching memex-pane.sh) points every memex call at an alternate data directory.
   [ -n "${MEMEX_ROOT:-}" ] && args+=(--root "$MEMEX_ROOT")

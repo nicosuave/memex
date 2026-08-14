@@ -33,7 +33,7 @@ use std::time::Duration;
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, and Copilot",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -119,7 +119,7 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, Pi, OpenClaw, and Copilot conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, and Copilot conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -189,7 +189,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -307,7 +307,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -342,7 +342,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -455,10 +455,13 @@ EXAMPLES:
 enum HerdrCommand {
     /// Resume the most recent resumable session, opening a new herdr tab
     ResumeLast {
-        /// Prefer sessions from this directory (falls back to the global latest)
+        /// Prefer sessions from this directory (falls back to the global latest unless strict)
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Filter by source: claude, codex, cursor, opencode, pi (including Oh My Pi), openclaw, or copilot
+        /// Refuse when no resumable session exists in --cwd instead of using another project
+        #[arg(long)]
+        strict_cwd: bool,
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, or copilot
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -738,15 +741,20 @@ pub fn run() -> Result<()> {
             run_sessions(cwd, project, source, since, limit, json_array, root)?;
         }
         Commands::Herdr { action } => match action {
-            HerdrCommand::ResumeLast { cwd, source, root } => {
-                run_herdr_resume(None, cwd, source, root)?;
+            HerdrCommand::ResumeLast {
+                cwd,
+                strict_cwd,
+                source,
+                root,
+            } => {
+                run_herdr_resume(None, cwd, strict_cwd, source, root)?;
             }
             HerdrCommand::Resume {
                 session_id,
                 source,
                 root,
             } => {
-                run_herdr_resume(Some(session_id), None, source, root)?;
+                run_herdr_resume(Some(session_id), None, false, source, root)?;
             }
         },
         Commands::Stats { root } => {
@@ -2196,6 +2204,7 @@ fn run_sessions(
 fn run_herdr_resume(
     session_id: Option<String>,
     cwd: Option<PathBuf>,
+    strict_cwd: bool,
     source: Option<SourceFilter>,
     root: Option<PathBuf>,
 ) -> Result<()> {
@@ -2211,8 +2220,9 @@ fn run_herdr_resume(
         if rows.is_empty() {
             return Err(anyhow!("session '{session_id}' not found"));
         }
-    } else if rows.is_empty() && cwd_filter.is_some() {
-        // No sessions recorded for this directory; fall back to the global latest.
+    } else if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
+        // The public CLI keeps its historical global fallback unless the Herdr plugin
+        // explicitly requires the focused directory to match.
         rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
     }
 

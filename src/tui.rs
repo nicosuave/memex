@@ -1491,21 +1491,15 @@ impl App {
             let (sources, projects) = (|| -> Result<(Vec<SourceChoice>, Vec<String>)> {
                 let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
                 let labels = store.query_source_labels()?;
-                let sources = [
-                    SourceChoice::Claude,
-                    SourceChoice::Codex,
-                    SourceChoice::Opencode,
-                    SourceChoice::Cursor,
-                    SourceChoice::Pi,
-                    SourceChoice::Copilot,
-                ]
-                .into_iter()
-                .filter(|choice| {
-                    labels
-                        .iter()
-                        .any(|label| source_choice_matches_storage_label(*choice, label))
-                })
-                .collect();
+                let sources = SourceKind::ALL
+                    .into_iter()
+                    .map(SourceChoice::from_source)
+                    .filter(|choice| {
+                        labels
+                            .iter()
+                            .any(|label| source_choice_matches_storage_label(*choice, label))
+                    })
+                    .collect();
                 let rows = store.query_project_timestamps(None, None, grouping)?;
                 let mut latest: HashMap<String, u64> = HashMap::new();
                 for (project, ts) in rows {

@@ -248,6 +248,7 @@ pub(crate) fn parse_index_records_for(
     let source_path = path.to_string_lossy().to_string();
     let mut session_id = session_id_from_path(path);
     let mut project = project_from_path(path);
+    let mut session_timestamp = 0;
     let mut pending_tool_calls = state.pending_tool_calls;
     let mut diagnostics = ParseDiagnostics::default();
 
@@ -261,6 +262,13 @@ pub(crate) fn parse_index_records_for(
                 && let Some(obj) = value.as_object()
                 && obj.get("type").and_then(|v| v.as_str()) == Some("session")
             {
+                if let Some(timestamp) = obj
+                    .get("timestamp")
+                    .map(timestamp_millis)
+                    .filter(|timestamp| *timestamp > 0)
+                {
+                    session_timestamp = timestamp;
+                }
                 apply_session_header(obj, &mut session_id, &mut project);
             }
             buf.clear();
@@ -291,7 +299,7 @@ pub(crate) fn parse_index_records_for(
             }
         };
         let entry_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = obj.get("timestamp").map(timestamp_millis).unwrap_or(0);
+        let entry_timestamp = obj.get("timestamp").map(timestamp_millis).unwrap_or(0);
         let conversation_kind = match entry_type {
             "branch_summary" => "branch",
             "compaction" => "compaction",
@@ -300,9 +308,17 @@ pub(crate) fn parse_index_records_for(
         let mut base_links = base_links(obj, conversation_kind);
 
         if entry_type == "session" {
+            if entry_timestamp > 0 {
+                session_timestamp = entry_timestamp;
+            }
             apply_session_header(obj, &mut session_id, &mut project);
             continue;
         }
+        let timestamp = if entry_timestamp > 0 {
+            entry_timestamp
+        } else {
+            session_timestamp
+        };
 
         if entry_type == "compaction" || entry_type == "branch_summary" {
             let summary = obj
@@ -377,10 +393,14 @@ pub(crate) fn parse_index_records_for(
             Some(m) => m,
             None => continue,
         };
-        let timestamp = if timestamp == 0 {
-            message.get("timestamp").map(timestamp_millis).unwrap_or(0)
+        let timestamp = if entry_timestamp == 0 {
+            message
+                .get("timestamp")
+                .map(timestamp_millis)
+                .filter(|timestamp| *timestamp > 0)
+                .unwrap_or(session_timestamp)
         } else {
-            timestamp
+            entry_timestamp
         };
         let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
         if conversation_kind == "main" {
@@ -686,6 +706,7 @@ pub(crate) fn parse_usage_file_for(
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut session = session_id_from_path(path);
     let mut project = project_from_path(path);
+    let mut session_timestamp = 0;
     let mut current_model = None;
     let mut current_provider = None;
     let mut start = 0usize;
@@ -708,6 +729,13 @@ pub(crate) fn parse_usage_file_for(
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if kind == "session" {
+            if let Some(timestamp) = value
+                .get("timestamp")
+                .map(timestamp_millis)
+                .filter(|timestamp| *timestamp > 0)
+            {
+                session_timestamp = timestamp;
+            }
             apply_session_identity(
                 value.get("id").and_then(|value| value.as_str()),
                 value.get("cwd").and_then(|value| value.as_str()),
@@ -783,7 +811,17 @@ pub(crate) fn parse_usage_file_for(
                 session_id: Some(session.clone()),
                 request_id: None,
                 message_id: borrowed_string(&value, &["id"]),
-                timestamp_ms: value.get("timestamp").map(timestamp_millis).unwrap_or(0),
+                timestamp_ms: value
+                    .get("timestamp")
+                    .map(timestamp_millis)
+                    .filter(|timestamp| *timestamp > 0)
+                    .or_else(|| {
+                        message
+                            .get("timestamp")
+                            .map(timestamp_millis)
+                            .filter(|timestamp| *timestamp > 0)
+                    })
+                    .unwrap_or(session_timestamp),
                 project: Some(project.clone()),
                 provider: borrowed_string(message, &["provider"])
                     .or_else(|| borrowed_string(&value, &["provider"]))

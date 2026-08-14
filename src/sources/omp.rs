@@ -11,10 +11,31 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 };
 
 pub fn matches_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    normalized.contains(".omp/agent/sessions")
-        || (normalized.contains(".omp/profiles/") && normalized.contains("/agent/sessions"))
-        || normalized.contains("omp/sessions")
+    let mut previous = "";
+    let mut two_back = "";
+    let mut three_back = "";
+    let mut four_back = "";
+    for component in path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+    {
+        let root_session = (two_back == ".omp" || two_back == "omp")
+            && previous == "agent"
+            && component == "sessions";
+        let data_session = previous == "omp" && component == "sessions";
+        let profile_session = (four_back == ".omp" || four_back == "omp")
+            && three_back == "profiles"
+            && previous == "agent"
+            && component == "sessions";
+        if root_session || data_session || profile_session {
+            return true;
+        }
+        four_back = three_back;
+        three_back = two_back;
+        two_back = previous;
+        previous = component;
+    }
+    false
 }
 
 fn config_root() -> PathBuf {
@@ -109,6 +130,12 @@ mod tests {
         assert!(matches_path(path));
         assert!(!crate::sources::pi::matches_path(path));
     }
+    #[test]
+    fn omp_profile_paths_are_classified() {
+        let path = "/Users/nico/.local/share/omp/profiles/work/agent/sessions/session.jsonl";
+        assert!(matches_path(path));
+        assert_eq!(crate::types::SourceKind::from_path(path), SourceKind::Omp);
+    }
 
     #[test]
     fn omp_fixture_uses_distinct_source_identity() {
@@ -144,5 +171,37 @@ mod tests {
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].source, "omp");
         assert_eq!(usage[0].session_id.as_deref(), Some("omp-session"));
+    }
+    #[test]
+    fn omp_usage_falls_back_to_session_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("omp.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"omp-session\",\"timestamp\":1786665600000,\"cwd\":\"/workspace/omp-project\"}\n",
+                "{\"type\":\"message\",\"id\":\"assistant-1\",\"timestamp\":0,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"usage\":{\"input\":12,\"output\":8}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ts, 1_786_665_600_000);
+
+        let usage = parse_usage_file(&path).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].timestamp_ms, 1_786_665_600_000);
     }
 }

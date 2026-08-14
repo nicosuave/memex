@@ -799,25 +799,50 @@ impl UsageCache {
             "DELETE FROM usage_file_cache WHERE source = ?1 AND parser_version != ?2",
             params![source, parser_version],
         )?;
-        let mut statement = self.connection.prepare(
-            "SELECT path, size, mtime_ns, scanned_at_ms, events_blob, deps_blob FROM usage_file_cache
-             WHERE source = ?1 AND parser_version = ?2",
-        )?;
-        let rows = statement.query_map(params![source, parser_version], |row| {
-            let deps_blob: Vec<u8> = row.get(5)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                CachedFileRow {
-                    size: row.get::<_, i64>(1)? as u64,
-                    mtime_ns: row.get(2)?,
-                    scanned_at_ms: row.get(3)?,
-                    events_blob: row.get(4)?,
-                    deps: postcard::from_bytes(&deps_blob).unwrap_or_default(),
-                },
-            ))
-        })?;
-        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(Into::into)
+        let mut cached = HashMap::new();
+        let mut invalid_paths = Vec::new();
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT path, size, mtime_ns, scanned_at_ms, events_blob, deps_blob FROM usage_file_cache
+                 WHERE source = ?1 AND parser_version = ?2",
+            )?;
+            let mut rows = statement.query(params![source, parser_version])?;
+            while let Some(row) = rows.next()? {
+                let path: String = row.get(0)?;
+                let size = row.get::<_, i64>(1)? as u64;
+                let mtime_ns = row.get::<_, i64>(2)?;
+                let scanned_at_ms = row.get::<_, i64>(3)?;
+                let Ok(events_blob) = row.get::<_, Vec<u8>>(4) else {
+                    invalid_paths.push(path);
+                    continue;
+                };
+                let Ok(deps_blob) = row.get::<_, Vec<u8>>(5) else {
+                    invalid_paths.push(path);
+                    continue;
+                };
+                let Ok(deps) = postcard::from_bytes(&deps_blob) else {
+                    invalid_paths.push(path);
+                    continue;
+                };
+                cached.insert(
+                    path,
+                    CachedFileRow {
+                        size,
+                        mtime_ns,
+                        scanned_at_ms,
+                        events_blob,
+                        deps,
+                    },
+                );
+            }
+        }
+        for path in invalid_paths {
+            self.connection.execute(
+                "DELETE FROM usage_file_cache WHERE source = ?1 AND path = ?2",
+                params![source, path],
+            )?;
+        }
+        Ok(cached)
     }
 
     fn delete_stale(&mut self, source: &str, stale_paths: &[String]) -> Result<()> {
@@ -1482,6 +1507,67 @@ mod tests {
             .connection
             .query_row(
                 "SELECT count(*) FROM usage_file_cache WHERE source = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+    #[test]
+    fn malformed_dependency_rows_are_quarantined() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('omp', '/tmp/session.jsonl', 1, 10, 20, 30, ?1, ?2)",
+                params![
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    vec![0xff_u8]
+                ],
+            )
+            .expect("seed malformed cache row");
+
+        assert!(cache.load_source("omp", 1).expect("load cache").is_empty());
+        let rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'omp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn malformed_event_rows_are_quarantined() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('omp', '/tmp/session.jsonl', 1, 10, 20, 30, ?1, ?2)",
+                params![
+                    "not a blob",
+                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
+                ],
+            )
+            .expect("seed malformed cache row");
+
+        assert!(cache.load_source("omp", 1).expect("load cache").is_empty());
+        let rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'omp'",
                 [],
                 |row| row.get(0),
             )

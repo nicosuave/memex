@@ -73,6 +73,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
 
+    push(
+        SourceKind::Omp,
+        super::omp::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
     groups
         .into_iter()
         .map(|(kind, files)| audit_files(kind, &deduplicate(files)))

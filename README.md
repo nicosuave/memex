@@ -118,8 +118,8 @@ Index (incremental):
 memex index
 ```
 
-The default Pi scan also includes Oh My Pi sessions from `~/.omp/agent/sessions` and named
-profile session directories.
+The default scan indexes Pi sessions from `~/.pi/agent/sessions` and Oh My Pi sessions
+separately from `~/.omp/agent/sessions` plus named profile session directories.
 
 Plaintext reasoning is excluded by default because it is usually low-value search noise. Opt
 in with `memex index --include-reasoning`; reasoning records remain BM25-only. Encrypted and
@@ -269,7 +269,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi/Oh My Pi) and p
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|openclaw|copilot` (`pi` includes Oh My Pi sessions)
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

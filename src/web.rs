@@ -469,6 +469,7 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "opencode" => Ok(SourceFilter::Opencode),
         "cursor" => Ok(SourceFilter::Cursor),
         "pi" => Ok(SourceFilter::Pi),
+        "omp" => Ok(SourceFilter::Omp),
         "openclaw" | "open-claw" => Ok(SourceFilter::OpenClaw),
         "copilot" => Ok(SourceFilter::Copilot),
         _ => Err(anyhow!("unknown source: {value}")),
@@ -742,6 +743,13 @@ mod tests {
         assert_eq!(request.project.as_deref(), Some("memex"));
         assert_eq!(request.offset, 200);
         assert_eq!(request.limit, 100);
+    }
+    #[test]
+    fn search_request_accepts_omp_source() {
+        let url = parse_url("/api/search?source=omp").unwrap();
+        let request = SearchRequest::from_url(&url).unwrap();
+
+        assert_eq!(request.source, Some(SourceFilter::Omp));
     }
 
     #[test]
