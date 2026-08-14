@@ -405,8 +405,10 @@ fn usage_event(
         model: borrowed_string(value, &["modelID", "model"]),
         tokens,
         source_cost_usd: value.get("cost").and_then(|value| value.as_f64()),
+        cost_authoritative: false,
         dedupe_confidence: "exact",
         conservative_undercount: false,
+        cache_chain_excluded: false,
         sidechain: false,
         source_order: 0,
     })

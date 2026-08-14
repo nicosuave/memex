@@ -112,8 +112,14 @@ pub struct UsageEvent {
     pub model: Option<String>,
     pub tokens: TokenBuckets,
     pub source_cost_usd: Option<f64>,
+    /// A missing source cost is intentionally covered by an authoritative aggregate.
+    #[serde(skip)]
+    pub(crate) cost_authoritative: bool,
     pub dedupe_confidence: &'static str,
     pub conservative_undercount: bool,
+    /// The source row is an aggregate rather than one request in a cache chain.
+    #[serde(skip)]
+    pub(crate) cache_chain_excluded: bool,
     #[serde(skip)]
     pub(crate) sidechain: bool,
     #[serde(skip)]
@@ -355,6 +361,10 @@ fn compute_cache_waste<'a>(
             event.source_path.as_ref()
         };
         let key = (event.source, session_id, thread);
+        if event.cache_chain_excluded {
+            chains.remove(&key);
+            continue;
+        }
         if event.conservative_undercount {
             chains.remove(&key);
             continue;
@@ -653,8 +663,10 @@ struct CachedUsageEvent {
     model: Option<String>,
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
+    cost_authoritative: bool,
     dedupe_confidence: String,
     conservative_undercount: bool,
+    cache_chain_excluded: bool,
     sidechain: bool,
     source_order: u64,
 }
@@ -672,8 +684,10 @@ impl CachedUsageEvent {
             model: event.model.clone(),
             tokens: event.tokens.clone(),
             source_cost_usd: event.source_cost_usd,
+            cost_authoritative: event.cost_authoritative,
             dedupe_confidence: event.dedupe_confidence.to_string(),
             conservative_undercount: event.conservative_undercount,
+            cache_chain_excluded: event.cache_chain_excluded,
             sidechain: event.sidechain,
             source_order: event.source_order,
         }
@@ -693,12 +707,14 @@ impl CachedUsageEvent {
             model: self.model,
             tokens: self.tokens,
             source_cost_usd: self.source_cost_usd,
+            cost_authoritative: self.cost_authoritative,
             dedupe_confidence: match self.dedupe_confidence.as_str() {
                 "exact" => "exact",
                 "strong" => "strong",
                 _ => "heuristic",
             },
             conservative_undercount: self.conservative_undercount,
+            cache_chain_excluded: self.cache_chain_excluded,
             sidechain: self.sidechain,
             source_order: self.source_order,
         }
@@ -1350,7 +1366,7 @@ const fn usd_per_million(value_milli_usd: u64) -> u64 {
     value_milli_usd * 1_000_000
 }
 
-fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
+pub(crate) fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
     let source = event
         .source_cost_usd
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -1360,7 +1376,11 @@ fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
         });
     match mode {
         CostMode::Source => source,
-        CostMode::Auto => source.or_else(|| calculated_cost_nanos(event)),
+        CostMode::Auto => source.or_else(|| {
+            (!event.cost_authoritative)
+                .then(|| calculated_cost_nanos(event))
+                .flatten()
+        }),
         CostMode::Reprice => calculated_cost_nanos(event),
     }
 }
@@ -1515,7 +1535,7 @@ mod tests {
 
     #[test]
     fn hermes_disjoint_usage_parser_version_is_newer_than_repair_two() {
-        assert_eq!(crate::sources::hermes::VERSIONS.usage, 4);
+        assert_eq!(crate::sources::hermes::VERSIONS.usage, 5);
     }
 
     #[test]
@@ -1577,7 +1597,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("reparsed row");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[derive(Serialize)]
@@ -1882,8 +1902,10 @@ mod tests {
                 reasoning: 0,
             },
             source_cost_usd: None,
+            cost_authoritative: false,
             dedupe_confidence: "exact",
             conservative_undercount: false,
+            cache_chain_excluded: false,
             sidechain: false,
             source_order: 0,
         }
@@ -2001,6 +2023,20 @@ mod tests {
             cache_event("s", 60_000, "claude-sonnet-4-6", 0, 100_000, 500),
         ];
         assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn hermes_aggregate_rows_are_excluded_from_cache_chains() {
+        let mut first = cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000);
+        first.source = "hermes";
+        first.source_path = Arc::from("hermes.db");
+        first.cache_chain_excluded = true;
+        let mut second = cache_event("s", 60_000, "claude-sonnet-4-6", 0, 0, 100_500);
+        second.source = "hermes";
+        second.source_path = Arc::from("hermes.db");
+        second.cache_chain_excluded = true;
+        let waste = compute_cache_waste([&first, &second]);
+        assert!(!waste.contains_key("hermes"));
     }
 
     #[test]
@@ -3030,8 +3066,10 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             tokens,
             source_cost_usd: None,
+            cost_authoritative: false,
             dedupe_confidence: "exact",
             conservative_undercount: false,
+            cache_chain_excluded: false,
             sidechain: false,
             source_order: 0,
         };
@@ -3054,12 +3092,40 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             tokens: TokenBuckets::disjoint(100, 0, 0, 0),
             source_cost_usd: Some(0.0),
+            cost_authoritative: false,
             dedupe_confidence: "exact",
             conservative_undercount: false,
+            cache_chain_excluded: false,
             sidechain: false,
             source_order: 0,
         };
         assert_eq!(event_cost_nanos(&event, CostMode::Auto), Some(0));
         assert_eq!(event_cost_nanos(&event, CostMode::Reprice), Some(300_000));
+    }
+
+    #[test]
+    fn implementation_only_event_state_is_absent_from_public_json_and_cached_internally() {
+        let mut event = cache_event("session", 0, "claude-sonnet-4-6", 100, 0, 0);
+        event.cost_authoritative = true;
+        event.cache_chain_excluded = true;
+        event.sidechain = true;
+        event.source_order = 42;
+
+        let json = serde_json::to_value(&event).unwrap();
+        let object = json.as_object().unwrap();
+        assert!(object.contains_key("source"));
+        assert!(object.contains_key("model"));
+        assert!(!object.contains_key("cost_authoritative"));
+        assert!(!object.contains_key("cache_chain_excluded"));
+        assert!(!object.contains_key("sidechain"));
+        assert!(!object.contains_key("source_order"));
+
+        let bytes = postcard::to_stdvec(&CachedUsageEvent::from_event(&event)).unwrap();
+        let cached: CachedUsageEvent = postcard::from_bytes(&bytes).unwrap();
+        assert!(cached.cost_authoritative);
+        assert!(cached.cache_chain_excluded);
+        let restored = cached.into_event("claude", Arc::from("cached"));
+        assert!(restored.cost_authoritative);
+        assert!(restored.cache_chain_excluded);
     }
 }

@@ -488,12 +488,14 @@ fn extract_usage(
                     }),
                 tokens: TokenBuckets::disjoint(input, 0, 0, output),
                 source_cost_usd: None,
+                cost_authoritative: false,
                 dedupe_confidence: if table == "cursorDiskKV" {
                     "exact"
                 } else {
                     "strong"
                 },
                 conservative_undercount: false,
+                cache_chain_excluded: false,
                 sidechain: false,
                 source_order: 0,
             });

@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
     index: 1,
-    usage: 4,
+    usage: 5,
 };
 
 pub fn matches_path(path: &str) -> bool {
@@ -125,26 +125,6 @@ fn add_profile_children(root: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_state_db(path: &Path) -> bool {
     path.file_name().and_then(|v| v.to_str()) == Some("state.db")
-        && !path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some(
-                    "snapshots"
-                        | "snapshot"
-                        | "backups"
-                        | "backup"
-                        | "upgrades"
-                        | "upgrade"
-                        | "sandbox"
-                        | "sandboxes"
-                        | "repo"
-                        | "repos"
-                        | "cron"
-                        | "kanban"
-                        | "verification"
-                )
-            )
-        })
 }
 
 type Row = HashMap<String, Value>;
@@ -154,12 +134,13 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
     let wal_before = crate::sources::UsageDependency::from_path_or_absent(&wal);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open Hermes SQLite database {}", path.display()))?;
-    let tables = table_names(&conn)?;
+    let transaction = conn.unchecked_transaction()?;
+    let tables = table_names(&transaction)?;
     if !tables.contains("sessions") {
         return Err(anyhow!("Hermes database has no sessions table"));
     }
     let sessions = rows(
-        &conn,
+        &transaction,
         "sessions",
         &[
             "id",
@@ -185,7 +166,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
     )?;
     let model_rows = if tables.contains("session_model_usage") {
         rows(
-            &conn,
+            &transaction,
             "session_model_usage",
             &[
                 "session_id",
@@ -241,6 +222,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                     session,
                     aggregate,
                     cost(session),
+                    cost(session).is_some(),
                     true,
                     timestamp(session),
                     0,
@@ -251,6 +233,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
         let mut summed = TokenBuckets::default();
         let mut invalid_model = false;
         let mut attributed_model_cost = 0.0;
+        let authoritative_cost = cost(session);
         let model_event_start = events.len();
         for row in model_rows {
             let raw_current = buckets(row);
@@ -282,6 +265,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                     model,
                     current,
                     source_cost,
+                    authoritative_cost.is_some() && source_cost.is_none(),
                     inconsistent,
                     timestamp(row).max(timestamp(session)),
                     timestamp(row).max(timestamp(session)),
@@ -289,7 +273,6 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
             }
         }
         let residual = subtract(aggregate, summed);
-        let authoritative_cost = cost(session);
         let model_cost_exceeds_authority =
             authoritative_cost.is_some_and(|authoritative| attributed_model_cost > authoritative);
         let reconcile_with_authority =
@@ -297,6 +280,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
         if reconcile_with_authority {
             for event in &mut events[model_event_start..] {
                 event.source_cost_usd = None;
+                event.cost_authoritative = true;
             }
         }
         let source_cost = if reconcile_with_authority {
@@ -315,12 +299,16 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
                 session,
                 residual,
                 source_cost,
+                authoritative_cost.is_some(),
                 true,
                 timestamp(session),
                 timestamp(session),
             ));
         }
     }
+    // Keep sessions and model usage on the same SQLite snapshot. This matters in WAL mode,
+    // where Hermes can commit the aggregate and detail rows independently while we read.
+    transaction.commit()?;
     let wal_after = crate::sources::UsageDependency::from_path_or_absent(&wal);
     Ok(crate::sources::UsageParseOutput {
         events,
@@ -518,6 +506,7 @@ fn event(
     row: &Row,
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
+    cost_authoritative: bool,
     conservative: bool,
     timestamp_ms: u64,
     order: u64,
@@ -535,8 +524,10 @@ fn event(
         model: text(row, "model"),
         tokens,
         source_cost_usd,
+        cost_authoritative,
         dedupe_confidence: "strong",
         conservative_undercount: conservative,
+        cache_chain_excluded: true,
         sidechain: false,
         source_order: order,
     }
@@ -551,6 +542,7 @@ fn model_event(
     model: Option<String>,
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
+    cost_authoritative: bool,
     conservative: bool,
     timestamp_ms: u64,
     order: u64,
@@ -562,6 +554,7 @@ fn model_event(
         row,
         tokens,
         source_cost_usd,
+        cost_authoritative,
         conservative,
         timestamp_ms,
         order,
@@ -618,6 +611,83 @@ mod tests {
     }
 
     #[test]
+    fn discovery_allows_backup_ancestors_and_repo_profile_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup_root = temp.path().join("backup/.hermes");
+        let repo_profile = backup_root.join("profiles/repo");
+        for path in [backup_root.join("state.db"), repo_profile.join("state.db")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+
+        let files = discover_from_roots(&[backup_root]);
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn discovery_allows_any_profile_name_but_not_artifact_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".hermes");
+        let blocked_names = [
+            "backup",
+            "cron",
+            "kanban",
+            "repo",
+            "repos",
+            "sandbox",
+            "sandboxes",
+            "snapshot",
+            "snapshots",
+            "upgrade",
+            "upgrades",
+            "verification",
+        ];
+        for name in blocked_names {
+            for path in [
+                root.join("profiles").join(name).join("state.db"),
+                root.join(name).join("state.db"),
+            ] {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"x").unwrap();
+            }
+        }
+
+        let files = discover_from_roots(std::slice::from_ref(&root));
+        assert_eq!(files.len(), blocked_names.len() + 1);
+        assert!(files.iter().all(|file| {
+            file.path.file_name().and_then(|name| name.to_str()) == Some("state.db")
+                && (file.path == root.join("state.db")
+                    || file
+                        .path
+                        .parent()
+                        .and_then(Path::parent)
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        == Some("profiles"))
+        }));
+    }
+
+    #[test]
+    fn explicit_profile_root_discovers_only_that_profile_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profiles/verification");
+        let sibling = temp.path().join("profiles/backup");
+        for path in [profile.join("state.db"), sibling.join("state.db")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+
+        let files = discover_from_roots(std::slice::from_ref(&profile));
+        assert_eq!(
+            files,
+            vec![SourceFile {
+                source: SourceKind::Hermes,
+                path: profile.join("state.db")
+            }]
+        );
+    }
+
+    #[test]
     fn legacy_sessions_are_aggregates_and_ignore_transcript_tables() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
@@ -654,6 +724,136 @@ mod tests {
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].tokens.raw_input, 1);
         drop(conn);
+    }
+
+    #[test]
+    fn session_only_aggregate_without_cost_can_use_catalog_pricing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session-only.db");
+        db(&path, false);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','claude-sonnet-4-6',1000,100,0,0,0,0,'anthropic',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let event = &parse_usage_file(&path).unwrap().events[0];
+        assert!(!event.cost_authoritative);
+        assert_eq!(
+            crate::usage::event_cost_nanos(event, crate::usage::CostMode::Source),
+            None
+        );
+        assert!(crate::usage::event_cost_nanos(event, crate::usage::CostMode::Auto).is_some());
+    }
+
+    #[test]
+    fn positive_residual_without_session_cost_can_use_catalog_pricing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("residual.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','claude-sonnet-4-6',1000,100,0,0,0,0,'anthropic',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','claude-sonnet-4-6','anthropic','task',40,0,0,0,0,NULL,1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let residual = parse_usage_file(&path)
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|event| event.source_record_id.as_deref() == Some("session:s:residual"))
+            .unwrap();
+        assert!(!residual.cost_authoritative);
+        assert_eq!(
+            crate::usage::event_cost_nanos(&residual, crate::usage::CostMode::Source),
+            None
+        );
+        assert!(crate::usage::event_cost_nanos(&residual, crate::usage::CostMode::Auto).is_some());
+    }
+
+    #[test]
+    fn capped_mixed_rows_without_session_cost_can_use_catalog_pricing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("capped-mixed.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','claude-sonnet-4-6',1000,100,0,0,0,0,'anthropic',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','claude-sonnet-4-6','anthropic','priced',80,0,0,0,0,1.0,1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','claude-sonnet-4-6','anthropic','capped',80,0,0,0,0,NULL,1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = parse_usage_file(&path).unwrap().events;
+        let capped = events
+            .iter()
+            .find(|event| event.conservative_undercount)
+            .unwrap();
+        assert!(!capped.cost_authoritative);
+        assert_eq!(
+            crate::usage::event_cost_nanos(capped, crate::usage::CostMode::Source),
+            None
+        );
+        assert!(crate::usage::event_cost_nanos(capped, crate::usage::CostMode::Auto).is_some());
+    }
+
+    #[test]
+    fn read_transaction_keeps_aggregate_tables_on_one_wal_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        db(&path, true);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let transaction = reader.unchecked_transaction().unwrap();
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        writer
+            .execute(
+                "INSERT INTO sessions VALUES ('s','m',1000,1,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+                [],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO session_model_usage VALUES ('s','m','p','task',1,0,0,0,0,NULL,1000)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            transaction
+                .query_row("SELECT COUNT(*) FROM session_model_usage", [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        transaction.commit().unwrap();
     }
 
     #[test]
@@ -747,6 +947,23 @@ mod tests {
                     .sum::<f64>(),
                 10.0
             );
+            for mode in [crate::usage::CostMode::Auto, crate::usage::CostMode::Source] {
+                let total = events
+                    .iter()
+                    .filter_map(|event| crate::usage::event_cost_nanos(event, mode))
+                    .sum::<u64>();
+                assert_eq!(total, 10_000_000_000, "{mode:?}");
+            }
+            assert!(
+                events
+                    .iter()
+                    .filter(|event| event
+                        .source_record_id
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("model:"))
+                    .all(|event| event.cost_authoritative)
+            );
         }
     }
 
@@ -758,12 +975,12 @@ mod tests {
             db(&path, true);
             let conn = Connection::open(&path).unwrap();
             conn.execute(
-                "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',10.0,'/work','/repo','prof')",
+                "INSERT INTO sessions VALUES ('s','claude-sonnet-4-6',1000,10,0,0,0,0,'anthropic',10.0,'/work','/repo','prof')",
                 [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO session_model_usage VALUES ('s','m','p','task',10,0,0,0,0,?1,1000)",
+                "INSERT INTO session_model_usage VALUES ('s','claude-sonnet-4-6','anthropic','task',10,0,0,0,0,?1,1000)",
                 [model_cost],
             )
             .unwrap();
@@ -835,6 +1052,10 @@ mod tests {
             assert_eq!(model.tokens.raw_input, 10);
             assert_eq!(model.source_cost_usd, expected_model_cost);
             assert_eq!(
+                model.cost_authoritative,
+                session_cost.is_some() && expected_model_cost.is_none()
+            );
+            assert_eq!(
                 residual.and_then(|event| event.source_cost_usd),
                 expected_residual
             );
@@ -845,6 +1066,58 @@ mod tests {
                     .sum::<f64>(),
                 session_cost.or(model_cost).unwrap_or(0.0)
             );
+            if let Some(session_cost) = session_cost {
+                for mode in [crate::usage::CostMode::Auto, crate::usage::CostMode::Source] {
+                    let total = events
+                        .iter()
+                        .filter_map(|event| crate::usage::event_cost_nanos(event, mode))
+                        .sum::<u64>();
+                    assert_eq!(total, (session_cost * 1_000_000_000.0) as u64, "{mode:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_priced_model_followed_by_capped_row_reconciles_authoritative_cost() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("valid-priced-capped.db");
+        db(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','fallback',1000,10,0,0,0,0,'p',5.0,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m1','p','priced',8,0,0,0,0,2.0,1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_model_usage VALUES ('s','m2','p','capped',8,0,0,0,0,NULL,1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let events = parse_usage_file(&path).unwrap().events;
+        assert!(
+            events
+                .iter()
+                .filter(|event| event
+                    .source_record_id
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("model:"))
+                .all(|event| event.cost_authoritative)
+        );
+        for mode in [crate::usage::CostMode::Auto, crate::usage::CostMode::Source] {
+            let total = events
+                .iter()
+                .filter_map(|event| crate::usage::event_cost_nanos(event, mode))
+                .sum::<u64>();
+            assert_eq!(total, 5_000_000_000, "{mode:?}");
         }
     }
 

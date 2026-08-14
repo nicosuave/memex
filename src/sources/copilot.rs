@@ -680,8 +680,10 @@ fn extract_usage(
                         .max(attribute_u64(attributes, "gen_ai.usage.reasoning_tokens")),
                 ),
                 source_cost_usd: None,
+                cost_authoritative: false,
                 dedupe_confidence: "exact",
                 conservative_undercount: false,
+                cache_chain_excluded: false,
                 sidechain: false,
                 source_order: index,
             });
