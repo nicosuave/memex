@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
     index: 1,
-    usage: 4,
+    usage: 5,
 };
 
 pub fn matches_path(path: &str) -> bool {
@@ -125,26 +125,6 @@ fn add_profile_children(root: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_state_db(path: &Path) -> bool {
     path.file_name().and_then(|v| v.to_str()) == Some("state.db")
-        && !path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some(
-                    "snapshots"
-                        | "snapshot"
-                        | "backups"
-                        | "backup"
-                        | "upgrades"
-                        | "upgrade"
-                        | "sandbox"
-                        | "sandboxes"
-                        | "repo"
-                        | "repos"
-                        | "cron"
-                        | "kanban"
-                        | "verification"
-                )
-            )
-        })
 }
 
 type Row = HashMap<String, Value>;
@@ -154,12 +134,15 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
     let wal_before = crate::sources::UsageDependency::from_path_or_absent(&wal);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open Hermes SQLite database {}", path.display()))?;
-    let tables = table_names(&conn)?;
+    // Keep session totals and their model/task breakdowns on the same SQLite snapshot. Hermes
+    // may append to both tables while a scan is in progress.
+    let transaction = conn.unchecked_transaction()?;
+    let tables = table_names(&transaction)?;
     if !tables.contains("sessions") {
         return Err(anyhow!("Hermes database has no sessions table"));
     }
     let sessions = rows(
-        &conn,
+        &transaction,
         "sessions",
         &[
             "id",
@@ -185,7 +168,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
     )?;
     let model_rows = if tables.contains("session_model_usage") {
         rows(
-            &conn,
+            &transaction,
             "session_model_usage",
             &[
                 "session_id",
@@ -219,6 +202,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
     } else {
         Vec::new()
     };
+    transaction.rollback()?;
     let mut by_session: HashMap<String, Vec<&Row>> = HashMap::new();
     for row in &model_rows {
         if let Some(id) = text(row, "session_id") {
@@ -294,9 +278,14 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParse
             authoritative_cost.is_some_and(|authoritative| attributed_model_cost > authoritative);
         let reconcile_with_authority =
             authoritative_cost.is_some() && (invalid_model || model_cost_exceeds_authority);
-        if reconcile_with_authority {
+        if authoritative_cost.is_some() {
             for event in &mut events[model_event_start..] {
-                event.source_cost_usd = None;
+                if reconcile_with_authority || event.source_cost_usd.is_none() {
+                    // An explicit zero suppresses CostMode::Auto's catalog fallback. The
+                    // authoritative session residual carries the portion not attributed to a
+                    // model row, so repricing this event would double count it.
+                    event.source_cost_usd = Some(0.0);
+                }
             }
         }
         let source_cost = if reconcile_with_authority {
@@ -618,6 +607,28 @@ mod tests {
     }
 
     #[test]
+    fn discovery_allows_reserved_names_outside_and_inside_profile_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups/.hermes");
+        for path in [root.join("state.db"), root.join("profiles/repo/state.db")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+
+        let files = discover_from_roots(std::slice::from_ref(&root));
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.strip_prefix(&root).unwrap().to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("profiles/repo/state.db"),
+                PathBuf::from("state.db")
+            ]
+        );
+    }
+
+    #[test]
     fn legacy_sessions_are_aggregates_and_ignore_transcript_tables() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
@@ -722,7 +733,7 @@ mod tests {
                     .as_deref()
                     .unwrap()
                     .starts_with("model:")
-                    || event.source_cost_usd.is_none()
+                    || event.source_cost_usd == Some(0.0)
             }));
             assert_eq!(
                 events
@@ -793,11 +804,11 @@ mod tests {
     fn authoritative_session_cost_reconciles_model_cost_matrix() {
         for (index, (session_cost, model_cost, expected_model_cost, expected_residual)) in [
             (None, Some(6.0), Some(6.0), None),
-            (Some(0.0), Some(6.0), None, Some(0.0)),
-            (Some(5.0), Some(6.0), None, Some(5.0)),
+            (Some(0.0), Some(6.0), Some(0.0), Some(0.0)),
+            (Some(5.0), Some(6.0), Some(0.0), Some(5.0)),
             (Some(6.0), Some(6.0), Some(6.0), None),
             (Some(10.0), Some(6.0), Some(6.0), Some(4.0)),
-            (Some(10.0), None, None, Some(10.0)),
+            (Some(10.0), None, Some(0.0), Some(10.0)),
         ]
         .into_iter()
         .enumerate()

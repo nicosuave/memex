@@ -339,7 +339,9 @@ fn compute_cache_waste<'a>(
     let mut chains: HashMap<(&'a str, &'a str, &'a str), CacheChainState<'a>> = HashMap::new();
     let mut by_source: HashMap<&'static str, CacheWaste> = HashMap::new();
     for event in events {
-        if event.sidechain {
+        // Hermes exposes session/model aggregates rather than an ordered request stream, so
+        // chaining its rows would fabricate prompt-cache misses.
+        if event.sidechain || event.source == "hermes" {
             continue;
         }
         let Some(session_id) = event.session_id.as_deref() else {
@@ -1514,12 +1516,12 @@ mod tests {
     }
 
     #[test]
-    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_two() {
-        assert_eq!(crate::sources::hermes::VERSIONS.usage, 4);
+    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_three() {
+        assert_eq!(crate::sources::hermes::VERSIONS.usage, 5);
     }
 
     #[test]
-    fn hermes_parser_version_change_reparses_a_repair_two_cache_row() {
+    fn hermes_parser_version_change_reparses_a_repair_three_cache_row() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("state.db");
         let conn = Connection::open(&db_path).expect("create db");
@@ -1536,7 +1538,7 @@ mod tests {
                 "INSERT INTO usage_file_cache(
                     source, path, parser_version, size, mtime_ns, scanned_at_ms,
                     events_blob, deps_blob
-                 ) VALUES ('hermes', ?1, 3, ?2, ?3, 30, ?4, ?5)",
+                 ) VALUES ('hermes', ?1, 4, ?2, ?3, 30, ?4, ?5)",
                 params![
                     db_path.to_string_lossy(),
                     fs::metadata(&db_path).unwrap().len() as i64,
@@ -1545,7 +1547,7 @@ mod tests {
                     postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
                 ],
             )
-            .expect("seed repair-two row");
+            .expect("seed repair-three row");
         drop(cache);
 
         let mut cache = UsageCache::open(&cache_path).expect("reopen cache");
@@ -1577,7 +1579,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("reparsed row");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[derive(Serialize)]
@@ -1846,6 +1848,47 @@ mod tests {
     }
 
     #[test]
+    fn hermes_authoritative_cost_suppresses_auto_repricing() {
+        for (index, model_input) in [10, 12].into_iter().enumerate() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let db_path = temp.path().join(format!("authoritative-cost-{index}.db"));
+            let conn = Connection::open(&db_path).expect("create db");
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT, model TEXT, started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT, estimated_cost_usd REAL, cwd TEXT, git_repo_root TEXT, profile_name TEXT);
+                 CREATE TABLE session_model_usage (session_id TEXT, model TEXT, billing_provider TEXT, task TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, estimated_cost_usd REAL, first_seen INTEGER);",
+            )
+            .expect("create Hermes tables");
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s','gpt-5',1000,10,0,0,0,0,'openai',10.0,'/work','/repo','prof')",
+                [],
+            )
+            .expect("insert session");
+            conn.execute(
+                "INSERT INTO session_model_usage VALUES ('s','gpt-5','openai','task',?1,0,0,0,0,NULL,1000)",
+                [model_input],
+            )
+            .expect("insert model usage");
+            drop(conn);
+
+            let events = crate::sources::hermes::parse_usage_file(&db_path)
+                .expect("parse Hermes usage")
+                .events;
+            let auto_cost = events
+                .iter()
+                .filter_map(|event| event_cost_nanos(event, CostMode::Auto))
+                .sum::<u64>();
+            assert_eq!(auto_cost, 10_000_000_000);
+            assert!(events.iter().any(|event| {
+                event
+                    .source_record_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("model:"))
+                    && event.source_cost_usd == Some(0.0)
+            }));
+        }
+    }
+
+    #[test]
     fn openai_cached_input_is_a_subset() {
         let tokens = TokenBuckets::codex(100, 80, 10, 4);
         assert_eq!(tokens.uncached_input, 20);
@@ -2053,6 +2096,16 @@ mod tests {
             .expect("miss counted");
         assert_eq!(waste.miss_count, 1);
         assert_eq!(waste.idle_misses, 1);
+    }
+
+    #[test]
+    fn cache_hermes_aggregates_are_excluded() {
+        let mut first = cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000);
+        first.source = "hermes";
+        let mut second = cache_event("s", 10 * 60 * 1000, "claude-sonnet-4-6", 0, 0, 100_500);
+        second.source = "hermes";
+
+        assert!(compute_cache_waste([&first, &second]).is_empty());
     }
 
     #[test]
