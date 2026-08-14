@@ -736,6 +736,27 @@ struct CachedFileRow {
 type FileParse = crate::sources::UsageParseOutput;
 type UsageFileDep = crate::sources::UsageDependency;
 
+/// Dependency representation written before native path bytes were persisted.
+#[derive(Serialize, Deserialize)]
+struct LegacyUsageFileDep {
+    path: String,
+    size: u64,
+    mtime_ns: i64,
+    exists: bool,
+}
+
+impl From<LegacyUsageFileDep> for UsageFileDep {
+    fn from(dependency: LegacyUsageFileDep) -> Self {
+        Self {
+            native_path: dependency.path.as_bytes().to_vec(),
+            path: dependency.path,
+            size: dependency.size,
+            mtime_ns: dependency.mtime_ns,
+            exists: dependency.exists,
+        }
+    }
+}
+
 struct ParsedUsageFile {
     index: usize,
     path: PathBuf,
@@ -833,7 +854,12 @@ impl UsageCache {
                     invalid_paths.push(path);
                     continue;
                 };
-                let Ok(deps) = postcard::from_bytes(&deps_blob) else {
+                let deps = postcard::from_bytes::<Vec<UsageFileDep>>(&deps_blob).or_else(|_| {
+                    postcard::from_bytes::<Vec<LegacyUsageFileDep>>(&deps_blob).map(
+                        |dependencies| dependencies.into_iter().map(UsageFileDep::from).collect(),
+                    )
+                });
+                let Ok(deps) = deps else {
                     invalid_paths.push(path);
                     continue;
                 };
@@ -1598,6 +1624,51 @@ mod tests {
             )
             .expect("reparsed row");
         assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn previous_dependency_postcard_format_loads_with_native_path_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("rollout.jsonl");
+        let dependency_path = temp.path().join("parent.jsonl");
+        fs::write(&source_path, "source").expect("write source");
+        fs::write(&dependency_path, "dependency").expect("write dependency");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        let source_metadata = usage_file_metadata(&source_path).expect("source metadata");
+        let dependency_metadata = usage_file_metadata(&dependency_path).expect("dep metadata");
+        let source_key = source_path.to_string_lossy().to_string();
+        let dependency_key = dependency_path.to_string_lossy().to_string();
+        let legacy = vec![LegacyUsageFileDep {
+            path: dependency_key.clone(),
+            size: dependency_metadata.0,
+            mtime_ns: dependency_metadata.1,
+            exists: true,
+        }];
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, ?3, ?4, 30, ?5, ?6)",
+                params![
+                    source_key,
+                    crate::sources::codex::VERSIONS.usage,
+                    source_metadata.0 as i64,
+                    source_metadata.1,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    postcard::to_stdvec(&legacy).unwrap()
+                ],
+            )
+            .expect("seed previous dependency format");
+
+        let loaded = cache
+            .load_source("codex", crate::sources::codex::VERSIONS.usage)
+            .expect("load previous dependency format");
+        let dependency = &loaded[&source_key].deps[0];
+        assert_eq!(dependency.native_path, dependency_key.as_bytes());
+        assert!(dependency.is_current());
     }
 
     #[derive(Serialize)]

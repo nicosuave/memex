@@ -130,7 +130,9 @@ fn is_state_db(path: &Path) -> bool {
 type Row = HashMap<String, Value>;
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<crate::sources::UsageParseOutput> {
-    let wal = PathBuf::from(format!("{}-wal", path.to_string_lossy()));
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let wal = PathBuf::from(wal);
     let wal_before = crate::sources::UsageDependency::from_path_or_absent(&wal);
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open Hermes SQLite database {}", path.display()))?;
@@ -570,6 +572,8 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     fn db(path: &Path, model_usage: bool) {
         let conn = Connection::open(path).unwrap();
@@ -722,6 +726,38 @@ mod tests {
         let parsed = parse_usage_file(&path).unwrap();
         assert_eq!(parsed.events.len(), 1);
         assert_eq!(parsed.events[0].tokens.raw_input, 1);
+        drop(conn);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_dependency_preserves_invalid_utf8_path_bytes_and_invalidates_on_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_directory = std::ffi::OsString::from_vec(b"profile-\xFF".to_vec());
+        let directory = temp.path().join(invalid_directory);
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("state.db");
+        db(&path, false);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s','m',1000,1,0,0,0,0,'p',NULL,'/work','/repo','prof')",
+            [],
+        )
+        .unwrap();
+
+        let parsed = parse_usage_file(&path).unwrap();
+        let dependency = parsed.deps.first().unwrap();
+        let mut wal_name = path.file_name().unwrap().to_os_string();
+        wal_name.push("-wal");
+        let wal = path.with_file_name(wal_name);
+        assert!(wal.as_os_str().as_bytes().contains(&0xFF));
+        assert_eq!(dependency.native_path, wal.as_os_str().as_bytes());
+        assert!(dependency.is_current());
+
+        fs::write(&wal, b"changed").unwrap();
+        assert!(!dependency.is_current());
         drop(conn);
     }
 
@@ -1383,6 +1419,7 @@ mod tests {
     fn wal_change_during_read_makes_parse_output_non_cacheable() {
         let before = crate::sources::UsageDependency {
             path: "state.db-wal".to_string(),
+            native_path: b"state.db-wal".to_vec(),
             size: 10,
             mtime_ns: 1,
             exists: true,

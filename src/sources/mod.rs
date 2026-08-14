@@ -20,6 +20,10 @@ use crate::types::SourceKind;
 use crate::usage::UsageEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -153,12 +157,35 @@ impl ParseDiagnostics {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct UsageDependency {
     pub path: String,
+    pub native_path: Vec<u8>,
     pub size: u64,
     pub mtime_ns: i64,
     pub exists: bool,
 }
 
 impl UsageDependency {
+    fn native_path(path: &Path) -> Vec<u8> {
+        #[cfg(unix)]
+        {
+            path.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            path.to_string_lossy().as_bytes().to_vec()
+        }
+    }
+
+    fn path_from_native(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            PathBuf::from(OsString::from_vec(self.native_path.clone()))
+        }
+        #[cfg(not(unix))]
+        {
+            PathBuf::from(String::from_utf8_lossy(&self.native_path).into_owned())
+        }
+    }
+
     pub fn from_path(path: &Path) -> std::io::Result<Self> {
         let metadata = path.metadata()?;
         let mtime_ns = metadata
@@ -169,6 +196,7 @@ impl UsageDependency {
             .min(i64::MAX as u128) as i64;
         Ok(Self {
             path: path.to_string_lossy().to_string(),
+            native_path: Self::native_path(path),
             size: metadata.len(),
             mtime_ns,
             exists: true,
@@ -178,6 +206,7 @@ impl UsageDependency {
     pub fn from_path_or_absent(path: &Path) -> Self {
         Self::from_path(path).unwrap_or_else(|_| Self {
             path: path.to_string_lossy().to_string(),
+            native_path: Self::native_path(path),
             size: 0,
             mtime_ns: 0,
             exists: false,
@@ -185,7 +214,7 @@ impl UsageDependency {
     }
 
     pub fn is_current(&self) -> bool {
-        Self::from_path_or_absent(Path::new(&self.path)) == *self
+        Self::from_path_or_absent(&self.path_from_native()) == *self
     }
 }
 
