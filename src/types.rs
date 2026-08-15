@@ -13,10 +13,11 @@ pub enum SourceKind {
     OpenClaw,
     Copilot,
     Omp,
+    Hermes,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 8] = [
+    pub const ALL: [SourceKind; 9] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -25,6 +26,7 @@ impl SourceKind {
         SourceKind::OpenClaw,
         SourceKind::Copilot,
         SourceKind::Omp,
+        SourceKind::Hermes,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -38,6 +40,7 @@ impl SourceKind {
             SourceKind::OpenClaw => 5,
             SourceKind::Copilot => 6,
             SourceKind::Omp => 7,
+            SourceKind::Hermes => 8,
         }
     }
 
@@ -51,6 +54,7 @@ impl SourceKind {
             5 => Some(SourceKind::OpenClaw),
             6 => Some(SourceKind::Copilot),
             7 => Some(SourceKind::Omp),
+            8 => Some(SourceKind::Hermes),
             _ => None,
         }
     }
@@ -65,11 +69,22 @@ impl SourceKind {
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
             SourceKind::Omp => "omp",
+            SourceKind::Hermes => "hermes",
         }
     }
 
     pub fn storage_label(self) -> &'static str {
-        self.label()
+        match self {
+            SourceKind::Claude => "claude",
+            SourceKind::Codex => "codex",
+            SourceKind::Opencode => "opencode",
+            SourceKind::Cursor => "cursor",
+            SourceKind::Pi => "pi",
+            SourceKind::OpenClaw => "openclaw",
+            SourceKind::Copilot => "copilot",
+            SourceKind::Omp => "omp",
+            SourceKind::Hermes => "hermes",
+        }
     }
 
     pub fn from_path(path: &str) -> Self {
@@ -86,6 +101,7 @@ impl SourceKind {
             "openclaw" => Some(SourceKind::OpenClaw),
             "copilot" => Some(SourceKind::Copilot),
             "omp" => Some(SourceKind::Omp),
+            "hermes" => Some(SourceKind::Hermes),
             _ => None,
         }
     }
@@ -104,11 +120,22 @@ pub enum SourceFilter {
     OpenClaw,
     Copilot,
     Omp,
+    Hermes,
 }
 
 impl SourceFilter {
     pub fn matches(self, source: SourceKind) -> bool {
-        source.label() == self.as_str()
+        match self {
+            SourceFilter::Claude => source == SourceKind::Claude,
+            SourceFilter::Codex => source == SourceKind::Codex,
+            SourceFilter::Opencode => source == SourceKind::Opencode,
+            SourceFilter::Cursor => source == SourceKind::Cursor,
+            SourceFilter::Pi => source == SourceKind::Pi,
+            SourceFilter::OpenClaw => source == SourceKind::OpenClaw,
+            SourceFilter::Copilot => source == SourceKind::Copilot,
+            SourceFilter::Omp => source == SourceKind::Omp,
+            SourceFilter::Hermes => source == SourceKind::Hermes,
+        }
     }
 
     pub fn storage_labels(self) -> &'static [&'static str] {
@@ -121,6 +148,7 @@ impl SourceFilter {
             SourceFilter::OpenClaw => &["openclaw"],
             SourceFilter::Copilot => &["copilot"],
             SourceFilter::Omp => &["omp"],
+            SourceFilter::Hermes => &["hermes"],
         }
     }
 
@@ -134,6 +162,7 @@ impl SourceFilter {
             SourceFilter::OpenClaw => "openclaw",
             SourceFilter::Copilot => "copilot",
             SourceFilter::Omp => "omp",
+            SourceFilter::Hermes => "hermes",
         }
     }
 }
@@ -198,6 +227,20 @@ mod tests {
             assert!(labels.insert(source.storage_label()));
             assert_eq!(SourceKind::from_label(source.storage_label()), Some(source));
         }
+    }
+
+    #[test]
+    fn hermes_is_a_stable_first_class_source() {
+        assert_eq!(SourceKind::Hermes.label(), "hermes");
+        assert_eq!(SourceKind::Hermes.storage_label(), "hermes");
+        assert_eq!(SourceKind::from_label("hermes"), Some(SourceKind::Hermes));
+        assert_eq!(
+            SourceKind::from_idx(SourceKind::Hermes.idx()),
+            Some(SourceKind::Hermes)
+        );
+        assert!(SourceFilter::Hermes.matches(SourceKind::Hermes));
+        assert_eq!(SourceFilter::Hermes.as_str(), "hermes");
+        assert_eq!(SourceFilter::Hermes.storage_labels(), &["hermes"]);
     }
 
     #[test]

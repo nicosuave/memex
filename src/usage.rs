@@ -112,8 +112,14 @@ pub struct UsageEvent {
     pub model: Option<String>,
     pub tokens: TokenBuckets,
     pub source_cost_usd: Option<f64>,
+    /// A missing source cost is intentionally covered by an authoritative aggregate.
+    #[serde(skip)]
+    pub(crate) cost_authoritative: bool,
     pub dedupe_confidence: &'static str,
     pub conservative_undercount: bool,
+    /// The source row is an aggregate rather than one request in a cache chain.
+    #[serde(skip)]
+    pub(crate) cache_chain_excluded: bool,
     #[serde(skip)]
     pub(crate) sidechain: bool,
     #[serde(skip)]
@@ -355,6 +361,10 @@ fn compute_cache_waste<'a>(
             event.source_path.as_ref()
         };
         let key = (event.source, session_id, thread);
+        if event.cache_chain_excluded {
+            chains.remove(&key);
+            continue;
+        }
         if event.conservative_undercount {
             chains.remove(&key);
             continue;
@@ -503,7 +513,7 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 8] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 9] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
@@ -512,6 +522,7 @@ fn assemble_usage_events(
         (SourceFilter::OpenClaw, scan_openclaw),
         (SourceFilter::Cursor, scan_cursor),
         (SourceFilter::Copilot, scan_copilot),
+        (SourceFilter::Hermes, scan_hermes),
     ];
     for (filter, scanner) in SCANNERS {
         if source.is_none_or(|selected| selected == filter) {
@@ -653,8 +664,10 @@ struct CachedUsageEvent {
     model: Option<String>,
     tokens: TokenBuckets,
     source_cost_usd: Option<f64>,
+    cost_authoritative: bool,
     dedupe_confidence: String,
     conservative_undercount: bool,
+    cache_chain_excluded: bool,
     sidechain: bool,
     source_order: u64,
 }
@@ -672,8 +685,10 @@ impl CachedUsageEvent {
             model: event.model.clone(),
             tokens: event.tokens.clone(),
             source_cost_usd: event.source_cost_usd,
+            cost_authoritative: event.cost_authoritative,
             dedupe_confidence: event.dedupe_confidence.to_string(),
             conservative_undercount: event.conservative_undercount,
+            cache_chain_excluded: event.cache_chain_excluded,
             sidechain: event.sidechain,
             source_order: event.source_order,
         }
@@ -693,12 +708,14 @@ impl CachedUsageEvent {
             model: self.model,
             tokens: self.tokens,
             source_cost_usd: self.source_cost_usd,
+            cost_authoritative: self.cost_authoritative,
             dedupe_confidence: match self.dedupe_confidence.as_str() {
                 "exact" => "exact",
                 "strong" => "strong",
                 _ => "heuristic",
             },
             conservative_undercount: self.conservative_undercount,
+            cache_chain_excluded: self.cache_chain_excluded,
             sidechain: self.sidechain,
             source_order: self.source_order,
         }
@@ -719,6 +736,27 @@ struct CachedFileRow {
 
 type FileParse = crate::sources::UsageParseOutput;
 type UsageFileDep = crate::sources::UsageDependency;
+
+/// Dependency representation written before native path bytes were persisted.
+#[derive(Serialize, Deserialize)]
+struct LegacyUsageFileDep {
+    path: String,
+    size: u64,
+    mtime_ns: i64,
+    exists: bool,
+}
+
+impl From<LegacyUsageFileDep> for UsageFileDep {
+    fn from(dependency: LegacyUsageFileDep) -> Self {
+        Self {
+            native_path: dependency.path.as_bytes().to_vec(),
+            path: dependency.path,
+            size: dependency.size,
+            mtime_ns: dependency.mtime_ns,
+            exists: dependency.exists,
+        }
+    }
+}
 
 struct ParsedUsageFile {
     index: usize,
@@ -820,7 +858,12 @@ impl UsageCache {
                     invalid_paths.push(path);
                     continue;
                 };
-                let Ok(deps) = postcard::from_bytes(&deps_blob) else {
+                let deps = postcard::from_bytes::<Vec<UsageFileDep>>(&deps_blob).or_else(|_| {
+                    postcard::from_bytes::<Vec<LegacyUsageFileDep>>(&deps_blob).map(
+                        |dependencies| dependencies.into_iter().map(UsageFileDep::from).collect(),
+                    )
+                });
+                let Ok(deps) = deps else {
                     invalid_paths.push(path);
                     continue;
                 };
@@ -1336,6 +1379,30 @@ fn scan_copilot(
     Ok(())
 }
 
+fn scan_hermes(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::hermes::discover()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    scan_files_cached(
+        SourceScan {
+            source: "hermes",
+            parser_version: crate::sources::hermes::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        crate::sources::hermes::parse_usage_file,
+    );
+    Ok(())
+}
+
 // Rates are nano-USD per million tokens. The catalog is deliberately small and versioned:
 // unknown models remain unpriced instead of silently inheriting a guessed family rate.
 const PRICE_CATALOG_ID: &str = "official-api-prices-2026-07-15";
@@ -1353,7 +1420,7 @@ const fn usd_per_million(value_milli_usd: u64) -> u64 {
     value_milli_usd * 1_000_000
 }
 
-fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
+pub(crate) fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
     let source = event
         .source_cost_usd
         .filter(|value| value.is_finite() && *value >= 0.0)
@@ -1363,7 +1430,11 @@ fn event_cost_nanos(event: &UsageEvent, mode: CostMode) -> Option<u64> {
         });
     match mode {
         CostMode::Source => source,
-        CostMode::Auto => source.or_else(|| calculated_cost_nanos(event)),
+        CostMode::Auto => source.or_else(|| {
+            (!event.cost_authoritative)
+                .then(|| calculated_cost_nanos(event))
+                .flatten()
+        }),
         CostMode::Reprice => calculated_cost_nanos(event),
     }
 }
@@ -1477,6 +1548,8 @@ fn claude_rates(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn usage_parser_version_change_invalidates_cached_rows() {
@@ -1576,6 +1649,383 @@ mod tests {
     }
 
     #[test]
+    fn hermes_disjoint_usage_parser_version_is_newer_than_repair_six() {
+        assert_eq!(crate::sources::hermes::VERSIONS.usage, 7);
+    }
+
+    #[test]
+    fn hermes_parser_version_change_reparses_a_repair_six_cache_row() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("state.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, model TEXT, started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT, estimated_cost_usd REAL, cwd TEXT, git_repo_root TEXT, profile_name TEXT);",
+        )
+        .expect("create sessions");
+        drop(conn);
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('hermes', ?1, 6, ?2, ?3, 30, ?4, ?5)",
+                params![
+                    db_path.to_string_lossy(),
+                    fs::metadata(&db_path).unwrap().len() as i64,
+                    usage_file_metadata(&db_path).unwrap().1,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap()
+                ],
+            )
+            .expect("seed repair-six row");
+        drop(cache);
+
+        let mut cache = UsageCache::open(&cache_path).expect("reopen cache");
+        let mut warnings = Vec::new();
+        let mut events = Vec::new();
+        let parses = AtomicUsize::new(0);
+        scan_files_cached(
+            SourceScan {
+                source: "hermes",
+                parser_version: crate::sources::hermes::VERSIONS.usage,
+                volatile_reuse_ms: |_| None,
+            },
+            std::slice::from_ref(&db_path),
+            Some(&mut cache),
+            &mut warnings,
+            &mut events,
+            |path| {
+                parses.fetch_add(1, Ordering::SeqCst);
+                crate::sources::hermes::parse_usage_file(path)
+            },
+        );
+        assert_eq!(parses.load(Ordering::SeqCst), 1);
+        assert!(warnings.is_empty());
+        let version: i64 = cache
+            .connection
+            .query_row(
+                "SELECT parser_version FROM usage_file_cache WHERE source = 'hermes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reparsed row");
+        assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn previous_dependency_postcard_format_loads_with_native_path_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("rollout.jsonl");
+        let dependency_path = temp.path().join("parent.jsonl");
+        fs::write(&source_path, "source").expect("write source");
+        fs::write(&dependency_path, "dependency").expect("write dependency");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        let source_metadata = usage_file_metadata(&source_path).expect("source metadata");
+        let dependency_metadata = usage_file_metadata(&dependency_path).expect("dep metadata");
+        let source_key = source_path.to_string_lossy().to_string();
+        let dependency_key = dependency_path.to_string_lossy().to_string();
+        let legacy = vec![LegacyUsageFileDep {
+            path: dependency_key.clone(),
+            size: dependency_metadata.0,
+            mtime_ns: dependency_metadata.1,
+            exists: true,
+        }];
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, ?3, ?4, 30, ?5, ?6)",
+                params![
+                    source_key,
+                    crate::sources::codex::VERSIONS.usage,
+                    source_metadata.0 as i64,
+                    source_metadata.1,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    postcard::to_stdvec(&legacy).unwrap()
+                ],
+            )
+            .expect("seed previous dependency format");
+
+        let loaded = cache
+            .load_source("codex", crate::sources::codex::VERSIONS.usage)
+            .expect("load previous dependency format");
+        let dependency = &loaded[&source_key].deps[0];
+        assert_eq!(dependency.native_path, dependency_key.as_bytes());
+        assert!(dependency.is_current());
+    }
+
+    #[derive(Serialize)]
+    struct LegacyUsageDependency {
+        path: String,
+        size: u64,
+        mtime_ns: i64,
+    }
+
+    #[test]
+    fn legacy_nonempty_dependency_blob_cannot_become_a_dependency_free_hit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("rollout.jsonl");
+        fs::write(&source_path, "source").expect("write source");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        let metadata = usage_file_metadata(&source_path).expect("metadata");
+        let legacy = vec![LegacyUsageDependency {
+            path: temp
+                .path()
+                .join("parent.jsonl")
+                .to_string_lossy()
+                .to_string(),
+            size: 12,
+            mtime_ns: 34,
+        }];
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, ?3, ?4, 30, ?5, ?6)",
+                params![
+                    source_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    metadata.0 as i64,
+                    metadata.1,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    postcard::to_stdvec(&legacy).unwrap()
+                ],
+            )
+            .expect("seed legacy row");
+        drop(cache);
+
+        let mut cache = UsageCache::open(&cache_path).expect("reopen cache");
+        let mut warnings = Vec::new();
+        let mut events = Vec::new();
+        let parses = AtomicUsize::new(0);
+        scan_files_cached(
+            SourceScan {
+                source: "codex",
+                parser_version: crate::sources::codex::VERSIONS.usage,
+                volatile_reuse_ms: |_| None,
+            },
+            std::slice::from_ref(&source_path),
+            Some(&mut cache),
+            &mut warnings,
+            &mut events,
+            |_| {
+                parses.fetch_add(1, Ordering::SeqCst);
+                Ok(FileParse::cacheable(Vec::new()))
+            },
+        );
+        assert_eq!(parses.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn corrupted_dependency_blob_forces_a_reparse() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("rollout.jsonl");
+        fs::write(&source_path, "source").expect("write source");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        let metadata = usage_file_metadata(&source_path).expect("metadata");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, ?3, ?4, 30, ?5, ?6)",
+                params![
+                    source_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    metadata.0 as i64,
+                    metadata.1,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    vec![0xff_u8, 0x00_u8]
+                ],
+            )
+            .expect("seed corrupt row");
+        drop(cache);
+
+        let mut cache = UsageCache::open(&cache_path).expect("reopen cache");
+        let mut warnings = Vec::new();
+        let mut events = Vec::new();
+        let parses = AtomicUsize::new(0);
+        scan_files_cached(
+            SourceScan {
+                source: "codex",
+                parser_version: crate::sources::codex::VERSIONS.usage,
+                volatile_reuse_ms: |_| None,
+            },
+            std::slice::from_ref(&source_path),
+            Some(&mut cache),
+            &mut warnings,
+            &mut events,
+            |_| {
+                parses.fetch_add(1, Ordering::SeqCst);
+                Ok(FileParse::cacheable(Vec::new()))
+            },
+        );
+        assert_eq!(parses.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_dependency_row_does_not_discard_valid_cache_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let valid_path = temp.path().join("valid.jsonl");
+        fs::write(&valid_path, "valid").expect("write valid source");
+        let vanished_path = temp.path().join("vanished.jsonl");
+        let malformed_path = temp.path().join("malformed.jsonl");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&cache_path).expect("open cache");
+        let metadata = usage_file_metadata(&valid_path).expect("metadata");
+        let empty_events = postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap();
+        let empty_deps = postcard::to_stdvec(&Vec::<UsageFileDep>::new()).unwrap();
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, ?3, ?4, 30, ?5, ?6)",
+                params![
+                    valid_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    metadata.0 as i64,
+                    metadata.1,
+                    empty_events,
+                    empty_deps
+                ],
+            )
+            .expect("seed valid row");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, 0, 0, 30, ?3, ?4)",
+                params![
+                    vanished_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                    vec![0xff_u8, 0x00_u8]
+                ],
+            )
+            .expect("seed invalid row");
+        cache
+            .connection
+            .execute(
+                "INSERT INTO usage_file_cache(
+                    source, path, parser_version, size, mtime_ns, scanned_at_ms,
+                    events_blob, deps_blob
+                 ) VALUES ('codex', ?1, ?2, 0, 0, 30, ?3, 7)",
+                params![
+                    malformed_path.to_string_lossy(),
+                    crate::sources::codex::VERSIONS.usage,
+                    postcard::to_stdvec(&Vec::<CachedUsageEvent>::new()).unwrap(),
+                ],
+            )
+            .expect("seed malformed dependency type row");
+
+        let mut cache = cache;
+        let mut warnings = Vec::new();
+        let mut events = Vec::new();
+        let parses = AtomicUsize::new(0);
+        scan_files_cached(
+            SourceScan {
+                source: "codex",
+                parser_version: crate::sources::codex::VERSIONS.usage,
+                volatile_reuse_ms: |_| None,
+            },
+            std::slice::from_ref(&valid_path),
+            Some(&mut cache),
+            &mut warnings,
+            &mut events,
+            |_| {
+                parses.fetch_add(1, Ordering::SeqCst);
+                Ok(FileParse::cacheable(Vec::new()))
+            },
+        );
+
+        assert_eq!(parses.load(Ordering::SeqCst), 0);
+        assert!(
+            cache
+                .load_source("codex", crate::sources::codex::VERSIONS.usage)
+                .is_ok()
+        );
+        let invalid_rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex' AND path = ?1",
+                [vanished_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_rows, 0);
+        let malformed_rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_file_cache WHERE source = 'codex' AND path = ?1",
+                [malformed_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(malformed_rows, 0);
+    }
+
+    #[test]
+    fn hermes_wal_changes_invalidate_but_shm_changes_do_not() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("state.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, model TEXT, started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT, estimated_cost_usd REAL, cwd TEXT, git_repo_root TEXT, profile_name TEXT);",
+        )
+        .expect("create sessions");
+        drop(conn);
+        let wal = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::write(&wal, "wal-1").expect("write wal");
+        fs::write(&shm, "shm-1").expect("write shm");
+        let cache_path = temp.path().join("usage-cache.sqlite3");
+        let mut cache = UsageCache::open(&cache_path).expect("open cache");
+        let mut warnings = Vec::new();
+        let mut events = Vec::new();
+        let parses = AtomicUsize::new(0);
+        let scan =
+            |cache: &mut UsageCache, warnings: &mut Vec<String>, events: &mut Vec<UsageEvent>| {
+                scan_files_cached(
+                    SourceScan {
+                        source: "hermes",
+                        parser_version: crate::sources::hermes::VERSIONS.usage,
+                        volatile_reuse_ms: |_| None,
+                    },
+                    std::slice::from_ref(&db_path),
+                    Some(cache),
+                    warnings,
+                    events,
+                    |path| {
+                        parses.fetch_add(1, Ordering::SeqCst);
+                        crate::sources::hermes::parse_usage_file(path)
+                    },
+                );
+            };
+        scan(&mut cache, &mut warnings, &mut events);
+        fs::write(&shm, "shm-2").expect("change shm");
+        scan(&mut cache, &mut warnings, &mut events);
+        assert_eq!(parses.load(Ordering::SeqCst), 1);
+        fs::write(&wal, "wal-2").expect("change wal");
+        scan(&mut cache, &mut warnings, &mut events);
+        assert_eq!(parses.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn openai_cached_input_is_a_subset() {
         let tokens = TokenBuckets::codex(100, 80, 10, 4);
         assert_eq!(tokens.uncached_input, 20);
@@ -1612,8 +2062,10 @@ mod tests {
                 reasoning: 0,
             },
             source_cost_usd: None,
+            cost_authoritative: false,
             dedupe_confidence: "exact",
             conservative_undercount: false,
+            cache_chain_excluded: false,
             sidechain: false,
             source_order: 0,
         }
@@ -1731,6 +2183,20 @@ mod tests {
             cache_event("s", 60_000, "claude-sonnet-4-6", 0, 100_000, 500),
         ];
         assert!(waste_for(&events).is_none());
+    }
+
+    #[test]
+    fn hermes_aggregate_rows_are_excluded_from_cache_chains() {
+        let mut first = cache_event("s", 0, "claude-sonnet-4-6", 0, 0, 100_000);
+        first.source = "hermes";
+        first.source_path = Arc::from("hermes.db");
+        first.cache_chain_excluded = true;
+        let mut second = cache_event("s", 60_000, "claude-sonnet-4-6", 0, 0, 100_500);
+        second.source = "hermes";
+        second.source_path = Arc::from("hermes.db");
+        second.cache_chain_excluded = true;
+        let waste = compute_cache_waste([&first, &second]);
+        assert!(!waste.contains_key("hermes"));
     }
 
     #[test]
@@ -2768,8 +3234,10 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             tokens,
             source_cost_usd: None,
+            cost_authoritative: false,
             dedupe_confidence: "exact",
             conservative_undercount: false,
+            cache_chain_excluded: false,
             sidechain: false,
             source_order: 0,
         };
@@ -2792,12 +3260,40 @@ mod tests {
             model: Some("claude-sonnet-4-6".into()),
             tokens: TokenBuckets::disjoint(100, 0, 0, 0),
             source_cost_usd: Some(0.0),
+            cost_authoritative: false,
             dedupe_confidence: "exact",
             conservative_undercount: false,
+            cache_chain_excluded: false,
             sidechain: false,
             source_order: 0,
         };
         assert_eq!(event_cost_nanos(&event, CostMode::Auto), Some(0));
         assert_eq!(event_cost_nanos(&event, CostMode::Reprice), Some(300_000));
+    }
+
+    #[test]
+    fn implementation_only_event_state_is_absent_from_public_json_and_cached_internally() {
+        let mut event = cache_event("session", 0, "claude-sonnet-4-6", 100, 0, 0);
+        event.cost_authoritative = true;
+        event.cache_chain_excluded = true;
+        event.sidechain = true;
+        event.source_order = 42;
+
+        let json = serde_json::to_value(&event).unwrap();
+        let object = json.as_object().unwrap();
+        assert!(object.contains_key("source"));
+        assert!(object.contains_key("model"));
+        assert!(!object.contains_key("cost_authoritative"));
+        assert!(!object.contains_key("cache_chain_excluded"));
+        assert!(!object.contains_key("sidechain"));
+        assert!(!object.contains_key("source_order"));
+
+        let bytes = postcard::to_stdvec(&CachedUsageEvent::from_event(&event)).unwrap();
+        let cached: CachedUsageEvent = postcard::from_bytes(&bytes).unwrap();
+        assert!(cached.cost_authoritative);
+        assert!(cached.cache_chain_excluded);
+        let restored = cached.into_event("claude", Arc::from("cached"));
+        assert!(restored.cost_authoritative);
+        assert!(restored.cache_chain_excluded);
     }
 }

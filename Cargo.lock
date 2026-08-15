@@ -862,6 +862,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1438,6 +1439,15 @@ dependencies = [
  "thiserror 2.0.17",
  "ureq 2.12.1",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
 ]
 
 [[package]]
@@ -2164,9 +2174,10 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "memex"
-version = "0.9.1"
+version = "0.10.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossbeam-channel",
@@ -2174,6 +2185,8 @@ dependencies = [
  "dialoguer",
  "directories",
  "fastembed",
+ "getrandom 0.3.4",
+ "hmac",
  "indicatif",
  "libc",
  "libloading",
@@ -2191,6 +2204,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "simd-json",
+ "subtle",
  "tantivy",
  "tempfile",
  "tiny_http",

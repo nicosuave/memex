@@ -1236,9 +1236,11 @@ pub(crate) fn parse_usage_file(
                         delta.reasoning,
                     ),
                     source_cost_usd: None,
+                    cost_authoritative: false,
                     dedupe_confidence: "strong",
                     conservative_undercount: counter.interleaved
                         || (parent.is_some() && !fork_resolved),
+                    cache_chain_excluded: false,
                     sidechain: false,
                     source_order,
                 });
@@ -1281,8 +1283,10 @@ pub(crate) fn parse_usage_file(
                         tokens.reasoning,
                     ),
                     source_cost_usd: None,
+                    cost_authoritative: false,
                     dedupe_confidence: "strong",
                     conservative_undercount: false,
+                    cache_chain_excluded: false,
                     sidechain: false,
                     source_order,
                 });

@@ -1,6 +1,6 @@
 [package]
 name = "memex"
-version = "0.9.1"
+version = "0.10.1"
 edition = "2024"
 build = "build.rs"
 description = "CLI tool for indexing and searching local agent conversation history"
@@ -47,5 +47,9 @@ tempfile = "3"
 libc = "0.2"
 libloading = { version = "0.8", optional = true }
 tiny_http = "0.12"
+base64 = "0.22"
+getrandom = "0.3"
+hmac = "0.12"
+subtle = "2.6"
 
 [dev-dependencies]

@@ -409,6 +409,7 @@ enum SourceChoice {
     Omp,
     OpenClaw,
     Copilot,
+    Hermes,
 }
 
 impl SourceChoice {
@@ -422,7 +423,8 @@ impl SourceChoice {
             SourceChoice::Pi => SourceChoice::Omp,
             SourceChoice::Omp => SourceChoice::OpenClaw,
             SourceChoice::OpenClaw => SourceChoice::Copilot,
-            SourceChoice::Copilot => SourceChoice::All,
+            SourceChoice::Copilot => SourceChoice::Hermes,
+            SourceChoice::Hermes => SourceChoice::All,
         }
     }
 
@@ -437,6 +439,7 @@ impl SourceChoice {
             SourceChoice::Omp => Some(SourceFilter::Omp),
             SourceChoice::OpenClaw => Some(SourceFilter::OpenClaw),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
+            SourceChoice::Hermes => Some(SourceFilter::Hermes),
         }
     }
 
@@ -451,6 +454,7 @@ impl SourceChoice {
             SourceChoice::Omp => "omp",
             SourceChoice::OpenClaw => "openclaw",
             SourceChoice::Copilot => "copilot",
+            SourceChoice::Hermes => "hermes",
         }
     }
 
@@ -464,6 +468,7 @@ impl SourceChoice {
             SourceKind::Omp => SourceChoice::Omp,
             SourceKind::OpenClaw => SourceChoice::OpenClaw,
             SourceKind::Copilot => SourceChoice::Copilot,
+            SourceKind::Hermes => SourceChoice::Hermes,
         }
     }
 }
@@ -2429,6 +2434,7 @@ impl App {
             SourceKind::OpenClaw => "pi",
             SourceKind::Copilot => "copilot",
             SourceKind::Omp => "omp",
+            SourceKind::Hermes => "hermes",
         };
         let source_path = session.source_path.clone();
 
@@ -3860,6 +3866,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Omp => label == "omp",
         SourceChoice::OpenClaw => label == "openclaw",
         SourceChoice::Copilot => label == "copilot",
+        SourceChoice::Hermes => label == "hermes",
         SourceChoice::All => false,
     }
 }
@@ -3874,6 +3881,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Omp => Color::Rgb(100, 170, 170),
         SourceKind::OpenClaw => Color::Rgb(235, 160, 110),
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
+        SourceKind::Hermes => Color::Rgb(190, 150, 220),
     }
 }
 

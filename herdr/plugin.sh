@@ -240,26 +240,23 @@ web)
   log="$dir/web.log"
   url="http://$web_listen"
   # Reuse a server that is already up — the background index service may well be serving it.
-  if ! curl -fsS -m 1 "$url/api/stats" >/dev/null 2>&1; then
+  if ! curl -fsS -m 1 "$url/healthz" >/dev/null 2>&1; then
     nohup "$MEMEX" web --listen "$web_listen" ${MEMEX_ROOT:+--root "$MEMEX_ROOT"} >>"$log" 2>&1 </dev/null &
     # The assets are embedded in the binary, so it comes up fast; give it ~3s anyway.
     up=""
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
       sleep 0.2
-      if curl -fsS -m 1 "$url/api/stats" >/dev/null 2>&1; then
+      if curl -fsS -m 1 "$url/healthz" >/dev/null 2>&1; then
         up=1
         break
       fi
     done
     [ -n "$up" ] || refuse "memex web did not come up on $web_listen, see $log"
   fi
-  case "$(uname -s)" in
-  Darwin) opener="open" ;;
-  *) opener="xdg-open" ;;
-  esac
-  command -v "$opener" >/dev/null 2>&1 || refuse "$opener not found; memex web is running at $url"
-  "$opener" "$url" >/dev/null 2>&1 || refuse "failed to open $url with $opener"
-  printf 'opened %s\n' "$url"
+  open_args=(index-service open --listen "$web_listen")
+  [ -n "${MEMEX_ROOT:-}" ] && open_args+=(--root "$MEMEX_ROOT")
+  "$MEMEX" "${open_args[@]}" >/dev/null 2>&1 || refuse "failed to open authenticated memex web UI at $url"
+  printf 'opened authenticated %s\n' "$url"
   ;;
 
 startup)

@@ -72,6 +72,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(
+        SourceKind::Hermes,
+        super::hermes::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
 
     push(
         SourceKind::Omp,
@@ -107,6 +114,12 @@ pub fn audit_files(source: SourceKind, files: &[PathBuf]) -> Result<SourceAudit>
 }
 
 fn audit_file(source: SourceKind, path: &Path, audit: &mut SourceAudit) -> Result<()> {
+    if source == SourceKind::Hermes {
+        // Hermes usage truth is SQLite aggregate data.  Audit must not reinterpret the
+        // database as JSON, and in particular must not read transcript/message columns.
+        std::fs::File::open(path)?;
+        return Ok(());
+    }
     let reader = std::io::BufReader::new(std::fs::File::open(path)?);
     for line in reader.lines() {
         let line = line?;
@@ -197,6 +210,11 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
                 increment(&mut audit.semantic_types, role);
             }
             record_content_blocks(value.get("content"), audit);
+        }
+        SourceKind::Hermes => {
+            if value.get("records").and_then(Value::as_array).is_some() {
+                increment(&mut audit.semantic_types, "records");
+            }
         }
     }
 }

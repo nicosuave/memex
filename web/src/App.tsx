@@ -113,6 +113,30 @@ const initialShellView: ShellView = paramsAtLoad.has("session")
   ? "transcript"
   : "home"
 
+let sessionToken: string | null = null
+
+async function exchangeBootstrapToken() {
+  const fragment = new URLSearchParams(window.location.hash.slice(1))
+  const bootstrap = fragment.get("bootstrap")
+  if (!bootstrap) return
+
+  history.replaceState(null, "", `${window.location.pathname}${window.location.search}`)
+  const response = await fetch("/auth/exchange", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${bootstrap}` },
+  })
+  if (!response.ok) {
+    throw new Error(
+      "Authentication failed. Run `memex index-service open` for a new link.",
+    )
+  }
+  const payload = (await response.json()) as { token?: string }
+  if (!payload.token) throw new Error("Authentication response did not include a token.")
+  sessionToken = payload.token
+}
+
+const authenticationReady = exchangeBootstrapToken()
+
 const formatDate = (timestamp: number) =>
   timestamp
     ? new Intl.DateTimeFormat(undefined, {
@@ -122,8 +146,11 @@ const formatDate = (timestamp: number) =>
     : ""
 
 async function api<T>(path: string): Promise<T> {
+  await authenticationReady
+  const headers: Record<string, string> = { Accept: "application/json" }
+  if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`
   const response = await fetch(path, {
-    headers: { Accept: "application/json" },
+    headers,
   })
   const data = (await response
     .json()

@@ -835,8 +835,10 @@ pub(crate) fn parse_usage_file_for(
                     .get("cost")
                     .and_then(|value| value.get("total"))
                     .and_then(|value| value.as_f64()),
+                cost_authoritative: false,
                 dedupe_confidence: "exact",
                 conservative_undercount: false,
+                cache_chain_excluded: false,
                 sidechain: false,
                 source_order: index,
             });

@@ -3,11 +3,13 @@ use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::types::SourceFilter;
 use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
+use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -18,15 +20,19 @@ const UI_CSS: &[u8] = include_bytes!("../web/dist/assets/app.css");
 const UI_JS: &[u8] = include_bytes!("../web/dist/assets/app.js");
 
 pub fn serve(root: Option<PathBuf>, listen: &str) -> Result<()> {
+    validate_listener(listen)?;
     let paths = Paths::new(root)?;
+    let auth = Arc::new(WebAuth::load_or_create(&paths)?);
     let server = bind(listen)?;
     println!("memex web UI: http://{listen}");
-    serve_requests(server, paths, restrict_hosts(listen));
+    serve_requests(server, paths, restrict_hosts(listen), auth);
     Ok(())
 }
 
 pub fn spawn(root: Option<PathBuf>, listen: &str) -> Result<JoinHandle<()>> {
+    validate_listener(listen)?;
     let paths = Paths::new(root)?;
+    let auth = Arc::new(WebAuth::load_or_create(&paths)?);
     let server = bind(listen)?;
     let listen = listen.to_string();
     let restrict_hosts = restrict_hosts(&listen);
@@ -34,7 +40,7 @@ pub fn spawn(root: Option<PathBuf>, listen: &str) -> Result<JoinHandle<()>> {
         .name("memex-web".to_string())
         .spawn(move || {
             println!("memex web UI: http://{listen}");
-            serve_requests(server, paths, restrict_hosts);
+            serve_requests(server, paths, restrict_hosts, auth);
         })
         .context("failed to start web UI thread")?;
     Ok(handle)
@@ -44,23 +50,43 @@ fn bind(listen: &str) -> Result<Server> {
     Server::http(listen).map_err(|err| anyhow!("failed to bind web UI to {listen}: {err}"))
 }
 
-fn serve_requests(server: Server, paths: Paths, restrict_hosts: bool) {
+pub fn bootstrap_url(root: Option<PathBuf>, listen: &str) -> Result<String> {
+    validate_listener(listen)?;
+    let paths = Paths::new(root)?;
+    let auth = WebAuth::load_or_create(&paths)?;
+    let bootstrap = auth.create_bootstrap_token()?;
+    let (host, port) = listen_host_port(listen)?;
+    let browser_host = match host {
+        "127.0.0.1" | "localhost" => "localhost".to_string(),
+        "::1" => "[::1]".to_string(),
+        _ => unreachable!("listener validation rejected unsupported loopback host"),
+    };
+    Ok(format!(
+        "http://{browser_host}:{port}/#bootstrap={bootstrap}"
+    ))
+}
+
+fn serve_requests(server: Server, paths: Paths, restrict_hosts: bool, auth: Arc<WebAuth>) {
     for request in server.incoming_requests() {
         let request_paths = paths.clone();
+        let request_auth = Arc::clone(&auth);
         std::thread::spawn(move || {
-            if let Err(err) = handle_request(request, &request_paths, restrict_hosts) {
+            if let Err(err) = handle_request(request, &request_paths, restrict_hosts, &request_auth)
+            {
                 eprintln!("web UI request failed: {err:#}");
             }
         });
     }
 }
 
-fn handle_request(request: Request, paths: &Paths, restrict_hosts: bool) -> Result<()> {
+fn handle_request(
+    request: Request,
+    paths: &Paths,
+    restrict_hosts: bool,
+    auth: &WebAuth,
+) -> Result<()> {
     if restrict_hosts && !has_local_host(&request) {
         return respond_text(request, StatusCode(403), "invalid host", "text/plain");
-    }
-    if request.method() != &Method::Get && request.method() != &Method::Head {
-        return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
     }
 
     let parsed = match parse_url(request.url()) {
@@ -69,6 +95,33 @@ fn handle_request(request: Request, paths: &Paths, restrict_hosts: bool) -> Resu
             return respond_json_error(request, StatusCode(400), &err.to_string());
         }
     };
+
+    if parsed.path() == "/auth/exchange" {
+        if request.method() != &Method::Post {
+            return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
+        }
+        let Some(token) = bearer_token(&request) else {
+            return respond_unauthorized(request);
+        };
+        let session = match auth.exchange_bootstrap_token(token) {
+            Ok(session) => session,
+            Err(_) => return respond_unauthorized(request),
+        };
+        return respond_json(
+            request,
+            StatusCode(200),
+            &SessionTokenPayload { token: &session },
+        );
+    }
+
+    if request.method() != &Method::Get && request.method() != &Method::Head {
+        return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
+    }
+    if (parsed.path() == "/api" || parsed.path().starts_with("/api/"))
+        && !request_is_authorized(&request, auth)
+    {
+        return respond_unauthorized(request);
+    }
 
     match parsed.path() {
         "/" => respond(
@@ -92,6 +145,7 @@ fn handle_request(request: Request, paths: &Paths, restrict_hosts: bool) -> Resu
             "application/javascript; charset=utf-8",
             false,
         ),
+        "/healthz" => respond_text(request, StatusCode(200), "ok", "text/plain"),
         "/api/stats" => match stats_payload(paths) {
             Ok(payload) => respond_json(request, StatusCode(200), &payload),
             Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
@@ -120,6 +174,39 @@ fn handle_request(request: Request, paths: &Paths, restrict_hosts: bool) -> Resu
         },
         _ => respond_json_error(request, StatusCode(404), "not found"),
     }
+}
+
+fn request_is_authorized(request: &Request, auth: &WebAuth) -> bool {
+    bearer_token(request)
+        .is_some_and(|token| auth.authorize_bearer(token) || auth.authorize_session(token))
+}
+
+fn bearer_token(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Authorization"))
+        .and_then(|header| header.value.as_str().strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+}
+
+fn respond_unauthorized(request: Request) -> Result<()> {
+    let body = serde_json::to_vec(&ErrorPayload {
+        error: "authentication required; run `memex index-service open`",
+    })?;
+    respond_with_headers(
+        request,
+        StatusCode(401),
+        body,
+        "application/json; charset=utf-8",
+        false,
+        vec![header("WWW-Authenticate", "Bearer realm=\"memex\"")?],
+    )
+}
+
+#[derive(Serialize)]
+struct SessionTokenPayload<'a> {
+    token: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,6 +408,30 @@ fn restrict_hosts(listen: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+pub fn validate_listener(listen: &str) -> Result<()> {
+    let (host, _) = listen_host_port(listen)?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return Err(anyhow!(
+            "refusing non-loopback web listener {listen}; bind to localhost and use an authenticated TLS reverse proxy for remote access"
+        ));
+    }
+    Ok(())
+}
+
+fn listen_host_port(listen: &str) -> Result<(&str, u16)> {
+    let (host, port) = listen
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("web listener must include a port: {listen}"))?;
+    let host = host.trim_matches(['[', ']']);
+    if host.is_empty() {
+        return Err(anyhow!("web listener must include a host: {listen}"));
+    }
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid web listener port: {listen}"))?;
+    Ok((host, port))
+}
+
 fn has_local_host(request: &Request) -> bool {
     let Some(host) = request
         .headers()
@@ -472,6 +583,7 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "omp" => Ok(SourceFilter::Omp),
         "openclaw" | "open-claw" => Ok(SourceFilter::OpenClaw),
         "copilot" => Ok(SourceFilter::Copilot),
+        "hermes" => Ok(SourceFilter::Hermes),
         _ => Err(anyhow!("unknown source: {value}")),
     }
 }
@@ -701,6 +813,17 @@ fn respond(
     content_type: &str,
     html: bool,
 ) -> Result<()> {
+    respond_with_headers(request, status, body, content_type, html, Vec::new())
+}
+
+fn respond_with_headers(
+    request: Request,
+    status: StatusCode,
+    body: Vec<u8>,
+    content_type: &str,
+    html: bool,
+    extra_headers: Vec<Header>,
+) -> Result<()> {
     let is_head = request.method() == &Method::Head;
     let response_body = if is_head { Vec::new() } else { body };
     let mut response = Response::from_data(response_body)
@@ -715,6 +838,9 @@ fn respond(
             "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
         )?);
     }
+    for extra_header in extra_headers {
+        response.add_header(extra_header);
+    }
     request.respond(response)?;
     Ok(())
 }
@@ -728,7 +854,25 @@ fn header(name: &str, value: &str) -> Result<Header> {
 mod tests {
     use super::*;
     use crate::types::{Record, RecordLinks, SourceKind};
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpStream};
     use tempfile::TempDir;
+
+    fn http_round_trip(paths: &Paths, auth: &WebAuth, request: String) -> String {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        let request = server.recv().unwrap();
+        handle_request(request, paths, true, auth).unwrap();
+        client.join().unwrap()
+    }
 
     #[test]
     fn search_request_decodes_and_caps_values() {
@@ -919,5 +1063,102 @@ mod tests {
         assert!(restrict_hosts("localhost:6363"));
         assert!(!restrict_hosts("0.0.0.0:6363"));
         assert!(!restrict_hosts("192.168.1.20:6363"));
+    }
+
+    #[test]
+    fn rejects_non_loopback_listeners() {
+        assert!(validate_listener(DEFAULT_LISTEN).is_ok());
+        assert!(validate_listener("localhost:8080").is_ok());
+        assert!(validate_listener("[::1]:6363").is_ok());
+        assert!(validate_listener("127.0.0.2:6363").is_err());
+        assert!(validate_listener("0.0.0.0:6363").is_err());
+        assert!(validate_listener("192.168.1.20:6363").is_err());
+    }
+
+    #[test]
+    fn private_api_requires_authentication_and_accepts_single_use_bootstrap_session() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let auth = WebAuth::load_or_create(&paths).unwrap();
+
+        let bootstrap_page = http_round_trip(
+            &paths,
+            &auth,
+            "GET / HTTP/1.1\r\nHost: localhost:6363\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        assert!(bootstrap_page.starts_with("HTTP/1.1 200"));
+
+        let health = http_round_trip(
+            &paths,
+            &auth,
+            "GET /healthz HTTP/1.1\r\nHost: localhost:6363\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        assert!(health.starts_with("HTTP/1.1 200"));
+        assert!(health.ends_with("ok"));
+
+        let unauthorized = http_round_trip(
+            &paths,
+            &auth,
+            "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        );
+        assert!(unauthorized.starts_with("HTTP/1.1 401"));
+        assert!(unauthorized.contains("WWW-Authenticate: Bearer realm=\"memex\""));
+
+        let bootstrap = auth.create_bootstrap_token().unwrap();
+        let exchange = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "POST /auth/exchange HTTP/1.1\r\nHost: localhost:6363\r\nAuthorization: Bearer {bootstrap}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(exchange.starts_with("HTTP/1.1 200"));
+        let body = exchange.split("\r\n\r\n").nth(1).unwrap();
+        let session = serde_json::from_str::<serde_json::Value>(body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let authorized = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nAuthorization: Bearer {session}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(authorized.starts_with("HTTP/1.1 200"));
+
+        let replay = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "POST /auth/exchange HTTP/1.1\r\nHost: localhost:6363\r\nAuthorization: Bearer {bootstrap}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(replay.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn private_api_accepts_installation_bearer_token() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let auth = WebAuth::load_or_create(&paths).unwrap();
+        let token = std::fs::read_to_string(crate::web_auth::token_path(&paths)).unwrap();
+
+        let response = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                token.trim()
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"));
     }
 }

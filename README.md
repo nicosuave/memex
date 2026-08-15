@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, Oh My Pi, OpenClaw, and GitHub Copilot CLI logs. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi Coding Agent, Oh My Pi, OpenClaw, GitHub Copilot CLI, and Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -213,11 +213,12 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, and Copilot logs:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, and Hermes records:
 
 ```
 memex usage
 memex usage --source codex --since 2026-07-01
+memex usage --source hermes --since 2026-07-01
 memex usage --json --events
 ```
 
@@ -225,7 +226,7 @@ memex usage --json --events
 
 Each source also reports prompt-cache efficiency: the cache hit rate, plus an estimate of cache waste — prompt tokens that were in the previous request's prompt but were re-billed at input rates instead of read from cache, priced at catalog rates and attributed to idle gaps past the cache TTL or model switches where those apply. Waste is estimated per transcript file chain and errs toward undercounting: subagent sidechains, ambiguous dedupe deltas, and prompts that shrink past compaction are not counted.
 
-Local token history is reconstructed usage. It is deliberately kept separate from authoritative subscription quota percentages and reset windows.
+Local token history is reconstructed usage. It is deliberately kept separate from authoritative subscription quota percentages and reset windows. Hermes usage is read from `state.db` in the Hermes root and immediate profile directories (`HERMES_PROFILE_ROOTS`, `HERMES_HOME`, or `HERMES_STATE_DIR`, with safe local defaults), opened read-only and WAL-compatible. The `sessions` aggregate is used for legacy databases; newer `session_model_usage` delta rows are emitted by model/task and reconciled against the session aggregate so historical seeded rows count once and positive residuals are retained. Snapshots, backups, arbitrary nested databases, JSON/JSONL transcripts, and auth, config, memory, skills, plugins, and cron paths are excluded. Hermes queries never read message, system-prompt, tool, reasoning-text, or credential tables. Usage output contains counters and metadata only. Any API-equivalent cost estimate is analytical and is not a Hermes subscription quota measurement; source-stored API costs are not quota percentages. Hermes parser-version changes invalidate only Hermes usage cache rows.
 
 When token tracking is enabled, press `Ctrl+T` on the TUI home screen to toggle the 30-day activity chart between session count and token volume. Token activity is loaded lazily and cached when first shown.
 
@@ -269,7 +270,7 @@ This detects which tools are installed (Claude/Codex/OpenCode/Pi/Oh My Pi) and p
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|hermes`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -296,6 +297,21 @@ memex index-service enable --continuous
 memex index-service enable --web-ui
 ```
 
+Regenerate the service from current config and restart it:
+```
+memex index-service restart
+```
+
+Inspect the registered service and whether it is serving the Web UI:
+```
+memex index-service status
+```
+
+Open an authenticated browser session:
+```
+memex index-service open
+```
+
 Disable:
 ```
 memex index-service disable
@@ -310,17 +326,30 @@ On successful enable, memex writes `auto_index_on_search = false` to config when
 `http://127.0.0.1:6363`. It mirrors the TUI's core workflow with search-as-you-type,
 source and project filters, a persistent session list, and Matches/History transcript
 previews. The server binds to loopback by default because the index
-contains private conversation history. Override the address explicitly when needed:
+contains private conversation history. Memex refuses non-loopback HTTP listeners. If
+remote access is required, use an authenticated TLS reverse proxy to `127.0.0.1` that
+injects the installation bearer token into upstream requests. To use a different local port:
 
 ```
 memex index-service enable --web-listen 127.0.0.1:8080
+memex index-service open --listen 127.0.0.1:8080
 ```
+
+The first Web UI start creates `~/.memex/web-auth-token` with mode `0600`. Private API
+routes require that token as `Authorization: Bearer ...` or a browser session established
+by `index-service open`. Browser links carry a signed, one-time credential in the URL
+fragment, remove it before navigation continues, and exchange it for an ephemeral bearer
+token held only in page memory. The browser token is never stored in a cookie,
+`localStorage`, or session storage. Browser sessions expire after 12 hours, disappear when
+the page closes, and are invalidated whenever the daemon restarts.
 
 To run the same UI in the foreground without changing the background service:
 
 ```
 memex web
 ```
+
+Then run `memex index-service open` from another terminal.
 
 The browser frontend lives in `web/`, uses React and shadcn components, and is
 built with `cd web && bun install && bun run build`. The generated static assets

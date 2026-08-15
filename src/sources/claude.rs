@@ -628,8 +628,10 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                         .map(str::to_string),
                     tokens,
                     source_cost_usd: value.get("costUSD").and_then(|value| value.as_f64()),
+                    cost_authoritative: false,
                     dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },
                     conservative_undercount: false,
+                    cache_chain_excluded: false,
                     sidechain: value
                         .get("isSidechain")
                         .and_then(|value| value.as_bool())
