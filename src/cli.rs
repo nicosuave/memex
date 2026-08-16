@@ -2525,6 +2525,7 @@ fn run_setup(force: bool) -> Result<()> {
     let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
     let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
     let pi_skill = include_str!("../skills/pi/memex-search/SKILL.md");
+    let omp_skill = include_str!("../skills/omp/memex-search/SKILL.md");
 
     for index in selected {
         let (tool, _) = &items[index];
@@ -2632,7 +2633,7 @@ fn run_setup(force: bool) -> Result<()> {
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, pi_skill)?;
+                    std::fs::write(&dest, if *tool == "omp" { omp_skill } else { pi_skill })?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
@@ -2773,13 +2774,7 @@ fn pi_agent_root() -> PathBuf {
 }
 
 fn omp_agent_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
-        return PathBuf::from(root);
-    }
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".omp").join("agent")
+    crate::sources::omp::agent_root()
 }
 
 #[cfg(unix)]

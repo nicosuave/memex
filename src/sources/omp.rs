@@ -44,9 +44,34 @@ fn config_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".omp"));
     if config_dir.is_absolute() {
-        config_dir
+        let relative = config_dir
+            .components()
+            .filter(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
+            .collect::<PathBuf>();
+        home.join(relative)
     } else {
         home.join(config_dir)
+    }
+}
+
+pub fn agent_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty()) {
+        return PathBuf::from(root);
+    }
+    let root = config_root();
+    let profile = match std::env::var_os("OMP_PROFILE") {
+        Some(value) => (!value.is_empty()).then_some(value),
+        None => std::env::var_os("PI_PROFILE").filter(|value| !value.is_empty()),
+    };
+    if let Some(profile) = profile {
+        root.join("profiles").join(profile).join("agent")
+    } else {
+        root.join("agent")
     }
 }
 
@@ -67,6 +92,9 @@ fn profile_session_roots(profiles_root: &Path) -> Vec<PathBuf> {
 }
 
 fn session_roots() -> Vec<PathBuf> {
+    if std::env::var_os("PI_CODING_AGENT_DIR").is_some_and(|value| !value.is_empty()) {
+        return vec![agent_root().join("sessions")];
+    }
     let root = config_root();
     let mut roots = vec![root.join("agent/sessions")];
     roots.extend(profile_session_roots(&root.join("profiles")));
@@ -123,6 +151,78 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<crate::usage::UsageEve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_root_matches_omp_environment_semantics() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let home = super::super::common::home();
+
+        {
+            let _env = EnvVarGuard::set_os(&[
+                ("PI_CODING_AGENT_DIR", None),
+                (
+                    "PI_CONFIG_DIR",
+                    Some(std::ffi::OsStr::new("/tmp/absconfig")),
+                ),
+                ("OMP_PROFILE", None),
+                ("PI_PROFILE", None),
+            ]);
+            assert_eq!(agent_root(), home.join("tmp/absconfig/agent"));
+        }
+        {
+            let _env = EnvVarGuard::set_os(&[
+                (
+                    "PI_CODING_AGENT_DIR",
+                    Some(std::ffi::OsStr::new("/tmp/customagent")),
+                ),
+                ("PI_CONFIG_DIR", Some(std::ffi::OsStr::new("customcfg"))),
+                ("OMP_PROFILE", Some(std::ffi::OsStr::new("audit"))),
+                ("PI_PROFILE", None),
+            ]);
+            assert_eq!(agent_root(), PathBuf::from("/tmp/customagent"));
+        }
+        {
+            let _env = EnvVarGuard::set_os(&[
+                ("PI_CODING_AGENT_DIR", None),
+                ("PI_CONFIG_DIR", None),
+                ("OMP_PROFILE", Some(std::ffi::OsStr::new("audit"))),
+                ("PI_PROFILE", None),
+            ]);
+            assert_eq!(agent_root(), home.join(".omp/profiles/audit/agent"));
+        }
+        {
+            let _env = EnvVarGuard::set_os(&[
+                ("PI_CODING_AGENT_DIR", None),
+                ("PI_CONFIG_DIR", None),
+                ("OMP_PROFILE", Some(std::ffi::OsStr::new(""))),
+                ("PI_PROFILE", Some(std::ffi::OsStr::new("ignored"))),
+            ]);
+            assert_eq!(agent_root(), home.join(".omp/agent"));
+        }
+    }
+
+    #[test]
+    fn discovery_honors_full_agent_directory_override() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions/project");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let transcript = sessions.join("session.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let _env = EnvVarGuard::set_os(&[("PI_CODING_AGENT_DIR", Some(temp.path().as_os_str()))]);
+
+        assert_eq!(
+            discover(),
+            vec![SourceFile {
+                source: SourceKind::Omp,
+                path: transcript
+            }]
+        );
+    }
 
     #[test]
     fn omp_paths_are_not_pi_paths() {

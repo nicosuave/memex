@@ -25,7 +25,8 @@ Use this skill to index local history and retrieve results in a structured way.
   - `--include-agents` to include agent transcripts
   - `--codex/--no-codex` to include or skip Codex logs
   - `--opencode/--no-opencode` to include or skip OpenCode logs
-  - `--pi/--no-pi` to include or skip Pi and Oh My Pi logs
+  - `--pi/--no-pi` to include or skip Pi logs
+  - `--omp/--no-omp` to include or skip Oh My Pi logs
   - `--copilot/--no-copilot` to include or skip GitHub Copilot CLI logs
   - `--model <minilm|bge|nomic|gemma|potion>` to select embedding model
   - `--root <path>` to change data root (default: `~/.memex`)
