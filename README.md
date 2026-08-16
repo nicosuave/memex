@@ -109,6 +109,10 @@ Then run setup to install the skills:
 memex setup
 ```
 
+The shared `memex-search` skill is installed once at
+`~/.agents/skills/memex-search/SKILL.md` for Codex, OpenCode, Pi, and Oh My Pi.
+Claude Code uses `~/.claude/skills/memex-search/SKILL.md`.
+
 Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after setup.
 
 ## Quickstart

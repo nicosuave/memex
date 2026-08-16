@@ -2423,23 +2423,27 @@ fn run_setup(force: bool) -> Result<()> {
         ));
     }
 
+    let shared_agents = [
+        ("Codex", codex_path.as_ref()),
+        ("Opencode", opencode_path.as_ref()),
+        ("Pi", pi_path.as_ref()),
+        ("Oh My Pi", omp_path.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, path)| path.map(|_| name))
+    .collect::<Vec<_>>();
+
     // Show what will be installed
     let action = if force { "install/update" } else { "install" };
     println!("This will {action}:");
     if claude_path.is_some() {
         println!("  Claude Code: memex-search skill, instruction-improver skill");
     }
-    if codex_path.is_some() {
-        println!("  Codex: memex-search skill");
-    }
-    if opencode_path.is_some() {
-        println!("  Opencode: memex-search skill");
-    }
-    if pi_path.is_some() {
-        println!("  Pi: memex-search skill");
-    }
-    if omp_path.is_some() {
-        println!("  Oh My Pi: memex-search skill");
+    if !shared_agents.is_empty() {
+        println!(
+            "  Shared agents ({}): memex-search skill",
+            shared_agents.join(", ")
+        );
     }
     if force {
         println!();
@@ -2455,20 +2459,11 @@ fn run_setup(force: bool) -> Result<()> {
         items.push(("claude", format!("Claude Code ({})", path.display())));
         defaults.push(true);
     }
-    if let Some(path) = &codex_path {
-        items.push(("codex", format!("Codex ({})", path.display())));
-        defaults.push(true);
-    }
-    if let Some(path) = &opencode_path {
-        items.push(("opencode", format!("Opencode ({})", path.display())));
-        defaults.push(true);
-    }
-    if let Some(path) = &pi_path {
-        items.push(("pi", format!("Pi ({})", path.display())));
-        defaults.push(true);
-    }
-    if let Some(path) = &omp_path {
-        items.push(("omp", format!("Oh My Pi ({})", path.display())));
+    if !shared_agents.is_empty() {
+        items.push((
+            "agents",
+            format!("Shared agents ({})", shared_agents.join(", ")),
+        ));
         defaults.push(true);
     }
 
@@ -2503,6 +2498,11 @@ fn run_setup(force: bool) -> Result<()> {
         home.join(".local/share/opencode/skills/memex-search.md"),
         pi_agent_root().join("skills/memex-search.md"),
         omp_agent_root().join("skills/memex-search.md"),
+        // Gen 3: agent-specific copies superseded by the shared agentskills.io root
+        home.join(".codex/skills/memex-search"),
+        home.join(".local/share/opencode/skills/memex-search"),
+        pi_agent_root().join("skills/memex-search"),
+        omp_agent_root().join("skills/memex-search"),
     ];
     for path in &stale_paths {
         if path.is_dir() {
@@ -2520,12 +2520,8 @@ fn run_setup(force: bool) -> Result<()> {
         }
     }
 
-    let claude_skill = include_str!("../skills/memex-search/SKILL.md");
+    let memex_skill = include_str!("../skills/memex-search/SKILL.md");
     let instruction_improver_skill = include_str!("../skills/instruction-improver/SKILL.md");
-    let codex_skill = include_str!("../skills/codex/memex-search/SKILL.md");
-    let opencode_skill = include_str!("../skills/opencode/memex-search/SKILL.md");
-    let pi_skill = include_str!("../skills/pi/memex-search/SKILL.md");
-    let omp_skill = include_str!("../skills/omp/memex-search/SKILL.md");
 
     for index in selected {
         let (tool, _) = &items[index];
@@ -2541,7 +2537,7 @@ fn run_setup(force: bool) -> Result<()> {
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, claude_skill)?;
+                    std::fs::write(&dest, memex_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
@@ -2575,75 +2571,23 @@ fn run_setup(force: bool) -> Result<()> {
                     );
                 }
             }
-            "codex" => {
-                let dest_dir = home.join(".codex").join("skills").join("memex-search");
+            "agents" => {
+                let dest_dir = home.join(".agents").join("skills").join("memex-search");
                 let dest = dest_dir.join("SKILL.md");
                 if dest.exists() && !force {
                     println!(
-                        "Skipping Codex skill (already installed at {}). Use --force to overwrite.",
+                        "Skipping shared memex-search skill (already installed at {}). Use --force to overwrite.",
                         dest.display()
                     );
                 } else {
                     std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, codex_skill)?;
+                    std::fs::write(&dest, memex_skill)?;
                     let verb = if dest.exists() {
                         "Updated"
                     } else {
                         "Installed"
                     };
-                    println!("{verb} Codex skill at {}.", dest.display());
-                }
-            }
-            "opencode" => {
-                let dest_dir = home
-                    .join(".local")
-                    .join("share")
-                    .join("opencode")
-                    .join("skills")
-                    .join("memex-search");
-                let dest = dest_dir.join("SKILL.md");
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping Opencode skill (already installed at {}). Use --force to overwrite.",
-                        dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, opencode_skill)?;
-                    let verb = if dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!("{verb} Opencode skill at {}.", dest.display());
-                }
-            }
-            "pi" | "omp" => {
-                let dest_dir = if *tool == "omp" {
-                    omp_agent_root().join("skills").join("memex-search")
-                } else {
-                    pi_agent_root().join("skills").join("memex-search")
-                };
-                let dest = dest_dir.join("SKILL.md");
-                if dest.exists() && !force {
-                    println!(
-                        "Skipping {} skill (already installed at {}). Use --force to overwrite.",
-                        if *tool == "omp" { "Oh My Pi" } else { "Pi" },
-                        dest.display()
-                    );
-                } else {
-                    std::fs::create_dir_all(&dest_dir)?;
-                    std::fs::write(&dest, if *tool == "omp" { omp_skill } else { pi_skill })?;
-                    let verb = if dest.exists() {
-                        "Updated"
-                    } else {
-                        "Installed"
-                    };
-                    println!(
-                        "{verb} {} skill at {}.",
-                        if *tool == "omp" { "Oh My Pi" } else { "Pi" },
-                        dest.display()
-                    );
+                    println!("{verb} shared memex-search skill at {}.", dest.display());
                 }
             }
             _ => {}
