@@ -2887,13 +2887,13 @@ mod tests {
     }
 
     #[test]
-    fn ingest_omp_session_from_config_root() {
+    fn ingest_omp_session_from_agent_root_override() {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let omp_root = tmp.path().join("omp");
+        let omp_agent_root = tmp.path().join("omp-agent");
         let pi_sessions = tmp.path().join("pi-sessions");
-        let session_dir = omp_root
-            .join("agent/sessions")
+        let session_dir = omp_agent_root
+            .join("sessions")
             .join("--Users-nico-Code-omp--");
         fs::create_dir_all(&session_dir).expect("create omp session dir");
         let session_file = session_dir.join("omp-session.jsonl");
@@ -2903,9 +2903,9 @@ mod tests {
         )
         .expect("write omp fixture");
         let _env = EnvVarGuard::set_os(&[
-            ("PI_CONFIG_DIR", Some(omp_root.as_os_str())),
+            ("PI_CONFIG_DIR", None),
             ("PI_CODING_AGENT_SESSION_DIR", Some(pi_sessions.as_os_str())),
-            ("PI_CODING_AGENT_DIR", None),
+            ("PI_CODING_AGENT_DIR", Some(omp_agent_root.as_os_str())),
             ("XDG_DATA_HOME", None),
         ]);
 
