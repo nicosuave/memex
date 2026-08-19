@@ -117,6 +117,22 @@ pub struct UsageActivityPointWire {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionActivitySpec {
+    pub source: Option<SourceFilter>,
+    pub project: Option<String>,
+    pub project_grouping: ProjectGrouping,
+    pub since_ms: Option<u64>,
+    pub until_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionActivityPointWire {
+    pub machine: String,
+    pub source: String,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct Federated<T> {
     pub items: Vec<T>,
@@ -144,6 +160,9 @@ enum RpcOperation {
     },
     UsageActivity {
         spec: UsageSpec,
+    },
+    SessionActivity {
+        spec: SessionActivitySpec,
     },
 }
 
@@ -177,6 +196,9 @@ enum RpcPayload {
     UsageActivity {
         points: Vec<UsageActivityPointWire>,
         partial: bool,
+    },
+    SessionActivity {
+        points: Vec<SessionActivityPointWire>,
     },
     Error {
         message: String,
@@ -587,6 +609,73 @@ pub fn federated_usage_activity(
     Ok((points, partial))
 }
 
+pub fn federated_session_activity(
+    paths: &Paths,
+    config: &UserConfig,
+    requested: &[String],
+    spec: &SessionActivitySpec,
+) -> Result<(Vec<SessionActivityPointWire>, bool)> {
+    let ids = selected_machine_ids(config, requested)?;
+    let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let tx = tx.clone();
+            let spec = spec.clone();
+            if id == LOCAL_MACHINE_ID {
+                let paths = paths.clone();
+                scope.spawn(move || {
+                    let result = session_activity_local(&paths, &spec);
+                    let _ = tx.send((LOCAL_MACHINE_ID.to_string(), result));
+                });
+            } else {
+                let machine = config
+                    .machines
+                    .iter()
+                    .find(|machine| machine.id == *id)
+                    .expect("selected machines were validated")
+                    .clone();
+                scope.spawn(move || {
+                    let result =
+                        match rpc(&machine, RpcOperation::SessionActivity { spec }, timeout) {
+                            Ok(RpcPayload::SessionActivity { points }) => Ok(points),
+                            Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
+                            Ok(other) => {
+                                Err(anyhow!("unexpected session activity response: {other:?}"))
+                            }
+                            Err(err) => Err(err),
+                        };
+                    let _ = tx.send((machine.id.clone(), result));
+                });
+            }
+        }
+        drop(tx);
+    });
+    let mut points = Vec::new();
+    let mut successes = 0usize;
+    let mut errors = Vec::new();
+    for (machine, result) in rx {
+        match result {
+            Ok(mut machine_points) => {
+                successes += 1;
+                for point in &mut machine_points {
+                    point.machine.clone_from(&machine);
+                }
+                points.extend(machine_points);
+            }
+            Err(err) => errors.push(format!("{machine}: {err}")),
+        }
+    }
+    if successes == 0 {
+        bail!(
+            "all machine session activity queries failed: {}",
+            errors.join("; ")
+        );
+    }
+    points.sort_by_key(|point| point.timestamp_ms);
+    Ok((points, !errors.is_empty()))
+}
+
 pub fn remote_shell_command(machine: &MachineConfig, command: &str) -> Result<String> {
     validate_machine(machine)?;
     let target = machine
@@ -674,6 +763,9 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             let (points, partial) = usage_activity_local(paths, config, &spec)?;
             Ok(RpcPayload::UsageActivity { points, partial })
         }
+        RpcOperation::SessionActivity { spec } => Ok(RpcPayload::SessionActivity {
+            points: session_activity_local(paths, &spec)?,
+        }),
     }
 }
 
@@ -727,6 +819,29 @@ fn usage_activity_local(
             .collect(),
         partial,
     ))
+}
+
+fn session_activity_local(
+    paths: &Paths,
+    spec: &SessionActivitySpec,
+) -> Result<Vec<SessionActivityPointWire>> {
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let rows = store.query_source_timestamps_filtered(
+        spec.source,
+        spec.since_ms,
+        spec.until_ms,
+        spec.project.as_deref(),
+        spec.project_grouping,
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, timestamp_ms)| *timestamp_ms > 0)
+        .map(|(source, timestamp_ms)| SessionActivityPointWire {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            source: source.storage_label().to_string(),
+            timestamp_ms,
+        })
+        .collect())
 }
 
 fn usage_query(paths: &Paths, spec: &UsageSpec) -> UsageQuery {
@@ -1316,6 +1431,7 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::AnalyticsWriter;
     use crate::config::{ControlConfig, IndexBackendConfig, MultiMachineConfig};
     use crate::types::{RecordLinks, SourceKind};
     use tempfile::TempDir;
@@ -1484,6 +1600,51 @@ mod tests {
         assert_eq!(other.session_keys, Some(Vec::new()));
         assert!(local.machine_session_keys.is_none());
         assert!(mini.machine_session_keys.is_none());
+    }
+
+    #[test]
+    fn session_activity_rpc_reads_complete_analytics_history() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut analytics =
+            AnalyticsWriter::open(analytics_path(&paths.state)).expect("analytics writer");
+        for (session_id, ts) in [("old", 10), ("new", 20)] {
+            analytics
+                .record(&Record {
+                    source: SourceKind::Codex,
+                    doc_id: ts,
+                    ts,
+                    project: "memex".to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: 1,
+                    role: "user".to_string(),
+                    text: "hello".to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: RecordLinks::default(),
+                    source_path: format!("{session_id}.jsonl"),
+                })
+                .expect("record session");
+        }
+        analytics.flush().expect("flush analytics");
+
+        let points = session_activity_local(
+            &paths,
+            &SessionActivitySpec {
+                source: Some(SourceFilter::Codex),
+                project: Some("memex".to_string()),
+                project_grouping: ProjectGrouping::Flat,
+                since_ms: None,
+                until_ms: None,
+            },
+        )
+        .expect("session activity");
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].timestamp_ms, 10);
+        assert_eq!(points[1].timestamp_ms, 20);
     }
 
     #[test]

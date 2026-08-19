@@ -4,9 +4,9 @@ use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
 use crate::machine::{
-    LOCAL_MACHINE_ID, SearchMode, SearchSpec, UsageSpec, federated_recent, federated_search,
-    federated_usage_activity, machine_by_id, remote_shell_command, session_context,
-    session_records,
+    LOCAL_MACHINE_ID, SearchMode, SearchSpec, SessionActivitySpec, UsageSpec, federated_recent,
+    federated_search, federated_session_activity, federated_usage_activity, machine_by_id,
+    remote_shell_command, session_context, session_records,
 };
 use crate::resume::{find_in_path, resume_template, shell_quote};
 use crate::types::{Record, SourceFilter, SourceKind};
@@ -97,6 +97,7 @@ enum SearchUpdate {
     HomeActivity {
         request_id: u64,
         points: Vec<HomeChartPoint>,
+        partial: bool,
     },
     HomeActivityError {
         request_id: u64,
@@ -540,6 +541,7 @@ struct App {
     timeline_state: LoadState,
     active_timeline_request: u64,
     home_activity: Vec<HomeChartPoint>,
+    home_activity_partial: bool,
     home_result_activity: Vec<HomeChartPoint>,
     home_activity_range: TimelineRange,
     home_activity_state: LoadState,
@@ -929,6 +931,7 @@ impl App {
             machine: String::new(),
             home_machines,
             home_activity: Vec::new(),
+            home_activity_partial: false,
             home_result_activity: Vec::new(),
             home_activity_range: TimelineRange::Month,
             home_activity_state: LoadState::Idle,
@@ -1025,17 +1028,22 @@ impl App {
     }
 
     fn home_chart_is_filtered(&self) -> bool {
-        !self.config.machines.is_empty()
-            || !self.query.trim().is_empty()
+        !self.query.trim().is_empty()
             || !self.machine.is_empty()
             || self.source != SourceChoice::All
             || !self.project.trim().is_empty()
     }
 
+    fn home_chart_uses_search_results(&self) -> bool {
+        !self.query.trim().is_empty()
+    }
+
     fn home_chart_activity(&self) -> &[HomeChartPoint] {
         match self.home_chart_mode {
             HomeChartMode::Tokens => &self.home_token_activity,
-            HomeChartMode::Sessions if self.home_chart_is_filtered() => &self.home_result_activity,
+            HomeChartMode::Sessions if self.home_chart_uses_search_results() => {
+                &self.home_result_activity
+            }
             HomeChartMode::Sessions => &self.home_activity,
         }
     }
@@ -1346,25 +1354,74 @@ impl App {
         let request_id = self.next_request_id();
         self.active_home_activity_request = request_id;
         self.home_activity_state = LoadState::Loading;
+        self.home_activity_partial = false;
         let paths = self.paths.clone();
+        let config = self.config.clone();
+        let machines = self.selected_machines();
+        let source = self.source.as_filter();
+        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
         let range = self.home_activity_range;
         std::thread::spawn(move || {
-            let result = (|| -> Result<Vec<HomeChartPoint>> {
-                let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-                let rows = store.query_source_timestamps(range.since_ms(now_ms()))?;
-                Ok(rows
-                    .into_iter()
-                    .filter(|(_, timestamp_ms)| *timestamp_ms > 0)
-                    .map(|(source, timestamp_ms)| HomeChartPoint {
+            let since_ms = range.since_ms(now_ms());
+            let result = if config.machines.is_empty() {
+                (|| -> Result<(Vec<HomeChartPoint>, bool)> {
+                    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+                    let rows = store.query_source_timestamps_filtered(
                         source,
-                        timestamp_ms,
-                        value: 1,
-                    })
-                    .collect())
-            })();
+                        since_ms,
+                        None,
+                        project.as_deref(),
+                        project_grouping,
+                    )?;
+                    Ok((
+                        rows.into_iter()
+                            .filter(|(_, timestamp_ms)| *timestamp_ms > 0)
+                            .map(|(source, timestamp_ms)| HomeChartPoint {
+                                source,
+                                timestamp_ms,
+                                value: 1,
+                            })
+                            .collect(),
+                        false,
+                    ))
+                })()
+            } else {
+                federated_session_activity(
+                    &paths,
+                    &config,
+                    &machines,
+                    &SessionActivitySpec {
+                        source,
+                        project,
+                        project_grouping,
+                        since_ms,
+                        until_ms: None,
+                    },
+                )
+                .map(|(points, partial)| {
+                    (
+                        points
+                            .into_iter()
+                            .filter_map(|point| {
+                                Some(HomeChartPoint {
+                                    source: SourceKind::from_label(&point.source)?,
+                                    timestamp_ms: point.timestamp_ms,
+                                    value: 1,
+                                })
+                            })
+                            .collect(),
+                        partial,
+                    )
+                })
+            };
             let _ = match result {
-                Ok(points) => tx.send(SearchUpdate::HomeActivity { request_id, points }),
+                Ok((points, partial)) => tx.send(SearchUpdate::HomeActivity {
+                    request_id,
+                    points,
+                    partial,
+                }),
                 Err(error) => tx.send(SearchUpdate::HomeActivityError {
                     request_id,
                     message: error.to_string(),
@@ -1662,6 +1719,9 @@ impl App {
         }
         if refresh_search {
             self.kickoff_search();
+            if token_filter_changed {
+                self.kickoff_home_activity();
+            }
         } else if refresh_activity {
             self.kickoff_home_activity();
         }
@@ -1703,7 +1763,9 @@ impl App {
 
     fn home_chart_state(&self) -> &LoadState {
         match self.home_chart_mode {
-            HomeChartMode::Sessions if self.home_chart_is_filtered() => &self.sessions_state,
+            HomeChartMode::Sessions if self.home_chart_uses_search_results() => {
+                &self.sessions_state
+            }
             HomeChartMode::Sessions => &self.home_activity_state,
             HomeChartMode::Tokens => &self.home_token_activity_state,
         }
@@ -1957,10 +2019,13 @@ impl App {
                 self.detail_line_offsets.clear();
                 self.detail_scroll = 0;
             }
-            SearchUpdate::HomeActivity { request_id, points }
-                if request_id == self.active_home_activity_request =>
-            {
+            SearchUpdate::HomeActivity {
+                request_id,
+                points,
+                partial,
+            } if request_id == self.active_home_activity_request => {
                 self.home_activity = points;
+                self.home_activity_partial = partial;
                 self.home_activity_state = if self.home_activity.is_empty() {
                     LoadState::Empty
                 } else {
@@ -2156,6 +2221,7 @@ impl App {
             self.kickoff_timeline_load();
         } else {
             self.refresh_results();
+            self.kickoff_home_activity();
             if self.project_source == self.source {
                 self.kickoff_project_load();
             }
@@ -2815,6 +2881,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.kickoff_timeline_load();
             } else {
                 app.refresh_results();
+                app.kickoff_home_activity();
             }
         }
         KeyCode::Char('[') => {
@@ -3153,9 +3220,23 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             LoadState::Loaded | LoadState::Empty => {
                 let metric = match app.home_chart_mode {
                     HomeChartMode::Sessions if filtered_chart => {
-                        format!("{plotted_count}/{total_count} matches")
+                        format!(
+                            "{plotted_count}/{total_count} matches{}",
+                            if app.home_activity_partial && !app.home_chart_uses_search_results() {
+                                " · partial"
+                            } else {
+                                ""
+                            }
+                        )
                     }
-                    HomeChartMode::Sessions => format!("{plotted_count} sessions"),
+                    HomeChartMode::Sessions => format!(
+                        "{plotted_count} sessions{}",
+                        if app.home_activity_partial && !app.home_chart_uses_search_results() {
+                            " · partial"
+                        } else {
+                            ""
+                        }
+                    ),
                     HomeChartMode::Tokens => {
                         let total = activity_value_in_bounds(chart_activity, bounds);
                         format!(
@@ -7008,7 +7089,7 @@ mod tests {
     }
 
     #[test]
-    fn home_chart_uses_accepted_results_while_searching() {
+    fn home_chart_uses_full_activity_unless_a_text_query_is_active() {
         let (_tmp, mut app) = test_app();
         app.home_activity = vec![HomeChartPoint {
             source: SourceKind::Claude,
@@ -7031,10 +7112,20 @@ mod tests {
 
         app.query.clear();
         app.source = SourceChoice::Codex;
-        assert_eq!(
-            app.home_chart_activity(),
-            app.home_result_activity.as_slice()
-        );
+        assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
+
+        app.source = SourceChoice::All;
+        app.config.machines.push(crate::config::MachineConfig {
+            id: "mini".to_string(),
+            label: None,
+            ssh: Some("mini".to_string()),
+            command: None,
+            enabled: None,
+            control: None,
+            index: None,
+        });
+        assert!(!app.home_chart_is_filtered());
+        assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
     }
 
     #[test]

@@ -421,11 +421,51 @@ impl AnalyticsStore {
     }
 
     pub fn query_source_timestamps(&self, since_ms: Option<u64>) -> Result<Vec<(SourceKind, u64)>> {
+        self.query_source_timestamps_filtered(None, since_ms, None, None, ProjectGrouping::Flat)
+    }
+
+    pub fn query_source_timestamps_filtered(
+        &self,
+        source: Option<SourceFilter>,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+        project: Option<&str>,
+        grouping: ProjectGrouping,
+    ) -> Result<Vec<(SourceKind, u64)>> {
         let mut sql = String::from("SELECT source, last_at FROM sessions");
+        let mut clauses = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(source) = source {
+            let labels = source.storage_labels();
+            let placeholders = std::iter::repeat_n("?", labels.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!("source IN ({placeholders})"));
+            values.extend(
+                labels
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+        }
         if let Some(since_ms) = since_ms {
-            sql.push_str(" WHERE last_at >= ?");
+            clauses.push("last_at >= ?".to_string());
             values.push(rusqlite::types::Value::Integer(since_ms as i64));
+        }
+        if let Some(until_ms) = until_ms {
+            clauses.push("last_at <= ?".to_string());
+            values.push(rusqlite::types::Value::Integer(until_ms as i64));
+        }
+        if let Some(project) = project {
+            let project_expr = match grouping {
+                ProjectGrouping::Flat => "project",
+                ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+            };
+            clauses.push(format!("{project_expr} = ?"));
+            values.push(rusqlite::types::Value::Text(project.to_string()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
         }
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
@@ -1233,6 +1273,37 @@ mod tests {
                 .query_project_timestamps(None, Some(15), ProjectGrouping::Flat)
                 .expect("timestamps"),
             vec![("alpha".to_string(), 20)]
+        );
+    }
+
+    #[test]
+    fn source_timestamps_apply_activity_filters_without_a_result_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        let records = [("alpha", "s1", 10), ("alpha", "s2", 20), ("beta", "s3", 30)]
+            .into_iter()
+            .map(|(project, session, ts)| {
+                record(
+                    project,
+                    session,
+                    &tmp.path().join(format!("{session}.jsonl")),
+                    ts,
+                )
+            });
+        rebuild_from_records(&db, records).expect("rebuild");
+        let store = AnalyticsStore::open_read_only(&db).expect("open read only");
+
+        assert_eq!(
+            store
+                .query_source_timestamps_filtered(
+                    Some(SourceFilter::Codex),
+                    Some(15),
+                    Some(25),
+                    Some("alpha"),
+                    ProjectGrouping::Flat,
+                )
+                .expect("filtered activity"),
+            vec![(SourceKind::Codex, 20)]
         );
     }
 
