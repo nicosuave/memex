@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -22,6 +31,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           arch="${{ matrix.arch }}"
           artifact="memex-${version}-macos-${arch}.tar.gz"
           tar -C target/${{ matrix.target }}/release -czf "${artifact}" memex
@@ -52,7 +63,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             runner: ubuntu-24.04-arm
@@ -60,6 +71,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           arch="${{ matrix.arch }}"
           artifact="memex-${version}-linux-${arch}.tar.gz"
           tar -C target/${{ matrix.target }}/release -czf "${artifact}" memex
@@ -97,6 +110,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
 
   update-homebrew:
@@ -106,7 +120,7 @@ jobs:
       - name: Trigger homebrew-tap update
         run: |
           # Strip all leading v's to handle vv0.2.3 -> 0.2.3
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           VERSION="${VERSION#v}"
           curl -X POST \
             -H "Authorization: token ${{ secrets.HOMEBREW_TAP_TOKEN }}" \
