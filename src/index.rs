@@ -69,6 +69,7 @@ const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationGcReport {
     pub generations_removed: usize,
+    pub abandoned_workdirs_removed: usize,
     pub legacy_files_removed: usize,
     pub dry_run: bool,
 }
@@ -189,6 +190,14 @@ impl SearchIndex {
             })
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
+        let abandoned_workdirs = fs::read_dir(&generations)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && is_abandoned_generation_workdir(&entry.file_name())
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
         let legacy_files = fs::read_dir(dir)?
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
@@ -199,6 +208,7 @@ impl SearchIndex {
             .collect::<Vec<_>>();
         let report = GenerationGcReport {
             generations_removed: old_generations.len(),
+            abandoned_workdirs_removed: abandoned_workdirs.len(),
             legacy_files_removed: legacy_files.len(),
             dry_run,
         };
@@ -249,6 +259,14 @@ impl SearchIndex {
                 format!(
                     "remove unreachable index generation {}",
                     generation.display()
+                )
+            })?;
+        }
+        for workdir in abandoned_workdirs {
+            fs::remove_dir_all(&workdir).with_context(|| {
+                format!(
+                    "remove abandoned index generation work directory {}",
+                    workdir.display()
                 )
             })?;
         }
@@ -766,6 +784,28 @@ fn new_generation_name() -> String {
     format!("{nanos:032x}-{:08x}", std::process::id())
 }
 
+fn is_abandoned_generation_workdir(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if name.starts_with(".gc-") {
+        return true;
+    }
+    let Some(generation) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((timestamp, pid)) = generation.split_once('-') else {
+        return false;
+    };
+    timestamp.len() == 32
+        && pid.len() == 8
+        && timestamp.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && pid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn clone_generation(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     for name in committed_generation_files(source)? {
@@ -868,7 +908,19 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
         }
         let name = entry.file_name();
         let name_text = name.to_string_lossy();
-        if name_text == current || name_text.starts_with('.') {
+        if name_text == current {
+            continue;
+        }
+        if is_abandoned_generation_workdir(&name) {
+            fs::remove_dir_all(entry.path()).with_context(|| {
+                format!(
+                    "remove abandoned index generation work directory {}",
+                    entry.path().display()
+                )
+            })?;
+            continue;
+        }
+        if name_text.starts_with('.') {
             continue;
         }
 
@@ -1450,6 +1502,14 @@ mod tests {
 
         let stale_generation = tmp.path().join(GENERATIONS_DIR).join("stale-generation");
         clone_generation(&original, &stale_generation).expect("clone stale generation");
+        let abandoned_staging = tmp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join(".00000000000000000000000000000001-00000002.tmp");
+        clone_generation(&original, &abandoned_staging)
+            .expect("clone abandoned staging generation");
+        let abandoned_gc = tmp.path().join(GENERATIONS_DIR).join(".gc-abandoned");
+        fs::create_dir(&abandoned_gc).expect("create abandoned GC work directory");
         fs::write(original.join("orphan.store"), b"unreachable").expect("write orphan");
         fs::write(tmp.path().join("legacy.store"), b"legacy").expect("write legacy file");
 
@@ -1457,8 +1517,11 @@ mod tests {
             SearchIndex::garbage_collect_generations_offline(tmp.path(), true).expect("dry-run gc");
         assert!(dry_run.dry_run);
         assert_eq!(dry_run.generations_removed, 2);
+        assert_eq!(dry_run.abandoned_workdirs_removed, 2);
         assert_eq!(dry_run.legacy_files_removed, 1);
         assert!(original.exists());
+        assert!(abandoned_staging.exists());
+        assert!(abandoned_gc.exists());
 
         let active_reader = SearchIndex::open_or_create(tmp.path()).expect("active reader");
         let error = SearchIndex::garbage_collect_generations_offline(tmp.path(), false)
@@ -1472,6 +1535,8 @@ mod tests {
         assert!(!tmp.path().join("legacy.store").exists());
         assert!(!original.exists());
         assert!(!stale_generation.exists());
+        assert!(!abandoned_staging.exists());
+        assert!(!abandoned_gc.exists());
 
         let cleaned = SearchIndex::open_or_create(tmp.path()).expect("cleaned index");
         assert_eq!(cleaned.doc_count().expect("document count"), 1);
@@ -1504,6 +1569,11 @@ mod tests {
         writer.wait_merging_threads().expect("finish first writer");
         first.publish_generation().expect("publish first");
         let current = resolve_current_generation(tmp.path()).expect("current generation");
+        let abandoned_staging = tmp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join(".00000000000000000000000000000001-00000002.tmp");
+        clone_generation(&current, &abandoned_staging).expect("clone abandoned staging generation");
 
         for generation in 0..300 {
             let stale = tmp
@@ -1526,6 +1596,7 @@ mod tests {
         let published = SearchIndex::open_or_create(tmp.path()).expect("published index");
         assert_eq!(published.doc_count().expect("document count"), 1);
         assert_eq!(search_text_count(&published, "preserved"), 1);
+        assert!(!abandoned_staging.exists());
         let generations = fs::read_dir(tmp.path().join(GENERATIONS_DIR))
             .expect("generation directory")
             .filter_map(Result::ok)

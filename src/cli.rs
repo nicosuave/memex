@@ -1279,13 +1279,17 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
     let report = SearchIndex::garbage_collect_generations_offline(&paths.index, dry_run)?;
     if report.dry_run {
         println!(
-            "would remove {} unreachable generations and {} legacy index files; no rebuild required",
-            report.generations_removed, report.legacy_files_removed
+            "would remove {} unreachable generations, {} abandoned generation work directories, and {} legacy index files; no rebuild required",
+            report.generations_removed,
+            report.abandoned_workdirs_removed,
+            report.legacy_files_removed
         );
     } else {
         println!(
-            "removed {} unreachable generations and {} legacy index files; retained the committed index without rebuilding",
-            report.generations_removed, report.legacy_files_removed
+            "removed {} unreachable generations, {} abandoned generation work directories, and {} legacy index files; retained the committed index without rebuilding",
+            report.generations_removed,
+            report.abandoned_workdirs_removed,
+            report.legacy_files_removed
         );
     }
     Ok(())
