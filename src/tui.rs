@@ -4995,6 +4995,7 @@ fn sessions_from_query(
         since,
         until: None,
         limit: limit.max(20),
+        include_reasoning: false,
     };
     let results = index.search(&options)?;
     let mut sessions: HashMap<String, SessionSummary> = HashMap::new();
@@ -5350,6 +5351,7 @@ fn run_search_request(
                     recency_half_life_days: 30.0,
                     min_score: None,
                     project_grouping: Some(request.grouping),
+                    include_reasoning: false,
                 },
                 false,
             )?

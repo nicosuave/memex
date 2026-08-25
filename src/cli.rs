@@ -219,6 +219,9 @@ OUTPUT FIELDS (--fields):
         /// Filter by role (user, assistant, tool_use, tool_result)
         #[arg(long)]
         role: Option<String>,
+        /// Include reasoning records, which are excluded from results by default
+        #[arg(long)]
+        include_reasoning: bool,
         /// Filter by tool name (e.g., Read, Edit, Bash)
         #[arg(long)]
         tool: Option<String>,
@@ -851,6 +854,7 @@ pub fn run() -> Result<()> {
             cwd,
             project,
             role,
+            include_reasoning,
             tool,
             session,
             source,
@@ -878,6 +882,7 @@ pub fn run() -> Result<()> {
                 cwd,
                 project,
                 role,
+                include_reasoning,
                 tool,
                 session,
                 source,
@@ -1421,6 +1426,7 @@ fn run_search(
     cwd: Option<PathBuf>,
     project: Option<String>,
     role: Option<String>,
+    include_reasoning: bool,
     tool: Option<String>,
     session: Option<String>,
     source: Option<SourceFilter>,
@@ -1469,6 +1475,7 @@ fn run_search(
         since: parse_ts_millis(since)?,
         until: parse_ts_millis(until)?,
         limit,
+        include_reasoning,
     };
     let matchers = build_matchers(&options.query)?;
     let fields = parse_fields(fields)?;
@@ -1527,6 +1534,7 @@ fn run_search(
             recency_half_life_days,
             min_score,
             project_grouping: None,
+            include_reasoning: options.include_reasoning,
         };
         let federated =
             federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
@@ -2052,6 +2060,7 @@ fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) ->
                 since: None,
                 until: None,
                 limit: k.max(20),
+                include_reasoning: false,
             };
             ranked.push(
                 index

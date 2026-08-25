@@ -57,6 +57,8 @@ pub struct SearchSpec {
     pub recency_half_life_days: f32,
     pub min_score: Option<f32>,
     pub project_grouping: Option<ProjectGrouping>,
+    #[serde(default)]
+    pub include_reasoning: bool,
 }
 
 impl SearchSpec {
@@ -72,6 +74,7 @@ impl SearchSpec {
             since: self.since,
             until: self.until,
             limit: self.limit,
+            include_reasoning: self.include_reasoning,
         }
     }
 }
@@ -1841,6 +1844,7 @@ mod tests {
             recency_half_life_days: 30.0,
             min_score: None,
             project_grouping: None,
+            include_reasoning: false,
         }
     }
 

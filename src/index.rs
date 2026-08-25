@@ -142,6 +142,8 @@ impl Directory for SealedDirectory {
     }
 }
 
+const REASONING_ROLE: &str = "reasoning";
+
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
     pub query: String,
@@ -156,6 +158,7 @@ pub struct QueryOptions {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub limit: usize,
+    pub include_reasoning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1182,6 +1185,15 @@ fn build_query(
         ));
     }
 
+    let reasoning_requested = options.role.as_deref() == Some(REASONING_ROLE);
+    if !options.include_reasoning && !reasoning_requested {
+        let term = Term::from_field_text(fields.role, REASONING_ROLE);
+        clauses.push((
+            Occur::MustNot,
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+        ));
+    }
+
     if let Some(tool) = &options.tool {
         let term = Term::from_field_text(fields.tool_name, tool);
         clauses.push((
@@ -1409,6 +1421,7 @@ mod tests {
             since: None,
             until: None,
             limit: 10,
+            include_reasoning: false,
         };
         let scoped = index.search(&options).expect("scoped search");
         assert_eq!(scoped.len(), 1);
@@ -1421,6 +1434,60 @@ mod tests {
             })
             .expect("empty scope");
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn reasoning_records_are_excluded_unless_requested() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let spoken = test_record(1, "shared needle");
+        let mut thought = test_record(2, "shared needle");
+        thought.role = REASONING_ROLE.to_string();
+        let mut writer = index.writer().expect("writer");
+        index.add_record(&mut writer, &spoken).expect("spoken");
+        index.add_record(&mut writer, &thought).expect("thought");
+        writer.commit().expect("commit");
+
+        let options = QueryOptions {
+            query: "shared needle".to_string(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 10,
+            include_reasoning: false,
+        };
+
+        let default = index.search(&options).expect("default search");
+        assert_eq!(
+            default.iter().map(|(_, r)| r.doc_id).collect::<Vec<_>>(),
+            vec![spoken.doc_id],
+        );
+
+        let included = index
+            .search(&QueryOptions {
+                include_reasoning: true,
+                ..options.clone()
+            })
+            .expect("include reasoning");
+        let mut ids = included.iter().map(|(_, r)| r.doc_id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![spoken.doc_id, thought.doc_id]);
+
+        let only = index
+            .search(&QueryOptions {
+                role: Some(REASONING_ROLE.to_string()),
+                ..options
+            })
+            .expect("explicit role overrides the exclusion");
+        assert_eq!(
+            only.iter().map(|(_, r)| r.doc_id).collect::<Vec<_>>(),
+            vec![thought.doc_id],
+        );
     }
 
     #[test]
@@ -1831,6 +1898,7 @@ mod tests {
                 since: None,
                 until: None,
                 limit: 10,
+                include_reasoning: false,
             })
             .expect("search")
             .len()
@@ -1925,6 +1993,7 @@ mod tests {
                         since: None,
                         until: None,
                         limit: 10,
+                        include_reasoning: false,
                     })
                     .expect("search merged segment")
                     .len(),
@@ -1964,6 +2033,7 @@ mod tests {
                     since: None,
                     until: None,
                     limit: 10,
+                    include_reasoning: false,
                 })
                 .expect("search adopted generation")
                 .len(),
@@ -2003,6 +2073,7 @@ mod tests {
                 since: None,
                 until: None,
                 limit: 10,
+                include_reasoning: false,
             })
             .expect("search sealed generation");
         fs::set_permissions(&generation, original_permissions).expect("restore permissions");

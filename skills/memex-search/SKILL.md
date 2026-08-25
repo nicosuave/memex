@@ -398,6 +398,7 @@ Useful filters and controls:
 - `--project <name>`
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
+- `--include-reasoning` — reasoning records are excluded from results by default; `--role reasoning` still returns only them
 - `--session <session_id>`
 - `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|hermes`
 - `--since <iso|unix>` / `--until <iso|unix>`

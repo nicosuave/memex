@@ -645,6 +645,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                     since: None,
                     until: None,
                     limit: candidate_limit,
+                    include_reasoning: false,
                 })?
                 .into_iter()
                 .map(|(score, record)| (Some(score), record))
