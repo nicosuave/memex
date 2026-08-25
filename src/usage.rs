@@ -513,7 +513,7 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 9] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 10] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
@@ -522,6 +522,7 @@ fn assemble_usage_events(
         (SourceFilter::OpenClaw, scan_openclaw),
         (SourceFilter::Cursor, scan_cursor),
         (SourceFilter::Copilot, scan_copilot),
+        (SourceFilter::Grok, scan_grok),
         (SourceFilter::Hermes, scan_hermes),
     ];
     for (filter, scanner) in SCANNERS {
@@ -1375,6 +1376,30 @@ fn scan_copilot(
         warnings,
         out,
         |path| crate::sources::copilot::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
+fn scan_grok(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::grok::discover_sessions()
+        .into_iter()
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    scan_files_cached(
+        SourceScan {
+            source: "grok",
+            parser_version: crate::sources::grok::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::grok::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }

@@ -39,6 +39,7 @@ fn concurrent_searches_coalesce_stale_auto_indexing() {
             "--no-cursor",
             "--no-pi",
             "--no-copilot",
+            "--no-grok",
             "--no-embeddings",
         ])
         .arg("--root")

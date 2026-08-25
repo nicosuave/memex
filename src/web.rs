@@ -583,6 +583,7 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "omp" => Ok(SourceFilter::Omp),
         "openclaw" | "open-claw" => Ok(SourceFilter::OpenClaw),
         "copilot" => Ok(SourceFilter::Copilot),
+        "grok" => Ok(SourceFilter::Grok),
         "hermes" => Ok(SourceFilter::Hermes),
         _ => Err(anyhow!("unknown source: {value}")),
     }

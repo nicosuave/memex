@@ -46,7 +46,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, and Hermes",
+    about = "Fast local history search for Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, and Hermes",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -112,6 +112,12 @@ struct IndexArgs {
     /// Skip indexing GitHub Copilot CLI sessions
     #[arg(long = "no-copilot", default_value_t = false)]
     no_copilot: bool,
+    /// Index Grok sessions from ~/.grok/sessions [default: true]
+    #[arg(long, default_value_t = true)]
+    grok: bool,
+    /// Skip indexing Grok sessions
+    #[arg(long = "no-grok", default_value_t = false)]
+    no_grok: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long)]
     embeddings: bool,
@@ -137,7 +143,7 @@ struct IndexArgs {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Index Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, and Copilot conversation history
+    /// Index Claude, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, and Grok conversation history
     #[command(after_help = "\
 EXAMPLES:
     memex index                         # Index all supported local history
@@ -225,7 +231,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long)]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Use semantic (embedding-based) search instead of keyword search
@@ -426,7 +432,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -461,7 +467,7 @@ EXAMPLES:
     memex usage --source codex --since 2026-07-01
     memex usage --json")]
     Usage {
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include events on or after this date/timestamp
@@ -625,7 +631,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, or hermes
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, or hermes
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -1177,6 +1183,7 @@ fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<
         index.omp && !index.no_omp,
         index.openclaw && !index.no_openclaw,
         index.copilot && !index.no_copilot,
+        index.grok && !index.no_grok,
         index.embeddings,
         index.no_embeddings,
         index.model.clone(),
@@ -1200,6 +1207,7 @@ fn run_index(
     omp: bool,
     openclaw: bool,
     copilot: bool,
+    grok: bool,
     embeddings_flag: bool,
     no_embeddings: bool,
     model: Option<String>,
@@ -1249,6 +1257,7 @@ fn run_index(
         include_omp: omp,
         include_openclaw: openclaw,
         include_copilot: copilot,
+        include_grok: grok,
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -3113,6 +3122,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Pi => "pi",
         crate::types::SourceKind::OpenClaw => "openclaw",
         crate::types::SourceKind::Copilot => "copilot",
+        crate::types::SourceKind::Grok => "grok",
         crate::types::SourceKind::Omp => "omp",
         crate::types::SourceKind::Hermes => "hermes",
     };
@@ -4132,6 +4142,9 @@ fn build_index_command_args(
     if !index.copilot || index.no_copilot {
         args.push("--no-copilot".to_string());
     }
+    if !index.grok || index.no_grok {
+        args.push("--no-grok".to_string());
+    }
     if index.embeddings {
         args.push("--embeddings".to_string());
     }
@@ -4827,12 +4840,14 @@ mod tests {
             omp: false,
             openclaw: false,
             copilot: false,
+            grok: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
             no_omp: false,
             no_openclaw: false,
             no_copilot: false,
+            no_grok: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -4849,6 +4864,7 @@ mod tests {
         assert!(args.contains(&"--no-openclaw".to_string()));
         assert!(args.contains(&"--no-omp".to_string()));
         assert!(args.contains(&"--no-copilot".to_string()));
+        assert!(args.contains(&"--no-grok".to_string()));
     }
 
     #[test]
@@ -4865,12 +4881,14 @@ mod tests {
             omp: true,
             openclaw: true,
             copilot: true,
+            grok: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
             no_omp: false,
             no_openclaw: false,
             no_copilot: false,
+            no_grok: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -4900,12 +4918,14 @@ mod tests {
             omp: true,
             openclaw: true,
             copilot: true,
+            grok: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
             no_omp: false,
             no_openclaw: false,
             no_copilot: false,
+            no_grok: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -5141,6 +5161,7 @@ arguments = {
             "--no-opencode",
             "--no-pi",
             "--no-copilot",
+            "--no-grok",
         ])
         .unwrap();
 
@@ -5151,6 +5172,7 @@ arguments = {
         assert!(index.no_opencode);
         assert!(index.no_pi);
         assert!(index.no_copilot);
+        assert!(index.no_grok);
     }
 
     #[test]

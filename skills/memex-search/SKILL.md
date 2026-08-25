@@ -399,7 +399,7 @@ Useful filters and controls:
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|hermes`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--machine <id>` (repeatable)
 - `--query <query>` (repeatable additional query view, fused with the positional query)

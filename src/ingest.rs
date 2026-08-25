@@ -38,6 +38,7 @@ pub struct IngestOptions {
     pub include_omp: bool,
     pub include_openclaw: bool,
     pub include_copilot: bool,
+    pub include_grok: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -736,6 +737,35 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_grok {
+        for source_file in crate::sources::grok::discover_sessions() {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Grok,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
     let mut excluded_index_paths: Vec<String> = Vec::new();
@@ -899,6 +929,14 @@ pub fn ingest_all(
                 SourceKind::Copilot => {
                     parse_copilot_session(task, &tx_record, &tx_update, &next_doc_id, &progress)
                 }
+                SourceKind::Grok => parse_grok_session(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
                 SourceKind::Hermes => Err(anyhow!("Hermes indexing is not supported")),
             };
             finish_file_task(task, &progress, &parse_skipped, result)
@@ -1494,6 +1532,39 @@ fn parse_copilot_session(
         parsed,
     )
 }
+
+fn parse_grok_session(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::grok::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Grok, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Grok,
+        source_path,
+        parsed,
+    )
+}
 fn flush_embeddings(
     buffer: &mut Vec<(u64, String, SourceKind)>,
     embedder: &mut EmbedderHandle,
@@ -1667,6 +1738,7 @@ mod tests {
             include_omp: false,
             include_openclaw: false,
             include_copilot: false,
+            include_grok: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -2608,6 +2680,7 @@ mod tests {
             include_omp: false,
             include_openclaw: false,
             include_copilot: false,
+            include_grok: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -3008,6 +3081,7 @@ mod tests {
             include_omp: false,
             include_openclaw: false,
             include_copilot: false,
+            include_grok: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -3159,6 +3233,82 @@ mod tests {
     }
 
     #[test]
+    fn ingest_grok_session_from_grok_home_override() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let grok_home = tmp.path().join("grok-home");
+        let session_dir = grok_home
+            .join("sessions")
+            .join("%2Fworkspace%2Fgrok-project")
+            .join("grok-session");
+        fs::create_dir_all(&session_dir).expect("create grok session dir");
+        fs::write(
+            session_dir.join("summary.json"),
+            r#"{"info":{"id":"grok-session","cwd":"/workspace/grok-project"},"git_root_dir":"/workspace/grok-project/"}"#,
+        )
+        .expect("write grok summary");
+        let session_file = session_dir.join("updates.jsonl");
+        fs::write(
+            &session_file,
+            include_str!("../fixtures/trajectory_parity/grok.jsonl"),
+        )
+        .expect("write grok fixture");
+        let _env = EnvVarGuard::set_os(&[("GROK_HOME", Some(grok_home.as_os_str()))]);
+
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = SearchIndex::open_or_create(&paths.index).expect("index");
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_grok = true;
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+        assert_eq!(report.files_scanned, 1);
+        // Reasoning is off, the pending tool update and the unknown event are skipped.
+        assert_eq!(report.records_added, 5);
+
+        let records = index
+            .records_by_session_id("grok-session")
+            .expect("records by session");
+        assert_eq!(records.len(), 5);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source == SourceKind::Grok)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.project == "grok-project")
+        );
+        assert!(!records.iter().any(|record| record.role == "reasoning"));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "Inspect the project")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "project contents")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.tool_name.as_deref() == Some("read_file")
+                    && record.role == "tool_use")
+        );
+        assert!(records.iter().any(|record| {
+            record.links.conversation_kind.as_deref() == Some("compaction")
+                && record.text.starts_with("session_recap: Read the README")
+        }));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == session_file.to_string_lossy())
+        );
+    }
+
+    #[test]
     fn ingest_pi_incremental_records_keep_header_project() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sessions_root = tmp
@@ -3275,8 +3425,8 @@ mod tests {
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
         let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len(), 0, 0],
-            [0, 0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, meta.len(), 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
             false,
         ));
 

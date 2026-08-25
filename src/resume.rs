@@ -31,6 +31,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Omp => config.omp_resume_cmd.clone(),
         SourceKind::OpenClaw => return None,
         SourceKind::Copilot => config.copilot_resume_cmd.clone(),
+        SourceKind::Grok => config.grok_resume_cmd.clone(),
         SourceKind::Hermes => None,
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
@@ -57,6 +58,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "copilot" if remote || find_in_path("copilot").is_some() => {
             Some("copilot --resume {session_id}".to_string())
+        }
+        "grok" if remote || find_in_path("grok").is_some() => {
+            Some("cd {cwd_shell} && grok --resume {session_id}".to_string())
         }
         _ => None,
     }

@@ -73,6 +73,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .collect(),
     );
     push(
+        SourceKind::Grok,
+        super::grok::discover_sessions()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
+    push(
         SourceKind::Hermes,
         super::hermes::discover()
             .into_iter()
@@ -210,6 +217,15 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
                 increment(&mut audit.semantic_types, role);
             }
             record_content_blocks(value.get("content"), audit);
+        }
+        SourceKind::Grok => {
+            if let Some(kind) = value
+                .pointer("/params/update/sessionUpdate")
+                .and_then(Value::as_str)
+            {
+                increment(&mut audit.semantic_types, kind);
+            }
+            record_content_blocks(value.pointer("/params/update/content"), audit);
         }
         SourceKind::Hermes => {
             if value.get("records").and_then(Value::as_array).is_some() {

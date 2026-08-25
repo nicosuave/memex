@@ -13,11 +13,12 @@ pub enum SourceKind {
     OpenClaw,
     Copilot,
     Omp,
+    Grok,
     Hermes,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 9] = [
+    pub const ALL: [SourceKind; 10] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -26,6 +27,7 @@ impl SourceKind {
         SourceKind::OpenClaw,
         SourceKind::Copilot,
         SourceKind::Omp,
+        SourceKind::Grok,
         SourceKind::Hermes,
     ];
     pub const COUNT: usize = Self::ALL.len();
@@ -40,7 +42,8 @@ impl SourceKind {
             SourceKind::OpenClaw => 5,
             SourceKind::Copilot => 6,
             SourceKind::Omp => 7,
-            SourceKind::Hermes => 8,
+            SourceKind::Grok => 8,
+            SourceKind::Hermes => 9,
         }
     }
 
@@ -54,7 +57,8 @@ impl SourceKind {
             5 => Some(SourceKind::OpenClaw),
             6 => Some(SourceKind::Copilot),
             7 => Some(SourceKind::Omp),
-            8 => Some(SourceKind::Hermes),
+            8 => Some(SourceKind::Grok),
+            9 => Some(SourceKind::Hermes),
             _ => None,
         }
     }
@@ -69,6 +73,7 @@ impl SourceKind {
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
             SourceKind::Omp => "omp",
+            SourceKind::Grok => "grok",
             SourceKind::Hermes => "hermes",
         }
     }
@@ -83,6 +88,7 @@ impl SourceKind {
             SourceKind::OpenClaw => "openclaw",
             SourceKind::Copilot => "copilot",
             SourceKind::Omp => "omp",
+            SourceKind::Grok => "grok",
             SourceKind::Hermes => "hermes",
         }
     }
@@ -101,6 +107,7 @@ impl SourceKind {
             "openclaw" => Some(SourceKind::OpenClaw),
             "copilot" => Some(SourceKind::Copilot),
             "omp" => Some(SourceKind::Omp),
+            "grok" => Some(SourceKind::Grok),
             "hermes" => Some(SourceKind::Hermes),
             _ => None,
         }
@@ -120,6 +127,7 @@ pub enum SourceFilter {
     OpenClaw,
     Copilot,
     Omp,
+    Grok,
     Hermes,
 }
 
@@ -134,6 +142,7 @@ impl SourceFilter {
             SourceFilter::OpenClaw => source == SourceKind::OpenClaw,
             SourceFilter::Copilot => source == SourceKind::Copilot,
             SourceFilter::Omp => source == SourceKind::Omp,
+            SourceFilter::Grok => source == SourceKind::Grok,
             SourceFilter::Hermes => source == SourceKind::Hermes,
         }
     }
@@ -148,6 +157,7 @@ impl SourceFilter {
             SourceFilter::OpenClaw => &["openclaw"],
             SourceFilter::Copilot => &["copilot"],
             SourceFilter::Omp => &["omp"],
+            SourceFilter::Grok => &["grok"],
             SourceFilter::Hermes => &["hermes"],
         }
     }
@@ -162,6 +172,7 @@ impl SourceFilter {
             SourceFilter::OpenClaw => "openclaw",
             SourceFilter::Copilot => "copilot",
             SourceFilter::Omp => "omp",
+            SourceFilter::Grok => "grok",
             SourceFilter::Hermes => "hermes",
         }
     }
@@ -244,6 +255,20 @@ mod tests {
     }
 
     #[test]
+    fn grok_is_a_stable_first_class_source() {
+        assert_eq!(SourceKind::Grok.label(), "grok");
+        assert_eq!(SourceKind::Grok.storage_label(), "grok");
+        assert_eq!(SourceKind::from_label("grok"), Some(SourceKind::Grok));
+        assert_eq!(
+            SourceKind::from_idx(SourceKind::Grok.idx()),
+            Some(SourceKind::Grok)
+        );
+        assert!(SourceFilter::Grok.matches(SourceKind::Grok));
+        assert_eq!(SourceFilter::Grok.as_str(), "grok");
+        assert_eq!(SourceFilter::Grok.storage_labels(), &["grok"]);
+    }
+
+    #[test]
     fn legacy_codex_labels_converge_to_codex() {
         for label in ["codex", "codex-session", "codex-history"] {
             assert_eq!(SourceKind::from_label(label), Some(SourceKind::Codex));
@@ -314,5 +339,15 @@ mod tests {
 
         assert_eq!(SourceKind::from_path(unix_path), SourceKind::Copilot);
         assert_eq!(SourceKind::from_path(windows_path), SourceKind::Copilot);
+    }
+
+    #[test]
+    fn from_path_recognizes_grok_sessions() {
+        let unix_path = "/Users/nico/.grok/sessions/%2Fwork/session-id/updates.jsonl";
+        let windows_path =
+            "C:\\Users\\nico\\.grok\\sessions\\C%3A%5Cwork\\session-id\\updates.jsonl";
+
+        assert_eq!(SourceKind::from_path(unix_path), SourceKind::Grok);
+        assert_eq!(SourceKind::from_path(windows_path), SourceKind::Grok);
     }
 }

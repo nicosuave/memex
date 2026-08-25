@@ -1487,6 +1487,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         include_omp: true,
         include_openclaw: true,
         include_copilot: true,
+        include_grok: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
         backfill_embeddings: false,

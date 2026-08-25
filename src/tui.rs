@@ -410,6 +410,7 @@ enum SourceChoice {
     Omp,
     OpenClaw,
     Copilot,
+    Grok,
     Hermes,
 }
 
@@ -424,7 +425,8 @@ impl SourceChoice {
             SourceChoice::Pi => SourceChoice::Omp,
             SourceChoice::Omp => SourceChoice::OpenClaw,
             SourceChoice::OpenClaw => SourceChoice::Copilot,
-            SourceChoice::Copilot => SourceChoice::Hermes,
+            SourceChoice::Copilot => SourceChoice::Grok,
+            SourceChoice::Grok => SourceChoice::Hermes,
             SourceChoice::Hermes => SourceChoice::All,
         }
     }
@@ -440,6 +442,7 @@ impl SourceChoice {
             SourceChoice::Omp => Some(SourceFilter::Omp),
             SourceChoice::OpenClaw => Some(SourceFilter::OpenClaw),
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
+            SourceChoice::Grok => Some(SourceFilter::Grok),
             SourceChoice::Hermes => Some(SourceFilter::Hermes),
         }
     }
@@ -455,6 +458,7 @@ impl SourceChoice {
             SourceChoice::Omp => "omp",
             SourceChoice::OpenClaw => "openclaw",
             SourceChoice::Copilot => "copilot",
+            SourceChoice::Grok => "grok",
             SourceChoice::Hermes => "hermes",
         }
     }
@@ -469,6 +473,7 @@ impl SourceChoice {
             SourceKind::Omp => SourceChoice::Omp,
             SourceKind::OpenClaw => SourceChoice::OpenClaw,
             SourceKind::Copilot => SourceChoice::Copilot,
+            SourceKind::Grok => SourceChoice::Grok,
             SourceKind::Hermes => SourceChoice::Hermes,
         }
     }
@@ -1110,6 +1115,7 @@ impl App {
                     include_omp: true,
                     include_openclaw: true,
                     include_copilot: true,
+                    include_grok: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2500,6 +2506,7 @@ impl App {
             SourceKind::Pi => "pi",
             SourceKind::OpenClaw => "pi",
             SourceKind::Copilot => "copilot",
+            SourceKind::Grok => "grok",
             SourceKind::Omp => "omp",
             SourceKind::Hermes => "hermes",
         };
@@ -3948,6 +3955,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Omp => label == "omp",
         SourceChoice::OpenClaw => label == "openclaw",
         SourceChoice::Copilot => label == "copilot",
+        SourceChoice::Grok => label == "grok",
         SourceChoice::Hermes => label == "hermes",
         SourceChoice::All => false,
     }
@@ -3963,6 +3971,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Omp => Color::Rgb(100, 170, 170),
         SourceKind::OpenClaw => Color::Rgb(235, 160, 110),
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
+        SourceKind::Grok => Color::Rgb(255, 120, 90),
         SourceKind::Hermes => Color::Rgb(190, 150, 220),
     }
 }

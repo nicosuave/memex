@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, GitHub Copilot CLI, and Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, GitHub Copilot CLI, and Grok. Also supports Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Mostly intended for agents to use via skill. The intended workflow is to ask agent about a previous session & then the agent can narrow things down & retrieve history as needed.
 
@@ -252,11 +252,12 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, and Hermes records:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, and Hermes records:
 
 ```
 memex usage
 memex usage --source codex --since 2026-07-01
+memex usage --source grok --since 2026-07-01
 memex usage --source hermes --since 2026-07-01
 memex usage --json --events
 ```
@@ -309,7 +310,7 @@ Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh 
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|hermes`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -499,6 +500,7 @@ cursor_resume_cmd = "cursor-agent --resume {session_id}"
 opencode_resume_cmd = "opencode resume {session_id}"
 pi_resume_cmd = "pi --session {source_path_shell}"
 # copilot_resume_cmd = "your-copilot-resume-command {session_id}"
+grok_resume_cmd = "cd {cwd_shell} && grok --resume {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"
 ```
 

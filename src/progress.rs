@@ -246,6 +246,7 @@ fn progress_label(source: SourceKind) -> &'static str {
         SourceKind::OpenClaw => "openclaw",
         SourceKind::Copilot => "copilot",
         SourceKind::Omp => "omp",
+        SourceKind::Grok => "grok",
         SourceKind::Hermes => "hermes",
     }
 }

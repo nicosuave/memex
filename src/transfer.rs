@@ -1535,6 +1535,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Pi => cwd_from_pi_session(Path::new(&first.source_path)),
         SourceKind::Omp => cwd_from_pi_session(Path::new(&first.source_path)),
         SourceKind::OpenClaw => cwd_from_pi_session(Path::new(&first.source_path)),
+        SourceKind::Grok => {
+            crate::sources::grok::session_cwd(Path::new(&first.source_path)).map(PathBuf::from)
+        }
         SourceKind::Hermes => None,
     }
     .filter(|path| path.is_dir())

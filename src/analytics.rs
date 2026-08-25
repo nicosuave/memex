@@ -937,6 +937,11 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd);
     }
+    if source == SourceKind::Grok
+        && let Some(cwd) = crate::sources::grok::session_cwd(Path::new(source_path))
+    {
+        return Some(cwd);
+    }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;
