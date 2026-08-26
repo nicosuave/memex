@@ -4,10 +4,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: i64 = 2;
+const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -765,10 +766,12 @@ struct GitMetadata {
 }
 
 fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
-    let root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"]);
+    let deadline = Instant::now() + GIT_METADATA_TIMEOUT;
+    let root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"], deadline);
     let common_dir = git_rev_parse(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline,
     );
     let path_repo_project = claude_worktree_repo_project(cwd);
     let repo_project = common_dir
@@ -815,12 +818,18 @@ fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
     None
 }
 
-fn git_rev_parse(cwd: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+fn git_rev_parse(cwd: &str, args: &[&str], deadline: Instant) -> Option<String> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let child = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    let output = child_output_before(child, deadline)?;
     if !output.status.success() {
         return None;
     }
@@ -830,6 +839,27 @@ fn git_rev_parse(cwd: &str, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(text.to_string())
+    }
+}
+
+fn child_output_before(mut child: Child, deadline: Instant) -> Option<Output> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
@@ -1076,8 +1106,32 @@ pub fn backfill_from_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use crate::types::RecordLinks;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_child_is_killed_and_reaped() {
+        let _guard = env_lock();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+
+        assert!(child_output_before(child, Instant::now() + Duration::from_millis(20)).is_none());
+        assert!(
+            !Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("check child")
+                .success()
+        );
+    }
 
     fn record(project: &str, session_id: &str, source_path: &Path, ts: u64) -> Record {
         Record {
@@ -1357,6 +1411,7 @@ mod tests {
 
     #[test]
     fn repository_grouping_uses_git_common_dir_project() {
+        let _guard = env_lock();
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("memex");
         fs::create_dir_all(&repo).expect("repo dir");
