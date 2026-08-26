@@ -116,18 +116,27 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
 }
 
 fn file_was_replaced(previous: &FileIdentity, current: &FileIdentity) -> bool {
-    previous
+    let prefix_matches = previous
+        .prefix_sha256
+        .as_ref()
+        .zip(current.prefix_sha256.as_ref())
+        .is_some_and(|(old, new)| {
+            previous.prefix_bytes > 0 && previous.prefix_bytes == current.prefix_bytes && old == new
+        });
+    let prefix_changed = previous
+        .prefix_sha256
+        .as_ref()
+        .zip(current.prefix_sha256.as_ref())
+        .is_some_and(|(old, new)| previous.prefix_bytes == current.prefix_bytes && old != new);
+    let filesystem_identity_changed = previous
         .device
         .zip(previous.inode)
         .zip(current.device.zip(current.inode))
         .is_some_and(|((old_device, old_inode), (new_device, new_inode))| {
-            old_device != new_device || old_inode != new_inode
-        })
-        || previous
-            .prefix_sha256
-            .as_ref()
-            .zip(current.prefix_sha256.as_ref())
-            .is_some_and(|(old, new)| previous.prefix_bytes == current.prefix_bytes && old != new)
+            old_inode != new_inode || (old_device != new_device && !prefix_matches)
+        });
+
+    filesystem_identity_changed || prefix_changed
 }
 
 fn prepare_file_task(
@@ -2528,6 +2537,47 @@ mod tests {
         assert!(replaced.delete_first);
         assert_eq!(replaced.offset, 0);
         assert!(replaced.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn device_renumbering_preserves_append_continuity() {
+        let previous = FileIdentity {
+            device: Some(1),
+            inode: Some(2),
+            prefix_sha256: Some("same".to_string()),
+            prefix_bytes: 4,
+            modified_ns: Some(3),
+        };
+        let current = FileIdentity {
+            device: Some(4),
+            ..previous.clone()
+        };
+
+        assert!(!file_was_replaced(&previous, &current));
+    }
+
+    #[test]
+    fn device_renumbering_does_not_hide_file_replacement() {
+        let previous = FileIdentity {
+            device: Some(1),
+            inode: Some(2),
+            prefix_sha256: Some("original".to_string()),
+            prefix_bytes: 8,
+            modified_ns: Some(3),
+        };
+        let different_inode = FileIdentity {
+            device: Some(4),
+            inode: Some(5),
+            ..previous.clone()
+        };
+        let different_prefix = FileIdentity {
+            device: Some(4),
+            prefix_sha256: Some("replaced".to_string()),
+            ..previous.clone()
+        };
+
+        assert!(file_was_replaced(&previous, &different_inode));
+        assert!(file_was_replaced(&previous, &different_prefix));
     }
 
     #[test]
