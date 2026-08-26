@@ -108,10 +108,12 @@ impl AnalyticsStore {
     }
 
     fn init(&self) -> Result<()> {
+        // Ingest state advances only after analytics commits. FULL keeps each WAL commit durable
+        // before the cross-store publication can clear its recovery marker.
         self.conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -1131,6 +1133,25 @@ mod tests {
                 .expect("check child")
                 .success()
         );
+    }
+
+    #[test]
+    fn writable_connections_use_durable_wal_commits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store =
+            AnalyticsStore::open(tmp.path().join("analytics.sqlite")).expect("open analytics");
+
+        let journal_mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        let synchronous: i64 = store
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous mode");
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2, "FULL synchronous mode");
     }
 
     fn record(project: &str, session_id: &str, source_path: &Path, ts: u64) -> Record {

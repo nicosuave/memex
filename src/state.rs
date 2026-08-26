@@ -116,6 +116,18 @@ pub struct IngestState {
     pub files: HashMap<String, FileState>,
 }
 
+/// Durable intent for an ingest batch that may have crossed one publication boundary.
+///
+/// Tantivy and SQLite cannot commit atomically. While this marker exists, the listed source
+/// paths must be removed from both stores and reparsed before their ingest state is trusted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingIngest {
+    pub next_doc_id: u64,
+    pub source_paths: Vec<String>,
+    #[serde(default)]
+    pub vector_publication: bool,
+}
+
 impl Default for IngestState {
     fn default() -> Self {
         Self {
@@ -141,15 +153,59 @@ impl IngestState {
     }
 }
 
+impl PendingIngest {
+    pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read_to_string(path)?;
+        Ok(Some(serde_json::from_str(&data)?))
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let data = serde_json::to_string_pretty(self)?;
+        atomic_write(path, data.as_bytes())
+    }
+
+    pub fn clear(path: &Path) -> anyhow::Result<()> {
+        let parent = parent_directory(path)?;
+        match fs::remove_file(path) {
+            Ok(()) => sync_directory(parent),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("state path has no parent: {}", path.display()))?;
+    let parent = parent_directory(path)?;
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(data)?;
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
+    sync_directory(parent)
+}
+
+fn parent_directory(path: &Path) -> anyhow::Result<&Path> {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Ok(Path::new(".")),
+        Some(parent) => Ok(parent),
+        None => Err(anyhow::anyhow!(
+            "state path has no parent: {}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -207,5 +263,38 @@ mod tests {
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn pending_ingest_round_trips_and_clears() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ingest.pending.json");
+        let pending = PendingIngest {
+            next_doc_id: 17,
+            source_paths: vec!["session.jsonl".to_string()],
+            vector_publication: true,
+        };
+
+        pending.save(&path).expect("save pending ingest");
+        assert_eq!(
+            PendingIngest::load(&path).expect("load pending ingest"),
+            Some(pending)
+        );
+
+        PendingIngest::clear(&path).expect("clear pending ingest");
+        PendingIngest::clear(&path).expect("clear missing pending ingest");
+        assert_eq!(
+            PendingIngest::load(&path).expect("load cleared ingest"),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_ingest_without_vector_flag_is_lexical_only() {
+        let pending: PendingIngest =
+            serde_json::from_str(r#"{"next_doc_id":17,"source_paths":["session.jsonl"]}"#)
+                .expect("load legacy pending ingest");
+
+        assert!(!pending.vector_publication);
     }
 }

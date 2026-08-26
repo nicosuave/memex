@@ -40,6 +40,39 @@ pub struct VectorIndex {
     needs_backfill: bool,
 }
 
+pub(crate) struct StagedVectorGeneration {
+    root: PathBuf,
+    generation: String,
+    cleanup_on_drop: bool,
+}
+
+impl StagedVectorGeneration {
+    pub(crate) fn publish(mut self) -> Result<()> {
+        // Once publication starts, keep the generation even on error: current.json may have
+        // changed before the error was reported. A later successful save collects it safely.
+        self.cleanup_on_drop = false;
+        atomic_write_json(
+            &self.root.join(CURRENT_GENERATION_FILE),
+            &VectorGenerationPointer {
+                version: 1,
+                generation: self.generation.clone(),
+            },
+        )?;
+        sync_directory(&self.root)?;
+        cleanup_inactive_generations(&self.root, &self.generation);
+        cleanup_legacy_files(&self.root);
+        Ok(())
+    }
+}
+
+impl Drop for StagedVectorGeneration {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = fs::remove_dir_all(self.root.join(GENERATIONS_DIR).join(&self.generation));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorInventory {
     pub dimensions: usize,
@@ -245,6 +278,10 @@ impl VectorIndex {
     }
 
     pub fn save(&self) -> Result<()> {
+        self.stage()?.publish()
+    }
+
+    pub(crate) fn stage(&self) -> Result<StagedVectorGeneration> {
         fs::create_dir_all(&self.root)?;
         let generations = self.root.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;
@@ -253,7 +290,7 @@ impl VectorIndex {
         let final_path = generations.join(&generation);
         fs::create_dir(&temporary)?;
 
-        let write_result = (|| -> Result<()> {
+        let write_result = (|| -> Result<StagedVectorGeneration> {
             let index_path = temporary.join("usearch.index");
             let ids_path = temporary.join("doc_ids.bin");
             let meta_path = temporary.join("meta.json");
@@ -281,24 +318,26 @@ impl VectorIndex {
             sync_directory(&temporary)?;
             fs::rename(&temporary, &final_path)?;
             sync_directory(&generations)?;
-
-            atomic_write_json(
-                &self.root.join(CURRENT_GENERATION_FILE),
-                &VectorGenerationPointer {
-                    version: 1,
-                    generation: generation.clone(),
-                },
-            )?;
-            sync_directory(&self.root)?;
-            cleanup_inactive_generations(&self.root, &generation);
-            cleanup_legacy_files(&self.root);
-            Ok(())
+            Ok(StagedVectorGeneration {
+                root: self.root.clone(),
+                generation: generation.clone(),
+                cleanup_on_drop: true,
+            })
         })();
 
         if write_result.is_err() {
             let _ = fs::remove_dir_all(&temporary);
         }
         write_result
+    }
+
+    pub(crate) fn retain_doc_ids(&mut self, retained: &HashSet<u64>) -> Result<()> {
+        let removed: Vec<_> = self.doc_id_set.difference(retained).copied().collect();
+        for doc_id in removed {
+            self.index.remove(doc_id)?;
+            self.doc_id_set.remove(&doc_id);
+        }
+        Ok(())
     }
 
     pub fn exists(dir: &Path) -> bool {
@@ -832,10 +871,40 @@ mod tests {
         replacement.add(2, &make_vector(4, 2.0)).unwrap();
         assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
 
-        replacement.save().unwrap();
+        let staged = replacement.stage().unwrap();
+        assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
+        staged.publish().unwrap();
         let published = VectorIndex::open(tmp.path()).unwrap();
         assert!(!published.contains(1));
         assert!(published.contains(2));
+    }
+
+    #[test]
+    fn dropping_unpublished_generation_removes_staged_files() {
+        let tmp = TempDir::new().unwrap();
+        let mut active = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        active.add(1, &make_vector(4, 1.0)).unwrap();
+        active.save().unwrap();
+
+        let mut replacement = VectorIndex::empty_replacement(tmp.path(), 4, Some("test")).unwrap();
+        replacement.add(2, &make_vector(4, 2.0)).unwrap();
+        let staged = replacement.stage().unwrap();
+        assert_eq!(
+            fs::read_dir(tmp.path().join(GENERATIONS_DIR))
+                .unwrap()
+                .count(),
+            2
+        );
+
+        drop(staged);
+
+        assert_eq!(
+            fs::read_dir(tmp.path().join(GENERATIONS_DIR))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
     }
 
     #[test]
