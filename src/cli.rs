@@ -2821,23 +2821,18 @@ fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
 }
 
 fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
-    if !vectors_dir.join("usearch.index").exists() {
+    let Some(inventory) = VectorIndex::inventory(vectors_dir)? else {
         return Ok("vectors: none".to_string());
-    }
-    let vector = VectorIndex::open(vectors_dir)?;
-    let index_path = vectors_dir.join("usearch.index");
-    let ids_path = vectors_dir.join("doc_ids.bin");
-    let index_bytes = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
-    let ids_bytes = std::fs::metadata(&ids_path).map(|m| m.len()).unwrap_or(0);
-    let model = vector.model().unwrap_or("unknown");
+    };
+    let model = inventory.model.as_deref().unwrap_or("unknown");
     Ok(format!(
         "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
-        vector.len(),
-        vector.dimensions(),
+        inventory.vector_count,
+        inventory.dimensions,
         model,
-        vector.doc_id_count(),
-        index_bytes,
-        ids_bytes
+        inventory.doc_ids.len(),
+        inventory.index_bytes,
+        inventory.ids_bytes
     ))
 }
 

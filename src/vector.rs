@@ -1,9 +1,23 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
+use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+
+const CURRENT_GENERATION_FILE: &str = "current.json";
+const GENERATIONS_DIR: &str = "generations";
+static GENERATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorGenerationPointer {
+    version: u32,
+    generation: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VectorMetadata {
@@ -11,15 +25,34 @@ struct VectorMetadata {
     model: Option<String>,
     index_file: String,
     ids_file: String,
+    #[serde(default)]
+    vector_count: Option<usize>,
 }
 
 pub struct VectorIndex {
     dims: usize,
     model: Option<String>,
-    path: PathBuf,
+    root: PathBuf,
+    active_path: Option<PathBuf>,
     index: Index,
     doc_id_set: HashSet<u64>,
     needs_backfill: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct VectorInventory {
+    pub dimensions: usize,
+    pub model: Option<String>,
+    pub doc_ids: HashSet<u64>,
+    pub vector_count: usize,
+    pub index_bytes: u64,
+    pub ids_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveStorage {
+    path: PathBuf,
+    generation: Option<String>,
 }
 
 impl VectorIndex {
@@ -33,31 +66,84 @@ impl VectorIndex {
 
     pub fn open_or_create(dir: &Path, dimensions: usize, model: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir)?;
-        let index_path = dir.join("usearch.index");
-        let ids_path = dir.join("doc_ids.bin");
-        let meta_path = dir.join("meta.json");
-        let mut needs_backfill = false;
         let model = model.map(str::to_string);
-
-        // Check if existing index has different dimensions or an incompatible embedding model.
-        if index_path.exists() {
-            let existing = Index::new(&IndexOptions::default())?;
-            existing.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
-            let existing_meta = load_metadata_if_exists(&meta_path)?;
-            let model_mismatch = match (&existing_meta, &model) {
-                (Some(meta), Some(model)) => meta.model.as_deref() != Some(model),
-                (None, Some(_)) => true,
-                _ => false,
+        if let Some(storage) = active_storage(dir)? {
+            let existing = Self::open_active_snapshot(dir, storage)?;
+            let model_matches = match model.as_deref() {
+                Some(model) => existing.model() == Some(model),
+                None => true,
             };
-            if existing.dimensions() != dimensions || model_mismatch {
-                // Dimension or model mismatch; remove the old vector store and backfill.
-                let _ = fs::remove_file(&index_path);
-                let _ = fs::remove_file(&ids_path);
-                let _ = fs::remove_file(&meta_path);
-                needs_backfill = true;
+            if existing.dimensions() == dimensions && model_matches {
+                return Ok(existing);
             }
         }
 
+        Self::empty(dir, dimensions, model)
+    }
+
+    /// Start a complete replacement without deleting the active generation.
+    pub(crate) fn empty_replacement(
+        dir: &Path,
+        dimensions: usize,
+        model: Option<&str>,
+    ) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        Self::empty(dir, dimensions, model.map(str::to_string))
+    }
+
+    pub fn open(dir: &Path) -> Result<Self> {
+        let storage = active_storage(dir)?.ok_or_else(|| anyhow!("vector index not found"))?;
+        Self::open_active_snapshot(dir, storage)
+    }
+
+    fn open_active_snapshot(root: &Path, mut storage: ActiveStorage) -> Result<Self> {
+        loop {
+            match Self::open_from_storage(root, &storage) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(load_error) => {
+                    // A publisher may replace current.json and collect the old generation between
+                    // our pointer read and opening its files. Retry only if the pointer changed.
+                    let refreshed = active_storage(root)?;
+                    if refreshed.as_ref().is_some_and(|active| active != &storage) {
+                        storage = refreshed.expect("checked above");
+                        continue;
+                    }
+                    if refreshed.is_none() {
+                        return Err(anyhow!("vector index not found"));
+                    }
+                    return Err(load_error);
+                }
+            }
+        }
+    }
+
+    fn open_from_storage(root: &Path, storage: &ActiveStorage) -> Result<Self> {
+        let index_path = storage.path.join("usearch.index");
+        let ids_path = storage.path.join("doc_ids.bin");
+        let index = Index::new(&IndexOptions::default())?;
+        index
+            .load(path_str(&index_path)?)
+            .with_context(|| format!("load vector index {}", index_path.display()))?;
+
+        let ids_bytes = fs::read(&ids_path)
+            .with_context(|| format!("read vector ID sidecar {}", ids_path.display()))?;
+        let doc_id_set = decode_doc_ids(&ids_bytes, &ids_path)?;
+        let metadata = load_storage_metadata(storage)?;
+        validate_snapshot(&index, &doc_id_set, metadata.as_ref(), &storage.path)?;
+        let model = metadata.and_then(|meta| meta.model);
+
+        Ok(Self {
+            dims: index.dimensions(),
+            model,
+            root: root.to_path_buf(),
+            active_path: Some(storage.path.clone()),
+            index,
+            doc_id_set,
+            needs_backfill: false,
+        })
+    }
+
+    fn empty(root: &Path, dimensions: usize, model: Option<String>) -> Result<Self> {
         let options = IndexOptions {
             dimensions,
             metric: MetricKind::Cos,
@@ -66,56 +152,16 @@ impl VectorIndex {
         };
 
         let index = Index::new(&options)?;
-
-        let doc_id_set = if index_path.exists() {
-            index.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
-            if ids_path.exists() {
-                load_doc_ids(&ids_path)?
-            } else {
-                HashSet::new()
-            }
-        } else {
-            index.reserve(10000)?;
-            needs_backfill = true;
-            HashSet::new()
-        };
+        index.reserve(10000)?;
 
         Ok(Self {
             dims: dimensions,
             model,
-            path: dir.to_path_buf(),
+            root: root.to_path_buf(),
+            active_path: None,
             index,
-            doc_id_set,
-            needs_backfill,
-        })
-    }
-
-    pub fn open(dir: &Path) -> Result<Self> {
-        let index_path = dir.join("usearch.index");
-        let ids_path = dir.join("doc_ids.bin");
-        let meta_path = dir.join("meta.json");
-
-        if !index_path.exists() {
-            return Err(anyhow!("vector index not found"));
-        }
-
-        let index = Index::new(&IndexOptions::default())?;
-        index.load(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
-
-        let doc_id_set = if ids_path.exists() {
-            load_doc_ids(&ids_path)?
-        } else {
-            HashSet::new()
-        };
-        let model = load_metadata_if_exists(&meta_path)?.and_then(|meta| meta.model);
-
-        Ok(Self {
-            dims: index.dimensions(),
-            model,
-            path: dir.to_path_buf(),
-            index,
-            doc_id_set,
-            needs_backfill: false,
+            doc_id_set: HashSet::new(),
+            needs_backfill: true,
         })
     }
 
@@ -158,27 +204,87 @@ impl VectorIndex {
     }
 
     pub fn save(&self) -> Result<()> {
-        let index_path = self.path.join("usearch.index");
-        let ids_path = self.path.join("doc_ids.bin");
-        let meta_path = self.path.join("meta.json");
+        fs::create_dir_all(&self.root)?;
+        let generations = self.root.join(GENERATIONS_DIR);
+        fs::create_dir_all(&generations)?;
+        let generation = unique_generation_name();
+        let temporary = generations.join(format!(".{generation}.tmp"));
+        let final_path = generations.join(&generation);
+        fs::create_dir(&temporary)?;
 
-        // Save index
-        self.index
-            .save(index_path.to_str().ok_or_else(|| anyhow!("invalid path"))?)?;
+        let write_result = (|| -> Result<()> {
+            let index_path = temporary.join("usearch.index");
+            let ids_path = temporary.join("doc_ids.bin");
+            let meta_path = temporary.join("meta.json");
+            self.index.save(path_str(&index_path)?)?;
+            save_doc_ids(&ids_path, &self.doc_id_set)?;
+            save_metadata(
+                &meta_path,
+                &VectorMetadata {
+                    dimensions: self.dims,
+                    model: self.model.clone(),
+                    index_file: "usearch.index".to_string(),
+                    ids_file: "doc_ids.bin".to_string(),
+                    vector_count: Some(self.index.size()),
+                },
+            )?;
+            sync_file(&index_path)?;
+            sync_file(&ids_path)?;
+            sync_file(&meta_path)?;
 
-        // Save doc_ids
-        save_doc_ids(&ids_path, &self.doc_id_set)?;
-        save_metadata(
-            &meta_path,
-            &VectorMetadata {
-                dimensions: self.dims,
-                model: self.model.clone(),
-                index_file: "usearch.index".to_string(),
-                ids_file: "doc_ids.bin".to_string(),
-            },
-        )?;
+            let storage = ActiveStorage {
+                path: temporary.clone(),
+                generation: Some(generation.clone()),
+            };
+            drop(Self::open_from_storage(&self.root, &storage)?);
+            sync_directory(&temporary)?;
+            fs::rename(&temporary, &final_path)?;
+            sync_directory(&generations)?;
 
-        Ok(())
+            atomic_write_json(
+                &self.root.join(CURRENT_GENERATION_FILE),
+                &VectorGenerationPointer {
+                    version: 1,
+                    generation: generation.clone(),
+                },
+            )?;
+            sync_directory(&self.root)?;
+            cleanup_inactive_generations(&self.root, &generation);
+            cleanup_legacy_files(&self.root);
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        write_result
+    }
+
+    pub fn exists(dir: &Path) -> bool {
+        dir.join(CURRENT_GENERATION_FILE).exists() || dir.join("usearch.index").exists()
+    }
+
+    pub fn inventory(dir: &Path) -> Result<Option<VectorInventory>> {
+        if !Self::exists(dir) {
+            return Ok(None);
+        }
+        let index = Self::open(dir)?;
+        let storage = index
+            .active_path
+            .as_ref()
+            .expect("opened vector index has active storage")
+            .clone();
+        let index_bytes = fs::metadata(storage.join("usearch.index"))?.len();
+        let ids_bytes = fs::metadata(storage.join("doc_ids.bin"))?.len();
+        let vector_count = index.index.size();
+        Ok(Some(VectorInventory {
+            dimensions: index.dims,
+            model: index.model,
+            doc_ids: index.doc_id_set,
+            vector_count,
+            index_bytes,
+            ids_bytes,
+        }))
     }
 
     pub fn contains(&self, doc_id: u64) -> bool {
@@ -211,6 +317,107 @@ impl VectorIndex {
     }
 }
 
+fn active_storage(root: &Path) -> Result<Option<ActiveStorage>> {
+    let pointer_path = root.join(CURRENT_GENERATION_FILE);
+    match fs::read(&pointer_path) {
+        Ok(bytes) => {
+            let pointer: VectorGenerationPointer =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!("read vector generation pointer {}", pointer_path.display())
+                })?;
+            if pointer.version != 1 || !is_safe_generation_name(&pointer.generation) {
+                return Err(anyhow!(
+                    "invalid vector generation pointer at {}",
+                    pointer_path.display()
+                ));
+            }
+            return Ok(Some(ActiveStorage {
+                path: root.join(GENERATIONS_DIR).join(&pointer.generation),
+                generation: Some(pointer.generation),
+            }));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read vector generation pointer {}", pointer_path.display())
+            });
+        }
+    }
+
+    if root.join("usearch.index").exists() {
+        Ok(Some(ActiveStorage {
+            path: root.to_path_buf(),
+            generation: None,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_safe_generation_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn unique_generation_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = GENERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("generation-{nanos}-{}-{sequence}", std::process::id())
+}
+
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow!("invalid path: {}", path.display()))
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn cleanup_inactive_generations(root: &Path, active: &str) {
+    let generations = root.join(GENERATIONS_DIR);
+    let Ok(entries) = fs::read_dir(generations) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let known_generation = name.starts_with("generation-");
+        let abandoned_write = name.starts_with(".generation-") && name.ends_with(".tmp");
+        if name != active && (known_generation || abandoned_write) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn cleanup_legacy_files(root: &Path) {
+    for name in ["usearch.index", "doc_ids.bin", "meta.json"] {
+        let _ = fs::remove_file(root.join(name));
+    }
+}
+
 fn load_metadata(path: &Path) -> Result<VectorMetadata> {
     let data = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&data)?)
@@ -224,20 +431,105 @@ fn load_metadata_if_exists(path: &Path) -> Result<Option<VectorMetadata>> {
 }
 
 fn save_metadata(path: &Path, metadata: &VectorMetadata) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(metadata)?)?;
-    fs::rename(&tmp, path)?;
+    fs::write(path, serde_json::to_vec_pretty(metadata)?)?;
     Ok(())
 }
 
-fn load_doc_ids(path: &Path) -> Result<HashSet<u64>> {
-    let bytes = fs::read(path)?;
-    let (chunks, _) = bytes.as_chunks::<8>();
-    let ids: Vec<u64> = chunks
-        .iter()
-        .map(|bytes| u64::from_le_bytes(*bytes))
-        .collect();
-    Ok(ids.into_iter().collect())
+fn load_storage_metadata(storage: &ActiveStorage) -> Result<Option<VectorMetadata>> {
+    let path = storage.path.join("meta.json");
+    let metadata = if storage.generation.is_some() {
+        let metadata = load_metadata(&path)
+            .with_context(|| format!("read vector metadata sidecar {}", path.display()))?;
+        if metadata.vector_count.is_none() {
+            return Err(anyhow!(
+                "vector metadata {} is missing vector_count",
+                path.display()
+            ));
+        }
+        Some(metadata)
+    } else {
+        load_metadata_if_exists(&path)?
+    };
+    if let Some(metadata) = metadata.as_ref() {
+        validate_metadata_layout(metadata, &storage.path)?;
+    }
+    Ok(metadata)
+}
+
+fn decode_doc_ids(bytes: &[u8], path: &Path) -> Result<HashSet<u64>> {
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    if !remainder.is_empty() {
+        return Err(anyhow!(
+            "invalid vector ID sidecar {}: {} bytes is not a multiple of 8",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    let mut ids = HashSet::with_capacity(bytes.len() / 8);
+    for chunk in chunks {
+        let id = u64::from_le_bytes(*chunk);
+        if !ids.insert(id) {
+            return Err(anyhow!(
+                "invalid vector ID sidecar {}: duplicate document ID {id}",
+                path.display()
+            ));
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_snapshot(
+    index: &Index,
+    doc_ids: &HashSet<u64>,
+    metadata: Option<&VectorMetadata>,
+    storage: &Path,
+) -> Result<()> {
+    if let Some(metadata) = metadata {
+        if metadata.dimensions != index.dimensions() {
+            return Err(anyhow!(
+                "vector metadata dimension mismatch in {}: metadata has {}, index has {}",
+                storage.join("meta.json").display(),
+                metadata.dimensions,
+                index.dimensions()
+            ));
+        }
+        if let Some(recorded_count) = metadata.vector_count
+            && recorded_count != index.size()
+        {
+            return Err(anyhow!(
+                "vector metadata count mismatch in {}: metadata records {}, index has {}",
+                storage.join("meta.json").display(),
+                recorded_count,
+                index.size()
+            ));
+        }
+    }
+
+    if doc_ids.len() != index.size() {
+        return Err(anyhow!(
+            "vector sidecar cardinality mismatch in {}: doc_ids.bin has {} IDs, usearch.index has {} vectors",
+            storage.display(),
+            doc_ids.len(),
+            index.size()
+        ));
+    }
+    if let Some(missing) = doc_ids.iter().find(|doc_id| !index.contains(**doc_id)) {
+        return Err(anyhow!(
+            "vector sidecar identity mismatch in {}: document ID {missing} is absent from usearch.index",
+            storage.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_metadata_layout(metadata: &VectorMetadata, storage: &Path) -> Result<()> {
+    if metadata.index_file != "usearch.index" || metadata.ids_file != "doc_ids.bin" {
+        return Err(anyhow!(
+            "invalid vector metadata {}: expected usearch.index and doc_ids.bin",
+            storage.join("meta.json").display()
+        ));
+    }
+    Ok(())
 }
 
 fn save_doc_ids(path: &Path, ids: &HashSet<u64>) -> Result<()> {
@@ -245,9 +537,7 @@ fn save_doc_ids(path: &Path, ids: &HashSet<u64>) -> Result<()> {
     for id in ids {
         bytes.extend_from_slice(&id.to_le_bytes());
     }
-    let tmp = path.with_extension("bin.tmp");
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, path)?;
+    fs::write(path, &bytes)?;
     Ok(())
 }
 
@@ -258,6 +548,10 @@ mod tests {
 
     fn make_vector(dims: usize, seed: f32) -> Vec<f32> {
         (0..dims).map(|i| (i as f32 + seed).sin()).collect()
+    }
+
+    fn active_dir(root: &Path) -> PathBuf {
+        active_storage(root).unwrap().unwrap().path
     }
 
     #[test]
@@ -279,14 +573,12 @@ mod tests {
         let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
         idx.add(1, &make_vector(64, 1.0)).unwrap();
         idx.save().unwrap();
-        assert!(tmp.path().join("usearch.index").exists());
+        assert!(tmp.path().join(CURRENT_GENERATION_FILE).exists());
 
         VectorIndex::reset(tmp.path()).unwrap();
 
         assert!(tmp.path().exists());
-        assert!(!tmp.path().join("usearch.index").exists());
-        assert!(!tmp.path().join("doc_ids.bin").exists());
-        assert!(!tmp.path().join("meta.json").exists());
+        assert!(!tmp.path().join(CURRENT_GENERATION_FILE).exists());
     }
 
     #[test]
@@ -353,6 +645,18 @@ mod tests {
             idx.add(100, &v1).unwrap();
             idx.add(200, &v2).unwrap();
             idx.save().unwrap();
+            let pointer: VectorGenerationPointer = serde_json::from_slice(
+                &fs::read(tmp.path().join(CURRENT_GENERATION_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(pointer.version, 1);
+            assert!(
+                tmp.path()
+                    .join(GENERATIONS_DIR)
+                    .join(pointer.generation)
+                    .join("usearch.index")
+                    .is_file()
+            );
         }
 
         // Reload and verify
@@ -381,13 +685,15 @@ mod tests {
             idx.save().unwrap();
         }
 
-        let metadata: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(tmp.path().join("meta.json")).unwrap())
-                .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(active_dir(tmp.path()).join("meta.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(metadata["dimensions"], 64);
         assert_eq!(metadata["model"], "bge");
         assert_eq!(metadata["index_file"], "usearch.index");
         assert_eq!(metadata["ids_file"], "doc_ids.bin");
+        assert_eq!(metadata["vector_count"], 1);
     }
 
     #[test]
@@ -412,9 +718,11 @@ mod tests {
         // Reopen with different dims, should reset
         {
             let idx = VectorIndex::open_or_create(tmp.path(), 128, Some("test")).unwrap();
-            assert!(!idx.contains(1)); // old data should be gone
+            assert!(!idx.contains(1));
             assert_eq!(idx.dimensions(), 128);
         }
+
+        assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
     }
 
     #[test]
@@ -435,10 +743,31 @@ mod tests {
             assert_eq!(idx.model(), Some("beta"));
             assert!(idx.needs_backfill());
         }
+
+        let active = VectorIndex::open(tmp.path()).unwrap();
+        assert!(active.contains(1));
+        assert_eq!(active.model(), Some("alpha"));
     }
 
     #[test]
-    fn test_missing_model_metadata_resets_when_model_specified() {
+    fn explicit_replacement_keeps_active_until_publish() {
+        let tmp = TempDir::new().unwrap();
+        let mut active = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        active.add(1, &make_vector(4, 1.0)).unwrap();
+        active.save().unwrap();
+
+        let mut replacement = VectorIndex::empty_replacement(tmp.path(), 4, Some("test")).unwrap();
+        replacement.add(2, &make_vector(4, 2.0)).unwrap();
+        assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
+
+        replacement.save().unwrap();
+        let published = VectorIndex::open(tmp.path()).unwrap();
+        assert!(!published.contains(1));
+        assert!(published.contains(2));
+    }
+
+    #[test]
+    fn missing_generation_metadata_is_rejected() {
         let tmp = TempDir::new().unwrap();
 
         {
@@ -448,14 +777,10 @@ mod tests {
             idx.save().unwrap();
         }
 
-        fs::remove_file(tmp.path().join("meta.json")).unwrap();
+        fs::remove_file(active_dir(tmp.path()).join("meta.json")).unwrap();
 
-        {
-            let idx = VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).unwrap();
-            assert!(!idx.contains(1));
-            assert_eq!(idx.model(), Some("alpha"));
-            assert!(idx.needs_backfill());
-        }
+        assert!(VectorIndex::open(tmp.path()).is_err());
+        assert!(VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).is_err());
     }
 
     #[test]
@@ -468,10 +793,110 @@ mod tests {
             idx.save().unwrap();
         }
 
-        fs::write(tmp.path().join("meta.json"), "{").unwrap();
+        fs::write(active_dir(tmp.path()).join("meta.json"), "{").unwrap();
 
         assert!(VectorIndex::open(tmp.path()).is_err());
         assert!(VectorIndex::open_or_create(tmp.path(), 64, Some("alpha")).is_err());
+    }
+
+    #[test]
+    fn failed_generation_does_not_replace_active() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let original_pointer = fs::read(tmp.path().join(CURRENT_GENERATION_FILE)).unwrap();
+
+        idx.doc_id_set.insert(2);
+        let error = idx.save().expect_err("invalid sidecar must not publish");
+
+        assert!(error.to_string().contains("cardinality mismatch"));
+        assert_eq!(
+            fs::read(tmp.path().join(CURRENT_GENERATION_FILE)).unwrap(),
+            original_pointer
+        );
+        let active = VectorIndex::open(tmp.path()).unwrap();
+        assert!(active.contains(1));
+        assert!(!active.contains(2));
+    }
+
+    #[test]
+    fn sidecar_and_metadata_count_must_match_index() {
+        let sidecar = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(sidecar.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        fs::write(
+            active_dir(sidecar.path()).join("doc_ids.bin"),
+            [1_u64.to_le_bytes(), 2_u64.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        assert!(
+            VectorIndex::open(sidecar.path())
+                .err()
+                .expect("sidecar mismatch")
+                .to_string()
+                .contains("cardinality mismatch")
+        );
+
+        let count = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(count.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let metadata_path = active_dir(count.path()).join("meta.json");
+        let mut metadata = load_metadata(&metadata_path).unwrap();
+        metadata.vector_count = Some(2);
+        save_metadata(&metadata_path, &metadata).unwrap();
+        assert!(
+            VectorIndex::open(count.path())
+                .err()
+                .expect("metadata count mismatch")
+                .to_string()
+                .contains("metadata count mismatch")
+        );
+    }
+
+    #[test]
+    fn metadata_dimensions_must_match_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let metadata_path = active_dir(tmp.path()).join("meta.json");
+        let mut metadata = load_metadata(&metadata_path).unwrap();
+        metadata.dimensions = 8;
+        save_metadata(&metadata_path, &metadata).unwrap();
+
+        assert!(
+            VectorIndex::open(tmp.path())
+                .err()
+                .expect("metadata dimension mismatch")
+                .to_string()
+                .contains("dimension mismatch")
+        );
+    }
+
+    #[test]
+    fn legacy_flat_store_migrates_without_reembedding() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        idx.add(1, &make_vector(4, 1.0)).unwrap();
+        idx.save().unwrap();
+        let generation = active_dir(tmp.path());
+        for name in ["usearch.index", "doc_ids.bin", "meta.json"] {
+            fs::rename(generation.join(name), tmp.path().join(name)).unwrap();
+        }
+        fs::remove_file(tmp.path().join(CURRENT_GENERATION_FILE)).unwrap();
+        fs::remove_dir_all(tmp.path().join(GENERATIONS_DIR)).unwrap();
+
+        let legacy = VectorIndex::open_or_create(tmp.path(), 4, Some("test")).unwrap();
+        assert!(legacy.contains(1));
+        assert!(!legacy.needs_backfill());
+        legacy.save().unwrap();
+
+        assert!(tmp.path().join(CURRENT_GENERATION_FILE).is_file());
+        assert!(!tmp.path().join("usearch.index").exists());
+        assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
     }
 
     #[test]

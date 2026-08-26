@@ -333,7 +333,7 @@ fn vector_migration(
     configured_model: ModelChoice,
 ) -> VectorMigration {
     let rebuild = tasks.iter().any(|task| task.parser_version_invalidated)
-        && vector_dir.join("usearch.index").exists();
+        && crate::vector::VectorIndex::exists(vector_dir);
     let model = if rebuild {
         crate::vector::VectorIndex::open(vector_dir)
             .ok()
@@ -1022,7 +1022,7 @@ fn can_skip_noop_index(
     let Some(dimensions) = options.model.known_dimensions() else {
         return Ok(false);
     };
-    if !paths.vectors.join("usearch.index").exists() {
+    if !crate::vector::VectorIndex::exists(&paths.vectors) {
         return Ok(false);
     }
     let vector_index = crate::vector::VectorIndex::open(&paths.vectors)?;
@@ -1050,6 +1050,19 @@ fn vector_index_covers_embeddable_records(
 
 fn record_needs_embedding(record: &Record) -> bool {
     is_embedding_role(&record.role) && !record.text.is_empty()
+}
+
+fn open_vector_index_for_ingest(
+    vector_dir: &Path,
+    dimensions: usize,
+    model: ModelChoice,
+    replace: bool,
+) -> Result<crate::vector::VectorIndex> {
+    if replace {
+        crate::vector::VectorIndex::empty_replacement(vector_dir, dimensions, Some(model.as_str()))
+    } else {
+        crate::vector::VectorIndex::open_or_create(vector_dir, dimensions, Some(model.as_str()))
+    }
 }
 
 fn writer_loop(
@@ -1085,13 +1098,11 @@ fn writer_loop(
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
         let dims = handle.dims;
-        if reset_vector_store {
-            crate::vector::VectorIndex::reset(&vector_dir)?;
-        }
-        vector_index = Some(crate::vector::VectorIndex::open_or_create(
+        vector_index = Some(open_vector_index_for_ingest(
             &vector_dir,
             dims,
-            Some(model.as_str()),
+            model,
+            reset_vector_store,
         )?);
         embedder = Some(handle);
         progress.set_embed_ready();
@@ -2647,6 +2658,25 @@ mod tests {
 
         assert!(!migration.rebuild);
         assert_eq!(migration.model, ModelChoice::Gemma);
+    }
+
+    #[test]
+    fn parser_rebuild_keeps_published_vectors_until_replacement_is_saved() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+        save_vector_store(&paths, "bge", 384);
+
+        let replacement =
+            open_vector_index_for_ingest(&paths.vectors, 384, ModelChoice::BGESmall, true)
+                .expect("start replacement");
+
+        assert!(replacement.is_empty());
+        assert_eq!(
+            crate::vector::VectorIndex::open(&paths.vectors)
+                .expect("published vectors")
+                .len(),
+            1
+        );
     }
 
     #[test]
