@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,6 +156,46 @@ impl VectorIndex {
 
         let results = self.index.search(embedding, limit)?;
         Ok(results.keys.into_iter().zip(results.distances).collect())
+    }
+
+    /// Search until `limit` accepted candidates are found or the vector inventory is exhausted.
+    pub(crate) fn search_filtered(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+        accept: impl FnMut(u64) -> Result<bool>,
+    ) -> Result<Vec<(u64, f32)>> {
+        if limit == 0 || self.is_empty() {
+            return Ok(Vec::new());
+        }
+        if embedding.len() != self.dims {
+            return Err(anyhow!(
+                "embedding dimensions mismatch: expected {}, got {}",
+                self.dims,
+                embedding.len()
+            ));
+        }
+
+        let accept = RefCell::new(accept);
+        let failure = RefCell::new(None);
+        let matches = self
+            .index
+            .filtered_search(embedding, limit.min(self.len()), |doc_id| {
+                if failure.borrow().is_some() {
+                    return true;
+                }
+                match accept.borrow_mut()(doc_id) {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        *failure.borrow_mut() = Some(error);
+                        true
+                    }
+                }
+            })?;
+        if let Some(error) = failure.into_inner() {
+            return Err(error);
+        }
+        Ok(matches.keys.into_iter().zip(matches.distances).collect())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -339,6 +380,37 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 1); // v1 should be first match
         assert!(results[0].1 < 0.01); // distance should be near zero
+    }
+
+    #[test]
+    fn filtered_search_deepens_past_rejected_nearest_ids() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
+        let query = make_vector(64, 1.0);
+        idx.add(1, &query).unwrap();
+        idx.add(2, &make_vector(64, 2.0)).unwrap();
+        idx.add(3, &make_vector(64, 3.0)).unwrap();
+
+        let results = idx
+            .search_filtered(&query, 1, |doc_id| Ok(doc_id == 3))
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 3);
+    }
+
+    #[test]
+    fn filtered_search_propagates_filter_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = VectorIndex::open_or_create(tmp.path(), 64, Some("test")).unwrap();
+        let query = make_vector(64, 1.0);
+        idx.add(1, &query).unwrap();
+
+        let error = idx
+            .search_filtered(&query, 1, |_| Err(anyhow!("filter failed")))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "filter failed");
     }
 
     #[test]

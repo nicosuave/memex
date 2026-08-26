@@ -593,6 +593,25 @@ impl SearchIndex {
         Ok(results)
     }
 
+    pub(crate) fn doc_ids_matching_filters(&self, options: &QueryOptions) -> Result<HashSet<u64>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let mut filter_options = options.clone();
+        filter_options.query.clear();
+        let query = build_query(&self.fields, &filter_options, &self.index)?;
+        let count = searcher.search(query.as_ref(), &Count)?;
+        if count == 0 {
+            return Ok(HashSet::new());
+        }
+
+        // This query-scoped set trades memory proportional to the filtered lexical matches for
+        // native filtered traversal without requesting or re-querying the entire vector corpus.
+        let collector = TopDocs::with_limit(count).order_by_fast_field::<u64>("doc_id", Order::Asc);
+        let doc_ids: Vec<(u64, tantivy::DocAddress)> =
+            searcher.search(query.as_ref(), &collector)?;
+        Ok(doc_ids.into_iter().map(|(doc_id, _)| doc_id).collect())
+    }
+
     pub fn records_by_session_id(&self, session_id: &str) -> Result<Vec<Record>> {
         let reader = self.reader()?;
         let searcher = reader.searcher();
