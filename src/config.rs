@@ -2,6 +2,7 @@ use crate::embed::{EmbedRuntimeConfig, ExecutionProviderChoice, ModelChoice};
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -40,7 +41,7 @@ impl Paths {
 
 pub fn default_claude_sources() -> Vec<PathBuf> {
     if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        let roots: Vec<_> = value
+        let mut roots: Vec<_> = value
             .to_string_lossy()
             .split(',')
             .filter_map(|value| {
@@ -59,6 +60,8 @@ pub fn default_claude_sources() -> Vec<PathBuf> {
                 }
             })
             .collect();
+        let mut seen = HashSet::new();
+        roots.retain(|root| seen.insert(root.clone()));
         if !roots.is_empty() {
             return roots;
         }
@@ -450,7 +453,7 @@ mod tests {
         let _guard = env_lock();
         let _env = EnvVarGuard::set(&[(
             "CLAUDE_CONFIG_DIR",
-            Some(" /tmp/claude-one, /tmp/claude-two/projects ,, "),
+            Some(" /tmp/claude-one, /tmp/claude-two/projects, /tmp/claude-one/projects ,, "),
         )]);
 
         assert_eq!(
