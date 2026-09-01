@@ -1,3 +1,4 @@
+use crate::config::default_claude_source;
 use crate::index::SearchIndex;
 use crate::types::{Record, SourceFilter, SourceKind};
 use anyhow::{Context, Result, anyhow};
@@ -1883,7 +1884,7 @@ fn now_millis() -> u64 {
 }
 
 fn claude_projects_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude").join("projects"))
+    Ok(default_claude_source())
 }
 
 fn cursor_projects_dir() -> Result<PathBuf> {
@@ -2206,6 +2207,16 @@ mod tests {
         let _env = EnvVarGuard::set_os(&[("COPILOT_HOME", Some(home.as_os_str()))]);
 
         assert_eq!(copilot_session_root().unwrap(), home.join("session-state"));
+    }
+
+    #[test]
+    fn claude_projects_dir_honors_claude_config_dir() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let claude_home = dir.path().join("claude-home");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(claude_home.as_os_str()))]);
+
+        assert_eq!(claude_projects_dir().unwrap(), claude_home.join("projects"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, analytics_path};
-use crate::config::{MachineConfig, Paths, UserConfig, default_claude_source};
+use crate::config::{MachineConfig, Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
@@ -1505,7 +1505,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
     let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
     let options = IngestOptions {
-        claude_source: default_claude_source(),
+        claude_sources: default_claude_sources(),
         include_agents: false,
         include_reasoning: config.include_reasoning_default(),
         include_codex: true,

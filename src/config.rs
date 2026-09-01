@@ -38,11 +38,46 @@ impl Paths {
     }
 }
 
-pub fn default_claude_source() -> PathBuf {
+pub fn default_claude_sources() -> Vec<PathBuf> {
+    if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let roots: Vec<_> = value
+            .to_string_lossy()
+            .split(',')
+            .filter_map(|value| {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    let root = PathBuf::from(value);
+                    Some(
+                        if root.file_name().and_then(|name| name.to_str()) == Some("projects") {
+                            root
+                        } else {
+                            root.join("projects")
+                        },
+                    )
+                }
+            })
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+
     let home = directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
-    home.join(".claude").join("projects")
+    vec![
+        home.join(".claude").join("projects"),
+        home.join(".config").join("claude").join("projects"),
+    ]
+}
+
+pub fn default_claude_source() -> PathBuf {
+    default_claude_sources()
+        .into_iter()
+        .next()
+        .expect("default Claude sources are never empty")
 }
 
 pub const DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES: usize = 64 * 1024;
@@ -409,6 +444,27 @@ fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn claude_sources_honor_config_dir_and_multiple_roots() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(" /tmp/claude-one, /tmp/claude-two/projects ,, "),
+        )]);
+
+        assert_eq!(
+            default_claude_sources(),
+            vec![
+                PathBuf::from("/tmp/claude-one/projects"),
+                PathBuf::from("/tmp/claude-two/projects"),
+            ]
+        );
+        assert_eq!(
+            default_claude_source(),
+            PathBuf::from("/tmp/claude-one/projects")
+        );
+    }
 
     #[test]
     fn exclude_paths_parse_and_expand_tilde() {

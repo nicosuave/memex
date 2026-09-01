@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_path};
-use crate::config::{Paths, UserConfig, default_claude_source};
+use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
@@ -1105,7 +1105,7 @@ impl App {
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
                 let opts = IngestOptions {
-                    claude_source: default_claude_source(),
+                    claude_sources: default_claude_sources(),
                     include_agents: false,
                     include_reasoning: config.include_reasoning_default(),
                     include_codex: true,

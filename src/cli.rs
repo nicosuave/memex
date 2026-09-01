@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
-use crate::config::{Paths, UserConfig, default_claude_source};
+use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::embed::EmbedderHandle;
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, ingest_all};
@@ -64,7 +64,7 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 struct IndexArgs {
-    /// Path to Claude projects directory [default: ~/.claude/projects]
+    /// Path to Claude projects directory [default: CLAUDE_CONFIG_DIR or ~/.claude/projects]
     #[arg(long)]
     source: Option<PathBuf>,
     /// Include agent subprocess conversations (Claude Code subagents)
@@ -1247,7 +1247,9 @@ fn run_index(
     };
 
     let opts = IngestOptions {
-        claude_source: source.unwrap_or_else(default_claude_source),
+        claude_sources: source
+            .map(|source| vec![source])
+            .unwrap_or_else(default_claude_sources),
         include_agents,
         include_reasoning,
         include_codex: codex,

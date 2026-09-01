@@ -30,7 +30,7 @@ const RECORD_CHANNEL_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
-    pub claude_source: PathBuf,
+    pub claude_sources: Vec<PathBuf>,
     pub include_agents: bool,
     pub include_reasoning: bool,
     pub include_codex: bool,
@@ -516,9 +516,11 @@ pub fn ingest_all(
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
 
-    if options.claude_source.exists() {
-        let claude_files =
-            crate::sources::claude::discover(&options.claude_source, options.include_agents)?;
+    for claude_source in &options.claude_sources {
+        if !claude_source.exists() {
+            continue;
+        }
+        let claude_files = crate::sources::claude::discover(claude_source, options.include_agents)?;
         for source_file in claude_files {
             let path = source_file.path;
             if excluder.is_excluded(&path) {
@@ -1908,7 +1910,7 @@ mod tests {
 
     fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         IngestOptions {
-            claude_source: PathBuf::from("/does/not/exist"),
+            claude_sources: vec![PathBuf::from("/does/not/exist")],
             exclude_patterns: Vec::new(),
             include_agents: false,
             include_reasoning: false,
@@ -1949,7 +1951,7 @@ mod tests {
 
         // First run with no exclusions indexes both transcripts.
         let mut options = ingest_options(false, ModelChoice::Gemma);
-        options.claude_source = claude_root.clone();
+        options.claude_sources = vec![claude_root.clone()];
         let lease = ingest_lease(&paths);
         let report = ingest_all(&paths, &index, &options, &lease).expect("first ingest");
         assert_eq!(report.records_added, 2);
@@ -1989,6 +1991,41 @@ mod tests {
             state.files.keys().all(|k| !k.contains("-client-")),
             "excluded paths must be pruned from ingest state"
         );
+    }
+
+    #[test]
+    fn ingest_discovers_claude_transcripts_across_multiple_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first_root = tmp.path().join("claude-one").join("projects");
+        let second_root = tmp.path().join("claude-two").join("projects");
+        let first_project = first_root.join("-Users-nico-Code-first");
+        let second_project = second_root.join("-Users-nico-Code-second");
+        fs::create_dir_all(&first_project).expect("create first project");
+        fs::create_dir_all(&second_project).expect("create second project");
+        fs::write(
+            first_project.join("first.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"first root"},"uuid":"u1"}
+"#,
+        )
+        .expect("write first transcript");
+        fs::write(
+            second_project.join("second.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"second root"},"uuid":"u2"}
+"#,
+        )
+        .expect("write second transcript");
+
+        let paths = Paths::new(Some(tmp.path().join("memex-root"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = open_search_index(&paths);
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![first_root, second_root];
+
+        let lease = ingest_lease(&paths);
+        let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.records_added, 2);
     }
 
     #[test]
@@ -2063,7 +2100,7 @@ mod tests {
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         paths.ensure_dirs().expect("ensure dirs");
         let mut options = ingest_options(false, ModelChoice::default());
-        options.claude_source = claude_root;
+        options.claude_sources = vec![claude_root];
         {
             let index =
                 SearchIndex::open_or_create_for_ingest(&paths.index).expect("initial generation");
@@ -2190,7 +2227,7 @@ mod tests {
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         paths.ensure_dirs().expect("ensure dirs");
         let mut options = ingest_options(true, ModelChoice::Potion);
-        options.claude_source = claude_root;
+        options.claude_sources = vec![claude_root];
         {
             let index =
                 SearchIndex::open_or_create_for_ingest(&paths.index).expect("initial generation");
@@ -2534,7 +2571,7 @@ mod tests {
         let _existing_writer = index.writer().expect("existing writer");
         let lease = ingest_lease(&paths);
         let mut options = ingest_options(false, ModelChoice::default());
-        options.claude_source = claude_root;
+        options.claude_sources = vec![claude_root];
 
         let error = ingest_all(&paths, &index, &options, &lease).expect_err("writer collision");
         let message = format!("{error:#}");
@@ -3340,7 +3377,7 @@ mod tests {
         paths.ensure_dirs().expect("ensure dirs");
         let index = SearchIndex::open_or_create(&paths.index).expect("index");
         let options = IngestOptions {
-            claude_source: claude_root,
+            claude_sources: vec![claude_root],
             exclude_patterns: Vec::new(),
             include_agents: false,
             include_reasoning: false,
@@ -3760,7 +3797,7 @@ mod tests {
         paths.ensure_dirs().expect("ensure dirs");
         let index = SearchIndex::open_or_create(&paths.index).expect("index");
         let options = IngestOptions {
-            claude_source: tmp.path().join("missing-claude"),
+            claude_sources: vec![tmp.path().join("missing-claude")],
             exclude_patterns: Vec::new(),
             include_agents: false,
             include_reasoning: false,

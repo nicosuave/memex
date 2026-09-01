@@ -58,32 +58,8 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
     Ok(files)
 }
 
-pub fn default_usage_roots() -> Vec<PathBuf> {
-    vec![
-        super::common::home().join(".claude/projects"),
-        super::common::home().join(".config/claude/projects"),
-    ]
-}
-
 pub fn usage_files() -> Vec<PathBuf> {
-    let roots = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(|root| {
-            root.to_string_lossy()
-                .split(',')
-                .map(expand_usage_root)
-                .collect()
-        })
-        .unwrap_or_else(default_usage_roots);
-    super::common::jsonl_files(roots)
-}
-
-fn expand_usage_root(path: &str) -> PathBuf {
-    let path = PathBuf::from(path.trim());
-    if path.file_name().and_then(|name| name.to_str()) == Some("projects") {
-        path
-    } else {
-        path.join("projects")
-    }
+    super::common::jsonl_files(crate::config::default_claude_sources())
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -803,18 +779,6 @@ mod tests {
         let events = parse_usage_file(&path).unwrap();
         assert_eq!(events[0].project.as_deref(), Some("/Users/nico/Code/memex"));
         assert_eq!(events[1].project, None);
-    }
-
-    #[test]
-    fn usage_root_accepts_config_and_already_expanded_projects_paths() {
-        assert_eq!(
-            expand_usage_root("/tmp/claude"),
-            PathBuf::from("/tmp/claude/projects")
-        );
-        assert_eq!(
-            expand_usage_root("/tmp/claude/projects"),
-            PathBuf::from("/tmp/claude/projects")
-        );
     }
 
     #[test]
