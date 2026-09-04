@@ -22,6 +22,58 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     usage: 4,
 };
 
+/// Return the human-facing title Claude stores alongside a conversation.
+///
+/// Title records are metadata rather than transcript messages, so the search
+/// index intentionally does not contain them. The TUI uses this lightweight
+/// reader when it builds the recent-session list.
+pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    let mut custom_title = None;
+    let mut ai_title = None;
+    let mut agent_name = None;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != session_id)
+        {
+            continue;
+        }
+        let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = match entry_type {
+            "custom-title" => value
+                .get("customTitle")
+                .or_else(|| value.get("title"))
+                .and_then(Value::as_str),
+            "ai-title" => value.get("aiTitle").and_then(Value::as_str),
+            "agent-name" => value
+                .get("agentName")
+                .or_else(|| value.get("name"))
+                .and_then(Value::as_str),
+            _ => None,
+        }
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
+
+        match entry_type {
+            "custom-title" if title.is_some() => custom_title = title,
+            "ai-title" if title.is_some() => ai_title = title,
+            "agent-name" if title.is_some() => agent_name = title,
+            _ => {}
+        }
+    }
+
+    custom_title.or(ai_title).or(agent_name)
+}
+
 pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
     let mut files = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -759,6 +811,26 @@ mod tests {
             ConversationKind::Sidechain
         );
         assert_eq!(metadata.project.as_deref(), Some("memex"));
+    }
+
+    #[test]
+    fn session_title_prefers_custom_title_over_ai_title() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"ai-title\",\"sessionId\":\"session-1\",\"aiTitle\":\"Generated title\"}\n",
+                "{\"type\":\"custom-title\",\"sessionId\":\"session-1\",\"customTitle\":\"My title\"}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_title(&path, "session-1").as_deref(),
+            Some("My title")
+        );
+        assert_eq!(session_title(&path, "another-session"), None);
     }
 
     #[test]

@@ -488,6 +488,7 @@ struct SessionSummary {
     last_ts: u64,
     hit_count: usize,
     top_score: f32,
+    title: String,
     snippet: String,
     source_path: String,
     source_dir: String,
@@ -4035,11 +4036,14 @@ fn session_result_line(
         ),
         Span::raw("  "),
     ];
-    if session.snippet.is_empty() {
+    if session.snippet.is_empty() && session.title.is_empty() {
         spans.push(Span::styled(
             truncate_middle(&session.session_id, detail_width),
             theme.muted,
         ));
+    } else if session.snippet.is_empty() {
+        let title = strip_ansi_and_controls(&session.title);
+        spans.push(Span::styled(truncate_end(&title, detail_width), theme.text));
     } else {
         let snippet = strip_ansi_and_controls(&session.snippet);
         spans.extend(match_context_spans(&snippet, terms, detail_width, theme));
@@ -5100,10 +5104,51 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
         last_ts: row.last_at,
         hit_count: row.message_count.max(1) as usize,
         top_score: 0.0,
+        title: String::new(),
         snippet: String::new(),
         source_dir: row.cwd.unwrap_or_else(|| parent_dir(&row.source_path)),
         source_path: row.source_path,
     }
+}
+
+fn enrich_session_titles(index: &SearchIndex, sessions: &mut [SessionSummary]) {
+    let codex_ids = sessions
+        .iter()
+        .filter(|session| session.source == SourceKind::Codex)
+        .map(|session| session.session_id.clone())
+        .collect::<Vec<_>>();
+    let codex_titles = crate::sources::codex::session_titles(&codex_ids);
+
+    for session in sessions {
+        let source_title = match session.source {
+            SourceKind::Codex => codex_titles.get(&session.session_id).cloned(),
+            SourceKind::Claude => crate::sources::claude::session_title(
+                std::path::Path::new(&session.source_path),
+                &session.session_id,
+            ),
+            _ => None,
+        };
+        session.title = source_title
+            .or_else(|| first_user_prompt(index, session))
+            .map(|title| summarize(&title, 120))
+            .unwrap_or_default();
+    }
+}
+
+fn first_user_prompt(index: &SearchIndex, session: &SessionSummary) -> Option<String> {
+    let mut records = index.records_by_session_id(&session.session_id).ok()?;
+    records.retain(|record| {
+        record.source_path == session.source_path
+            && record.role == "user"
+            && !record.text.trim().is_empty()
+    });
+    records.sort_by(|left, right| {
+        left.turn_id
+            .cmp(&right.turn_id)
+            .then_with(|| left.ts.cmp(&right.ts))
+            .then_with(|| left.doc_id.cmp(&right.doc_id))
+    });
+    records.into_iter().next().map(|record| record.text)
 }
 
 fn enrich_session_projects(
@@ -5224,6 +5269,7 @@ fn add_record_to_session(
             last_ts: record.ts,
             hit_count: 0,
             top_score: score,
+            title: String::new(),
             snippet: summarize(&record.text, 160),
             source_path: record.source_path.clone(),
             source_dir: parent_dir(&record.source_path),
@@ -5265,6 +5311,7 @@ fn add_located_record_to_session(
         last_ts: record.ts,
         hit_count: 0,
         top_score: score,
+        title: String::new(),
         snippet: summarize(&record.text, 160),
         source_path: record.source_path.clone(),
         source_dir: parent_dir(&record.source_path),
@@ -5397,7 +5444,7 @@ fn run_search_request(
         return Ok((sessions, failures));
     }
     if request.query.is_empty() {
-        return sessions_from_analytics(
+        let mut sessions = sessions_from_analytics(
             paths,
             request.source.as_filter(),
             request.since,
@@ -5406,8 +5453,9 @@ fn run_search_request(
         )
         .or_else(|_| {
             sessions_from_recent(index, request.source.as_filter(), request.since, project)
-        })
-        .map(|sessions| (sessions, Vec::new()));
+        })?;
+        enrich_session_titles(index, &mut sessions);
+        return Ok((sessions, Vec::new()));
     }
 
     let tantivy_project = if request.grouping == ProjectGrouping::Flat {
@@ -6998,6 +7046,33 @@ mod tests {
     }
 
     #[test]
+    fn recent_session_row_shows_title_instead_of_uuid() {
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "01a00000-0000-0000-0000-000000000000".to_string(),
+            project: "memex".to_string(),
+            source: SourceKind::Codex,
+            last_ts: 1,
+            hit_count: 1,
+            top_score: 0.0,
+            title: "Readable session title".to_string(),
+            snippet: String::new(),
+            source_path: "source.jsonl".to_string(),
+            source_dir: String::new(),
+        };
+
+        let line = session_result_line(&session, &[], 8, 40, &Theme::new());
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("Readable session title"));
+        assert!(!rendered.contains("01a00000"));
+    }
+
+    #[test]
     fn enter_browse_switches_to_split_and_selects_first() {
         let (_tmp, mut app) = test_app();
         app.results.push(SessionSummary {
@@ -7008,6 +7083,7 @@ mod tests {
             last_ts: 1,
             hit_count: 1,
             top_score: 0.0,
+            title: String::new(),
             snippet: String::new(),
             source_path: "source.jsonl".to_string(),
             source_dir: String::new(),
@@ -7154,6 +7230,7 @@ mod tests {
                 last_ts: 42,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "source.jsonl".to_string(),
                 source_dir: String::new(),
@@ -7338,6 +7415,7 @@ mod tests {
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "codex.jsonl".into(),
                 source_dir: String::new(),
@@ -7350,6 +7428,7 @@ mod tests {
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "claude.jsonl".into(),
                 source_dir: String::new(),
@@ -7362,6 +7441,7 @@ mod tests {
                 last_ts: 1,
                 hit_count: 1,
                 top_score: 1.0,
+                title: String::new(),
                 snippet: String::new(),
                 source_path: "remote-codex.jsonl".into(),
                 source_dir: String::new(),

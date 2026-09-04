@@ -9,10 +9,11 @@ use memchr::{memchr, memmem};
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,76 @@ pub fn history_paths() -> Vec<PathBuf> {
         .map(|home| home.join("history.jsonl"))
         .filter(|path| path.exists())
         .collect()
+}
+
+/// Load the human-facing titles maintained by Codex's local thread database.
+/// The rollout JSONL files do not carry this value themselves.
+pub fn session_titles(session_ids: &[String]) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for home in homes() {
+        for path in state_database_paths(&home) {
+            let Ok(connection) = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) else {
+                continue;
+            };
+            for session_id in session_ids {
+                if titles.contains_key(session_id) {
+                    continue;
+                }
+                if let Some(title) = codex_thread_title(&connection, session_id) {
+                    titles.insert(session_id.clone(), title);
+                }
+            }
+        }
+    }
+    titles
+}
+
+fn state_database_paths(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(home) else {
+        return Vec::new();
+    };
+    let mut versioned_paths = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let version = name
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u64>()
+                .ok()?;
+            Some((version, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    versioned_paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    versioned_paths.into_iter().map(|(_, path)| path).collect()
+}
+
+fn codex_thread_title(connection: &Connection, session_id: &str) -> Option<String> {
+    // Current Codex builds have all three columns. The second query keeps the
+    // reader useful with older databases that only stored `title`.
+    for sql in [
+        "SELECT COALESCE(NULLIF(name, ''), NULLIF(title, ''), NULLIF(first_user_message, '')) FROM threads WHERE id = ?1",
+        "SELECT NULLIF(title, '') FROM threads WHERE id = ?1",
+    ] {
+        let title = connection
+            .query_row(sql, params![session_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty());
+        if title.is_some() {
+            return title;
+        }
+    }
+    None
 }
 
 pub fn session_id_from_path(path: &Path) -> Option<String> {
@@ -1377,6 +1448,40 @@ mod tests {
         fs::write(archived.join("archived.jsonl"), "{}\n").unwrap();
         let files = super::super::common::jsonl_files([active, archived]);
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn codex_thread_title_prefers_an_explicit_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT);
+                 INSERT INTO threads VALUES ('session-1', 'Pinned name', 'Generated title', 'First prompt');",
+            )
+            .unwrap();
+
+        assert_eq!(
+            codex_thread_title(&connection, "session-1").as_deref(),
+            Some("Pinned name")
+        );
+        assert_eq!(codex_thread_title(&connection, "missing"), None);
+    }
+
+    #[test]
+    fn state_database_paths_prefer_the_newest_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["state_2.sqlite", "state_12.sqlite", "state.sqlite"] {
+            fs::write(temp.path().join(name), "").unwrap();
+        }
+
+        let names = state_database_paths(temp.path())
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["state_12.sqlite", "state_2.sqlite"]);
     }
 
     #[test]
