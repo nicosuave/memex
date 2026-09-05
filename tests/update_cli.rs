@@ -32,7 +32,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let executable = Path::new(env!("CARGO_BIN_EXE_memex"));
+        // Keep fixtures on the executable's filesystem so they can share its inode.
+        // Copying a fresh Mach-O for every case triggers repeated macOS verification.
+        let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
         let home = temp.path().join("home");
         let root = temp.path().join("root");
         let bin = temp.path().join("bin");
@@ -55,8 +58,9 @@ impl Fixture {
             "auto_index_on_search = false\n",
         )
         .unwrap();
-        std::fs::copy(env!("CARGO_BIN_EXE_memex"), &cellar_memex).unwrap();
-        make_executable(&cellar_memex);
+        // A hard link preserves the simulated Cellar path (unlike a symlink)
+        // without creating another executable or changing the build's permissions.
+        std::fs::hard_link(executable, &cellar_memex).unwrap();
 
         write_script(
             &bin.join("brew"),
@@ -438,7 +442,8 @@ fn no_update_check_keeps_stale_skill_warning_off_search_stdout() {
         .args(search_args)
         .args(["--format", "toon"]));
     assert!(toon.status.success());
-    toon_format::decode_default(std::str::from_utf8(&toon.stdout).unwrap()).unwrap();
+    toon_format::decode_default::<serde_json::Value>(std::str::from_utf8(&toon.stdout).unwrap())
+        .unwrap();
     let stderr = String::from_utf8_lossy(&toon.stderr);
     assert!(stderr.contains("memex-search skill is outdated or locally modified (shared)"));
     assert!(!stderr.contains("update: memex v99.0.0 is available"));
