@@ -241,6 +241,15 @@ memex session SESSION_ID --machine mini --source-path /path/on/mini/session.json
 memex session SESSION_ID --machine mini --offset 500 --limit 500
 ~~~
 
+`memex context` selects a source/session/path neighborhood around a stable record ID,
+document ID, or native event ID. `--expand-interactions` adds only directly owned tool
+calls/results and stops with an actionable error above 100 additional records.
+
+New indexes provide exact canonical record-ID lookup plus indexed document/event lookup.
+Existing indexes remain readable: canonical record IDs fall back to a stored-record scan
+until the index is rebuilt. Neighborhood reads use indexed session, source, and source-path
+scope. Session pages sort by turn, timestamp, and document ID before applying the offset.
+
 Session pages are limited to 500 records. To fetch several sessions in one bounded
 request, provide JSONL on stdin or as a file:
 

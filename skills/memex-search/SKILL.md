@@ -269,7 +269,13 @@ memex context --event-id <event_id> --session <session_id> --before 5 --after 5 
 memex context --doc-id <doc_id> --before 5 --after 5
 ```
 
-Use `--expand-interactions` when linked tool calls/results matter. It adds the connected interaction records without turning the request into an unbounded full-session fetch. For a result on another machine, use machine-aware `show` or paginated `session` instead.
+Use `--expand-interactions` when directly owned tool calls/results matter. It does not
+follow general parent or conversation ancestry. Expansion has a hard cap of 100 additional
+records; if the command reports that cap, narrow `--before`/`--after` or disable expansion.
+Canonical record IDs use an exact field in new indexes and a stored-record fallback scan
+in old indexes until rebuilt. Document/event anchors are indexed, and neighborhoods are
+scoped by session, source, and source path. For a result on another machine, use
+machine-aware `show` or paginated `session`.
 
 ## Step 7: Reformulate From Evidence
 
