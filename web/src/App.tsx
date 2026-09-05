@@ -77,6 +77,29 @@ type SearchPayload = {
 
 type PreviewMode = "matches" | "history"
 type ShellView = "home" | "transcript"
+type TimeRange = "24h" | "7d" | "30d" | "all"
+
+const timeRanges: TimeRange[] = ["24h", "7d", "30d", "all"]
+const defaultTimeRange: TimeRange = "30d"
+
+function parseTimeRange(value: string | null): TimeRange {
+  return timeRanges.includes(value as TimeRange)
+    ? (value as TimeRange)
+    : defaultTimeRange
+}
+
+function describeTimeRange(range: TimeRange) {
+  switch (range) {
+    case "24h":
+      return "the last 24 hours"
+    case "7d":
+      return "the last 7 days"
+    case "30d":
+      return "the last 30 days"
+    case "all":
+      return "all time"
+  }
+}
 
 const paramsAtLoad = new URLSearchParams(window.location.search)
 const requestedMode = paramsAtLoad.get("mode")
@@ -107,7 +130,9 @@ type ActivityMetric = "sessions" | "tokens"
 
 type ActivityPayload = {
   metric: ActivityMetric
-  days: number
+  range?: TimeRange
+  bucket_keys?: string[]
+  days?: number
   token_usage_enabled: boolean
   partial: boolean
   points: Array<{
@@ -168,7 +193,10 @@ function activityDateKeys(days: number) {
 
 function buildBrailleChart(payload: ActivityPayload | null): BrailleChartData {
   const points = payload?.points || []
-  const dates = activityDateKeys(payload?.days || 30)
+  const dates =
+    payload?.bucket_keys?.length
+      ? payload.bucket_keys
+      : activityDateKeys(payload?.days || 30)
   const totalsBySource = new Map<string, number>()
   const valuesByDate = new Map<string, Map<string, number>>()
   let total = 0
@@ -238,12 +266,16 @@ function buildBrailleChart(payload: ActivityPayload | null): BrailleChartData {
 
 function HomeActivityChart({
   active,
+  onRangeChange,
   project,
+  range,
   source,
   origin,
 }: {
   active: boolean
+  onRangeChange: (value: string) => void
   project: string
+  range: TimeRange
   source: string
   origin: string
 }) {
@@ -257,7 +289,7 @@ function HomeActivityChart({
     if (!active) return
     const controller = new AbortController()
     const generation = ++requestGeneration.current
-    const params = new URLSearchParams({ days: "30", metric })
+    const params = new URLSearchParams({ range, metric })
     if (source !== "all") params.set("source", source)
     if (project.trim()) params.set("project", project.trim())
     if (origin !== "interactive") params.set("origin", origin)
@@ -283,13 +315,16 @@ function HomeActivityChart({
       ++requestGeneration.current
       controller.abort()
     }
-  }, [active, metric, project, source, origin])
+  }, [active, metric, project, range, source, origin])
+
+  const currentPayload =
+    payload?.metric === metric && payload.range === range ? payload : null
 
   const chart = useMemo(
-    () => buildBrailleChart(payload?.metric === metric ? payload : null),
-    [payload, metric],
+    () => buildBrailleChart(currentPayload),
+    [currentPayload],
   )
-  const chartLabel = `${compactNumber.format(chart.total)} ${metric} over the last 30 days`
+  const chartLabel = `${compactNumber.format(chart.total)} ${metric} over ${describeTimeRange(range)}`
 
   return (
     <section
@@ -303,7 +338,13 @@ function HomeActivityChart({
         role="img"
       >
         {chart.grid.map((row, rowIndex) => (
-          <div className="braille-row" key={rowIndex}>
+          <div
+            className="braille-row"
+            key={rowIndex}
+            style={{
+              gridTemplateColumns: `repeat(${Math.max(1, row.length)}, minmax(0, 1fr))`,
+            }}
+          >
             {row.map((cell, columnIndex) => (
               <span
                 aria-hidden="true"
@@ -322,9 +363,9 @@ function HomeActivityChart({
           <span>
             {error
               ? "Activity unavailable"
-              : loading || payload?.metric !== metric
+              : loading || !currentPayload
                 ? "Loading activity…"
-                : `${compactNumber.format(chart.total)} ${metric}${payload?.partial ? " · partial" : ""}`}
+                : `${compactNumber.format(chart.total)} ${metric}${currentPayload.partial ? " · partial" : ""}`}
           </span>
           {chart.groups.length > 0 && (
             <span className="activity-legend" aria-hidden="true">
@@ -337,30 +378,50 @@ function HomeActivityChart({
             </span>
           )}
         </div>
-        <Select
-          onValueChange={(value) => setMetric(value as ActivityMetric)}
-          value={metric}
-        >
-          <SelectTrigger
-            aria-label="Activity metric"
-            className="home-chart-select"
-            size="sm"
-            variant="ghost"
+        <div className="home-chart-controls">
+          <Select
+            onValueChange={(value) => setMetric(value as ActivityMetric)}
+            value={metric}
           >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              <SelectItem value="sessions">Sessions</SelectItem>
-              <SelectItem value="tokens">Tokens</SelectItem>
-            </SelectGroup>
-          </SelectContent>
-        </Select>
+            <SelectTrigger
+              aria-label="Activity metric"
+              className="home-chart-select"
+              size="sm"
+              variant="ghost"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="sessions">Sessions</SelectItem>
+                <SelectItem value="tokens">Tokens</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          <Select onValueChange={onRangeChange} value={range}>
+            <SelectTrigger
+              aria-label="Time range"
+              className="home-chart-select"
+              size="sm"
+              variant="ghost"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectItem value="24h">24h</SelectItem>
+                <SelectItem value="7d">7d</SelectItem>
+                <SelectItem value="30d">30d</SelectItem>
+                <SelectItem value="all">All</SelectItem>
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+        </div>
       </div>
 
       {metric === "tokens" &&
-        payload?.metric === metric &&
-        !payload.token_usage_enabled && (
+        currentPayload &&
+        !currentPayload.token_usage_enabled && (
           <p className="home-activity-note">
             Token usage is disabled. Set <code>token_usage = true</code> in the
             memex config to enable it.
@@ -384,6 +445,9 @@ function App() {
   const [project, setProject] = useState(paramsAtLoad.get("project") || "")
   const [origin, setOrigin] = useState(
     paramsAtLoad.get("origin") || "interactive",
+  )
+  const [timeRange, setTimeRange] = useState(() =>
+    parseTimeRange(paramsAtLoad.get("range")),
   )
   const [shellView, setShellView] = useState<ShellView>(initialShellView)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -425,7 +489,7 @@ function App() {
   const searchController = useRef<AbortController | null>(null)
   const resultOffset = useRef(0)
   const loadingMore = useRef(false)
-  const intent = JSON.stringify([query, source, project, origin])
+  const intent = JSON.stringify([query, source, project, origin, timeRange])
   const currentIntent = useRef(intent)
   currentIntent.current = intent
 
@@ -439,12 +503,16 @@ function App() {
   }, [mode])
 
   const locationForTarget = useCallback(
-    (nextTarget: SessionTarget | null) => {
+    (
+      nextTarget: SessionTarget | null,
+      nextTimeRange: TimeRange = timeRange,
+    ) => {
       const next = new URLSearchParams()
       if (query.trim()) next.set("q", query.trim())
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
       if (origin !== "interactive") next.set("origin", origin)
+      if (nextTimeRange !== defaultTimeRange) next.set("range", nextTimeRange)
       if (nextTarget) {
         next.set("session", nextTarget.id)
         if (nextTarget.sourcePath) next.set("path", nextTarget.sourcePath)
@@ -456,7 +524,7 @@ function App() {
       const url = next.size ? `?${next}` : location.pathname
       return url
     },
-    [mode, origin, project, query, source],
+    [mode, origin, project, query, source, timeRange],
   )
 
   const updateLocation = useCallback(
@@ -475,6 +543,16 @@ function App() {
       recordId: query.trim() ? result.record_id : undefined,
     })
 
+  const changeTimeRange = useCallback(
+    (value: string) => {
+      const nextRange = parseTimeRange(value)
+      if (nextRange === timeRange) return
+      history.pushState({}, "", locationForTarget(target, nextRange))
+      setTimeRange(nextRange)
+    },
+    [locationForTarget, target, timeRange],
+  )
+
   useEffect(() => {
     const restore = () => {
       const params = new URLSearchParams(location.search)
@@ -482,6 +560,7 @@ function App() {
       setSource(params.get("source") || "all")
       setProject(params.get("project") || "")
       setOrigin(params.get("origin") || "interactive")
+      setTimeRange(parseTimeRange(params.get("range")))
       setMode(params.get("mode") === "history" ? "history" : "matches")
       setTarget(
         params.has("session")
@@ -509,9 +588,10 @@ function App() {
       if (source !== "all") searchParams.set("source", source)
       if (project.trim()) searchParams.set("project", project.trim())
       if (origin !== "interactive") searchParams.set("origin", origin)
+      searchParams.set("range", timeRange)
       return searchParams
     },
-    [origin, project, query, source],
+    [origin, project, query, source, timeRange],
   )
 
   const searchStatus = useCallback(
@@ -641,7 +721,7 @@ function App() {
 
   useEffect(() => {
     setHomeSelectedIndex(0)
-  }, [origin, query, source, project])
+  }, [origin, project, query, source, timeRange])
 
   useEffect(() => {
     const discovered = results
@@ -787,7 +867,9 @@ function App() {
       <div className="home-column">
         <HomeActivityChart
           active={shellView === "home"}
+          onRangeChange={changeTimeRange}
           project={project}
+          range={timeRange}
           source={source}
           origin={origin}
         />
@@ -1216,6 +1298,25 @@ function App() {
                 <TabsTrigger value="matches">Matches</TabsTrigger>
                 <TabsTrigger value="history">History</TabsTrigger>
               </TabsList>
+
+              <Select onValueChange={changeTimeRange} value={timeRange}>
+                <SelectTrigger
+                  aria-label="Time range"
+                  className="transcript-range-select"
+                  size="sm"
+                  variant="ghost"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="24h">24h</SelectItem>
+                    <SelectItem value="7d">7d</SelectItem>
+                    <SelectItem value="30d">30d</SelectItem>
+                    <SelectItem value="all">All</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
 
               <ToggleGroup
                 aria-label="Transcript visibility"

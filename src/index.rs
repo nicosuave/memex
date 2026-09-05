@@ -663,6 +663,27 @@ impl SearchIndex {
         .map(Some)
     }
 
+    /// Resolve up to two canonical-ID matches within one session scope. Current indexes use the
+    /// canonical-ID term directly. Legacy indexes must inspect stored records, but the fallback is
+    /// constrained to the supplied session/source/path scope and preserves session order.
+    pub fn records_by_canonical_id_in_session_scope(
+        &self,
+        record_id: &str,
+        session_id: &str,
+        source_path: Option<&str>,
+        source: Option<crate::types::SourceKind>,
+    ) -> Result<Vec<Record>> {
+        let reader = self.reader()?;
+        records_by_canonical_id_in_session_scope(
+            &reader.searcher(),
+            &self.fields,
+            record_id,
+            session_id,
+            source_path,
+            source,
+        )
+    }
+
     pub(crate) fn records_by_context_scope(
         &self,
         session_id: Option<&str>,
@@ -846,7 +867,8 @@ impl SearchIndex {
     }
 
     /// Find a canonical record in an exact session scope and return a page centered on it.
-    /// Only the matching anchor and returned page are hydrated from the document store.
+    /// Current indexes hydrate only the matching anchor and returned page. Legacy indexes scan
+    /// stored records within the supplied scope to reconstruct canonical IDs before paging.
     pub fn records_by_session_path_around(
         &self,
         session_id: &str,
@@ -865,29 +887,19 @@ impl SearchIndex {
         record_id: &str,
         limit: usize,
     ) -> Result<Option<(Vec<Record>, usize, usize)>> {
-        let Some(canonical_record_id) = self.fields.canonical_record_id else {
-            bail!(
-                "index does not support bounded record lookup; rebuild it with `memex index rebuild`"
-            );
-        };
-        let anchor_query = session_query(
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let anchors = records_by_canonical_id_in_session_scope(
+            &searcher,
             &self.fields,
+            record_id,
             session_id,
             source_path,
             source,
-            Some(Box::new(TermQuery::new(
-                Term::from_field_text(canonical_record_id, record_id),
-                IndexRecordOption::Basic,
-            ))),
-        );
-        let reader = self.reader()?;
-        let searcher = reader.searcher();
-        let anchors = searcher.search(&anchor_query, &TopDocs::with_limit(1))?;
-        let Some((_, address)) = anchors.first() else {
+        )?;
+        let Some(anchor) = anchors.into_iter().next() else {
             return Ok(None);
         };
-        let anchor_doc = searcher.doc::<TantivyDocument>(*address)?;
-        let anchor = record_from_doc(&self.fields, &anchor_doc);
 
         let predecessors = BooleanQuery::new(vec![
             (
@@ -1182,6 +1194,16 @@ impl SearchIndex {
         source: Option<SourceFilter>,
         project: Option<&str>,
     ) -> Result<Vec<Record>> {
+        self.recent_records_filtered_since(limit, source, project, None)
+    }
+
+    pub fn recent_records_filtered_since(
+        &self,
+        limit: usize,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        since: Option<u64>,
+    ) -> Result<Vec<Record>> {
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -1209,6 +1231,16 @@ impl SearchIndex {
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.project, project),
                     IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if let Some(since) = since {
+            clauses.push((
+                Occur::Must,
+                Box::new(RangeQuery::new_u64_bounds(
+                    "ts".to_string(),
+                    Bound::Included(since),
+                    Bound::Unbounded,
                 )),
             ));
         }
@@ -1295,6 +1327,60 @@ fn exact_source_query(
         })
         .collect();
     Some(Box::new(BooleanQuery::new(queries)))
+}
+
+fn records_by_canonical_id_in_session_scope(
+    searcher: &tantivy::Searcher,
+    fields: &IndexFields,
+    record_id: &str,
+    session_id: &str,
+    source_path: Option<&str>,
+    source: Option<crate::types::SourceKind>,
+) -> Result<Vec<Record>> {
+    let scope = if let Some(canonical_record_id) = fields.canonical_record_id {
+        session_query(
+            fields,
+            session_id,
+            source_path,
+            source,
+            Some(Box::new(TermQuery::new(
+                Term::from_field_text(canonical_record_id, record_id),
+                IndexRecordOption::Basic,
+            ))),
+        )
+    } else {
+        session_query(fields, session_id, source_path, source, None)
+    };
+    let limit = if fields.canonical_record_id.is_some() {
+        2
+    } else {
+        searcher.search(&scope, &Count)?
+    };
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let addresses = searcher.search(
+        &scope,
+        &TopDocs::with_limit(limit).custom_score(SessionOrderScorerFactory),
+    )?;
+    let mut matches = Vec::new();
+    for (_, address) in addresses {
+        let doc = searcher.doc::<TantivyDocument>(address)?;
+        let record = record_from_doc(fields, &doc);
+        if crate::retrieval::canonical_record_id(&record) == record_id {
+            matches.push(record);
+            if matches.len() == 2 {
+                break;
+            }
+        }
+    }
+    matches.sort_by(|a, b| {
+        a.turn_id
+            .cmp(&b.turn_id)
+            .then_with(|| a.ts.cmp(&b.ts))
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    Ok(matches)
 }
 
 fn session_query(
@@ -1766,7 +1852,9 @@ fn build_schema() -> Result<Schema> {
     build_schema_with_canonical_record_id(true)
 }
 
-fn build_schema_with_canonical_record_id(include_canonical_record_id: bool) -> Result<Schema> {
+pub(crate) fn build_schema_with_canonical_record_id(
+    include_canonical_record_id: bool,
+) -> Result<Schema> {
     let mut builder = SchemaBuilder::default();
 
     if include_canonical_record_id {
@@ -2134,6 +2222,93 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_around_resolves_scoped_stored_record_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let schema = build_schema_with_canonical_record_id(false).expect("legacy schema");
+        let raw = Index::create_in_dir(tmp.path(), schema).expect("legacy index");
+        drop(raw);
+
+        let index = SearchIndex::open_or_create(tmp.path()).expect("open legacy index");
+        let mut writer = index.writer().expect("legacy writer");
+        let before = test_record(1, "before");
+        let mut anchor = test_record(2, "anchor");
+        anchor.links.event_id = Some("shared-native-event".to_string());
+        let after = test_record(3, "after");
+        let mut other_path = anchor.clone();
+        other_path.doc_id = 4;
+        other_path.source_path = "other.jsonl".to_string();
+        for record in [&before, &anchor, &after, &other_path] {
+            index
+                .add_record(&mut writer, record)
+                .expect("add legacy record");
+        }
+        writer.commit().expect("commit legacy records");
+        let anchor_id = crate::retrieval::canonical_record_id(&anchor);
+
+        let resolved = index
+            .records_by_canonical_id_in_session_scope(
+                &anchor_id,
+                "session",
+                Some("session.jsonl"),
+                Some(crate::types::SourceKind::Codex),
+            )
+            .expect("resolve legacy anchor");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].doc_id, anchor.doc_id);
+
+        let (records, total, offset) = index
+            .records_by_session_scope_around(
+                "session",
+                Some("session.jsonl"),
+                Some(crate::types::SourceKind::Codex),
+                &anchor_id,
+                3,
+            )
+            .expect("legacy around read")
+            .expect("legacy anchor");
+        assert_eq!(total, 3);
+        assert_eq!(offset, 0);
+        assert_eq!(
+            records
+                .into_iter()
+                .map(|record| record.doc_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        for (record_id, path, source) in [
+            (
+                "rid1_missing",
+                "session.jsonl",
+                crate::types::SourceKind::Codex,
+            ),
+            (
+                anchor_id.as_str(),
+                "missing.jsonl",
+                crate::types::SourceKind::Codex,
+            ),
+            (
+                anchor_id.as_str(),
+                "session.jsonl",
+                crate::types::SourceKind::Claude,
+            ),
+        ] {
+            assert!(
+                index
+                    .records_by_session_scope_around(
+                        "session",
+                        Some(path),
+                        Some(source),
+                        record_id,
+                        3,
+                    )
+                    .expect("scoped legacy miss")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn canonical_and_session_path_lookups_use_exact_index_fields() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let index = SearchIndex::open_or_create(tmp.path()).expect("index");
@@ -2160,6 +2335,40 @@ mod tests {
             .expect("session path lookup");
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].doc_id, first.doc_id);
+    }
+
+    #[test]
+    fn recent_records_since_uses_inclusive_indexed_timestamp_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        let mut records = [
+            test_record(1, "before"),
+            test_record(2, "boundary"),
+            test_record(3, "after"),
+            test_record(4, "other project"),
+            test_record(5, "other source"),
+        ];
+        for (record, ts) in records.iter_mut().zip([99, 100, 101, 102, 103]) {
+            record.ts = ts;
+        }
+        records[3].project = "other".to_string();
+        records[4].source = crate::types::SourceKind::Claude;
+        for record in &records {
+            index.add_record(&mut writer, record).expect("add record");
+        }
+        writer.commit().expect("commit records");
+
+        let recent = index
+            .recent_records_filtered_since(10, Some(SourceFilter::Codex), Some("memex"), Some(100))
+            .expect("recent range");
+        assert_eq!(
+            recent
+                .into_iter()
+                .map(|record| (record.ts, record.text))
+                .collect::<Vec<_>>(),
+            vec![(101, "after".to_string()), (100, "boundary".to_string())]
+        );
     }
 
     #[test]

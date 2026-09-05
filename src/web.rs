@@ -6,7 +6,7 @@ use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
 use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,7 +16,6 @@ use std::thread::JoinHandle;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:6363";
-const MAX_SESSION_OFFSET: usize = 100_000;
 const MAX_MESSAGE_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_SESSION_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_CONTENT_PAGE_BYTES: usize = 64 * 1024;
@@ -232,6 +231,9 @@ fn handle_request(
                 Err(err) if err.downcast_ref::<AmbiguousSessionScope>().is_some() => {
                     respond_json_error(request, StatusCode(400), &err.to_string())
                 }
+                Err(err) if err.downcast_ref::<InvalidSessionOffset>().is_some() => {
+                    respond_json_error(request, StatusCode(400), &err.to_string())
+                }
                 Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
             },
             Err(err) => respond_json_error(request, StatusCode(400), &err.to_string()),
@@ -365,12 +367,54 @@ enum ActivityMetric {
     Tokens,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeRange {
+    Day,
+    Week,
+    Month,
+    All,
+}
+
+impl TimeRange {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "24h" => Ok(Self::Day),
+            "7d" => Ok(Self::Week),
+            "30d" => Ok(Self::Month),
+            "all" => Ok(Self::All),
+            _ => Err(anyhow!(
+                "unknown time range: {value} (expected 24h, 7d, 30d, or all)"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "24h",
+            Self::Week => "7d",
+            Self::Month => "30d",
+            Self::All => "all",
+        }
+    }
+
+    fn since_ms(self, now: u64) -> Option<u64> {
+        let days = match self {
+            Self::Day => 1,
+            Self::Week => 7,
+            Self::Month => 30,
+            Self::All => return None,
+        };
+        Some(now.saturating_sub(days * 86_400_000))
+    }
+}
+
 #[derive(Debug)]
 struct ActivityRequest {
     metric: ActivityMetric,
     source: Option<SourceFilter>,
     project: Option<String>,
     days: i64,
+    range: Option<TimeRange>,
     origin: SessionKindFilter,
 }
 
@@ -380,6 +424,7 @@ impl ActivityRequest {
         let mut source = None;
         let mut project = None;
         let mut days = 30;
+        let mut range = None;
         let mut origin = SessionKindFilter::Primary;
         for (key, value) in url.query_pairs() {
             match key {
@@ -393,6 +438,7 @@ impl ActivityRequest {
                     project = Some(value.trim().to_string());
                 }
                 "origin" => origin = parse_origin(value)?,
+                "range" => range = Some(TimeRange::parse(value)?),
                 "days" => {
                     days = value
                         .parse::<i64>()
@@ -407,6 +453,7 @@ impl ActivityRequest {
             source,
             project,
             days,
+            range,
             origin,
         })
     }
@@ -416,6 +463,9 @@ impl ActivityRequest {
 struct ActivityPayload {
     metric: &'static str,
     days: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<&'static str>,
+    bucket_keys: Vec<String>,
     token_usage_enabled: bool,
     partial: bool,
     points: Vec<ActivityPoint>,
@@ -431,22 +481,36 @@ struct ActivityPoint {
 fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityPayload> {
     let config = UserConfig::load(paths)?;
     let token_usage_enabled = config.token_usage_enabled();
-    let since = Utc::now() - Duration::days(params.days);
-    let since_ms = since.timestamp_millis().max(0) as u64;
-    let mut buckets: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let now = Utc::now().timestamp_millis().max(0) as u64;
+    let since_ms = params
+        .range
+        .map(|range| range.since_ms(now))
+        .unwrap_or_else(|| Some(now.saturating_sub(params.days as u64 * 86_400_000)));
+    let bucket_ms = if params.range == Some(TimeRange::Day) {
+        3_600_000
+    } else {
+        86_400_000
+    };
+    let mut buckets: BTreeMap<(u64, String), u64> = BTreeMap::new();
 
     let partial = match params.metric {
         ActivityMetric::Sessions => {
             let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
             for session in store.query_sessions_filtered(
                 params.source,
-                Some(since_ms),
+                since_ms,
                 params.project.as_deref(),
                 ProjectGrouping::Flat,
                 Some(params.origin),
                 None,
             )? {
-                add_activity_value(&mut buckets, session.last_at, session.source.label(), 1);
+                add_activity_value(
+                    &mut buckets,
+                    session.last_at,
+                    session.source.label(),
+                    1,
+                    bucket_ms,
+                );
             }
             false
         }
@@ -462,7 +526,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 let keys = store
                     .query_sessions_filtered(
                         params.source,
-                        Some(since_ms),
+                        since_ms,
                         params.project.as_deref(),
                         ProjectGrouping::Flat,
                         Some(params.origin),
@@ -483,7 +547,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 project: params.project.clone(),
                 project_grouping: ProjectGrouping::Flat,
                 session_keys,
-                since_ms: Some(since_ms),
+                since_ms,
                 until_ms: None,
                 cost_mode: CostMode::Source,
                 include_events: false,
@@ -497,26 +561,28 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                     point.timestamp_ms,
                     point.source,
                     point.total_tokens,
+                    bucket_ms,
                 );
             }
             partial
         }
     };
 
-    let points = buckets
-        .into_iter()
-        .map(|((date, source), value)| ActivityPoint {
-            date,
-            source,
-            value,
-        })
-        .collect();
+    let (bucket_keys, points, days) = activity_buckets(buckets, since_ms, now, bucket_ms);
     Ok(ActivityPayload {
         metric: match params.metric {
             ActivityMetric::Sessions => "sessions",
             ActivityMetric::Tokens => "tokens",
         },
-        days: params.days,
+        days: match params.range {
+            Some(TimeRange::Day) => 1,
+            Some(TimeRange::Week) => 7,
+            Some(TimeRange::Month) => 30,
+            Some(TimeRange::All) => days,
+            None => params.days,
+        },
+        range: params.range.map(TimeRange::label),
+        bucket_keys,
         token_usage_enabled,
         partial,
         points,
@@ -524,18 +590,73 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
 }
 
 fn add_activity_value(
-    buckets: &mut BTreeMap<(String, String), u64>,
+    buckets: &mut BTreeMap<(u64, String), u64>,
     timestamp_ms: u64,
     source: &str,
     value: u64,
+    bucket_ms: u64,
 ) {
     let Some(timestamp) = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_ms as i64)
     else {
         return;
     };
-    let key = (timestamp.format("%Y-%m-%d").to_string(), source.to_string());
+    let key = (
+        timestamp.timestamp_millis() as u64 / bucket_ms * bucket_ms,
+        source.to_string(),
+    );
     let bucket = buckets.entry(key).or_default();
     *bucket = bucket.saturating_add(value);
+}
+
+fn activity_buckets(
+    buckets: BTreeMap<(u64, String), u64>,
+    since: Option<u64>,
+    now: u64,
+    unit: u64,
+) -> (Vec<String>, Vec<ActivityPoint>, i64) {
+    let end = now / unit * unit;
+    let start = since
+        .map(|since| since / unit * unit)
+        .or_else(|| {
+            buckets
+                .first_key_value()
+                .map(|((timestamp, _), _)| *timestamp)
+        })
+        .unwrap_or(end)
+        .min(end);
+    // Keep all history in view without mounting one chart column per historical day.
+    let units = (end - start) / unit + 1;
+    let step = units.div_ceil(60) * unit;
+    let label = |timestamp: u64| {
+        let date = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp as i64)
+            .expect("activity timestamps are validated before bucketing");
+        if unit < 86_400_000 {
+            date.format("%Y-%m-%dT%H:00Z").to_string()
+        } else {
+            date.format("%Y-%m-%d").to_string()
+        }
+    };
+    let bucket_keys = (0..units.div_ceil(step / unit))
+        .map(|index| label(start + index * step))
+        .collect();
+    let mut grouped: BTreeMap<(String, String), u64> = BTreeMap::new();
+    for ((timestamp, source), value) in buckets {
+        if timestamp < start || timestamp > end {
+            continue;
+        }
+        let timestamp = start + (timestamp - start) / step * step;
+        let total = grouped.entry((label(timestamp), source)).or_default();
+        *total = total.saturating_add(value);
+    }
+    let points = grouped
+        .into_iter()
+        .map(|((date, source), value)| ActivityPoint {
+            date,
+            source,
+            value,
+        })
+        .collect();
+    (bucket_keys, points, ((end - start) / 86_400_000 + 1) as i64)
 }
 
 #[derive(Debug)]
@@ -603,12 +724,6 @@ impl SessionRequest {
                 "version" if !value.is_empty() => version = Some(value.to_string()),
                 _ => {}
             }
-        }
-        if offset > MAX_SESSION_OFFSET {
-            return Err(anyhow!("offset must not exceed {MAX_SESSION_OFFSET}"));
-        }
-        if before.is_some_and(|before| before > MAX_SESSION_OFFSET) {
-            return Err(anyhow!("before must not exceed {MAX_SESSION_OFFSET}"));
         }
         if before == Some(0) {
             return Err(anyhow!("before must be positive"));
@@ -837,6 +952,7 @@ struct SearchRequest {
     offset: usize,
     limit: usize,
     origin: SessionKindFilter,
+    range: TimeRange,
 }
 
 impl SearchRequest {
@@ -847,6 +963,7 @@ impl SearchRequest {
         let mut offset = 0;
         let mut limit = 50;
         let mut origin = SessionKindFilter::Primary;
+        let mut range = TimeRange::All;
 
         for (key, value) in url.query_pairs() {
             match key {
@@ -858,6 +975,7 @@ impl SearchRequest {
                     project = Some(value.trim().to_string());
                 }
                 "origin" => origin = parse_origin(value)?,
+                "range" => range = TimeRange::parse(value)?,
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -880,6 +998,7 @@ impl SearchRequest {
             offset,
             limit,
             origin,
+            range,
         })
     }
 }
@@ -950,6 +1069,9 @@ struct SessionSummary {
 
 fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload> {
     let index = open_index(paths)?;
+    let since = params
+        .range
+        .since_ms(Utc::now().timestamp_millis().max(0) as u64);
     let target = params.offset.saturating_add(params.limit).saturating_add(1);
     let document_count = index.doc_count()?.max(1);
     let mut candidate_limit = target.saturating_mul(4).max(100).min(document_count);
@@ -957,7 +1079,12 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let summaries = loop {
         let records: Vec<(Option<f32>, crate::types::Record)> = if params.query.is_empty() {
             index
-                .recent_records_filtered(candidate_limit, params.source, params.project.as_deref())?
+                .recent_records_filtered_since(
+                    candidate_limit,
+                    params.source,
+                    params.project.as_deref(),
+                    since,
+                )?
                 .into_iter()
                 .map(|record| (None, record))
                 .collect()
@@ -971,7 +1098,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                     session_id: None,
                     session_scope: None,
                     source: params.source,
-                    since: None,
+                    since,
                     until: None,
                     limit: candidate_limit,
                 })?
@@ -1142,6 +1269,17 @@ impl std::fmt::Display for AmbiguousSessionScope {
 
 impl std::error::Error for AmbiguousSessionScope {}
 
+#[derive(Debug)]
+struct InvalidSessionOffset;
+
+impl std::fmt::Display for InvalidSessionOffset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session page boundary is past the end")
+    }
+}
+
+impl std::error::Error for InvalidSessionOffset {}
+
 fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<SessionPayload>> {
     let index = open_index(paths)?;
     ensure_snapshot(&index, params.version.as_deref())?;
@@ -1151,18 +1289,14 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
     if let SessionSelection::Around(record_id) = &params.selection
         && (resolved_source_path.is_none() || resolved_source.is_none())
     {
-        let Some(records) = index.records_by_canonical_id(record_id)? else {
-            return Err(anyhow!(
-                "index does not support bounded record lookup; rebuild it with `memex index rebuild`"
-            ));
-        };
-        let mut anchors = records.into_iter().filter(|record| {
-            record.session_id == params.session_id
-                && resolved_source_path
-                    .as_deref()
-                    .is_none_or(|path| record.source_path == path)
-                && resolved_source.is_none_or(|source| record.source == source)
-        });
+        let mut anchors = index
+            .records_by_canonical_id_in_session_scope(
+                record_id,
+                &params.session_id,
+                resolved_source_path.as_deref(),
+                resolved_source,
+            )?
+            .into_iter();
         let Some(anchor) = anchors.next() else {
             ensure_snapshot_current(paths, &version)?;
             return Ok(None);
@@ -1212,6 +1346,10 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
                 usize::MAX,
                 1,
             )?;
+            if total > 0 && *before > total {
+                ensure_snapshot_current(paths, &version)?;
+                return Err(InvalidSessionOffset.into());
+            }
             let before = (*before).min(total);
             let offset = before.saturating_sub(params.limit);
             let limit = before - offset;
@@ -1271,7 +1409,7 @@ fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<Sess
     }
     if records.is_empty() {
         ensure_snapshot_current(paths, &version)?;
-        return Err(anyhow!("session page offset is past the end"));
+        return Err(InvalidSessionOffset.into());
     }
 
     let first = records.first().expect("records is not empty");
@@ -1349,19 +1487,14 @@ fn session_content_payload(
     let index = open_index(paths)?;
     ensure_snapshot(&index, params.version.as_deref())?;
     let version = index.snapshot_version().to_string();
-    let Some(records) = index.records_by_canonical_id(&params.record_id)? else {
-        return Err(anyhow!(
-            "index does not support bounded record lookup; rebuild it with `memex index rebuild`"
-        ));
-    };
-    let mut matches = records.into_iter().filter(|record| {
-        record.session_id == params.session_id
-            && params
-                .source_path
-                .as_deref()
-                .is_none_or(|path| record.source_path == path)
-            && params.source.is_none_or(|source| record.source == source)
-    });
+    let mut matches = index
+        .records_by_canonical_id_in_session_scope(
+            &params.record_id,
+            &params.session_id,
+            params.source_path.as_deref(),
+            params.source,
+        )?
+        .into_iter();
     let Some(record) = matches.next() else {
         ensure_snapshot_current(paths, &version)?;
         return Ok(None);
@@ -1620,6 +1753,156 @@ mod tests {
         assert_eq!(request.offset, 200);
         assert_eq!(request.limit, 100);
     }
+
+    #[test]
+    fn time_ranges_filter_search_and_activity_together() {
+        use crate::analytics::AnalyticsWriter;
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let now = Utc::now().timestamp_millis() as u64;
+        let hour = 3_600_000;
+        let records = [1, 3, 48, 240, 9600]
+            .into_iter()
+            .enumerate()
+            .map(|(index, hours)| {
+                let mut value = record(
+                    index as u64 + 1,
+                    &format!("session-{index}"),
+                    &format!("/tmp/session-{index}.jsonl"),
+                    "needle".to_string(),
+                );
+                value.ts = now - hours * hour;
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for record in &records {
+            analytics.record(record).unwrap();
+        }
+        analytics.flush().unwrap();
+        drop(analytics);
+        publish_records(&paths, records);
+        for (range, expected) in [("24h", 2), ("7d", 3), ("30d", 4), ("all", 5)] {
+            for query in ["", "needle"] {
+                let request = SearchRequest::from_url(
+                    &parse_url(&format!("/api/search?range={range}&q={query}")).unwrap(),
+                )
+                .unwrap();
+                let search = search_payload(&paths, &request).unwrap();
+                assert_eq!(search.results.len(), expected, "{range}: {query}");
+            }
+            let request = ActivityRequest::from_url(
+                &parse_url(&format!("/api/activity?range={range}")).unwrap(),
+            )
+            .unwrap();
+            let activity = activity_payload(&paths, &request).unwrap();
+            assert_eq!(activity.range, Some(range));
+            assert_eq!(
+                activity.points.iter().map(|point| point.value).sum::<u64>(),
+                expected as u64
+            );
+            assert!(activity.bucket_keys.len() <= 60);
+            assert!(
+                activity
+                    .points
+                    .iter()
+                    .all(|point| activity.bucket_keys.contains(&point.date))
+            );
+            if range == "24h" {
+                assert_eq!(activity.bucket_keys.len(), 25);
+                assert!(activity.points.iter().all(|point| point.date.contains('T')));
+                assert_eq!(activity.points.len(), 2);
+            }
+        }
+        for range in ["yesterday", "365d", ""] {
+            assert!(
+                SearchRequest::from_url(&parse_url(&format!("/api/search?range={range}")).unwrap())
+                    .is_err()
+            );
+            assert!(
+                ActivityRequest::from_url(
+                    &parse_url(&format!("/api/activity?range={range}")).unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_search_hits_open_and_expand_without_rebuilding() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let schema = crate::index::build_schema_with_canonical_record_id(false).unwrap();
+        drop(tantivy::Index::create_in_dir(&paths.index, schema).unwrap());
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let text = format!("needle {}", "é".repeat(40_000));
+        let records = [
+            record(1, "legacy", "/tmp/legacy.jsonl", "first".to_string()),
+            record(2, "legacy", "/tmp/legacy.jsonl", text.clone()),
+            record(3, "legacy", "/tmp/legacy.jsonl", "last".to_string()),
+            record(
+                4,
+                "legacy",
+                "/tmp/other.jsonl",
+                "needle other path".to_string(),
+            ),
+        ];
+        let mut writer = index.writer().unwrap();
+        for record in records {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let search = search_payload(
+            &paths,
+            &SearchRequest::from_url(&parse_url("/api/search?q=needle").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let hit = search
+            .results
+            .iter()
+            .find(|hit| hit.source_path == "/tmp/legacy.jsonl")
+            .unwrap();
+        for (source_path, source) in [
+            (Some(hit.source_path.clone()), Some(SourceKind::Claude)),
+            (None, None),
+        ] {
+            let page = session_payload(
+                &paths,
+                &SessionRequest {
+                    session_id: hit.session_id.clone(),
+                    source_path: source_path.clone(),
+                    source,
+                    selection: SessionSelection::Around(hit.record_id.clone()),
+                    limit: 3,
+                    version: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(page.total, 3);
+            assert_eq!(page.messages[1].record_id, hit.record_id);
+            assert!(page.messages[1].truncated);
+            let content = session_content_payload(
+                &paths,
+                &SessionContentRequest {
+                    session_id: hit.session_id.clone(),
+                    source_path,
+                    source,
+                    record_id: hit.record_id.clone(),
+                    offset: page.messages[1].content.len(),
+                    limit: MAX_CONTENT_PAGE_BYTES,
+                    version: Some(page.version),
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(page.messages[1].content.clone() + &content.content, text);
+            assert!(!content.truncated);
+        }
+    }
     #[test]
     fn search_request_accepts_omp_source() {
         let url = parse_url("/api/search?source=omp").unwrap();
@@ -1691,19 +1974,73 @@ mod tests {
     }
 
     #[test]
-    fn session_request_rejects_excessive_offsets() {
-        let url = parse_url(&format!(
-            "/api/session?id=session-a&offset={}&limit=200",
-            MAX_SESSION_OFFSET + 1
-        ))
-        .unwrap();
-
-        let error = SessionRequest::from_url(&url).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            format!("offset must not exceed {MAX_SESSION_OFFSET}")
+    fn session_request_accepts_large_boundaries_and_rejects_invalid_numbers() {
+        for (selector, selection) in [
+            ("offset", SessionSelection::Offset(100_041)),
+            ("before", SessionSelection::Before(100_041)),
+        ] {
+            let request = SessionRequest::from_url(
+                &parse_url(&format!("/api/session?id=s&{selector}=100041&limit=40")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(request.selection, selection);
+            for invalid in ["-1", "not-a-number", "999999999999999999999999999999"] {
+                assert!(
+                    SessionRequest::from_url(
+                        &parse_url(&format!("/api/session?id=s&{selector}={invalid}")).unwrap(),
+                    )
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            SessionRequest::from_url(&parse_url("/api/session?id=s&before=0").unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn session_pages_cross_one_hundred_thousand_messages() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let total = 100_081;
+        publish_records(
+            &paths,
+            (1..=total).map(|id| record(id, "large", "/tmp/large.jsonl", format!("message {id}"))),
+        );
+        let request = |selector: &str| {
+            SessionRequest::from_url(
+            &parse_url(&format!("/api/session?id=large&session_source=claude&source_path=%2Ftmp%2Flarge.jsonl&limit=40&{selector}")).unwrap(),
+        ).unwrap()
+        };
+        let tail = session_payload(&paths, &request("tail=true"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail.offset, 100_041);
+        assert_eq!(tail.messages.len(), 40);
+        let before = session_payload(&paths, &request(&format!("before={}", tail.offset)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.offset, 100_001);
+        assert_eq!(before.next_offset, Some(tail.offset));
+        assert_eq!(before.messages.len(), 40);
+        assert_eq!(before.messages.last().unwrap().content, "message 100041");
+        assert_eq!(tail.messages.first().unwrap().content, "message 100042");
+        let forward = session_payload(
+            &paths,
+            &request(&format!("offset={}", before.next_offset.unwrap())),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(forward.offset, tail.offset);
+        assert_eq!(
+            forward.messages.first().unwrap().record_id,
+            tail.messages.first().unwrap().record_id
+        );
+        for selector in [format!("before={}", total + 1), format!("offset={}", total)] {
+            let error = session_payload(&paths, &request(&selector)).unwrap_err();
+            assert!(error.downcast_ref::<InvalidSessionOffset>().is_some());
+        }
     }
 
     #[test]
@@ -1798,6 +2135,7 @@ mod tests {
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
             },
         )
         .unwrap();
@@ -1814,6 +2152,7 @@ mod tests {
                 offset: 0,
                 limit: 1,
                 origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
             },
         )
         .unwrap();
@@ -1829,6 +2168,7 @@ mod tests {
                 offset: 1,
                 limit: 1,
                 origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
             },
         )
         .unwrap();
@@ -1868,6 +2208,7 @@ mod tests {
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
             },
         )
         .unwrap();
@@ -1995,6 +2336,7 @@ mod tests {
                 offset: 0,
                 limit: 10,
                 origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
             },
         )
         .unwrap();
@@ -2223,6 +2565,7 @@ mod tests {
                     offset: 0,
                     limit: 30,
                     origin,
+                    range: TimeRange::All,
                 },
             )
             .unwrap()
@@ -2293,6 +2636,7 @@ mod tests {
                     project: None,
                     days: 30,
                     origin,
+                    range: None,
                 },
             )
             .expect("payload")

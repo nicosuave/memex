@@ -29,6 +29,7 @@ type MockReply = {
 }
 
 type ApiMock = {
+  activityCalls: () => URL[]
   calls: URL[]
   searchCalls: () => URL[]
   sessionCalls: (id?: string) => URL[]
@@ -110,6 +111,8 @@ async function mockApi(
           ? {
               body: {
                 metric: url.searchParams.get("metric") || "sessions",
+                range: url.searchParams.get("range") || "30d",
+                bucket_keys: [],
                 days: 30,
                 token_usage_enabled: true,
                 partial: false,
@@ -128,6 +131,8 @@ async function mockApi(
       .catch(() => {})
   })
   return {
+    activityCalls: () =>
+      calls.filter((url) => url.pathname === "/api/activity"),
     calls,
     searchCalls: () => calls.filter((url) => url.pathname === "/api/search"),
     sessionCalls: (id?: string) =>
@@ -141,6 +146,13 @@ async function mockApi(
 
 function searchReply(results: SearchResult[], hasMore = false, offset = 0) {
   return { body: { query: "", offset, has_more: hasMore, results } }
+}
+
+async function chooseTimeRange(page: Page, value: "24h" | "7d" | "30d" | "all") {
+  await page.getByRole("combobox", { name: "Time range" }).click()
+  await page
+    .getByRole("option", { name: value === "all" ? "All" : value, exact: true })
+    .click()
 }
 
 test("mode and visibility toggles stay local and responsive for a large transcript", async ({
@@ -698,6 +710,190 @@ test("Back and Forward restore the home and transcript views", async ({
   await page.goForward()
   await expect(page.getByRole("region", { name: "Transcript" })).toBeVisible()
   expect(api.sessionCalls("nav")).toHaveLength(1)
+})
+
+test("the shared time range drives search and activity for every value", async ({
+  page,
+}) => {
+  const api = await mockApi(page, (url) => {
+    const range = url.searchParams.get("range") || "30d"
+    if (url.pathname === "/api/search")
+      return searchReply([result(range, `Range ${range}`)])
+    if (url.pathname === "/api/activity")
+      return {
+        body: {
+          metric: url.searchParams.get("metric") || "sessions",
+          range,
+          bucket_keys: [range],
+          token_usage_enabled: true,
+          partial: false,
+          points: [{ date: range, source: "codex", value: 1 }],
+        },
+      }
+  })
+  await page.goto("/")
+
+  for (const range of ["30d", "24h", "7d", "all"] as const) {
+    if (range !== "30d") await chooseTimeRange(page, range)
+    await expect(page.getByRole("option", { name: `Range ${range}` })).toBeVisible()
+    await expect
+      .poll(() =>
+        api
+          .activityCalls()
+          .some((url) => url.searchParams.get("range") === range),
+      )
+      .toBe(true)
+  }
+
+  expect(
+    new Set(api.searchCalls().map((url) => url.searchParams.get("range"))),
+  ).toEqual(new Set(["24h", "7d", "30d", "all"]))
+  expect(
+    new Set(api.activityCalls().map((url) => url.searchParams.get("range"))),
+  ).toEqual(new Set(["24h", "7d", "30d", "all"]))
+  expect(new URL(page.url()).searchParams.get("range")).toBe("all")
+})
+
+test("direct range URLs and Back and Forward preserve transcript content", async ({
+  page,
+}) => {
+  const api = await mockApi(page, (url) => {
+    if (url.pathname === "/api/search")
+      return searchReply([result("range-nav", "Range navigation")])
+    if (url.pathname === "/api/session")
+      return { body: sessionPage("range-nav", 0, 4) }
+  })
+  await page.goto(
+    "/?range=7d&session=range-nav&session_source=codex&path=%2Fhistory%2Fcodex%2Frange-nav.jsonl",
+  )
+  const transcript = page.getByRole("region", { name: "Transcript" })
+  const range = page.getByRole("combobox", { name: "Time range" })
+  await expect(transcript).toBeVisible()
+  await expect(range).toContainText("7d")
+  await expect.poll(() => api.sessionCalls("range-nav").length).toBe(1)
+  await expect(
+    page.locator('[data-session-id="range-nav"]'),
+  ).toHaveAttribute("href", /range=7d/)
+
+  await chooseTimeRange(page, "all")
+  await expect(range).toContainText("All")
+  expect(new URL(page.url()).searchParams.get("range")).toBe("all")
+  await page.goBack()
+  await expect(range).toContainText("7d")
+  await expect(transcript).toBeVisible()
+  await page.goForward()
+  await expect(range).toContainText("All")
+  await expect(transcript).toBeVisible()
+  expect(api.sessionCalls("range-nav")).toHaveLength(1)
+})
+
+test("stale search and activity responses stay hidden after range and metric changes", async ({
+  page,
+}) => {
+  const api = await mockApi(page, (url) => {
+    const range = url.searchParams.get("range") || "30d"
+    if (url.pathname === "/api/search")
+      return range === "30d"
+        ? { ...searchReply([result("old-range", "Old range")]), delay: 500 }
+        : searchReply([result("current-range", "Current range")])
+    if (url.pathname === "/api/activity") {
+      const metric = url.searchParams.get("metric") || "sessions"
+      const current = range === "7d" && metric === "tokens"
+      return {
+        body: {
+          metric,
+          range,
+          bucket_keys: [range],
+          token_usage_enabled: current,
+          partial: false,
+          points: [
+            { date: range, source: "codex", value: current ? 7 : 999 },
+          ],
+        },
+        delay: current ? 0 : metric === "tokens" ? 400 : 500,
+      }
+    }
+  })
+  await page.goto("/")
+  await expect.poll(() => api.searchCalls().length).toBeGreaterThan(0)
+  await expect.poll(() => api.activityCalls().length).toBeGreaterThan(0)
+  await page.getByRole("combobox", { name: "Activity metric" }).click()
+  await page.getByRole("option", { name: "Tokens", exact: true }).click()
+  await expect
+    .poll(() =>
+      api
+        .activityCalls()
+        .some((url) => url.searchParams.get("metric") === "tokens"),
+    )
+    .toBe(true)
+  await chooseTimeRange(page, "7d")
+
+  await expect(page.getByRole("option", { name: "Current range" })).toBeVisible()
+  await expect(page.getByText("7 tokens", { exact: true })).toBeVisible()
+  await expect(
+    page.getByRole("img", { name: "7 tokens over the last 7 days" }),
+  ).toBeVisible()
+  await page.waitForTimeout(550)
+  await expect(page.getByRole("option", { name: "Old range" })).toHaveCount(0)
+  await expect(page.getByText(/999 (sessions|tokens)/)).toHaveCount(0)
+  await expect(page.getByText(/Token usage is disabled/)).toHaveCount(0)
+})
+
+test("changing range cancels stale pagination and restarts its offset", async ({
+  page,
+}) => {
+  let releaseOldPage: (() => void) | undefined
+  const api = await mockApi(page, (url) => {
+    if (url.pathname !== "/api/search") return
+    const range = url.searchParams.get("range") || "30d"
+    const offset = Number(url.searchParams.get("offset") || 0)
+    if (range === "30d" && offset === 0)
+      return searchReply([result("old-first", "Old first")], true)
+    if (range === "30d")
+      return new Promise<MockReply>((resolve) => {
+        releaseOldPage = () =>
+          resolve(searchReply([result("old-page", "Old page")], false, offset))
+      })
+    if (offset === 0)
+      return searchReply([result("new-first", "New first")], true)
+    return searchReply([result("new-page", "New page")], false, offset)
+  })
+  await page.goto("/")
+  await expect(page.getByRole("option", { name: "Old first" })).toBeVisible()
+  await page
+    .locator(".home-surface")
+    .getByRole("button", { name: "Load more results" })
+    .click()
+  await expect
+    .poll(() =>
+      api
+        .searchCalls()
+        .some(
+          (url) =>
+            url.searchParams.get("range") === "30d" &&
+            url.searchParams.get("offset") === "1",
+        ),
+    )
+    .toBe(true)
+
+  await chooseTimeRange(page, "7d")
+  await expect(page.getByRole("option", { name: "New first" })).toBeVisible()
+  releaseOldPage?.()
+  await page.waitForTimeout(50)
+  await expect(page.getByRole("option", { name: "Old page" })).toHaveCount(0)
+  await page
+    .locator(".home-surface")
+    .getByRole("button", { name: "Load more results" })
+    .click()
+  await expect(page.getByRole("option", { name: "New page" })).toBeVisible()
+  const currentPage = api
+    .searchCalls()
+    .find(
+      (url) =>
+        url.searchParams.get("range") === "7d" &&
+        url.searchParams.get("offset") === "1",
+    )
+  expect(currentPage).toBeTruthy()
 })
 
 test("mobile users can reach results beyond twelve and open the session controls", async ({

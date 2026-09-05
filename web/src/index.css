@@ -304,7 +304,6 @@ body {
 
 .braille-row {
   display: grid;
-  grid-template-columns: repeat(30, minmax(0, 1fr));
   height: 20px;
   overflow: hidden;
   font: 22px/20px ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -362,6 +361,12 @@ body {
 
 .home-chart-select {
   width: 108px;
+}
+
+.home-chart-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .home-activity-note {
@@ -497,6 +502,10 @@ body {
 
 .view-toggles {
   flex: none;
+}
+
+.transcript-range-select {
+  width: 82px;
 }
 
 .view-toggles [data-pressed]:not(:disabled) {
