@@ -286,6 +286,9 @@ OUTPUT FIELDS (--fields):
         /// Comma-separated list of fields to include in output
         #[arg(long, value_name = "FIELDS")]
         fields: Option<String>,
+        /// Include full record text and all metadata (legacy search output)
+        #[arg(long, conflicts_with = "fields")]
+        full: bool,
         /// Sort results by score or timestamp
         #[arg(long, value_enum, default_value = "score")]
         sort: SortBy,
@@ -913,6 +916,7 @@ pub fn run() -> Result<()> {
             unique_session,
             json_array,
             fields,
+            full,
             sort,
             verbose,
             root,
@@ -941,6 +945,7 @@ pub fn run() -> Result<()> {
                 unique_session,
                 json_array,
                 fields,
+                full,
                 sort,
                 verbose,
                 root,
@@ -1506,6 +1511,7 @@ fn run_search(
     unique_session: bool,
     json_array: bool,
     fields: Option<String>,
+    full: bool,
     sort: SortBy,
     verbose: bool,
     root: Option<PathBuf>,
@@ -1540,8 +1546,14 @@ fn run_search(
         until: parse_ts_millis(until)?,
         limit,
     };
-    let matchers = build_matchers(&options.query)?;
-    let fields = parse_fields(fields)?;
+    let matchers = queries
+        .iter()
+        .map(|query| build_matchers(query))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let fields = search_fields(fields, full)?;
     let top_n_per_session = if unique_session && top_n_per_session.is_none() {
         Some(1)
     } else {
@@ -1715,7 +1727,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
         } in results
         {
             let ts = format_ts(record.ts);
-            let text = summarize(&record.text, 200);
+            let text = match_preview(&record.text, &render.matchers, 200);
             println!(
                 "[{score:.3}] {} {} {} {} {} {} {}",
                 machine, ts, record.doc_id, record.project, record.role, record.session_id, text
@@ -1738,7 +1750,7 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
         let wants_matches = wants_field(&render.fields, "matches");
         let wants_text = wants_field(&render.fields, "text");
         let snippet = if wants_snippet {
-            summarize(text_ref, 400)
+            match_preview(text_ref, &render.matchers, 400)
         } else {
             String::new()
         };
@@ -4553,6 +4565,23 @@ enum SortBy {
     Ts,
 }
 
+const DEFAULT_SEARCH_FIELDS: &str =
+    "machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches";
+
+fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
+    if full {
+        return Ok(None);
+    }
+    Ok(parse_fields(fields)?.or_else(|| {
+        Some(
+            DEFAULT_SEARCH_FIELDS
+                .split(',')
+                .map(str::to_string)
+                .collect(),
+        )
+    }))
+}
+
 fn parse_fields(value: Option<String>) -> Result<Option<HashSet<String>>> {
     let Some(value) = value else {
         return Ok(None);
@@ -4712,26 +4741,70 @@ fn format_ts(ts: u64) -> String {
 }
 
 fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
-    let mut terms = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for part in query.split_whitespace() {
-        let cleaned = part.trim_matches(|c: char| !c.is_alphanumeric());
-        if cleaned.len() < 2 {
-            continue;
-        }
-        let key = cleaned.to_lowercase();
-        if seen.insert(key.clone()) {
-            terms.push(key);
+    use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
+    fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
+        match ast {
+            UserInputAst::Clause(children) => {
+                for (occur, child) in children {
+                    if *occur != Some(Occur::MustNot) {
+                        literals(child, terms);
+                    }
+                }
+            }
+            UserInputAst::Boost(child, _) => literals(child, terms),
+            UserInputAst::Leaf(leaf) => {
+                if let UserInputLeaf::Literal(literal) = leaf.as_ref()
+                    && literal
+                        .field_name
+                        .as_deref()
+                        .is_none_or(|field| field == "text")
+                {
+                    terms.extend(literal.phrase.split_whitespace().map(str::to_string));
+                }
+            }
         }
     }
+    let mut terms = Vec::new();
+    match tantivy::query_grammar::parse_query(query) {
+        Ok(ast) => literals(&ast, &mut terms),
+        // Semantic requests need not be valid lexical syntax.
+        Err(_) => terms.extend(query.split_whitespace().map(str::to_string)),
+    }
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for term in terms {
-        let re = RegexBuilder::new(&regex::escape(&term))
-            .case_insensitive(true)
-            .build()?;
-        out.push(re);
+        let term = term
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        if term.is_empty() || !seen.insert(term.clone()) {
+            continue;
+        }
+        out.push(
+            RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?,
+        );
     }
     Ok(out)
+}
+
+// Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
+fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
+    let first = matchers
+        .iter()
+        .filter_map(|matcher| matcher.find(text))
+        .min_by_key(|m| m.start());
+    let Some(hit) = first else {
+        return summarize(text, max_chars);
+    };
+    let prefix = take_last_chars(&text[..hit.start()], 80);
+    let start = hit.start() - prefix.len();
+    let preview = summarize(&text[start..], max_chars.saturating_sub(1));
+    if start > 0 {
+        format!("…{preview}")
+    } else {
+        preview
+    }
 }
 
 fn collect_matches(text: &str, matchers: &[regex::Regex], max: usize) -> Vec<MatchSpan> {
@@ -5013,6 +5086,31 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn previews_use_positive_text_literals_and_bound_unicode() {
+        let text = format!("padding {} needlé evidence", "界".repeat(1000));
+        let matchers = build_matchers("text:needlé AND NOT text:padding").unwrap();
+        let preview = match_preview(&text, &matchers, 400);
+        assert!(preview.contains("needlé"));
+        assert!(!preview.contains("padding"));
+        assert!(preview.chars().count() <= 400);
+        assert_eq!(
+            match_preview("semantic fallback", &[], 400),
+            "semantic fallback"
+        );
+        assert!(build_matchers("project:memex").unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_search_projection_keeps_the_compact_default() {
+        for fields in [None, Some("".to_string()), Some(" , ".to_string())] {
+            let fields = search_fields(fields, false).unwrap().unwrap();
+            assert!(fields.contains("record_id"));
+            assert!(!fields.contains("text"));
+        }
+        assert!(search_fields(None, true).unwrap().is_none());
+    }
 
     #[test]
     fn sessions_interactive_only_conflicts_with_explicit_origin() {
