@@ -508,7 +508,7 @@ async fn register(
                 "delete from oauth_clients
                   where client_id = (
                     select c.client_id from oauth_clients c
-                     where not exists (select 1 from oauth_grants g where g.client_id = c.client_id)
+                     where c.approved_at is null
                        and not exists (select 1 from oauth_codes x where x.client_id = c.client_id)
                      order by c.created_at asc limit 1
                   )",
@@ -925,6 +925,10 @@ fn exchange_code(
         params![code_hash.as_slice()],
     )?;
     transaction.execute(
+        "update oauth_clients set approved_at = coalesce(approved_at, ?1) where client_id = ?2",
+        params![now, stored.client_id],
+    )?;
+    transaction.execute(
         "insert into oauth_grants (id, family_id, client_id, resource, scope, created_at, revoked_at)
          values (?1, ?2, ?3, ?4, ?5, ?6, null)",
         params![grant_id, family_id, stored.client_id, resource, stored.scope, now],
@@ -1109,7 +1113,8 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
              client_id text primary key,
              client_name text not null,
              redirect_uris text not null,
-             created_at integer not null
+             created_at integer not null,
+             approved_at integer
          );
          create table if not exists oauth_codes (
              code_hash blob primary key,
@@ -1148,6 +1153,24 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
          create index if not exists oauth_refresh_expiry on oauth_refresh_tokens(expires_at);
          create index if not exists oauth_refresh_family on oauth_refresh_tokens(family_id);",
     )?;
+    let has_approved_at: bool = connection.query_row(
+        "select exists(
+            select 1 from pragma_table_info('oauth_clients') where name = 'approved_at'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_approved_at {
+        connection.execute(
+            "alter table oauth_clients add column approved_at integer",
+            [],
+        )?;
+        connection.execute(
+            "update oauth_clients set approved_at = created_at
+              where exists (select 1 from oauth_grants g where g.client_id = oauth_clients.client_id)",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -1174,7 +1197,7 @@ fn prune_database(connection: &Connection, now: i64) -> Result<()> {
     connection.execute(
         "delete from oauth_clients
           where created_at <= ?1 - ?2
-            and not exists (select 1 from oauth_grants g where g.client_id = oauth_clients.client_id)
+            and approved_at is null
             and not exists (select 1 from oauth_codes c where c.client_id = oauth_clients.client_id)",
         params![now, UNAPPROVED_CLIENT_TTL_SECONDS],
     )?;
@@ -1208,7 +1231,7 @@ fn prune_unapproved_clients_tx(transaction: &rusqlite::Transaction<'_>, now: i64
     transaction.execute(
         "delete from oauth_clients
           where created_at <= ?1 - ?2
-            and not exists (select 1 from oauth_grants g where g.client_id = oauth_clients.client_id)
+            and approved_at is null
             and not exists (select 1 from oauth_codes c where c.client_id = oauth_clients.client_id)",
         params![now, UNAPPROVED_CLIENT_TTL_SECONDS],
     )?;
@@ -1615,5 +1638,31 @@ mod tests {
         assert!(first.authorize_access(token).unwrap());
         let second = OAuthServer::new(&paths, "https://second.example", owner).unwrap();
         assert!(!second.authorize_access(token).unwrap());
+    }
+
+    #[test]
+    fn approved_clients_survive_revocation_and_expiry_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        let owner = Arc::new(WebAuth::load_or_create(&paths).unwrap());
+        let server = OAuthServer::new(&paths, "https://memex.example", owner.clone()).unwrap();
+        let connection = server.open_database(false).unwrap();
+        let old = now_seconds().unwrap() - UNAPPROVED_CLIENT_TTL_SECONDS - 1;
+        connection.execute(
+            "insert into oauth_clients (client_id, client_name, redirect_uris, created_at, approved_at)
+             values ('approved', 'Approved', '[]', ?1, ?1), ('unapproved', 'Unapproved', '[]', ?1, null)",
+            params![old],
+        ).unwrap();
+        revoke_all(&paths).unwrap();
+        drop(server);
+        let _restarted = OAuthServer::new(&paths, "https://memex.example", owner).unwrap();
+        let remaining: String = connection
+            .query_row("select client_id from oauth_clients", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, "approved");
+        let count: i64 = connection
+            .query_row("select count(*) from oauth_clients", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
