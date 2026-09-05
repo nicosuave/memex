@@ -462,11 +462,12 @@ Embeddings are optional. If semantic/hybrid retrieval degrades to lexical but th
 Relevant indexing controls include:
 
 ```bash
-memex index --include-agents
 memex index --include-reasoning
 memex index --exclude '<glob>'
 memex index --embeddings --model <minilm|bge|nomic|gemma|potion>
 ```
+
+Agent subprocess transcripts are always indexed; filter them at query time.
 
 Plaintext reasoning is excluded by default; encrypted/redacted reasoning remains excluded.
 

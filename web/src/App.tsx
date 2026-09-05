@@ -482,10 +482,12 @@ function HomeActivityChart({
   active,
   project,
   source,
+  origin,
 }: {
   active: boolean
   project: string
   source: string
+  origin: string
 }) {
   const [metric, setMetric] = useState<ActivityMetric>("sessions")
   const [payload, setPayload] = useState<ActivityPayload | null>(null)
@@ -499,6 +501,7 @@ function HomeActivityChart({
     const params = new URLSearchParams({ days: "30", metric })
     if (source !== "all") params.set("source", source)
     if (project.trim()) params.set("project", project.trim())
+    if (origin !== "interactive") params.set("origin", origin)
     setLoading(true)
     setError("")
     void api<ActivityPayload>(`/api/activity?${params}`)
@@ -516,7 +519,7 @@ function HomeActivityChart({
       .finally(() => {
         if (generation === requestGeneration.current) setLoading(false)
       })
-  }, [active, metric, project, source])
+  }, [active, metric, project, source, origin])
 
   const chart = useMemo(() => buildBrailleChart(payload), [payload])
   const chartLabel = `${compactNumber.format(chart.total)} ${metric} over the last 30 days`
@@ -602,6 +605,7 @@ function App() {
   const [query, setQuery] = useState(paramsAtLoad.get("q") || "")
   const [source, setSource] = useState(paramsAtLoad.get("source") || "all")
   const [project, setProject] = useState(paramsAtLoad.get("project") || "")
+  const [origin, setOrigin] = useState(paramsAtLoad.get("origin") || "interactive")
   const [shellView, setShellView] = useState<ShellView>(initialShellView)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [mode, setMode] = useState<PreviewMode>(initialMode)
@@ -638,11 +642,12 @@ function App() {
       if (query.trim()) next.set("q", query.trim())
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
+      if (origin !== "interactive") next.set("origin", origin)
       if (nextSelectedId) next.set("session", nextSelectedId)
       if (nextSelectedId && mode !== "matches") next.set("mode", mode)
       history.replaceState({}, "", next.size ? `?${next}` : location.pathname)
     },
-    [mode, project, query, source],
+    [mode, origin, project, query, source],
   )
 
   const fetchFirstPage = useCallback((id: string) => {
@@ -672,9 +677,10 @@ function App() {
       if (query.trim()) searchParams.set("q", query.trim())
       if (source !== "all") searchParams.set("source", source)
       if (project.trim()) searchParams.set("project", project.trim())
+      if (origin !== "interactive") searchParams.set("origin", origin)
       return searchParams
     },
-    [project, query, source],
+    [origin, project, query, source],
   )
 
   const searchStatus = useCallback(
@@ -900,7 +906,7 @@ function App() {
 
   useEffect(() => {
     setHomeSelectedIndex(0)
-  }, [query, source, project])
+  }, [origin, query, source, project])
 
   useEffect(() => {
     const discovered = results
@@ -1045,7 +1051,10 @@ function App() {
     [openTranscript, results, selectedId],
   )
 
-  const filterCount = Number(source !== "all") + Number(Boolean(project.trim()))
+  const filterCount =
+    Number(source !== "all") +
+    Number(Boolean(project.trim())) +
+    Number(origin !== "interactive")
   const homeSurface = (
     <main className="home-surface">
       <div className="home-column">
@@ -1053,6 +1062,7 @@ function App() {
           active={shellView === "home"}
           project={project}
           source={source}
+          origin={origin}
         />
 
         <InputGroup className="home-search search-morph shadow-none">
@@ -1106,6 +1116,23 @@ function App() {
                   <SelectItem value="pi">Pi</SelectItem>
                   <SelectItem value="openclaw">OpenClaw</SelectItem>
                   <SelectItem value="copilot">Copilot</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Select onValueChange={setOrigin} value={origin}>
+              <SelectTrigger
+                aria-label="Origin"
+                className="home-filter-select"
+                size="sm"
+                variant="ghost"
+              >
+                <SelectValue placeholder="interactive" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="interactive">interactive</SelectItem>
+                  <SelectItem value="subagent">subagent</SelectItem>
+                  <SelectItem value="all">all origins</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1375,6 +1402,24 @@ function App() {
                           <SelectItem value="pi">Pi</SelectItem>
                           <SelectItem value="openclaw">OpenClaw</SelectItem>
                           <SelectItem value="copilot">Copilot</SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="filter-field">
+                    <label>Origin</label>
+                    <Select onValueChange={setOrigin} value={origin}>
+                      <SelectTrigger
+                        aria-label="Origin"
+                        className="w-full shadow-none"
+                      >
+                        <SelectValue placeholder="Interactive" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="interactive">Interactive</SelectItem>
+                          <SelectItem value="subagent">Subagent</SelectItem>
+                          <SelectItem value="all">All origins</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>

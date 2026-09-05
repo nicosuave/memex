@@ -67,7 +67,8 @@ struct IndexArgs {
     /// Path to Claude projects directory [default: CLAUDE_CONFIG_DIR or ~/.claude/projects]
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Include agent subprocess conversations (Claude Code subagents)
+    /// Deprecated no-op (kept for compatibility): agent subprocess
+    /// conversations are always indexed now; filter them at query time
     #[arg(long)]
     include_agents: bool,
     /// Index plaintext reasoning as BM25-only records (encrypted/redacted reasoning is always dropped)
@@ -160,7 +161,7 @@ enum Commands {
 EXAMPLES:
     memex index                         # Index all supported local history
     memex index --embeddings            # Also generate embeddings for semantic search
-    memex index --include-agents        # Include Claude Code subagent conversations
+    memex index --exclude '<glob>'        # Skip paths matching a glob
     memex index --source ~/custom/path  # Use custom Claude projects directory")]
     Index {
         #[command(flatten)]

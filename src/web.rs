@@ -1,4 +1,4 @@
-use crate::analytics::{AnalyticsStore, ProjectGrouping, analytics_path};
+use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analytics_path};
 use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::types::SourceFilter;
@@ -7,7 +7,7 @@ use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -221,6 +221,7 @@ struct ActivityRequest {
     source: Option<SourceFilter>,
     project: Option<String>,
     days: i64,
+    origin: SessionKindFilter,
 }
 
 impl ActivityRequest {
@@ -229,6 +230,7 @@ impl ActivityRequest {
         let mut source = None;
         let mut project = None;
         let mut days = 30;
+        let mut origin = SessionKindFilter::Primary;
         for (key, value) in url.query_pairs() {
             match key {
                 "metric" if value == "tokens" => metric = ActivityMetric::Tokens,
@@ -240,6 +242,7 @@ impl ActivityRequest {
                 "project" if !value.trim().is_empty() => {
                     project = Some(value.trim().to_string());
                 }
+                "origin" => origin = parse_origin(value)?,
                 "days" => {
                     days = value
                         .parse::<i64>()
@@ -254,6 +257,7 @@ impl ActivityRequest {
             source,
             project,
             days,
+            origin,
         })
     }
 }
@@ -284,11 +288,12 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
     let partial = match params.metric {
         ActivityMetric::Sessions => {
             let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-            for session in store.query_sessions(
+            for session in store.query_sessions_filtered(
                 params.source,
                 Some(since_ms),
                 params.project.as_deref(),
                 ProjectGrouping::Flat,
+                Some(params.origin),
                 None,
             )? {
                 add_activity_value(&mut buckets, session.last_at, session.source.label(), 1);
@@ -297,11 +302,37 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
         }
         ActivityMetric::Tokens if !token_usage_enabled => false,
         ActivityMetric::Tokens => {
+            // Restrict token activity to the selected origin via the sessions
+            // that survive the same filter: usage events carry no kind of
+            // their own, so the session roster is the source of truth.
+            let session_keys = if params.origin == SessionKindFilter::All {
+                None
+            } else {
+                let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+                let keys = store
+                    .query_sessions_filtered(
+                        params.source,
+                        Some(since_ms),
+                        params.project.as_deref(),
+                        ProjectGrouping::Flat,
+                        Some(params.origin),
+                        None,
+                    )?
+                    .into_iter()
+                    .map(|session| {
+                        (
+                            session.source.storage_label().to_string(),
+                            session.session_id,
+                        )
+                    })
+                    .collect::<HashSet<_>>();
+                Some(keys)
+            };
             let query = UsageQuery {
                 source: params.source,
                 project: params.project.clone(),
                 project_grouping: ProjectGrouping::Flat,
-                session_keys: None,
+                session_keys,
                 since_ms: Some(since_ms),
                 until_ms: None,
                 cost_mode: CostMode::Source,
@@ -529,6 +560,7 @@ struct SearchRequest {
     project: Option<String>,
     offset: usize,
     limit: usize,
+    origin: SessionKindFilter,
 }
 
 impl SearchRequest {
@@ -538,6 +570,7 @@ impl SearchRequest {
         let mut project = None;
         let mut offset = 0;
         let mut limit = 50;
+        let mut origin = SessionKindFilter::Primary;
 
         for (key, value) in url.query_pairs() {
             match key {
@@ -548,6 +581,7 @@ impl SearchRequest {
                 "project" if !value.trim().is_empty() => {
                     project = Some(value.trim().to_string());
                 }
+                "origin" => origin = parse_origin(value)?,
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -569,7 +603,21 @@ impl SearchRequest {
             project,
             offset,
             limit,
+            origin,
         })
+    }
+}
+
+/// Shared `origin` vocabulary with the CLI (`--origin`) and the TUI kind
+/// filter: `interactive` (default), `subagent`, or `all`.
+fn parse_origin(value: &str) -> Result<SessionKindFilter> {
+    match value {
+        "" | "interactive" => Ok(SessionKindFilter::Primary),
+        "subagent" => Ok(SessionKindFilter::Subagent),
+        "all" => Ok(SessionKindFilter::All),
+        _ => Err(anyhow!(
+            "unknown origin: {value} (expected interactive, subagent, or all)"
+        )),
     }
 }
 
@@ -655,10 +703,32 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         };
 
         let raw_count = records.len();
+        // Session-grouped origin filter with prefer-main: a sidechain hit
+        // inside a primary session must not hide the session (mirrors the
+        // CLI, the TUI, and the analytics accumulator).
+        let mut group_kind: HashMap<String, Option<String>> = HashMap::new();
+        for (_, record) in &records {
+            let dominated = record.links.conversation_kind.as_deref() == Some("main");
+            group_kind
+                .entry(record.session_id.clone())
+                .and_modify(|kind| {
+                    if dominated {
+                        *kind = Some("main".to_string());
+                    }
+                })
+                .or_insert_with(|| record.links.conversation_kind.clone());
+        }
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
         for (score, record) in records {
             if !seen.insert(record.session_id.clone()) {
+                continue;
+            }
+            if !params.origin.matches_kind(
+                group_kind
+                    .get(&record.session_id)
+                    .and_then(|kind| kind.as_deref()),
+            ) {
                 continue;
             }
             summaries.push(SessionSummary {
@@ -953,6 +1023,39 @@ mod tests {
     }
 
     #[test]
+    fn requests_default_to_interactive_origin() {
+        let search = SearchRequest::from_url(&parse_url("/api/search?q=hi").unwrap()).unwrap();
+        assert_eq!(search.origin, SessionKindFilter::Primary);
+        let activity = ActivityRequest::from_url(&parse_url("/api/activity").unwrap()).unwrap();
+        assert_eq!(activity.origin, SessionKindFilter::Primary);
+    }
+
+    #[test]
+    fn requests_parse_origin_values() {
+        for (query, expected) in [
+            ("subagent", SessionKindFilter::Subagent),
+            ("all", SessionKindFilter::All),
+            ("interactive", SessionKindFilter::Primary),
+            ("", SessionKindFilter::Primary),
+        ] {
+            let search = SearchRequest::from_url(
+                &parse_url(&format!("/api/search?q=hi&origin={query}")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(search.origin, expected);
+            let activity = ActivityRequest::from_url(
+                &parse_url(&format!("/api/activity?origin={query}")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(activity.origin, expected);
+        }
+        assert!(SearchRequest::from_url(&parse_url("/api/search?origin=bots").unwrap()).is_err());
+        assert!(
+            ActivityRequest::from_url(&parse_url("/api/activity?origin=bots").unwrap()).is_err()
+        );
+    }
+
+    #[test]
     fn search_payload_groups_results_by_session() {
         let temp = TempDir::new().unwrap();
         let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
@@ -998,6 +1101,7 @@ mod tests {
                 project: Some("memex".to_string()),
                 offset: 0,
                 limit: 30,
+                origin: SessionKindFilter::Primary,
             },
         )
         .unwrap();
@@ -1013,6 +1117,7 @@ mod tests {
                 project: Some("memex".to_string()),
                 offset: 0,
                 limit: 1,
+                origin: SessionKindFilter::Primary,
             },
         )
         .unwrap();
@@ -1027,6 +1132,7 @@ mod tests {
                 project: Some("memex".to_string()),
                 offset: 1,
                 limit: 1,
+                origin: SessionKindFilter::Primary,
             },
         )
         .unwrap();
@@ -1062,6 +1168,7 @@ mod tests {
                 project: None,
                 offset: 0,
                 limit: 30,
+                origin: SessionKindFilter::Primary,
             },
         )
         .unwrap();
@@ -1075,6 +1182,137 @@ mod tests {
         assert!(!UI_CSS.is_empty());
         assert!(!UI_JS.is_empty());
         assert!(!UI_HTML.contains("https://cdn."));
+    }
+
+    #[test]
+    fn search_payload_filters_sessions_by_origin() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        for (doc_id, session_id, kind) in
+            [(1, "session-main", "main"), (2, "session-sub", "subagent")]
+        {
+            index
+                .add_record(
+                    &mut writer,
+                    &Record {
+                        source: SourceKind::Claude,
+                        doc_id,
+                        ts: doc_id * 1_000,
+                        project: "memex".to_string(),
+                        session_id: session_id.to_string(),
+                        turn_id: doc_id as u32,
+                        role: "assistant".to_string(),
+                        text: "fix the flaky widget".to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: RecordLinks {
+                            conversation_kind: Some(kind.to_string()),
+                            ..RecordLinks::default()
+                        },
+                        source_path: "/tmp/session.jsonl".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+
+        let payload_for = |origin| {
+            search_payload(
+                &paths,
+                &SearchRequest {
+                    query: "flaky".to_string(),
+                    source: None,
+                    project: None,
+                    offset: 0,
+                    limit: 30,
+                    origin,
+                },
+            )
+            .unwrap()
+        };
+        let ids = |payload: SearchPayload| {
+            payload
+                .results
+                .iter()
+                .map(|result| result.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Default hides subagent sessions.
+        assert_eq!(
+            ids(payload_for(SessionKindFilter::Primary)),
+            vec!["session-main"]
+        );
+        assert_eq!(
+            ids(payload_for(SessionKindFilter::Subagent)),
+            vec!["session-sub"]
+        );
+        let mut all = ids(payload_for(SessionKindFilter::All));
+        all.sort();
+        assert_eq!(all, vec!["session-main", "session-sub"]);
+    }
+
+    #[test]
+    fn activity_payload_filters_sessions_by_origin() {
+        use crate::analytics::AnalyticsWriter;
+        use crate::types::Record;
+
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut writer =
+            AnalyticsWriter::open(analytics_path(&paths.state)).expect("open analytics");
+        for (session_id, kind, ts) in [("s-main", "main", now_ms), ("s-sub", "subagent", now_ms)] {
+            writer
+                .record(&Record {
+                    source: SourceKind::Claude,
+                    doc_id: 1,
+                    ts,
+                    project: "memex".to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: 0,
+                    role: "user".to_string(),
+                    text: "fix the flaky widget".to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: RecordLinks {
+                        conversation_kind: Some(kind.to_string()),
+                        ..RecordLinks::default()
+                    },
+                    source_path: "/tmp/session.jsonl".to_string(),
+                })
+                .expect("record");
+        }
+        writer.flush().expect("flush");
+
+        let total = |origin| {
+            activity_payload(
+                &paths,
+                &ActivityRequest {
+                    metric: ActivityMetric::Sessions,
+                    source: None,
+                    project: None,
+                    days: 30,
+                    origin,
+                },
+            )
+            .expect("payload")
+            .points
+            .iter()
+            .map(|point| point.value)
+            .sum::<u64>()
+        };
+        assert_eq!(total(SessionKindFilter::Primary), 1);
+        assert_eq!(total(SessionKindFilter::Subagent), 1);
+        assert_eq!(total(SessionKindFilter::All), 2);
     }
 
     #[test]

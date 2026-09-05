@@ -76,7 +76,10 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
     custom_title.or(ai_title).or(agent_name)
 }
 
-pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
+pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
+    // `_include_agents` is a retired opt-in kept only for CLI compatibility:
+    // agent transcripts are always indexed now, matching every other source.
+    // Consumers hide them from default views via `conversation_kind`.
     let mut files = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
         if !entry.file_type().is_file()
@@ -89,10 +92,8 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
         let under_subagents = entry.path().ancestors().any(|ancestor| {
             ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents")
         });
-        if is_agent && !include_agents {
-            continue;
-        }
-        if under_subagents && (!include_agents || !is_agent) {
+        if under_subagents && !is_agent {
+            // Workflow journals and other non-transcript files.
             continue;
         }
         // Standard sessions live at most two levels below root
@@ -775,11 +776,12 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn discovery_includes_subagents_only_when_requested() {
+    fn discovery_always_includes_agent_transcripts() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("main.jsonl"), "{}\n").unwrap();
         fs::write(temp.path().join("agent-child.jsonl"), "{}\n").unwrap();
-        assert_eq!(discover(temp.path(), false).unwrap().len(), 1);
+        // The retired opt-in flag no longer gates anything.
+        assert_eq!(discover(temp.path(), false).unwrap().len(), 2);
         assert_eq!(discover(temp.path(), true).unwrap().len(), 2);
     }
 
@@ -791,7 +793,7 @@ mod tests {
         fs::write(subagents.join("agent-child.jsonl"), "{}\n").unwrap();
         fs::write(subagents.join("journal.jsonl"), "{}\n").unwrap();
 
-        let files = discover(temp.path(), true).unwrap();
+        let files = discover(temp.path(), false).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].path.file_name().and_then(|name| name.to_str()),
