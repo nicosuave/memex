@@ -7,6 +7,7 @@ pub mod index;
 pub mod ingest;
 pub mod lease;
 pub mod machine;
+pub mod mcp;
 pub mod progress;
 pub mod read_budget;
 pub mod resume;

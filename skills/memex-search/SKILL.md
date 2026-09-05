@@ -13,6 +13,15 @@ Use Memex for broader discovery or when those sources are unavailable or insuffi
 
 ## Choose the retrieval depth
 
+When Memex MCP tools are available, use them for the same workflow below instead
+of shell commands: `search`, `sessions`, `show`, `context`, `session`, and `hydrate`.
+MCP search returns compact structured JSON and defaults to session diversity;
+CLI search still prefers TOON. Use `additional_queries` for multiple search views
+and `machines` for search scope; read tools take one `machine`. Sessions are local
+and do not auto-index. Preserve the same identifiers, evidence standards, shared
+content budgets, and field/page continuations described below. MCP reads are
+always bounded; hydrate takes a `requests` array instead of a JSONL file.
+
 Silently identify the target fact or episode, repository/source/machine/time scope,
 exact anchors, and what evidence would be sufficient. For analogous work, also
 identify the mechanism or task shape; topic similarity alone is insufficient.

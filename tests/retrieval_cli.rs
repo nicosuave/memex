@@ -28,6 +28,7 @@ fn fixture() -> (tempfile::TempDir, Vec<Record>) {
         index.add_record(&mut writer, record).unwrap();
     }
     writer.commit().unwrap();
+    writer.wait_merging_threads().unwrap();
     (temp, records)
 }
 
