@@ -97,6 +97,9 @@ function paramsFor(target: SessionTarget) {
 export function useSessionResource(target: SessionTarget | null) {
   const [session, setSession] = useState<SessionPayload | null>(null)
   const [error, setError] = useState("")
+  const [pageErrorDirection, setPageErrorDirection] = useState<
+    "earlier" | "later" | null
+  >(null)
   const [loading, setLoading] = useState(false)
   const [revision, setRevision] = useState(0)
   const cache = useRef(new Map<string, CachedSession>())
@@ -152,6 +155,7 @@ export function useSessionResource(target: SessionTarget | null) {
     setDisplayKey(key)
     busy.current = false
     setError("")
+    setPageErrorDirection(null)
     setLoading(false)
     if (!target) {
       current.current = null
@@ -241,6 +245,7 @@ export function useSessionResource(target: SessionTarget | null) {
   const refresh = useCallback(() => {
     const cached = cache.current.get(cacheKey)
     if (cached) cache.current.set(cacheKey, { ...cached, at: 0 })
+    setPageErrorDirection(null)
     setRevision((value) => value + 1)
   }, [cacheKey])
   const loadPage = useCallback(
@@ -254,6 +259,7 @@ export function useSessionResource(target: SessionTarget | null) {
       busy.current = true
       setLoading(true)
       setError("")
+      setPageErrorDirection(null)
       const params = paramsFor(target)
       params.set(
         direction === "earlier" ? "before" : "offset",
@@ -311,6 +317,7 @@ export function useSessionResource(target: SessionTarget | null) {
               ? err.message
               : "Could not load transcript page",
         )
+        setPageErrorDirection(direction)
       } finally {
         if (
           activeKey.current === key &&
@@ -341,6 +348,7 @@ export function useSessionResource(target: SessionTarget | null) {
       busy.current = true
       setLoading(true)
       setError("")
+      setPageErrorDirection(null)
       try {
         const data = await api<{
           version: string
@@ -405,11 +413,22 @@ export function useSessionResource(target: SessionTarget | null) {
       session: displayKey === key ? session : null,
       error: displayKey === key ? error : "",
       loading,
+      pageErrorDirection,
       loadPage,
       loadContent,
       refresh,
     }),
-    [key, displayKey, session, error, loading, loadPage, loadContent, refresh],
+    [
+      key,
+      displayKey,
+      session,
+      error,
+      loading,
+      pageErrorDirection,
+      loadPage,
+      loadContent,
+      refresh,
+    ],
   )
 }
 export type SessionResource = ReturnType<typeof useSessionResource>

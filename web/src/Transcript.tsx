@@ -116,14 +116,26 @@ const VirtualMessages = memo(function VirtualMessages({
   version,
   positionKey,
   loadContent,
+  loadPage,
   loading,
+  paginationFailed,
+  canLoadEarlier,
+  canLoadLater,
+  initialAtTail,
+  autoPage,
 }: {
   rows: Message[]
   target: SessionTarget
   version: string
   positionKey: string
   loadContent: (id: string) => Promise<void>
+  loadPage: (direction: "earlier" | "later") => Promise<void>
   loading: boolean
+  paginationFailed: boolean
+  canLoadEarlier: boolean
+  canLoadLater: boolean
+  initialAtTail: boolean
+  autoPage: boolean
 }) {
   const parent = useRef<HTMLDivElement>(null)
   const currentRows = useRef(rows)
@@ -142,6 +154,23 @@ const VirtualMessages = memo(function VirtualMessages({
       ?.filter((item, index) => rows[index]?.record_id === item.key),
   })
   const restoreFrame = useRef<number | null>(null)
+  const boundaryFrame = useRef<number | null>(null)
+  const pagination = useRef({
+    autoPage,
+    loading,
+    paginationFailed,
+    canLoadEarlier,
+    canLoadLater,
+    loadPage,
+  })
+  pagination.current = {
+    autoPage,
+    loading,
+    paginationFailed,
+    canLoadEarlier,
+    canLoadLater,
+    loadPage,
+  }
   const previousRows = useRef<Message[]>([])
   const initialPosition = useRef(scrollPositions.get(positionKey))
   const savePosition = () => {
@@ -157,6 +186,38 @@ const VirtualMessages = memo(function VirtualMessages({
     while (scrollPositions.size > 64)
       scrollPositions.delete(scrollPositions.keys().next().value!)
   }
+  const loadAtBoundary = useCallback(() => {
+    const element = parent.current
+    const state = pagination.current
+    if (
+      !element ||
+      !state.autoPage ||
+      state.loading ||
+      state.paginationFailed ||
+      restoreFrame.current !== null
+    )
+      return
+    const threshold = Math.min(640, Math.max(160, element.clientHeight / 2))
+    if (state.canLoadEarlier && element.scrollTop <= threshold) {
+      savePosition()
+      void state.loadPage("earlier")
+      return
+    }
+    const distanceFromEnd =
+      element.scrollHeight - element.clientHeight - element.scrollTop
+    if (state.canLoadLater && distanceFromEnd <= threshold) {
+      savePosition()
+      void state.loadPage("later")
+    }
+  }, [])
+  const scheduleBoundaryCheck = useCallback(() => {
+    if (boundaryFrame.current !== null)
+      cancelAnimationFrame(boundaryFrame.current)
+    boundaryFrame.current = requestAnimationFrame(() => {
+      boundaryFrame.current = null
+      loadAtBoundary()
+    })
+  }, [loadAtBoundary])
   useLayoutEffect(
     () => () => {
       savePosition()
@@ -194,32 +255,82 @@ const VirtualMessages = memo(function VirtualMessages({
           )
         if (++attempts < 4)
           restoreFrame.current = requestAnimationFrame(restore)
-        else restoreFrame.current = null
+        else {
+          restoreFrame.current = null
+          scheduleBoundaryCheck()
+        }
       }
       restoreFrame.current = requestAnimationFrame(restore)
+    } else if (initial && initialAtTail && !saved) {
+      let attempts = 0
+      const restoreTail = () => {
+        virtualizer.scrollToOffset(virtualizer.getTotalSize(), {
+          align: "end",
+        })
+        if (++attempts < 4)
+          restoreFrame.current = requestAnimationFrame(restoreTail)
+        else {
+          restoreFrame.current = null
+          scheduleBoundaryCheck()
+        }
+      }
+      restoreFrame.current = requestAnimationFrame(restoreTail)
     }
     previousRows.current = rows
     return () => {
-      if (restoreFrame.current !== null)
+      if (restoreFrame.current !== null) {
         cancelAnimationFrame(restoreFrame.current)
+        restoreFrame.current = null
+      }
     }
-  }, [rows, virtualizer, positionKey, target.recordId])
+  }, [rows, virtualizer, positionKey, target.recordId, initialAtTail])
+  useLayoutEffect(() => {
+    if (!autoPage) return
+    // Let anchor restoration and virtual row measurement settle before deciding
+    // whether the viewport is still at an unloaded boundary.
+    scheduleBoundaryCheck()
+    return () => {
+      if (boundaryFrame.current !== null)
+        cancelAnimationFrame(boundaryFrame.current)
+    }
+  }, [
+    rows.length,
+    autoPage,
+    loading,
+    paginationFailed,
+    canLoadEarlier,
+    canLoadLater,
+    scheduleBoundaryCheck,
+  ])
   return (
     <div
       ref={parent}
       className="transcript-scroll"
-      onScroll={savePosition}
+      tabIndex={0}
+      onScroll={() => {
+        savePosition()
+        loadAtBoundary()
+      }}
       onWheel={() => {
-        if (restoreFrame.current !== null)
+        if (restoreFrame.current !== null) {
           cancelAnimationFrame(restoreFrame.current)
+          restoreFrame.current = null
+        }
+        scheduleBoundaryCheck()
       }}
       onTouchStart={() => {
-        if (restoreFrame.current !== null)
+        if (restoreFrame.current !== null) {
           cancelAnimationFrame(restoreFrame.current)
+          restoreFrame.current = null
+        }
+        scheduleBoundaryCheck()
       }}
       onKeyDown={() => {
-        if (restoreFrame.current !== null)
+        if (restoreFrame.current !== null) {
           cancelAnimationFrame(restoreFrame.current)
+          restoreFrame.current = null
+        }
+        scheduleBoundaryCheck()
       }}
     >
       <div className="messages">
@@ -265,7 +376,15 @@ export const Transcript = memo(function Transcript({
   showDetails: boolean
   onReveal: () => void
 }) {
-  const { session, error, loading, loadPage, loadContent, refresh } = resource
+  const {
+    session,
+    error,
+    loading,
+    pageErrorDirection,
+    loadPage,
+    loadContent,
+    refresh,
+  } = resource
   const { rows, hiddenHit } = useMemo(() => {
     if (!session) return { rows: [], hiddenHit: false }
     const visible = session.messages.filter(
@@ -291,6 +410,10 @@ export const Transcript = memo(function Transcript({
     }
   }, [session, target?.recordId, mode, showThinking, showDetails])
   const key = `${targetKey(target)}:${session?.version}:${mode}`
+  const canLoadEarlier = Boolean(session && session.offset > 0)
+  const canLoadLater = Boolean(
+    session && session.offset + session.messages.length < session.total,
+  )
   return (
     <section
       className="transcript-surface"
@@ -314,6 +437,16 @@ export const Transcript = memo(function Transcript({
           ) && <span>This window has no reasoning or tool messages.</span>}
         {loading && <span>Loading transcript…</span>}
         {error && <span role="alert">{error}</span>}
+        {error && pageErrorDirection && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={loading}
+            onClick={() => void loadPage(pageErrorDirection)}
+          >
+            Retry loading {pageErrorDirection} messages
+          </Button>
+        )}
         {(error || session) && (
           <Button
             size="sm"
@@ -332,33 +465,13 @@ export const Transcript = memo(function Transcript({
             </Button>
           </>
         )}
-        {session && session.offset > 0 && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={loading}
-            onClick={() => void loadPage("earlier")}
-          >
-            Load earlier messages
-          </Button>
-        )}
-        {session &&
-          session.offset + session.messages.length < session.total && (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={loading}
-              onClick={() => void loadPage("later")}
-            >
-              Load later messages
-            </Button>
-          )}
       </div>
       {!session && !loading && <p className="empty">No session to preview.</p>}
       {session && !rows.length && (
         <p className="empty">
-          No visible messages in this window. Load an adjacent page or enable
-          tools and reasoning.
+          {mode === "history"
+            ? "No visible messages in this window. Scroll paging will continue until visible messages are found, or enable tools and reasoning."
+            : "No visible messages in this window. Enable tools and reasoning to inspect hidden matches."}
         </p>
       )}
       {session && target && (
@@ -369,7 +482,17 @@ export const Transcript = memo(function Transcript({
           version={session.version}
           positionKey={key}
           loadContent={loadContent}
+          loadPage={loadPage}
           loading={loading}
+          paginationFailed={Boolean(pageErrorDirection)}
+          canLoadEarlier={canLoadEarlier}
+          canLoadLater={canLoadLater}
+          initialAtTail={
+            mode === "history" &&
+            !canLoadLater &&
+            !rows.some((row) => row.record_id === target.recordId)
+          }
+          autoPage={mode === "history"}
         />
       )}
     </section>

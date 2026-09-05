@@ -258,10 +258,16 @@ body {
   -webkit-line-clamp: 2;
 }
 
-.load-more-results {
+.result-continuation {
+  flex: none;
+  min-height: 1px;
   width: 100%;
   color: var(--muted-foreground);
   font-size: 11px;
+}
+
+.result-continuation:not(:empty) {
+  padding: 8px;
 }
 
 .search-morph {

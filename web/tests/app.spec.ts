@@ -155,6 +155,17 @@ async function chooseTimeRange(page: Page, value: "24h" | "7d" | "30d" | "all") 
     .click()
 }
 
+async function scrollTranscriptTo(page: Page, edge: "start" | "end") {
+  await page
+    .getByRole("region", { name: "Transcript" })
+    .locator(".transcript-scroll")
+    .evaluate((element, targetEdge) => {
+      element.dispatchEvent(new WheelEvent("wheel", { bubbles: true }))
+      element.scrollTop = targetEdge === "start" ? 0 : element.scrollHeight
+      element.dispatchEvent(new Event("scroll"))
+    }, edge)
+}
+
 test("mode and visibility toggles stay local and responsive for a large transcript", async ({
   page,
 }) => {
@@ -187,7 +198,7 @@ test("mode and visibility toggles stay local and responsive for a large transcri
   })
 
   await page.goto(
-    "/?session=large&path=%2Fhistory%2Fcodex%2Flarge.jsonl&mode=history",
+    "/?session=large&path=%2Fhistory%2Fcodex%2Flarge.jsonl&record=large-r2&mode=history",
   )
   await expect(
     page.getByText("needle large message 2", { exact: true }),
@@ -362,7 +373,7 @@ test("a hidden reasoning hit can be revealed without another request", async ({
   expect(api.sessionCalls("hidden")).toHaveLength(settledSessions)
 })
 
-test("a 10k-message session opens one bounded tail page and loads earlier on demand", async ({
+test("a 10k-message session opens one bounded tail page and loads earlier near the boundary", async ({
   page,
 }) => {
   const api = await mockApi(page, (url) => {
@@ -374,7 +385,7 @@ test("a 10k-message session opens one bounded tail page and loads earlier on dem
         const offset = url.searchParams.has("before")
           ? Number(url.searchParams.get("before")) - limit
           : Number(url.searchParams.get("offset"))
-        return { body: sessionPage("huge", offset, limit, 10_000) }
+        return { body: sessionPage("huge", offset, limit, 10_000), delay: 100 }
       }
       return { body: sessionPage("huge", 9960, 40, 10_000) }
     }
@@ -390,7 +401,14 @@ test("a 10k-message session opens one bounded tail page and loads earlier on dem
   expect(initial.searchParams.get("limit")).toBe("40")
   expect(initial.searchParams.get("session_source")).toBe("codex")
 
-  await page.getByRole("button", { name: "Load earlier messages" }).click()
+  await page.getByRole("tab", { name: "History" }).click()
+  await expect(page.getByText("needle huge message 9998")).toBeVisible()
+  await expect(
+    page.getByRole("button", { name: /Load (earlier|later) messages/ }),
+  ).toHaveCount(0)
+  await scrollTranscriptTo(page, "start")
+  await scrollTranscriptTo(page, "start")
+  await scrollTranscriptTo(page, "start")
   await expect.poll(() => api.sessionCalls("huge").length).toBe(2)
   const earlier = api.sessionCalls("huge")[1]
   const earlierBoundary = earlier.searchParams.has("before")
@@ -424,15 +442,29 @@ test("around pages expand in both directions and survive a cached navigation rev
     "/?session=middle&path=%2Fhistory%2Fcodex%2Fmiddle.jsonl&record=middle-r5000",
   )
   await expect(page.getByText("needle middle message 5000")).toBeVisible()
-  await page.getByRole("button", { name: "Load earlier messages" }).click()
-  await page.getByRole("button", { name: "Load later messages" }).click()
+  await page.getByRole("tab", { name: "History" }).click()
+  await scrollTranscriptTo(page, "start")
+  await expect.poll(() => api.sessionCalls("middle").length).toBe(2)
+  await scrollTranscriptTo(page, "end")
   await expect.poll(() => api.sessionCalls("middle").length).toBe(3)
+  await expect(page.getByRole("region", { name: "Transcript" })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  )
+  const visibleRecord = await page.locator(".transcript-scroll").evaluate((element) => {
+    const bounds = element.getBoundingClientRect()
+    return Array.from(element.querySelectorAll("[data-record-id]")).find((row) => {
+      const rect = row.getBoundingClientRect()
+      return rect.bottom > bounds.top && rect.top < bounds.bottom
+    })?.getAttribute("data-record-id")
+  })
+  expect(visibleRecord).toBeTruthy()
 
   await page.getByRole("button", { name: "Toggle Sidebar" }).click()
   await page.locator('[data-session-id="second"]').click()
   await expect(page.getByText(/needle second message/).first()).toBeVisible()
   await page.goBack()
-  await expect(page.getByText("needle middle message 5000")).toBeVisible()
+  await expect(page.locator(`[data-record-id="${visibleRecord}"]`)).toBeVisible()
   expect(api.sessionCalls("middle")).toHaveLength(3)
 })
 
@@ -457,13 +489,17 @@ test("page failures and stale versions preserve loaded transcript content", asyn
   await page.goto(
     "/?session=stale&path=%2Fhistory%2Fcodex%2Fstale.jsonl&mode=history",
   )
-  await expect(page.getByText("needle stale message 9960")).toBeVisible()
+  await expect(page.getByText("needle stale message 9998")).toBeVisible()
 
-  await page.getByRole("button", { name: "Load earlier messages" }).click()
+  await scrollTranscriptTo(page, "start")
   await expect(page.getByRole("alert")).toContainText("Older page failed")
+  await page.waitForTimeout(150)
+  expect(api.sessionCalls("stale")).toHaveLength(2)
   await expect(page.getByText("needle stale message 9960")).toBeVisible()
 
-  await page.getByRole("button", { name: "Load earlier messages" }).click()
+  await page
+    .getByRole("button", { name: "Retry loading earlier messages" })
+    .click()
   await expect(page.getByText("Transcript changed on disk.")).toBeVisible()
   await expect(
     page.getByRole("button", { name: "Reload latest transcript" }),
@@ -560,6 +596,7 @@ test("different hit anchors reuse one cached window and retain loaded message by
 test("intra-message scroll position survives prepend, mode changes, and route revisit", async ({
   page,
 }) => {
+  let releaseEarlier: (() => void) | undefined
   const tallPage = (offset: number, id = "scroll") => {
     const payload = sessionPage(id, offset, 40, id === "scroll" ? 80 : 40)
     payload.messages = payload.messages.map((message, index) => {
@@ -578,20 +615,31 @@ test("intra-message scroll position survives prepend, mode changes, and route re
     if (url.pathname !== "/api/session") return
     const id = url.searchParams.get("id") || "scroll"
     if (id === "away") return { body: tallPage(0, "away") }
-    return { body: tallPage(url.searchParams.has("before") ? 0 : 40) }
+    if (url.searchParams.has("before"))
+      return new Promise<MockReply>((resolve) => {
+        releaseEarlier = () => resolve({ body: tallPage(0) })
+      })
+    return { body: tallPage(40) }
   })
 
   await page.goto(
-    "/?session=scroll&session_source=codex&path=%2Fhistory%2Fcodex%2Fscroll.jsonl&mode=history",
+    "/?session=scroll&session_source=codex&path=%2Fhistory%2Fcodex%2Fscroll.jsonl&record=scroll-r40&mode=history",
   )
   const transcript = page.getByRole("region", { name: "Transcript" })
   const scroller = transcript.locator(".transcript-scroll")
   const anchor = transcript.locator('[data-record-id="scroll-r40"]')
   await anchor.getByRole("button", { name: "Expand message" }).click()
   await expect(anchor.getByText(/END scroll 40/)).toBeVisible()
-  await scroller.evaluate((element) => {
+  const before = await scroller.evaluate((element) => {
     element.scrollTop = 500
+    const row = element
+      .querySelector('[data-record-id="scroll-r40"]')
+      ?.closest(".virtual-message")
+    const delta = row
+      ? element.getBoundingClientRect().top - row.getBoundingClientRect().top
+      : -1
     element.dispatchEvent(new Event("scroll"))
+    return delta
   })
   const anchorDelta = async () =>
     scroller.evaluate((element) => {
@@ -604,14 +652,13 @@ test("intra-message scroll position survives prepend, mode changes, and route re
       )
     })
   await expect.poll(anchorDelta).toBeGreaterThan(200)
-  const before = await anchorDelta()
+  await expect.poll(() => Boolean(releaseEarlier)).toBe(true)
+  releaseEarlier?.()
 
-  await page.getByRole("button", { name: "Load earlier messages" }).click()
   await expect(page.getByText(/1–80 of 80 messages/)).toBeVisible()
   await expect
     .poll(async () => Math.abs((await anchorDelta()) - before))
     .toBeLessThan(100)
-
   await page.getByRole("tab", { name: "Matches" }).click()
   await page.getByRole("tab", { name: "History" }).click()
   await expect(anchor.getByText(/END scroll 40/)).toBeVisible()
@@ -636,6 +683,30 @@ test("intra-message scroll position survives prepend, mode changes, and route re
   expect(api.sessionCalls("scroll")).toHaveLength(2)
 })
 
+test("history wheel scrolling reaches both ends and stops fetching at exhaustion", async ({ page }) => {
+  const api = await mockApi(page, (url) => {
+    if (url.pathname === "/api/search") return searchReply([])
+    if (url.pathname === "/api/session")
+      return { body: sessionPage("ends", url.searchParams.has("before") ? 0 : 40, 40, 80) }
+  })
+  await page.goto("/?session=ends&mode=history")
+  const scroller = page.locator(".transcript-scroll")
+  await expect(page.locator('[data-record-id="ends-r79"]')).toBeInViewport()
+  await scroller.hover()
+  await page.mouse.wheel(0, -100000)
+  await expect(page.getByText(/1–80 of 80 messages/)).toBeVisible()
+  await page.mouse.wheel(0, -100000)
+  await expect(page.locator('[data-record-id="ends-r0"]')).toBeInViewport()
+  await expect(async () => {
+    await page.mouse.wheel(0, 600)
+    await expect(page.locator('[data-record-id="ends-r79"]')).toBeInViewport({
+      timeout: 100,
+    })
+  }).toPass({ timeout: 10000, intervals: [100] })
+  await page.waitForTimeout(200)
+  expect(api.sessionCalls("ends")).toHaveLength(2)
+})
+
 test("a missing around anchor falls back to the bounded tail with an explanation", async ({
   page,
 }) => {
@@ -645,6 +716,8 @@ test("a missing around anchor falls back to the bounded tail with an explanation
     if (url.searchParams.has("around")) {
       return { status: 404, body: { error: "record no longer indexed" } }
     }
+    if (url.searchParams.has("before"))
+      return { body: sessionPage("missing", 920, 40, 1_000) }
     return { body: sessionPage("missing", 960, 40, 1_000) }
   })
   await page.goto(
@@ -662,6 +735,12 @@ test("a missing around anchor falls back to the bounded tail with an explanation
   )
   expect(api.sessionCalls("missing")[1].searchParams.get("tail")).toBe("true")
   expect(api.sessionCalls("missing")[1].searchParams.get("limit")).toBe("40")
+  await page.getByRole("tab", { name: "History" }).click()
+  await expect(page.getByText("needle missing message 998")).toBeVisible()
+  await scrollTranscriptTo(page, "start")
+  await expect.poll(() => api.sessionCalls("missing").length).toBe(3)
+  expect(api.sessionCalls("missing")[2].searchParams.get("before")).toBe("960")
+  await expect(page.getByText(/921–1000 of 1000 messages/)).toBeVisible()
 })
 
 test("a failed refresh keeps the cached transcript visible", async ({
@@ -669,7 +748,7 @@ test("a failed refresh keeps the cached transcript visible", async ({
 }) => {
   let attempts = 0
   let failRefresh: (() => void) | undefined
-  await mockApi(page, (url) => {
+  const api = await mockApi(page, (url) => {
     if (url.pathname === "/api/search") return searchReply([result("refresh")])
     if (url.pathname !== "/api/session") return
     attempts += 1
@@ -860,10 +939,6 @@ test("changing range cancels stale pagination and restarts its offset", async ({
   })
   await page.goto("/")
   await expect(page.getByRole("option", { name: "Old first" })).toBeVisible()
-  await page
-    .locator(".home-surface")
-    .getByRole("button", { name: "Load more results" })
-    .click()
   await expect
     .poll(() =>
       api
@@ -881,10 +956,6 @@ test("changing range cancels stale pagination and restarts its offset", async ({
   releaseOldPage?.()
   await page.waitForTimeout(50)
   await expect(page.getByRole("option", { name: "Old page" })).toHaveCount(0)
-  await page
-    .locator(".home-surface")
-    .getByRole("button", { name: "Load more results" })
-    .click()
   await expect(page.getByRole("option", { name: "New page" })).toBeVisible()
   const currentPage = api
     .searchCalls()
@@ -987,7 +1058,7 @@ test("visibility controls reveal and hide each supported message kind", async ({
   expect(api.sessionCalls()).toHaveLength(sessionCalls)
 })
 
-test("visibility availability explains empty windows and updates after paging", async ({
+test("visibility availability updates while automatic paging traverses hidden kinds", async ({
   page,
 }) => {
   const roles = [
@@ -998,7 +1069,7 @@ test("visibility availability explains empty windows and updates after paging", 
     "assistant",
     "developer",
   ]
-  await mockApi(page, (url) => {
+  const api = await mockApi(page, (url) => {
     if (url.pathname === "/api/search")
       return searchReply([result("availability")])
     if (url.pathname === "/api/session") {
@@ -1021,22 +1092,46 @@ test("visibility availability explains empty windows and updates after paging", 
   const explanation = page.getByText(
     "This window has no reasoning or tool messages.",
   )
-  await expect(explanation).toBeVisible()
-  await expect(reasoning).toBeDisabled()
-  await expect(reasoning).toHaveText("0")
-  await expect(reasoning).toHaveAttribute(
-    "title",
-    "No reasoning in loaded messages",
-  )
-  await expect(tools).toBeDisabled()
-  await expect(tools).toHaveAttribute(
-    "title",
-    "No tool calls in loaded messages",
-  )
-  await page.getByRole("button", { name: "Load earlier messages" }).click()
+  await expect.poll(() => api.sessionCalls("availability").length).toBe(2)
   await expect(reasoning).toBeEnabled()
   await expect(reasoning).toHaveText("1")
   await expect(tools).toBeEnabled()
   await expect(tools).toHaveText("2")
   await expect(explanation).toHaveCount(0)
+})
+
+test("automatic history paging crosses an all-hidden page", async ({ page }) => {
+  const api = await mockApi(page, (url) => {
+    if (url.pathname === "/api/search")
+      return searchReply([result("hidden-page")])
+    if (url.pathname !== "/api/session") return
+    if (!url.searchParams.has("before"))
+      return { body: sessionPage("hidden-page", 80, 40, 120) }
+    const before = Number(url.searchParams.get("before"))
+    const limit = Number(url.searchParams.get("limit"))
+    return {
+      body: sessionPage(
+        "hidden-page",
+        before - limit,
+        limit,
+        120,
+        "v1",
+        (index) => (index >= 40 ? "system" : "assistant"),
+      ),
+    }
+  })
+
+  await page.goto("/?session=hidden-page&mode=history")
+  await expect(page.getByText("needle hidden-page message 118")).toBeVisible()
+  await scrollTranscriptTo(page, "start")
+  await expect.poll(() => api.sessionCalls("hidden-page").length).toBe(3)
+  await expect(page.getByText(/1–120 of 120 messages/)).toBeVisible()
+  await scrollTranscriptTo(page, "start")
+  await expect(page.getByText("needle hidden-page message 0")).toBeVisible()
+  expect(
+    api
+      .sessionCalls("hidden-page")
+      .slice(1)
+      .map((url) => url.searchParams.get("before")),
+  ).toEqual(["80", "40"])
 })

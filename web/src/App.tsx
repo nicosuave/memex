@@ -439,6 +439,55 @@ function CloseMobileOnNavigation({ target }: { target: SessionTarget | null }) {
   return null
 }
 
+function ResultContinuation({
+  hasMore,
+  loading,
+  error,
+  loadMore,
+  intent,
+  sidebar = false,
+}: {
+  hasMore: boolean
+  loading: boolean
+  error: string
+  loadMore: () => Promise<void>
+  intent: string
+  sidebar?: boolean
+}) {
+  const boundary = useRef<HTMLDivElement>(null)
+  const { isMobile, open, openMobile } = useSidebar()
+  const visible = !sidebar || (isMobile ? openMobile : open)
+  useEffect(() => {
+    boundary.current?.parentElement?.scrollTo({ top: 0 })
+  }, [intent])
+  useEffect(() => {
+    const element = boundary.current
+    if (!element || !visible || !hasMore || loading || error) return
+    // Both continuations live directly inside their list's scroll container.
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) void loadMore()
+      },
+      { root: element.parentElement, rootMargin: "0px 0px 240px 0px" },
+    )
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [visible, hasMore, loading, error, loadMore])
+  return (
+    <div ref={boundary} className="result-continuation">
+      {loading && <span role="status">Loading more sessions…</span>}
+      {error && (
+        <div role="alert">
+          {error}
+          <Button variant="ghost" onClick={() => void loadMore()}>
+            Retry loading sessions
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function App() {
   const [query, setQuery] = useState(paramsAtLoad.get("q") || "")
   const [source, setSource] = useState(paramsAtLoad.get("source") || "all")
@@ -488,6 +537,7 @@ function App() {
   const searchGeneration = useRef(0)
   const searchController = useRef<AbortController | null>(null)
   const resultOffset = useRef(0)
+  const resultIntent = useRef("")
   const loadingMore = useRef(false)
   const intent = JSON.stringify([query, source, project, origin, timeRange])
   const currentIntent = useRef(intent)
@@ -627,6 +677,7 @@ function App() {
         )
           return
         resultOffset.current = data.offset + data.results.length
+        resultIntent.current = intent
         setResults(data.results)
         setHasMoreResults(data.has_more && data.results.length > 0)
         setStatus(searchStatus(data.results.length, data.has_more))
@@ -650,7 +701,13 @@ function App() {
   }, [intent, query, searchParamsFor, searchStatus, searchRevision])
 
   const loadMoreResults = useCallback(async () => {
-    if (!hasMoreResults || loadingMore.current) return
+    if (
+      !hasMoreResults ||
+      loadingMore.current ||
+      resultIntent.current !== intent ||
+      currentIntent.current !== intent
+    )
+      return
     loadingMore.current = true
     const generation = searchGeneration.current
     const offset = resultOffset.current
@@ -1037,16 +1094,14 @@ function App() {
               </a>
             ))
           )}
+          <ResultContinuation
+            hasMore={hasMoreResults}
+            loading={loadingMoreResults}
+            error={pageError}
+            loadMore={loadMoreResults}
+            intent={intent}
+          />
         </div>
-        {pageError && <p role="alert">{pageError}</p>}
-        {hasMoreResults && (
-          <Button
-            disabled={loadingMoreResults}
-            onClick={() => void loadMoreResults()}
-          >
-            Load more results
-          </Button>
-        )}
       </div>
     </main>
   )
@@ -1164,21 +1219,17 @@ function App() {
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 ))}
-                {hasMoreResults && (
-                  <SidebarMenuItem>
-                    <Button
-                      className="load-more-results"
-                      disabled={loadingMoreResults}
-                      onClick={() => void loadMoreResults()}
-                      variant="ghost"
-                    >
-                      {loadingMoreResults ? "Loading…" : "Load more results"}
-                    </Button>
-                  </SidebarMenuItem>
-                )}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
+          <ResultContinuation
+            hasMore={hasMoreResults}
+            loading={loadingMoreResults}
+            error={pageError}
+            loadMore={loadMoreResults}
+            intent={intent}
+            sidebar
+          />
         </SidebarContent>
       </Sidebar>
 
