@@ -405,3 +405,109 @@ fn rpc_serializes_bounded_bodies_before_transport() {
         assert_eq!(item["content"]["continuations"][0]["offset_chars"], 4);
     }
 }
+
+#[test]
+fn search_toon_preserves_json_values_for_all_projections() {
+    let (root, _) = fixture();
+    for projection in [
+        vec![],
+        vec!["--full"],
+        vec!["--fields", "doc_id,record_id,snippet"],
+    ] {
+        let mut args = vec!["search", "late_needle OR outcome", "--machine", "local"];
+        args.extend(projection);
+        let expected = values(root.path(), &args);
+        args.extend(["--format", "toon"]);
+        let out = run(root.path(), &args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let decoded: Value =
+            toon_format::decode_default(std::str::from_utf8(&out.stdout).unwrap()).unwrap();
+        assert_eq!(decoded["results"], serde_json::json!(expected));
+    }
+    let empty = run(
+        root.path(),
+        &[
+            "search",
+            "nonexistentterm",
+            "--machine",
+            "local",
+            "--format",
+            "toon",
+        ],
+    );
+    assert!(empty.status.success());
+    let decoded: Value =
+        toon_format::decode_default(std::str::from_utf8(&empty.stdout).unwrap()).unwrap();
+    assert_eq!(decoded, serde_json::json!({"results": []}));
+}
+
+#[test]
+fn search_formats_preserve_escaping_large_ids_and_existing_flags() {
+    let (root, _) = fixture();
+    let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut writer = index.writer().unwrap();
+    let mut special = record(
+        4,
+        "specialneedle: \"quoted\", slash\\ and\nnew line 界".into(),
+    );
+    special.doc_id = u64::MAX;
+    special.tool_output = Some("true,null,123\n[brackets]".into());
+    index.add_record(&mut writer, &special).unwrap();
+    writer.commit().unwrap();
+    let base = ["search", "specialneedle", "--machine", "local", "--full"];
+    let expected = values(root.path(), &base);
+    for flag in [
+        vec!["--format", "jsonl"],
+        vec!["--format", "json"],
+        vec!["--json-array"],
+        vec!["--format", "toon"],
+    ] {
+        let mut args = base.to_vec();
+        args.extend(&flag);
+        let out = run(root.path(), &args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = std::str::from_utf8(&out.stdout).unwrap();
+        let actual: Value = match flag.as_slice() {
+            ["--format", "toon"] => {
+                toon_format::decode_default::<Value>(text).unwrap()["results"].clone()
+            }
+            ["--format", "jsonl"] => {
+                serde_json::json!([serde_json::from_str::<Value>(text).unwrap()])
+            }
+            _ => serde_json::from_str(text).unwrap(),
+        };
+        assert_eq!(actual, serde_json::json!(expected));
+    }
+    assert!(
+        run(root.path(), &["search", "specialneedle", "-v"])
+            .status
+            .success()
+    );
+    for extra in ["--json-array", "--verbose"] {
+        assert!(
+            !run(
+                root.path(),
+                &["search", "specialneedle", "--format", "toon", extra]
+            )
+            .status
+            .success()
+        );
+    }
+    assert!(
+        !run(
+            root.path(),
+            &["search", "specialneedle", "--format", "invalid"]
+        )
+        .status
+        .success()
+    );
+}

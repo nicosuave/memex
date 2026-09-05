@@ -2233,6 +2233,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "toml",
+ "toon-format",
  "tui-markdown",
  "usearch",
  "walkdir",
@@ -3513,6 +3514,7 @@ version = "1.0.148"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3084b546a1dd6289475996f182a22aba973866ea8e8b02c51d9f46b1336a22da"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -4256,6 +4258,18 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "toon-format"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f89570c1a68d73941f728cca32a4345b2ffca36667ad921af336c60309a3e7e"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "tower"
