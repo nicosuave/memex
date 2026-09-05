@@ -397,17 +397,42 @@ memex skill install --target shared
 Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh My Pi installations.
 ## MCP server
 
-Run `memex mcp` to serve the Model Context Protocol over stdio using the official
-Rust SDK (`rmcp`). The agent client starts and stops the process; no listener or
-separate daemon is required. Use `memex mcp --root /path/to/memex-data` for a custom
-data directory. This is separate from Memex's internal `rpc` protocol.
+Run `memex mcp` to serve the Model Context Protocol over **Streamable HTTP** at
+`http://127.0.0.1:5363/mcp` using the official Rust SDK (`rmcp`). Use
+`--listen 127.0.0.1:5364` to change the socket and `--root /path/to/memex-data`
+for a custom data directory. This is separate from Memex's internal `rpc` protocol.
 
+The HTTP endpoint requires `Authorization: Bearer <token>` on every MCP request.
+The token is stored in `<root>/web-auth-token` (normally `~/.memex/web-auth-token`),
+the same restricted token file used by Memex's web server. Startup prints its
+path, never the token. Configure the endpoint URL and bearer token in your client.
+For a browser that calls Memex directly, allow its exact origin:
+
+```bash
+memex mcp --allowed-origin https://chat.example.com
+```
+
+Repeat `--allowed-origin` for multiple origins. Browser origins are denied by
+default; clients without an Origin header still require bearer authentication.
+CORS preflights do not require authentication. Remote clients need a reachable
+HTTPS URL, typically through a TLS reverse proxy to the loopback listener; add
+`--allowed-host memex.example.com` when the proxy preserves that Host header.
+Binding to loopback alone does not make the server reachable by hosted chat apps.
+This server supports clients that accept a configured bearer token; it does not
+provide an OAuth login flow for clients that require one.
+
+The transport follows the [2026-07-28 Streamable HTTP specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http):
+one POST endpoint with request-scoped SSE responses and no protocol sessions or
+standalone GET stream. The SDK also accepts older clients' initialize flow without
+creating a session. HTTP disconnects cancel the request's wait for retrieval.
+
+For local process clients, stdio remains available with `memex mcp --transport stdio`.
 For clients using an `mcpServers` configuration:
 
 ```json
 {
   "mcpServers": {
-    "memex": { "command": "memex", "args": ["mcp"] }
+    "memex": { "command": "memex", "args": ["mcp", "--transport", "stdio"] }
   }
 }
 ```
@@ -452,7 +477,7 @@ semantic search may load an embedding model. Run the index service separately
 when predictable search latency matters. Up to four retrieval calls run at once;
 MCP cancellation stops waiting but synchronous work can finish under its existing
 timeouts. Index readers are opened per call so a running server sees newly
-published generations. Diagnostics go to stderr; stdout is reserved for MCP.
+published generations. Diagnostics go to stderr; in stdio mode, stdout is reserved for MCP.
 
 The server supplies retrieval guidance during initialization: read known IDs
 directly, search exact anchors first, expand progressively, verify source records,

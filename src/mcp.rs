@@ -24,6 +24,8 @@ use crate::{
 };
 
 const MAX_READ_CHARS: usize = 64_000;
+mod http;
+pub use http::HttpOptions;
 const INSTRUCTIONS: &str = "Recover the smallest set of source-grounded records that answers the question. \
 Read known record/session IDs directly. Otherwise search using exact anchors first, hybrid for uncertain wording, \
 and semantic for abstract similarity. Scope by repository, source, machine and time when known; diversify by session. \
@@ -476,7 +478,7 @@ fn push_page(
 }
 
 /// Start MCP without running an index refresh or opening a UI during handshake.
-pub fn run(root: Option<PathBuf>) -> Result<()> {
+pub fn run(root: Option<PathBuf>, http: Option<HttpOptions>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         // Leave blocking capacity for Tokio's stdin/stdout adapters in addition
@@ -485,6 +487,9 @@ pub fn run(root: Option<PathBuf>) -> Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
+        if let Some(options) = http {
+            return http::run(root, options).await;
+        }
         let service = MemexServer::new(root)
             .serve(rmcp::transport::stdio())
             .await?;

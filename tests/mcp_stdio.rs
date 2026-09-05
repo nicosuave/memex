@@ -28,7 +28,7 @@ impl Client {
     fn command(root: &Path, configure: impl FnOnce(&mut Command)) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
         command
-            .args(["mcp", "--root"])
+            .args(["mcp", "--transport", "stdio", "--root"])
             .arg(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -363,7 +363,7 @@ fn sessions_match_cli_and_do_not_auto_index() {
     let before = std::fs::read(paths.index.join("meta.json")).unwrap();
     std::fs::write(
         root.path().join("config.toml"),
-        "auto_index_on_search = true\n",
+        "auto_index_on_search = true\ncodex_resume_cmd = \"codex resume {session_id}\"\n",
     )
     .unwrap();
     let mut client = Client::command(root.path(), |command| {

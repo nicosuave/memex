@@ -53,7 +53,10 @@ getrandom = "0.3"
 hmac = "0.12"
 subtle = "2.6"
 toon-format = { version = "0.5.0", default-features = false }
-rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+rmcp = { version = "3.2.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }

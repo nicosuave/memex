@@ -643,12 +643,29 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Run the native Model Context Protocol server over stdio
+    /// Run the Model Context Protocol server (Streamable HTTP by default)
     Mcp {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "http")]
+        transport: McpTransport,
+        /// HTTP socket address
+        #[arg(long, default_value = "127.0.0.1:5363")]
+        listen: std::net::SocketAddr,
+        /// Additional accepted HTTP Host authority; repeat for multiple hosts
+        #[arg(long)]
+        allowed_host: Vec<String>,
+        /// Accepted browser Origin; repeat for multiple origins
+        #[arg(long)]
+        allowed_origin: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum McpTransport {
+    Http,
+    Stdio,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1460,8 +1477,19 @@ pub fn run() -> Result<()> {
         Commands::Rpc { root } => {
             crate::machine::run_rpc_stdio(root)?;
         }
-        Commands::Mcp { root } => {
-            crate::mcp::run(root)?;
+        Commands::Mcp {
+            root,
+            transport,
+            listen,
+            allowed_host,
+            allowed_origin,
+        } => {
+            let http = (transport == McpTransport::Http).then_some(crate::mcp::HttpOptions {
+                listen,
+                allowed_hosts: allowed_host,
+                allowed_origins: allowed_origin,
+            });
+            crate::mcp::run(root, http)?;
         }
     }
     Ok(())
@@ -6006,10 +6034,18 @@ mod tests {
     fn mcp_command_accepts_a_custom_root() {
         let cli = Cli::try_parse_from(["memex", "mcp", "--root", "/tmp/custom-memex"])
             .expect("parse MCP root");
-        let Some(Commands::Mcp { root }) = cli.command else {
+        let Some(Commands::Mcp {
+            root,
+            transport,
+            listen,
+            ..
+        }) = cli.command
+        else {
             panic!("expected MCP command");
         };
         assert_eq!(root, Some(PathBuf::from("/tmp/custom-memex")));
+        assert_eq!(transport, McpTransport::Http);
+        assert_eq!(listen.to_string(), "127.0.0.1:5363");
     }
 
     #[test]
