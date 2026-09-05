@@ -39,7 +39,9 @@ const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_CLIENTS: i64 = 256;
 const MAX_PENDING: usize = 256;
 const MAX_GRANTS: i64 = 256;
-const MAX_REFRESH_TOKENS_PER_FAMILY: i64 = 256;
+// Keep replay evidence for the full refresh lifetime, with room for clients
+// rotating as often as every five minutes rather than at hourly access expiry.
+const MAX_REFRESH_TOKENS_PER_FAMILY: i64 = REFRESH_TTL_SECONDS / (5 * 60) + 2;
 const MAX_FAILED_APPROVALS: usize = 8;
 const FAILED_APPROVAL_WINDOW: Duration = Duration::from_secs(60);
 
@@ -287,7 +289,7 @@ impl OAuthServer {
             pending.requests.remove(&oldest);
         }
         let request_id = random_token()?;
-        let html = approval_html(&request, &request_id);
+        let html = approval_html(&request, &request_id, None);
         pending.requests.insert(request_id.clone(), request);
         Ok((request_id, html))
     }
@@ -302,6 +304,21 @@ impl OAuthServer {
             .requests
             .retain(|_, request| now.duration_since(request.created_at) <= PENDING_TTL);
         pending.requests.remove(request_id)
+    }
+
+    fn pending_approval_html(&self, request_id: &str, error: &str) -> Option<String> {
+        let now = Instant::now();
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending
+            .requests
+            .retain(|_, request| now.duration_since(request.created_at) <= PENDING_TTL);
+        pending
+            .requests
+            .get(request_id)
+            .map(|request| approval_html(request, request_id, Some(error)))
     }
 
     fn approval_allowed(&self) -> bool {
@@ -631,6 +648,27 @@ async fn authorize_post(
     if form.request_id.len() != 43 || form.decision.len() > 16 || form.owner_key.len() > 256 {
         return authorization_error("approval parameter is invalid");
     }
+    if form.decision != "approve" && form.decision != "deny" {
+        return authorization_error("approval decision is invalid");
+    }
+    if form.decision == "approve" && !server.owner.authorize_bearer(form.owner_key.trim()) {
+        let (status, message) = if server.approval_allowed() {
+            server.record_failed_approval();
+            (
+                StatusCode::UNAUTHORIZED,
+                "Owner key is invalid. Correct the key and try again.",
+            )
+        } else {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many failed attempts. Check your owner key and try again shortly.",
+            )
+        };
+        return match server.pending_approval_html(&form.request_id, message) {
+            Some(html) => (status, Html(html)).into_response(),
+            None => authorization_error("authorization request is invalid or expired"),
+        };
+    }
     let Some(request) = server.take_pending(&form.request_id) else {
         return authorization_error("authorization request is invalid or expired");
     };
@@ -641,17 +679,6 @@ async fn authorize_post(
             request.state.as_deref(),
             [("error", "access_denied")],
         );
-    }
-    if form.decision != "approve" || !server.owner.authorize_bearer(form.owner_key.trim()) {
-        if !server.approval_allowed() {
-            return oauth_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "temporarily_unavailable",
-                "too many failed approval attempts; try again shortly",
-            );
-        }
-        server.record_failed_approval();
-        return (StatusCode::UNAUTHORIZED, "owner key is invalid").into_response();
     }
     let code = match random_token() {
         Ok(value) => value,
@@ -937,30 +964,29 @@ fn exchange_code(
         "insert into oauth_access_tokens (token_hash, grant_id, expires_at) values (?1, ?2, ?3)",
         params![access_hash.as_slice(), grant_id, now + ACCESS_TTL_SECONDS],
     )?;
-    let issue_refresh = has_scope(&stored.scope, SCOPE_OFFLINE);
-    if issue_refresh {
-        transaction.execute(
-            "insert into oauth_refresh_tokens
+    // Every approved read grant supports unattended connector access. OAuth
+    // refresh tokens do not require clients to request an extra scope.
+    transaction.execute(
+        "insert into oauth_refresh_tokens
              (token_hash, grant_id, family_id, client_id, resource, scope, expires_at, used_at)
              values (?1, ?2, ?3, ?4, ?5, ?6, ?7, null)",
-            params![
-                refresh_hash.as_slice(),
-                grant_id,
-                family_id,
-                stored.client_id,
-                resource,
-                stored.scope,
-                now + REFRESH_TTL_SECONDS
-            ],
-        )?;
-    }
+        params![
+            refresh_hash.as_slice(),
+            grant_id,
+            family_id,
+            stored.client_id,
+            resource,
+            stored.scope,
+            now + REFRESH_TTL_SECONDS
+        ],
+    )?;
     transaction.commit()?;
     Ok(TokenResponse {
         access_token,
         token_type: "Bearer",
         expires_in: ACCESS_TTL_SECONDS,
         scope: stored.scope,
-        refresh_token: issue_refresh.then_some(refresh_token),
+        refresh_token: Some(refresh_token),
     })
 }
 
@@ -1463,9 +1489,12 @@ fn now_seconds() -> Result<i64> {
         .context("timestamp overflow")
 }
 
-fn approval_html(request: &PendingRequest, request_id: &str) -> String {
+fn approval_html(request: &PendingRequest, request_id: &str, error: Option<&str>) -> String {
+    let error = error
+        .map(|message| format!("<p role=\"alert\">{}</p>", html_escape(message)))
+        .unwrap_or_default();
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Approve Memex access</title><style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:4rem auto;padding:0 1.25rem;color:#171717}}main{{border:1px solid #ddd;border-radius:12px;padding:1.5rem}}code{{overflow-wrap:anywhere}}label{{display:block;margin:1.25rem 0 .5rem}}input{{box-sizing:border-box;width:100%;padding:.7rem}}.actions{{display:flex;gap:.75rem;margin-top:1rem}}button{{padding:.7rem 1rem}}</style></head><body><main><h1>Approve Memex access</h1><p>App label supplied by the client: <strong>{}</strong></p><p>This grants read access to your full Memex history, including configured remote history.</p><p>After approval, your browser will return to this exact destination:</p><p><code>{}</code></p><form method="post" action="/oauth/authorize"><input type="hidden" name="request_id" value="{}"><label for="owner_key">Owner key</label><input id="owner_key" name="owner_key" type="password" required autocomplete="off"><div class="actions"><button type="submit" name="decision" value="approve">Approve</button><button type="submit" name="decision" value="deny" formnovalidate>Deny</button></div></form></main></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Approve Memex access</title><style>body{{font:16px system-ui,sans-serif;max-width:42rem;margin:4rem auto;padding:0 1.25rem;color:#171717}}main{{border:1px solid #ddd;border-radius:12px;padding:1.5rem}}code{{overflow-wrap:anywhere}}label{{display:block;margin:1.25rem 0 .5rem}}input{{box-sizing:border-box;width:100%;padding:.7rem}}.actions{{display:flex;gap:.75rem;margin-top:1rem}}button{{padding:.7rem 1rem}}</style></head><body><main><h1>Approve Memex access</h1><p>App label supplied by the client: <strong>{}</strong></p><p>This grants read access to your full Memex history, including configured remote history.</p><p>After approval, your browser will return to this exact destination:</p><p><code>{}</code></p>{error}<form method="post" action="/oauth/authorize"><input type="hidden" name="request_id" value="{}"><label for="owner_key">Owner key</label><input id="owner_key" name="owner_key" type="password" required autocomplete="off"><div class="actions"><button type="submit" name="decision" value="approve">Approve</button><button type="submit" name="decision" value="deny" formnovalidate>Deny</button></div></form></main></body></html>"#,
         html_escape(&request.client_name),
         html_escape(&request.redirect_uri),
         html_escape(request_id)
@@ -1588,7 +1617,7 @@ mod tests {
             scope: SCOPE_READ.into(),
             state: None,
         };
-        let html = approval_html(&request, "request&one");
+        let html = approval_html(&request, "request&one", None);
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("request&amp;one"));

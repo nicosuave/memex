@@ -154,7 +154,26 @@ impl OAuthMcpServer {
         verifier: &str,
         state: &str,
     ) -> RequestBuilder {
-        self.client.get(self.endpoint("/oauth/authorize")).query(&[
+        self.authorize_request_with_scope(
+            client_id,
+            redirect_uri,
+            resource,
+            verifier,
+            state,
+            Some(SCOPE),
+        )
+    }
+
+    fn authorize_request_with_scope(
+        &self,
+        client_id: &str,
+        redirect_uri: &str,
+        resource: &str,
+        verifier: &str,
+        state: &str,
+        scope: Option<&str>,
+    ) -> RequestBuilder {
+        let request = self.client.get(self.endpoint("/oauth/authorize")).query(&[
             ("response_type", "code"),
             ("client_id", client_id),
             ("redirect_uri", redirect_uri),
@@ -162,8 +181,11 @@ impl OAuthMcpServer {
             ("code_challenge_method", "S256"),
             ("resource", resource),
             ("state", state),
-            ("scope", SCOPE),
-        ])
+        ]);
+        match scope {
+            Some(scope) => request.query(&[("scope", scope)]),
+            None => request,
+        }
     }
 
     fn approval(&self, request_id: &str, owner_key: &str, decision: &str) -> Response {
@@ -185,7 +207,28 @@ impl OAuthMcpServer {
         verifier: &str,
         state: &str,
     ) -> String {
-        let response = self.authorize_get(client_id, REDIRECT_URI, &self.mcp_url, verifier, state);
+        self.approve_code_with_scope(client_id, owner_key, verifier, state, Some(SCOPE))
+    }
+
+    fn approve_code_with_scope(
+        &self,
+        client_id: &str,
+        owner_key: &str,
+        verifier: &str,
+        state: &str,
+        scope: Option<&str>,
+    ) -> String {
+        let response = self
+            .authorize_request_with_scope(
+                client_id,
+                REDIRECT_URI,
+                &self.mcp_url,
+                verifier,
+                state,
+                scope,
+            )
+            .send()
+            .expect("authorization request");
         let html = text_response(response, StatusCode::OK);
         let request_id = input_value(&html, "request_id");
         let response = self.approval(&request_id, owner_key, "approve");
@@ -233,6 +276,18 @@ impl OAuthMcpServer {
             .expect("refresh token exchange")
     }
 
+    fn refresh_without_resource(&self, client_id: &str, refresh_token: &str) -> Response {
+        self.client
+            .post(self.endpoint("/oauth/token"))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", client_id),
+            ])
+            .send()
+            .expect("refresh token exchange without resource")
+    }
+
     fn revoke(&self, client_id: &str, token: &str) -> Response {
         self.client
             .post(self.endpoint("/oauth/revoke"))
@@ -274,10 +329,14 @@ struct Tokens {
 }
 
 fn tokens(response: Response) -> Tokens {
+    tokens_for_scope(response, SCOPE)
+}
+
+fn tokens_for_scope(response: Response, expected_scope: &str) -> Tokens {
     assert_no_store(&response);
     let body = json_response(response, StatusCode::OK);
     assert_eq!(body["token_type"], "Bearer");
-    assert_eq!(body["scope"], SCOPE);
+    assert_eq!(body["scope"], expected_scope);
     assert!(body["expires_in"].as_u64().is_some_and(|value| value > 0));
     let access = body["access_token"]
         .as_str()
@@ -561,8 +620,6 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
 
     let malformed = server.approval("not-a-request", &owner_key, "approve");
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
-    let wrong_owner = server.approval(&request_id, "wrong-owner-key", "approve");
-    assert_eq!(wrong_owner.status(), StatusCode::UNAUTHORIZED);
     let foreign_approval = server
         .client
         .post(server.endpoint("/oauth/authorize"))
@@ -575,6 +632,27 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
         .send()
         .expect("foreign-origin approval");
     assert_eq!(foreign_approval.status(), StatusCode::FORBIDDEN);
+    let wrong_owner = text_response(
+        server.approval(&request_id, "wrong-owner-key", "approve"),
+        StatusCode::UNAUTHORIZED,
+    );
+    assert_eq!(input_value(&wrong_owner, "request_id"), request_id);
+    assert!(!wrong_owner.contains(&owner_key));
+    let recovered = redirect_params(server.approval(&request_id, &owner_key, "approve"));
+    assert!(recovered.contains_key("code"));
+    assert_eq!(
+        recovered.get("state").map(String::as_str),
+        Some("approval-state")
+    );
+    assert_eq!(
+        recovered.get("iss").map(String::as_str),
+        Some(server.public_url.as_str())
+    );
+    assert_eq!(
+        server.approval(&request_id, &owner_key, "approve").status(),
+        StatusCode::BAD_REQUEST,
+        "a successful approval must consume its request"
+    );
 
     let denied_html = text_response(
         server.authorize_get(
@@ -655,6 +733,66 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
         server.mcp_tools(Some(&second.access)).status(),
         StatusCode::UNAUTHORIZED,
         "refresh replay must revoke the token family"
+    );
+}
+
+#[test]
+fn read_scope_grants_refresh_beyond_the_previous_history_cap() {
+    let root = tempfile::tempdir().expect("OAuth MCP root");
+    let server = OAuthMcpServer::start(root.path());
+    let owner_key = OAuthMcpServer::owner_key(root.path());
+    let client_id = server.register("read scope refresh test client");
+
+    let default_code =
+        server.approve_code_with_scope(&client_id, &owner_key, VERIFIER, "default-read", None);
+    let default_read = tokens_for_scope(
+        server.exchange_code(
+            &client_id,
+            &default_code,
+            REDIRECT_URI,
+            VERIFIER,
+            &server.mcp_url,
+        ),
+        "memex:read",
+    );
+    oauth_error(
+        server.refresh_without_resource(&client_id, &default_read.refresh),
+        "invalid_grant",
+    );
+    let default_rotated = tokens_for_scope(
+        server.refresh(&client_id, &default_read.refresh),
+        "memex:read",
+    );
+    assert_ne!(default_rotated.refresh, default_read.refresh);
+
+    let explicit_code = server.approve_code_with_scope(
+        &client_id,
+        &owner_key,
+        VERIFIER,
+        "explicit-read",
+        Some("memex:read"),
+    );
+    let mut latest = tokens_for_scope(
+        server.exchange_code(
+            &client_id,
+            &explicit_code,
+            REDIRECT_URI,
+            VERIFIER,
+            &server.mcp_url,
+        ),
+        "memex:read",
+    );
+    let first_refresh = latest.refresh.clone();
+    for _ in 0..721 {
+        latest = tokens_for_scope(server.refresh(&client_id, &latest.refresh), "memex:read");
+    }
+
+    oauth_error(server.refresh(&client_id, &first_refresh), "invalid_grant");
+    oauth_error(server.refresh(&client_id, &latest.refresh), "invalid_grant");
+    assert_eq!(
+        server.mcp_tools(Some(&latest.access)).status(),
+        StatusCode::UNAUTHORIZED,
+        "replaying the first retained refresh token must revoke the latest access token"
     );
 }
 

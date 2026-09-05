@@ -426,7 +426,9 @@ including its configured remote machines.
 The owner key is in `<root>/web-auth-token` (normally `~/.memex/web-auth-token`),
 the same restricted key file used by Memex's web server. Startup prints its path,
 never the key. Enter it only on your Memex instance's approval page; the chat
-client receives its own access and refresh tokens. Grants survive server restarts.
+client receives its own access and refresh tokens, including when it requests only
+`memex:read` or omits the scope. Access tokens last one hour; rotating refresh tokens
+last 30 days from issuance. Grants survive server restarts.
 To disconnect all OAuth clients, run:
 
 ```bash
