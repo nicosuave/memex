@@ -354,6 +354,44 @@ fn tool_payload_continuations_can_be_used_directly_as_field_selectors() {
 }
 
 #[test]
+fn retrieval_evaluation_reports_supplied_outcomes_separately_from_search_metrics() {
+    let (root, _) = fixture();
+    let dataset = root.path().join("evaluation.jsonl");
+    let outcomes = root.path().join("outcomes.jsonl");
+    let qrel = serde_json::json!({ "machine":"local", "source":"codex", "session_id":"session", "source_path":"/tmp/fixture.jsonl", "doc_id":2 });
+    std::fs::write(
+        &dataset,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"id":"case-a","query":"late_needle","relevant":[qrel]}),
+            serde_json::json!({"id":"case-b","query":"late_needle","relevant":[qrel]})
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &outcomes,
+        "{\"case_id\":\"case-a\",\"correct_conclusion\":true,\"context_tokens\":2000}\n",
+    )
+    .unwrap();
+    let report = values(
+        root.path(),
+        &[
+            "eval-retrieval",
+            dataset.to_str().unwrap(),
+            "--outcomes",
+            outcomes.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(report[0]["cases"], 2);
+    assert_eq!(report[0]["outcomes"]["evaluated_cases"], 1);
+    assert_eq!(report[0]["outcomes"]["accuracy"], 1.0);
+    assert_eq!(
+        report[0]["outcomes"]["correct_conclusions_per_1000_context_tokens"],
+        0.5
+    );
+}
+
+#[test]
 fn rpc_serializes_bounded_bodies_before_transport() {
     use std::io::Write;
     use std::process::Stdio;

@@ -15,7 +15,8 @@ use crate::retrieval::canonical_record_id;
 use crate::retrieval::{ContextOptions, ContextSelector};
 use crate::retrieval_eval::{
     EvaluationDataset, RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace,
-    fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k, unique_sessions_at_k,
+    evaluate_outcomes, fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k,
+    unique_sessions_at_k,
 };
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
@@ -458,6 +459,9 @@ The input contains at most 32 requests; each page is limited to 500 records."
         /// Cutoff used for recall and nDCG metrics
         #[arg(long, default_value_t = 20)]
         k: usize,
+        /// Optional JSONL of externally judged conclusions and measured context tokens
+        #[arg(long)]
+        outcomes: Option<PathBuf>,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -1145,8 +1149,13 @@ pub fn run() -> Result<()> {
                 root,
             })?;
         }
-        Commands::EvalRetrieval { dataset, k, root } => {
-            run_eval_retrieval(dataset, k, root)?;
+        Commands::EvalRetrieval {
+            dataset,
+            k,
+            outcomes,
+            root,
+        } => {
+            run_eval_retrieval(dataset, k, outcomes, root)?;
         }
         Commands::Sessions {
             cwd,
@@ -2264,8 +2273,17 @@ fn hydrate_error_value(machine: &str, request: &SessionPageRequest, error: &str)
     })?)
 }
 
-fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) -> Result<()> {
+fn run_eval_retrieval(
+    dataset_path: PathBuf,
+    k: usize,
+    outcomes: Option<PathBuf>,
+    root: Option<PathBuf>,
+) -> Result<()> {
     let dataset = EvaluationDataset::read_jsonl(&dataset_path)?;
+    let outcomes = outcomes
+        .as_deref()
+        .map(|path| evaluate_outcomes(path, &dataset.cases))
+        .transpose()?;
     let paths = Paths::new(root)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut result_lists = Vec::with_capacity(dataset.cases.len());
@@ -2327,18 +2345,15 @@ fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) ->
         .map(|results| unique_sessions_at_k(results, k))
         .sum::<usize>() as f64
         / dataset.cases.len() as f64;
-    println!(
-        "{}",
-        serde_json::json!({
-            "cases": dataset.cases.len(),
-            "k": k,
-            "mrr": mrr,
-            "recall_at_k": recall,
-            "ndcg_at_k": ndcg,
-            "mean_unique_sessions_at_k": unique_sessions,
-        })
-    );
-    Ok(())
+    let mut report = serde_json::json!({
+        "cases": dataset.cases.len(), "k": k, "mrr": mrr,
+        "recall_at_k": recall, "ndcg_at_k": ndcg,
+        "mean_unique_sessions_at_k": unique_sessions,
+    });
+    if let Some(outcomes) = outcomes {
+        report["outcomes"] = serde_json::to_value(outcomes)?;
+    }
+    print_json(&report, false)
 }
 
 struct SessionRunArgs {

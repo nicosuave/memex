@@ -659,3 +659,19 @@ description = "memex session palette"
 
 The plugin is listed in the herdr marketplace through the `herdr-plugin` GitHub topic on this
 repo.
+
+### Retrieval workflow evaluation
+
+`memex eval-retrieval dataset.jsonl --outcomes outcomes.jsonl` adds an optional workflow
+outcome summary to the existing search-ranking metrics. Supply externally judged outcomes
+and measured context-token counts, keyed by the dataset case's `id`:
+
+```json
+{"case_id":"investigation-a","correct_conclusion":true,"context_tokens":2000}
+{"case_id":"investigation-b","correct_conclusion":false,"context_tokens":3000}
+```
+
+The `outcomes` object reports evaluated-case coverage, accuracy, total context tokens,
+and correct conclusions per 1,000 context tokens. Missing judgments are not counted as
+failures or successes. Unknown/duplicate case IDs and zero token counts are rejected.
+Memex does not generate correctness judgments or estimate tokens from character counts.

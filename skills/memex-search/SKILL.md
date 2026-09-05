@@ -499,6 +499,12 @@ memex search "query" --trace
 memex eval-retrieval <dataset.jsonl> --k 20
 ```
 
+For workflow evaluation with externally judged answers, use
+`memex eval-retrieval dataset.jsonl --outcomes outcomes.jsonl`. Each outcome names a dataset
+case ID and records `correct_conclusion` plus measured `context_tokens`. The optional
+summary reports judged-case coverage, accuracy, and correct conclusions per 1,000 context
+tokens; it does not infer judgments or treat unjudged cases as failures.
+
 Tracing records retrieval metadata without transcript contents. Evaluation reports recall, MRR, nDCG, and session diversity against JSONL relevance cases.
 
 ### Index freshness / embeddings
