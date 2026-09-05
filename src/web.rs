@@ -11,12 +11,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:6363";
 const MAX_SESSION_OFFSET: usize = 100_000;
+const MAX_MESSAGE_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_SESSION_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_CONTENT_PAGE_BYTES: usize = 64 * 1024;
+const WEB_WORKER_COUNT: usize = 8;
+const WEB_REQUEST_QUEUE_CAPACITY: usize = 64;
 const UI_HTML: &str = include_str!("../web/dist/index.html");
 const UI_CSS: &[u8] = include_bytes!("../web/dist/assets/app.css");
 const UI_JS: &[u8] = include_bytes!("../web/dist/assets/app.js");
@@ -83,21 +88,42 @@ fn serve_requests(
     cookie_name: String,
     auth: Arc<WebAuth>,
 ) {
-    for request in server.incoming_requests() {
+    let (sender, receiver) = mpsc::sync_channel(WEB_REQUEST_QUEUE_CAPACITY);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for worker in 0..WEB_WORKER_COUNT {
+        let receiver = Arc::clone(&receiver);
         let request_paths = paths.clone();
         let request_auth = Arc::clone(&auth);
         let request_cookie_name = cookie_name.clone();
-        std::thread::spawn(move || {
-            if let Err(err) = handle_request(
-                request,
-                &request_paths,
-                restrict_hosts,
-                &request_cookie_name,
-                &request_auth,
-            ) {
-                eprintln!("web UI request failed: {err:#}");
-            }
-        });
+        let _ = std::thread::Builder::new()
+            .name(format!("memex-web-{worker}"))
+            .spawn(move || {
+                loop {
+                    let request = {
+                        let Ok(receiver) = receiver.lock() else {
+                            return;
+                        };
+                        match receiver.recv() {
+                            Ok(request) => request,
+                            Err(_) => return,
+                        }
+                    };
+                    if let Err(err) = handle_request(
+                        request,
+                        &request_paths,
+                        restrict_hosts,
+                        &request_cookie_name,
+                        &request_auth,
+                    ) {
+                        eprintln!("web UI request failed: {err:#}");
+                    }
+                }
+            });
+    }
+    for request in server.incoming_requests() {
+        if sender.send(request).is_err() {
+            break;
+        }
     }
 }
 
@@ -200,6 +226,29 @@ fn handle_request(
             Ok(params) => match session_payload(paths, &params) {
                 Ok(Some(payload)) => respond_json(request, StatusCode(200), &payload),
                 Ok(None) => respond_json_error(request, StatusCode(404), "session not found"),
+                Err(err) if err.downcast_ref::<StaleSnapshot>().is_some() => {
+                    respond_json_error(request, StatusCode(409), &err.to_string())
+                }
+                Err(err) if err.downcast_ref::<AmbiguousSessionScope>().is_some() => {
+                    respond_json_error(request, StatusCode(400), &err.to_string())
+                }
+                Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
+            },
+            Err(err) => respond_json_error(request, StatusCode(400), &err.to_string()),
+        },
+        "/api/session/content" => match SessionContentRequest::from_url(&parsed) {
+            Ok(params) => match session_content_payload(paths, &params) {
+                Ok(Some(payload)) => respond_json(request, StatusCode(200), &payload),
+                Ok(None) => respond_json_error(request, StatusCode(404), "record not found"),
+                Err(err) if err.downcast_ref::<StaleSnapshot>().is_some() => {
+                    respond_json_error(request, StatusCode(409), &err.to_string())
+                }
+                Err(err) if err.downcast_ref::<InvalidContentOffset>().is_some() => {
+                    respond_json_error(request, StatusCode(400), &err.to_string())
+                }
+                Err(err) if err.downcast_ref::<AmbiguousSessionScope>().is_some() => {
+                    respond_json_error(request, StatusCode(400), &err.to_string())
+                }
                 Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
             },
             Err(err) => respond_json_error(request, StatusCode(400), &err.to_string()),
@@ -492,18 +541,135 @@ fn add_activity_value(
 #[derive(Debug)]
 struct SessionRequest {
     session_id: String,
-    offset: usize,
+    source_path: Option<String>,
+    source: Option<crate::types::SourceKind>,
+    selection: SessionSelection,
     limit: usize,
+    version: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionSelection {
+    Offset(usize),
+    Before(usize),
+    Tail,
+    Around(String),
 }
 
 impl SessionRequest {
     fn from_url(url: &RequestUrl) -> Result<Self> {
         let mut session_id = None;
+        let mut source_path = None;
+        let mut source = None;
         let mut offset = 0;
+        let mut offset_supplied = false;
+        let mut before = None;
+        let mut tail = false;
+        let mut around = None;
         let mut limit = 100;
+        let mut version = None;
         for (key, value) in url.query_pairs() {
             match key {
                 "id" if !value.is_empty() => session_id = Some(value.to_string()),
+                "source_path" if !value.is_empty() => source_path = Some(value.to_string()),
+                "session_source" if !value.is_empty() => {
+                    source = Some(parse_session_source(value)?);
+                }
+                "offset" => {
+                    offset_supplied = true;
+                    offset = value
+                        .parse::<usize>()
+                        .context("offset must be a non-negative integer")?;
+                }
+                "before" => {
+                    before = Some(
+                        value
+                            .parse::<usize>()
+                            .context("before must be a non-negative integer")?,
+                    );
+                }
+                "tail" => match value {
+                    "true" => tail = true,
+                    "" | "false" => {}
+                    _ => return Err(anyhow!("tail must be true or false")),
+                },
+                "around" if !value.is_empty() => around = Some(value.to_string()),
+                "limit" => {
+                    limit = value
+                        .parse::<usize>()
+                        .context("limit must be a positive integer")?
+                        .clamp(1, 200);
+                }
+                "version" if !value.is_empty() => version = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        if offset > MAX_SESSION_OFFSET {
+            return Err(anyhow!("offset must not exceed {MAX_SESSION_OFFSET}"));
+        }
+        if before.is_some_and(|before| before > MAX_SESSION_OFFSET) {
+            return Err(anyhow!("before must not exceed {MAX_SESSION_OFFSET}"));
+        }
+        if before == Some(0) {
+            return Err(anyhow!("before must be positive"));
+        }
+        let selection_count = usize::from(offset_supplied)
+            + before.is_some() as usize
+            + usize::from(tail)
+            + around.is_some() as usize;
+        if selection_count > 1 {
+            return Err(anyhow!(
+                "choose exactly one of offset, before, tail=true, or around"
+            ));
+        }
+        let selection = if tail {
+            SessionSelection::Tail
+        } else if let Some(before) = before {
+            SessionSelection::Before(before)
+        } else if let Some(record_id) = around {
+            SessionSelection::Around(record_id)
+        } else {
+            SessionSelection::Offset(offset)
+        };
+        Ok(Self {
+            session_id: session_id.ok_or_else(|| anyhow!("missing session id"))?,
+            source_path,
+            source,
+            selection,
+            limit,
+            version,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SessionContentRequest {
+    session_id: String,
+    source_path: Option<String>,
+    source: Option<crate::types::SourceKind>,
+    record_id: String,
+    offset: usize,
+    limit: usize,
+    version: Option<String>,
+}
+
+impl SessionContentRequest {
+    fn from_url(url: &RequestUrl) -> Result<Self> {
+        let mut session_id = None;
+        let mut source_path = None;
+        let mut source = None;
+        let mut record_id = None;
+        let mut offset = 0;
+        let mut limit = MAX_CONTENT_PAGE_BYTES;
+        let mut version = None;
+        for (key, value) in url.query_pairs() {
+            match key {
+                "id" if !value.is_empty() => session_id = Some(value.to_string()),
+                "source_path" if !value.is_empty() => source_path = Some(value.to_string()),
+                "session_source" if !value.is_empty() => {
+                    source = Some(parse_session_source(value)?);
+                }
+                "record_id" if !value.is_empty() => record_id = Some(value.to_string()),
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -513,20 +679,29 @@ impl SessionRequest {
                     limit = value
                         .parse::<usize>()
                         .context("limit must be a positive integer")?
-                        .clamp(1, 200);
+                        .clamp(1, MAX_CONTENT_PAGE_BYTES);
                 }
+                "version" if !value.is_empty() => version = Some(value.to_string()),
                 _ => {}
             }
         }
-        if offset > MAX_SESSION_OFFSET {
-            return Err(anyhow!("offset must not exceed {MAX_SESSION_OFFSET}"));
-        }
         Ok(Self {
             session_id: session_id.ok_or_else(|| anyhow!("missing session id"))?,
+            source_path,
+            source,
+            record_id: record_id.ok_or_else(|| anyhow!("missing record_id"))?,
             offset,
             limit,
+            version,
         })
     }
+}
+
+fn parse_session_source(value: &str) -> Result<crate::types::SourceKind> {
+    crate::types::SourceKind::ALL
+        .into_iter()
+        .find(|source| source.label() == value)
+        .ok_or_else(|| anyhow!("unknown session_source: {value}"))
 }
 
 fn restrict_hosts(listen: &str) -> bool {
@@ -763,6 +938,8 @@ struct SearchPayload {
 #[derive(Serialize)]
 struct SessionSummary {
     session_id: String,
+    record_id: String,
+    source_path: String,
     project: String,
     source: String,
     role: String,
@@ -807,11 +984,15 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         // Session-grouped origin filter with prefer-main: a sidechain hit
         // inside a primary session must not hide the session (mirrors the
         // CLI, the TUI, and the analytics accumulator).
-        let mut group_kind: HashMap<String, Option<String>> = HashMap::new();
+        let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
         for (_, record) in &records {
             let dominated = record.links.conversation_kind.as_deref() == Some("main");
             group_kind
-                .entry(record.session_id.clone())
+                .entry((
+                    record.source.storage_label().to_string(),
+                    record.session_id.clone(),
+                    record.source_path.clone(),
+                ))
                 .and_modify(|kind| {
                     if dominated {
                         *kind = Some("main".to_string());
@@ -822,18 +1003,25 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
         for (score, record) in records {
-            if !seen.insert(record.session_id.clone()) {
+            let session_key = (
+                record.source.storage_label().to_string(),
+                record.session_id.clone(),
+                record.source_path.clone(),
+            );
+            if !seen.insert(session_key.clone()) {
                 continue;
             }
             if !params.origin.matches_kind(
                 group_kind
-                    .get(&record.session_id)
+                    .get(&session_key)
                     .and_then(|kind| kind.as_deref()),
             ) {
                 continue;
             }
             summaries.push(SessionSummary {
+                record_id: crate::retrieval::canonical_record_id(&record),
                 session_id: record.session_id,
+                source_path: record.source_path,
                 project: record.project,
                 source: record.source.label().to_string(),
                 role: record.role,
@@ -868,63 +1056,375 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     })
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct SessionPayload {
+    version: String,
     session_id: String,
+    source_path: String,
     project: String,
     source: String,
     started_at: u64,
     ended_at: u64,
     offset: usize,
     total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_offset: Option<usize>,
     messages: Vec<MessagePayload>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct MessagePayload {
+    record_id: String,
     role: String,
     content: String,
+    content_bytes: usize,
+    truncated: bool,
     ts: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SessionContentPayload {
+    version: String,
+    record_id: String,
+    offset: usize,
+    content: String,
+    content_bytes: usize,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_offset: Option<usize>,
+}
+
+#[derive(Debug)]
+struct StaleSnapshot {
+    requested: String,
+    current: String,
+}
+
+impl std::fmt::Display for StaleSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "index snapshot changed (requested {}, current {})",
+            self.requested, self.current
+        )
+    }
+}
+
+impl std::error::Error for StaleSnapshot {}
+
+#[derive(Debug)]
+struct InvalidContentOffset(usize);
+
+impl std::fmt::Display for InvalidContentOffset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "content offset {} is not a UTF-8 boundary",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidContentOffset {}
+
+#[derive(Debug)]
+struct AmbiguousSessionScope;
+
+impl std::fmt::Display for AmbiguousSessionScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "session id is ambiguous; provide source_path and session_source from search",
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousSessionScope {}
+
 fn session_payload(paths: &Paths, params: &SessionRequest) -> Result<Option<SessionPayload>> {
     let index = open_index(paths)?;
-    let (records, total) =
-        index.records_by_session_id_page(&params.session_id, params.offset, params.limit)?;
+    ensure_snapshot(&index, params.version.as_deref())?;
+    let version = index.snapshot_version().to_string();
+    let mut resolved_source_path = params.source_path.clone();
+    let mut resolved_source = params.source;
+    if let SessionSelection::Around(record_id) = &params.selection
+        && (resolved_source_path.is_none() || resolved_source.is_none())
+    {
+        let Some(records) = index.records_by_canonical_id(record_id)? else {
+            return Err(anyhow!(
+                "index does not support bounded record lookup; rebuild it with `memex index rebuild`"
+            ));
+        };
+        let mut anchors = records.into_iter().filter(|record| {
+            record.session_id == params.session_id
+                && resolved_source_path
+                    .as_deref()
+                    .is_none_or(|path| record.source_path == path)
+                && resolved_source.is_none_or(|source| record.source == source)
+        });
+        let Some(anchor) = anchors.next() else {
+            ensure_snapshot_current(paths, &version)?;
+            return Ok(None);
+        };
+        if anchors.next().is_some() {
+            return Err(AmbiguousSessionScope.into());
+        }
+        resolved_source_path.get_or_insert(anchor.source_path);
+        resolved_source.get_or_insert(anchor.source);
+    }
+    if resolved_source_path.is_none() || resolved_source.is_none() {
+        let scopes = index.matching_session_scopes(
+            &params.session_id,
+            resolved_source_path.as_deref(),
+            resolved_source,
+        )?;
+        match scopes.as_slice() {
+            [] => {
+                ensure_snapshot_current(paths, &version)?;
+                return Ok(None);
+            }
+            [(source, path)] => {
+                resolved_source.get_or_insert(*source);
+                resolved_source_path.get_or_insert_with(|| path.clone());
+            }
+            _ => return Err(AmbiguousSessionScope.into()),
+        }
+    }
+    let source_path = resolved_source_path.as_deref();
+    let source = resolved_source;
+    let (records, total, offset) = match &params.selection {
+        SessionSelection::Offset(offset) => {
+            let (records, total) = index.records_by_session_scope_page(
+                &params.session_id,
+                source_path,
+                source,
+                *offset,
+                params.limit,
+            )?;
+            (records, total, *offset)
+        }
+        SessionSelection::Before(before) => {
+            let (_, total) = index.records_by_session_scope_page(
+                &params.session_id,
+                source_path,
+                source,
+                usize::MAX,
+                1,
+            )?;
+            let before = (*before).min(total);
+            let offset = before.saturating_sub(params.limit);
+            let limit = before - offset;
+            let (records, page_total) = index.records_by_session_scope_page(
+                &params.session_id,
+                source_path,
+                source,
+                offset,
+                limit,
+            )?;
+            if page_total != total {
+                ensure_snapshot_current(paths, &version)?;
+                return Err(anyhow!("session changed while reading"));
+            }
+            (records, total, offset)
+        }
+        SessionSelection::Tail => {
+            let (_, total) = index.records_by_session_scope_page(
+                &params.session_id,
+                source_path,
+                source,
+                usize::MAX,
+                1,
+            )?;
+            let offset = total.saturating_sub(params.limit);
+            let (records, page_total) = index.records_by_session_scope_page(
+                &params.session_id,
+                source_path,
+                source,
+                offset,
+                params.limit,
+            )?;
+            if page_total != total {
+                ensure_snapshot_current(paths, &version)?;
+                return Err(anyhow!("session changed while reading"));
+            }
+            (records, total, offset)
+        }
+        SessionSelection::Around(record_id) => {
+            let Some((records, total, offset)) = index.records_by_session_scope_around(
+                &params.session_id,
+                source_path,
+                source,
+                record_id,
+                params.limit,
+            )?
+            else {
+                ensure_snapshot_current(paths, &version)?;
+                return Ok(None);
+            };
+            (records, total, offset)
+        }
+    };
     if total == 0 {
+        ensure_snapshot_current(paths, &version)?;
         return Ok(None);
     }
     if records.is_empty() {
+        ensure_snapshot_current(paths, &version)?;
         return Err(anyhow!("session page offset is past the end"));
     }
 
     let first = records.first().expect("records is not empty");
     let project = first.project.clone();
-    let source = first.source.label().to_string();
-    let started_at = records.iter().map(|record| record.ts).min().unwrap_or(0);
-    let ended_at = records.iter().map(|record| record.ts).max().unwrap_or(0);
-    let messages = records
+    let source_label = first.source.label().to_string();
+    let resolved_source_path = source_path.unwrap_or(&first.source_path).to_string();
+    let Some((started_at, ended_at)) =
+        index.session_scope_time_bounds(&params.session_id, source_path, source)?
+    else {
+        ensure_snapshot_current(paths, &version)?;
+        return Err(anyhow!("session changed while reading"));
+    };
+    let mut content_limits = vec![0; records.len()];
+    let priority = match &params.selection {
+        SessionSelection::Tail => (0..records.len()).rev().collect::<Vec<_>>(),
+        SessionSelection::Around(record_id) => {
+            let anchor = records
+                .iter()
+                .position(|record| crate::retrieval::canonical_record_id(record) == *record_id)
+                .unwrap_or(records.len() / 2);
+            let mut priority = (0..records.len()).collect::<Vec<_>>();
+            priority.sort_by_key(|index| index.abs_diff(anchor));
+            priority
+        }
+        SessionSelection::Offset(_) | SessionSelection::Before(_) => {
+            (0..records.len()).collect::<Vec<_>>()
+        }
+    };
+    let mut content_budget = MAX_SESSION_CONTENT_BYTES;
+    for index in priority {
+        let limit = MAX_MESSAGE_CONTENT_BYTES.min(content_budget);
+        let actual = utf8_prefix(&records[index].text, limit).len();
+        content_limits[index] = actual;
+        content_budget -= actual;
+    }
+    let messages: Vec<MessagePayload> = records
         .into_iter()
-        .map(|record| MessagePayload {
-            role: record.role,
-            content: record.text,
-            ts: record.ts,
-            tool_name: record.tool_name,
+        .enumerate()
+        .map(|(index, record)| {
+            let content_bytes = record.text.len();
+            let content = utf8_prefix(&record.text, content_limits[index]).to_string();
+            MessagePayload {
+                record_id: crate::retrieval::canonical_record_id(&record),
+                role: record.role,
+                truncated: content.len() < content_bytes,
+                content,
+                content_bytes,
+                ts: record.ts,
+                tool_name: record.tool_name,
+            }
         })
         .collect();
+    let next_offset = (offset + messages.len() < total).then_some(offset + messages.len());
 
+    ensure_snapshot_current(paths, &version)?;
     Ok(Some(SessionPayload {
+        version,
         session_id: params.session_id.clone(),
+        source_path: resolved_source_path,
         project,
-        source,
+        source: source_label,
         started_at,
         ended_at,
-        offset: params.offset,
+        offset,
         total,
+        next_offset,
         messages,
     }))
+}
+
+fn session_content_payload(
+    paths: &Paths,
+    params: &SessionContentRequest,
+) -> Result<Option<SessionContentPayload>> {
+    let index = open_index(paths)?;
+    ensure_snapshot(&index, params.version.as_deref())?;
+    let version = index.snapshot_version().to_string();
+    let Some(records) = index.records_by_canonical_id(&params.record_id)? else {
+        return Err(anyhow!(
+            "index does not support bounded record lookup; rebuild it with `memex index rebuild`"
+        ));
+    };
+    let mut matches = records.into_iter().filter(|record| {
+        record.session_id == params.session_id
+            && params
+                .source_path
+                .as_deref()
+                .is_none_or(|path| record.source_path == path)
+            && params.source.is_none_or(|source| record.source == source)
+    });
+    let Some(record) = matches.next() else {
+        ensure_snapshot_current(paths, &version)?;
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(AmbiguousSessionScope.into());
+    }
+    if params.offset > record.text.len() {
+        ensure_snapshot_current(paths, &version)?;
+        return Ok(None);
+    }
+    if !record.text.is_char_boundary(params.offset) {
+        return Err(InvalidContentOffset(params.offset).into());
+    }
+    let remaining = &record.text[params.offset..];
+    let content = utf8_prefix(remaining, params.limit).to_string();
+    let next = params.offset + content.len();
+    ensure_snapshot_current(paths, &version)?;
+    Ok(Some(SessionContentPayload {
+        version,
+        record_id: params.record_id.clone(),
+        offset: params.offset,
+        content,
+        content_bytes: record.text.len(),
+        truncated: next < record.text.len(),
+        next_offset: (next < record.text.len()).then_some(next),
+    }))
+}
+
+fn ensure_snapshot(index: &SearchIndex, requested: Option<&str>) -> Result<()> {
+    if let Some(requested) = requested
+        && requested != index.snapshot_version()
+    {
+        return Err(StaleSnapshot {
+            requested: requested.to_string(),
+            current: index.snapshot_version().to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_current(paths: &Paths, expected: &str) -> Result<()> {
+    if !expected.starts_with("legacy-") {
+        return Ok(());
+    }
+    let current = open_index(paths)?;
+    if current.snapshot_version() != expected {
+        return Err(StaleSnapshot {
+            requested: expected.to_string(),
+            current: current.snapshot_version().to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn open_index(paths: &Paths) -> Result<SearchIndex> {
@@ -1077,6 +1577,35 @@ mod tests {
             .map(|(_, value)| value.trim())
     }
 
+    fn record(doc_id: u64, session_id: &str, source_path: &str, text: String) -> Record {
+        Record {
+            source: SourceKind::Claude,
+            doc_id,
+            ts: doc_id * 1_000,
+            project: "memex".to_string(),
+            session_id: session_id.to_string(),
+            turn_id: doc_id as u32,
+            role: "assistant".to_string(),
+            text,
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: RecordLinks::default(),
+            source_path: source_path.to_string(),
+        }
+    }
+
+    fn publish_records(paths: &Paths, records: impl IntoIterator<Item = Record>) {
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        for record in records {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+    }
+
     #[test]
     fn search_request_decodes_and_caps_values() {
         let url = parse_url(
@@ -1119,8 +1648,46 @@ mod tests {
         let request = SessionRequest::from_url(&url).unwrap();
 
         assert_eq!(request.session_id, "session-a");
-        assert_eq!(request.offset, 40);
+        assert_eq!(request.selection, SessionSelection::Offset(40));
         assert_eq!(request.limit, 200);
+    }
+
+    #[test]
+    fn session_request_parses_bounded_window_selectors() {
+        let tail = SessionRequest::from_url(
+            &parse_url(
+                "/api/session?id=s&source_path=%2Ftmp%2Fs.jsonl&session_source=codex&tail=true&version=g1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tail.selection, SessionSelection::Tail);
+        assert_eq!(tail.source_path.as_deref(), Some("/tmp/s.jsonl"));
+        assert_eq!(tail.source, Some(SourceKind::Codex));
+        assert_eq!(tail.version.as_deref(), Some("g1"));
+
+        let around = SessionRequest::from_url(
+            &parse_url("/api/session?id=s&around=rid1_hit&limit=21").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            around.selection,
+            SessionSelection::Around("rid1_hit".to_string())
+        );
+
+        let before =
+            SessionRequest::from_url(&parse_url("/api/session?id=s&before=40").unwrap()).unwrap();
+        assert_eq!(before.selection, SessionSelection::Before(40));
+        assert!(
+            SessionRequest::from_url(&parse_url("/api/session?id=s&offset=1&tail=true").unwrap())
+                .is_err()
+        );
+        assert!(
+            SessionRequest::from_url(
+                &parse_url("/api/session?id=s&around=rid1_hit&before=1").unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1273,8 +1840,11 @@ mod tests {
             &paths,
             &SessionRequest {
                 session_id: "session-a".to_string(),
-                offset: 1,
+                source_path: None,
+                source: None,
+                selection: SessionSelection::Offset(1),
                 limit: 1,
+                version: None,
             },
         )
         .unwrap()
@@ -1302,6 +1872,298 @@ mod tests {
         )
         .unwrap();
         assert!(filtered.results.is_empty());
+    }
+
+    #[test]
+    fn session_tail_is_bounded_and_prioritizes_latest_messages() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        publish_records(
+            &paths,
+            (1..=40).map(|doc_id| {
+                record(
+                    doc_id,
+                    "long-session",
+                    "/tmp/long.jsonl",
+                    "é".repeat(40_000),
+                )
+            }),
+        );
+
+        let page = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "long-session".to_string(),
+                source_path: Some("/tmp/long.jsonl".to_string()),
+                source: Some(SourceKind::Claude),
+                selection: SessionSelection::Tail,
+                limit: 20,
+                version: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.offset, 20);
+        assert_eq!(page.total, 40);
+        assert_eq!(page.started_at, 1_000);
+        assert_eq!(page.ended_at, 40_000);
+        assert!(page.messages[0].content.is_empty());
+        assert!(!page.messages.last().unwrap().content.is_empty());
+        assert!(
+            page.messages
+                .iter()
+                .all(|message| message.content.is_char_boundary(message.content.len()))
+        );
+        assert!(
+            page.messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>()
+                <= MAX_SESSION_CONTENT_BYTES
+        );
+    }
+
+    #[test]
+    fn session_around_finds_a_late_hit_without_prefix_paging() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let records = (1..=400)
+            .map(|doc_id| {
+                record(
+                    doc_id,
+                    "late",
+                    "/tmp/late.jsonl",
+                    format!("message {doc_id}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let hit_id = crate::retrieval::canonical_record_id(&records[389]);
+        publish_records(&paths, records);
+
+        let page = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "late".to_string(),
+                source_path: None,
+                source: None,
+                selection: SessionSelection::Around(hit_id.clone()),
+                limit: 21,
+                version: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(page.offset, 379);
+        assert_eq!(page.messages.len(), 21);
+        assert_eq!(page.messages[10].record_id, hit_id);
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn source_path_disambiguates_reused_session_ids() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        publish_records(
+            &paths,
+            [
+                record(
+                    1,
+                    "reused",
+                    "/tmp/first.jsonl",
+                    "collision first".to_string(),
+                ),
+                record(
+                    2,
+                    "reused",
+                    "/tmp/second.jsonl",
+                    "collision second".to_string(),
+                ),
+            ],
+        );
+
+        let search = search_payload(
+            &paths,
+            &SearchRequest {
+                query: "collision".to_string(),
+                source: None,
+                project: None,
+                offset: 0,
+                limit: 10,
+                origin: SessionKindFilter::Primary,
+            },
+        )
+        .unwrap();
+        assert_eq!(search.results.len(), 2);
+        assert_ne!(search.results[0].record_id, search.results[1].record_id);
+
+        for result in search.results {
+            let page = session_payload(
+                &paths,
+                &SessionRequest {
+                    session_id: result.session_id,
+                    source_path: Some(result.source_path.clone()),
+                    source: Some(SourceKind::Claude),
+                    selection: SessionSelection::Offset(0),
+                    limit: 10,
+                    version: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(page.total, 1);
+            assert_eq!(page.source_path, result.source_path);
+        }
+    }
+
+    #[test]
+    fn session_source_disambiguates_same_id_and_path_across_sources() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let claude = record(
+            1,
+            "shared",
+            "/tmp/shared.jsonl",
+            "shared claude".to_string(),
+        );
+        let mut codex = record(2, "shared", "/tmp/shared.jsonl", "shared codex".to_string());
+        codex.source = SourceKind::Codex;
+        publish_records(&paths, [claude, codex]);
+
+        let ambiguous = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "shared".to_string(),
+                source_path: Some("/tmp/shared.jsonl".to_string()),
+                source: None,
+                selection: SessionSelection::Offset(0),
+                limit: 10,
+                version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(ambiguous.downcast_ref::<AmbiguousSessionScope>().is_some());
+
+        let scoped = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "shared".to_string(),
+                source_path: Some("/tmp/shared.jsonl".to_string()),
+                source: Some(SourceKind::Codex),
+                selection: SessionSelection::Offset(0),
+                limit: 10,
+                version: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(scoped.total, 1);
+        assert_eq!(scoped.source, "codex");
+        assert_eq!(scoped.messages[0].content, "shared codex");
+    }
+
+    #[test]
+    fn stale_snapshot_versions_are_rejected() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        publish_records(
+            &paths,
+            [record(
+                1,
+                "versioned",
+                "/tmp/versioned.jsonl",
+                "one".to_string(),
+            )],
+        );
+        let first = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "versioned".to_string(),
+                source_path: Some("/tmp/versioned.jsonl".to_string()),
+                source: Some(SourceKind::Claude),
+                selection: SessionSelection::Offset(0),
+                limit: 10,
+                version: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        publish_records(
+            &paths,
+            [record(
+                2,
+                "versioned",
+                "/tmp/versioned.jsonl",
+                "two".to_string(),
+            )],
+        );
+
+        let error = session_payload(
+            &paths,
+            &SessionRequest {
+                session_id: "versioned".to_string(),
+                source_path: Some("/tmp/versioned.jsonl".to_string()),
+                source: Some(SourceKind::Claude),
+                selection: SessionSelection::Offset(0),
+                limit: 10,
+                version: Some(first.version),
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<StaleSnapshot>().is_some());
+    }
+
+    #[test]
+    fn content_expansion_uses_utf8_safe_byte_offsets() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let record = record(
+            1,
+            "expand",
+            "/tmp/expand.jsonl",
+            "é".repeat(MAX_CONTENT_PAGE_BYTES),
+        );
+        let record_id = crate::retrieval::canonical_record_id(&record);
+        publish_records(&paths, [record]);
+
+        let first = session_content_payload(
+            &paths,
+            &SessionContentRequest {
+                session_id: "expand".to_string(),
+                source_path: Some("/tmp/expand.jsonl".to_string()),
+                source: Some(SourceKind::Claude),
+                record_id: record_id.clone(),
+                offset: 0,
+                limit: MAX_CONTENT_PAGE_BYTES - 1,
+                version: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.content.len(), MAX_CONTENT_PAGE_BYTES - 2);
+        assert!(first.truncated);
+
+        let error = session_content_payload(
+            &paths,
+            &SessionContentRequest {
+                session_id: "expand".to_string(),
+                source_path: Some("/tmp/expand.jsonl".to_string()),
+                source: Some(SourceKind::Claude),
+                record_id,
+                offset: 1,
+                limit: 10,
+                version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<InvalidContentOffset>().is_some());
     }
 
     #[test]

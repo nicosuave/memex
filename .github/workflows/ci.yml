@@ -9,6 +9,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Install Chromium
+        working-directory: web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Typecheck frontend
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Run browser tests
+        working-directory: web
+        run: bun run test
+
+      - name: Build production frontend
+        working-directory: web
+        run: bun run build
+
+      - name: Verify committed frontend assets
+        run: git diff --exit-code -- web/dist
+
   build:
     runs-on: ubuntu-latest
     steps:

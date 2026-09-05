@@ -4,11 +4,14 @@
   "type": "module",
   "scripts": {
     "build": "vite build && bun run scripts/strip-built-whitespace.ts",
+    "dev": "vite --host 127.0.0.1",
+    "test": "playwright test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
-    "@vitejs/plugin-react": "latest",
+    "@tanstack/react-virtual": "3.14.10",
+    "@vitejs/plugin-react": "6.0.4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.27.0",
@@ -19,14 +22,15 @@
     "recharts": "3.8.0",
     "remark-gfm": "latest",
     "tailwind-merge": "^3.6.0",
-    "vite": "latest"
+    "vite": "8.1.5"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "latest",
+    "@playwright/test": "1.63.0",
+    "@tailwindcss/vite": "4.3.3",
     "@types/node": "^26.1.1",
     "@types/react": "latest",
     "@types/react-dom": "latest",
-    "tailwindcss": "latest",
-    "typescript": "latest"
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2"
   }
 }

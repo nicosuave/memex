@@ -1,5 +1,4 @@
 import {
-  startTransition,
   type CSSProperties,
   type KeyboardEvent,
   useCallback,
@@ -8,17 +7,7 @@ import {
   useRef,
   useState,
 } from "react"
-import { flushSync } from "react-dom"
-import {
-  Brain,
-  Filter,
-  Moon,
-  Search,
-  Sun,
-  TerminalSquare,
-} from "lucide-react"
-import ReactMarkdown from "react-markdown"
-import remarkGfm from "remark-gfm"
+import { Brain, Filter, Moon, Search, Sun, TerminalSquare } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -54,15 +43,23 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import {
-  ToggleGroup,
-  ToggleGroupItem,
-} from "@/components/ui/toggle-group"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { cn } from "@/lib/utils"
+import { api, authenticationRequiredMessage } from "@/api"
+import {
+  isThinkingMessage,
+  isToolMessage,
+  useSessionResource,
+  type SessionTarget,
+} from "@/session"
+import { Transcript } from "@/Transcript"
+import { useSidebar } from "@/components/ui/sidebar"
 
 type SearchResult = {
   session_id: string
+  record_id?: string
+  source_path?: string
   project: string
   source: string
   role: string
@@ -78,28 +75,8 @@ type SearchPayload = {
   results: SearchResult[]
 }
 
-type Message = {
-  role: string
-  content: string
-  ts: number
-  tool_name?: string | null
-  provisional?: boolean
-}
-
-type SessionPayload = {
-  session_id: string
-  project: string
-  source: string
-  started_at: number
-  ended_at: number
-  offset: number
-  total: number
-  messages: Message[]
-}
-
 type PreviewMode = "matches" | "history"
 type ShellView = "home" | "transcript"
-type PreviewRow = { message: Message; index: number; context: boolean }
 
 const paramsAtLoad = new URLSearchParams(window.location.search)
 const requestedMode = paramsAtLoad.get("mode")
@@ -113,247 +90,17 @@ const initialShellView: ShellView = paramsAtLoad.has("session")
   ? "transcript"
   : "home"
 
-const authenticationRequiredMessage = "Authentication required"
-
-class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-  ) {
-    super(message)
-  }
-}
-
-async function exchangeBootstrapToken() {
-  const fragment = new URLSearchParams(window.location.hash.slice(1))
-  const bootstrap = fragment.get("bootstrap")
-  if (!bootstrap) return
-
-  history.replaceState(null, "", `${window.location.pathname}${window.location.search}`)
-  const response = await fetch("/auth/exchange", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${bootstrap}` },
-    credentials: "same-origin",
-  })
-  if (!response.ok) {
-    const existingSession = await fetch("/api/stats", {
-      headers: { Accept: "application/json" },
-      credentials: "same-origin",
-    })
-    if (existingSession.status !== 401) return
-    throw new ApiError(authenticationRequiredMessage, 401)
-  }
-}
-
-const authenticationReady = exchangeBootstrapToken()
-
+const dateFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+})
 const formatDate = (timestamp: number) =>
-  timestamp
-    ? new Intl.DateTimeFormat(undefined, {
-        dateStyle: "medium",
-        timeStyle: "short",
-      }).format(new Date(timestamp))
-    : ""
-
-async function api<T>(path: string): Promise<T> {
-  try {
-    await authenticationReady
-  } catch (error) {
-    if (error instanceof ApiError) throw error
-    throw new ApiError(authenticationRequiredMessage, 401)
-  }
-  const response = await fetch(path, {
-    headers: { Accept: "application/json" },
-    credentials: "same-origin",
-  })
-  const data = (await response
-    .json()
-    .catch(() => ({ error: `HTTP ${response.status}` }))) as T & {
-    error?: string
-  }
-  if (!response.ok) {
-    if (response.status === 401) {
-      throw new ApiError(authenticationRequiredMessage, response.status)
-    }
-    throw new ApiError(data.error || `HTTP ${response.status}`, response.status)
-  }
-  return data
-}
+  timestamp ? dateFormatter.format(new Date(timestamp)) : ""
 
 function getPreferredTheme() {
   const stored = localStorage.getItem("memex-theme")
   if (stored === "dark" || stored === "light") return stored
   return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
-}
-
-type XmlField = { label: string; value: string; path: string }
-type ToolPayload = Record<string, unknown>
-
-const rustDebugString = /\bString\(("(?:\\.|[^"\\])*")\)/g
-const rustDebugStaticBoolean = /\bStatic\(Bool\((true|false)\)\)/g
-const rustDebugStaticNull = /\bStatic\(Null\)/g
-const rustDebugStaticNumber =
-  /\bStatic\((?:I64|U64|F64)\((-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\)\)/g
-const rustDebugBoolean = /\bBool\((true|false)\)/g
-const rustDebugNumber =
-  /\bNumber\((-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)\)/g
-
-function parseToolPayload(content: string): ToolPayload | null {
-  const source = content.trim()
-  if (!source.startsWith("{") || !source.endsWith("}")) return null
-
-  for (const candidate of [
-    source,
-    source
-      .replace(rustDebugString, "$1")
-      .replace(rustDebugStaticBoolean, "$1")
-      .replace(rustDebugStaticNull, "null")
-      .replace(rustDebugStaticNumber, "$1")
-      .replace(rustDebugBoolean, "$1")
-      .replace(rustDebugNumber, "$1"),
-  ]) {
-    try {
-      const value = JSON.parse(candidate) as unknown
-      if (value && typeof value === "object" && !Array.isArray(value)) {
-        return value as ToolPayload
-      }
-    } catch {
-      // Try the normalized representation before falling back to raw text.
-    }
-  }
-
-  return null
-}
-
-function formatToolLabel(value: string) {
-  return value.replace(/[-_]+/g, " ")
-}
-
-function ToolValue({ name, value }: { name: string; value: unknown }) {
-  const serialized = JSON.stringify(value, null, 2)
-  const text =
-    typeof value === "string"
-      ? value
-      : typeof value === "undefined"
-        ? "undefined"
-        : serialized ?? String(value)
-  const blockValue =
-    typeof value === "object" ||
-    text.includes("\n") ||
-    /^(command|code|content|patch|prompt|query|script|sql)$/i.test(name)
-
-  return blockValue ? (
-    <pre className="tool-value">{text}</pre>
-  ) : (
-    <code className="tool-value-inline">{text}</code>
-  )
-}
-
-function ToolCallContent({ content }: { content: string }) {
-  const payload = useMemo(() => parseToolPayload(content), [content])
-  if (!payload) return <pre className="tool-content">{content}</pre>
-
-  const description =
-    typeof payload.description === "string" ? payload.description : null
-  const fields = Object.entries(payload).filter(
-    ([name]) => name !== "description",
-  )
-
-  return (
-    <div className="tool-call">
-      {description && <p className="tool-call-description">{description}</p>}
-      {fields.length > 0 && (
-        <dl className="tool-fields">
-          {fields.map(([name, value]) => (
-            <div className="tool-field" key={name}>
-              <dt>{formatToolLabel(name)}</dt>
-              <dd>
-                <ToolValue name={name} value={value} />
-              </dd>
-            </div>
-          ))}
-        </dl>
-      )}
-    </div>
-  )
-}
-
-function parseXml(content: string): { title: string; fields: XmlField[] } | null {
-  const source = content.trim()
-  if (!/^<[A-Za-z_][\w:.-]*(?:\s[^>]*)?>[\s\S]*>$/.test(source)) return null
-
-  const parser = new DOMParser()
-  let documentNode = parser.parseFromString(source, "application/xml")
-  let root = documentNode.documentElement
-  let fragment = documentNode.querySelector("parsererror") !== null
-  if (fragment) {
-    documentNode = parser.parseFromString(
-      `<memex-fragment>${source}</memex-fragment>`,
-      "application/xml",
-    )
-    if (documentNode.querySelector("parsererror")) return null
-    root = documentNode.documentElement
-    if (!root.children.length) return null
-  }
-
-  const fields: XmlField[] = []
-  const walk = (node: Element, parentPath = "") => {
-    const path = parentPath ? `${parentPath}/${node.tagName}` : node.tagName
-    if (!node.children.length) {
-      fields.push({
-        label: node.tagName.replace(/[-_]+/g, " "),
-        value: node.textContent?.trim() || "",
-        path,
-      })
-      return
-    }
-    Array.from(node.children).forEach((child) => walk(child, path))
-  }
-
-  if (fragment) Array.from(root.children).forEach((child) => walk(child))
-  else walk(root)
-
-  return {
-    title: fragment
-      ? "structured message"
-      : root.tagName.replace(/[-_]+/g, " "),
-    fields,
-  }
-}
-
-function XmlMessage({ content }: { content: string }) {
-  const parsed = useMemo(() => parseXml(content), [content])
-  if (!parsed) return null
-
-  return (
-    <div className="xml-card">
-      <div className="xml-title">{parsed.title}</div>
-      <dl>
-        {parsed.fields.map((field, index) => (
-          <div className="xml-row" key={`${field.path}-${index}`} title={field.path}>
-            <dt>{field.label}</dt>
-            <dd>{field.value}</dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  )
-}
-
-function MessageContent({ message }: { message: Message }) {
-  if (message.role === "tool_use")
-    return <ToolCallContent content={message.content} />
-
-  if (message.role === "tool_result")
-    return <pre className="tool-content">{message.content}</pre>
-
-  if (parseXml(message.content)) return <XmlMessage content={message.content} />
-
-  return (
-    <div className="markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-    </div>
-  )
 }
 
 type ActivityMetric = "sessions" | "tokens"
@@ -410,14 +157,8 @@ type BrailleChartData = {
   total: number
 }
 
-function activityDateKeys(days: number, points: ActivityPayload["points"]) {
-  const latestPoint = points
-    .map((point) => point.date)
-    .sort()
-    .at(-1)
-  const end = latestPoint
-    ? new Date(`${latestPoint}T00:00:00Z`)
-    : new Date()
+function activityDateKeys(days: number) {
+  const end = new Date()
   return Array.from({ length: days }, (_, index) => {
     const date = new Date(end)
     date.setUTCDate(end.getUTCDate() - (days - index - 1))
@@ -427,7 +168,7 @@ function activityDateKeys(days: number, points: ActivityPayload["points"]) {
 
 function buildBrailleChart(payload: ActivityPayload | null): BrailleChartData {
   const points = payload?.points || []
-  const dates = activityDateKeys(payload?.days || 30, points)
+  const dates = activityDateKeys(payload?.days || 30)
   const totalsBySource = new Map<string, number>()
   const valuesByDate = new Map<string, Map<string, number>>()
   let total = 0
@@ -470,9 +211,7 @@ function buildBrailleChart(payload: ActivityPayload | null): BrailleChartData {
   dates.forEach((date, column) => {
     const columnTotal = columnTotals[column]
     if (!columnTotal || !maximum) return
-    const level = Math.ceil(
-      (columnTotal * homeChartHeight * 4) / maximum,
-    )
+    const level = Math.ceil((columnTotal * homeChartHeight * 4) / maximum)
     const values = valuesByDate.get(date)
     const dotColors: string[] = []
     let cumulative = 0
@@ -516,14 +255,16 @@ function HomeActivityChart({
 
   useEffect(() => {
     if (!active) return
+    const controller = new AbortController()
     const generation = ++requestGeneration.current
     const params = new URLSearchParams({ days: "30", metric })
     if (source !== "all") params.set("source", source)
     if (project.trim()) params.set("project", project.trim())
     if (origin !== "interactive") params.set("origin", origin)
     setLoading(true)
+    setPayload(null)
     setError("")
-    void api<ActivityPayload>(`/api/activity?${params}`)
+    void api<ActivityPayload>(`/api/activity?${params}`, controller.signal)
       .then((data) => {
         if (generation === requestGeneration.current) setPayload(data)
       })
@@ -538,9 +279,16 @@ function HomeActivityChart({
       .finally(() => {
         if (generation === requestGeneration.current) setLoading(false)
       })
+    return () => {
+      ++requestGeneration.current
+      controller.abort()
+    }
   }, [active, metric, project, source, origin])
 
-  const chart = useMemo(() => buildBrailleChart(payload), [payload])
+  const chart = useMemo(
+    () => buildBrailleChart(payload?.metric === metric ? payload : null),
+    [payload, metric],
+  )
   const chartLabel = `${compactNumber.format(chart.total)} ${metric} over the last 30 days`
 
   return (
@@ -574,7 +322,7 @@ function HomeActivityChart({
           <span>
             {error
               ? "Activity unavailable"
-              : loading && !payload
+              : loading || payload?.metric !== metric
                 ? "Loading activity…"
                 : `${compactNumber.format(chart.total)} ${metric}${payload?.partial ? " · partial" : ""}`}
           </span>
@@ -610,21 +358,33 @@ function HomeActivityChart({
         </Select>
       </div>
 
-      {metric === "tokens" && payload && !payload.token_usage_enabled && (
-        <p className="home-activity-note">
-          Token usage is disabled. Set <code>token_usage = true</code> in the
-          memex config to enable it.
-        </p>
-      )}
+      {metric === "tokens" &&
+        payload?.metric === metric &&
+        !payload.token_usage_enabled && (
+          <p className="home-activity-note">
+            Token usage is disabled. Set <code>token_usage = true</code> in the
+            memex config to enable it.
+          </p>
+        )}
     </section>
   )
+}
+
+function CloseMobileOnNavigation({ target }: { target: SessionTarget | null }) {
+  const { setOpenMobile } = useSidebar()
+  useEffect(() => {
+    setOpenMobile(false)
+  }, [target, setOpenMobile])
+  return null
 }
 
 function App() {
   const [query, setQuery] = useState(paramsAtLoad.get("q") || "")
   const [source, setSource] = useState(paramsAtLoad.get("source") || "all")
   const [project, setProject] = useState(paramsAtLoad.get("project") || "")
-  const [origin, setOrigin] = useState(paramsAtLoad.get("origin") || "interactive")
+  const [origin, setOrigin] = useState(
+    paramsAtLoad.get("origin") || "interactive",
+  )
   const [shellView, setShellView] = useState<ShellView>(initialShellView)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [mode, setMode] = useState<PreviewMode>(initialMode)
@@ -635,16 +395,39 @@ function App() {
   const [homeSelectedIndex, setHomeSelectedIndex] = useState(0)
   const [hasMoreResults, setHasMoreResults] = useState(false)
   const [loadingMoreResults, setLoadingMoreResults] = useState(false)
-  const [selectedId, setSelectedId] = useState(paramsAtLoad.get("session"))
-  const [session, setSession] = useState<SessionPayload | null>(null)
+  const [target, setTarget] = useState<SessionTarget | null>(() =>
+    paramsAtLoad.has("session")
+      ? {
+          id: paramsAtLoad.get("session")!,
+          sourcePath: paramsAtLoad.get("path") || undefined,
+          sessionSource: paramsAtLoad.get("session_source") || undefined,
+          recordId: paramsAtLoad.get("record") || undefined,
+        }
+      : null,
+  )
+  const selectedId = target?.id || null
+  const resource = useSessionResource(target)
+  const visibilityCounts = useMemo(
+    () => ({
+      reasoning:
+        resource.session?.messages.filter(isThinkingMessage).length || 0,
+      tools: resource.session?.messages.filter(isToolMessage).length || 0,
+    }),
+    [resource.session],
+  )
   const [status, setStatus] = useState("Loading recent sessions…")
   const [error, setError] = useState("")
+  const [pageError, setPageError] = useState("")
+  const [searchRevision, setSearchRevision] = useState(0)
   const [documentCount, setDocumentCount] = useState<number | null>(null)
-  const [historyLimit, setHistoryLimit] = useState(150)
   const [theme, setTheme] = useState(getPreferredTheme)
   const searchGeneration = useRef(0)
-  const sessionGeneration = useRef(0)
-  const sessionCache = useRef(new Map<string, Promise<SessionPayload>>())
+  const searchController = useRef<AbortController | null>(null)
+  const resultOffset = useRef(0)
+  const loadingMore = useRef(false)
+  const intent = JSON.stringify([query, source, project, origin])
+  const currentIntent = useRef(intent)
+  currentIntent.current = intent
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark")
@@ -655,36 +438,65 @@ function App() {
     localStorage.setItem("memex-preview-mode", mode)
   }, [mode])
 
-  const updateLocation = useCallback(
-    (nextSelectedId: string | null) => {
+  const locationForTarget = useCallback(
+    (nextTarget: SessionTarget | null) => {
       const next = new URLSearchParams()
       if (query.trim()) next.set("q", query.trim())
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
       if (origin !== "interactive") next.set("origin", origin)
-      if (nextSelectedId) next.set("session", nextSelectedId)
-      if (nextSelectedId && mode !== "matches") next.set("mode", mode)
-      history.replaceState({}, "", next.size ? `?${next}` : location.pathname)
+      if (nextTarget) {
+        next.set("session", nextTarget.id)
+        if (nextTarget.sourcePath) next.set("path", nextTarget.sourcePath)
+        if (nextTarget.sessionSource)
+          next.set("session_source", nextTarget.sessionSource)
+        if (nextTarget.recordId) next.set("record", nextTarget.recordId)
+        if (mode !== "matches") next.set("mode", mode)
+      }
+      const url = next.size ? `?${next}` : location.pathname
+      return url
     },
     [mode, origin, project, query, source],
   )
 
-  const fetchFirstPage = useCallback((id: string) => {
-    const cached = sessionCache.current.get(id)
-    if (cached) return cached
-    const request = api<SessionPayload>(
-      `/api/session?id=${encodeURIComponent(id)}&limit=40`,
-    ).catch((requestError) => {
-      sessionCache.current.delete(id)
-      throw requestError
+  const updateLocation = useCallback(
+    (nextTarget: SessionTarget | null, push = false) => {
+      const url = locationForTarget(nextTarget)
+      if (push) history.pushState({}, "", url)
+      else history.replaceState({}, "", url)
+    },
+    [locationForTarget],
+  )
+  const resultHref = (result: SearchResult) =>
+    locationForTarget({
+      id: result.session_id,
+      sourcePath: result.source_path,
+      sessionSource: result.source,
+      recordId: query.trim() ? result.record_id : undefined,
     })
-    sessionCache.current.set(id, request)
-    while (sessionCache.current.size > 8) {
-      const oldest = sessionCache.current.keys().next().value
-      if (oldest) sessionCache.current.delete(oldest)
-      else break
+
+  useEffect(() => {
+    const restore = () => {
+      const params = new URLSearchParams(location.search)
+      setQuery(params.get("q") || "")
+      setSource(params.get("source") || "all")
+      setProject(params.get("project") || "")
+      setOrigin(params.get("origin") || "interactive")
+      setMode(params.get("mode") === "history" ? "history" : "matches")
+      setTarget(
+        params.has("session")
+          ? {
+              id: params.get("session")!,
+              sourcePath: params.get("path") || undefined,
+              sessionSource: params.get("session_source") || undefined,
+              recordId: params.get("record") || undefined,
+            }
+          : null,
+      )
+      setShellView(params.has("session") ? "transcript" : "home")
     }
-    return request
+    window.addEventListener("popstate", restore)
+    return () => window.removeEventListener("popstate", restore)
   }, [])
 
   const searchParamsFor = useCallback(
@@ -710,142 +522,105 @@ function App() {
     [query],
   )
 
-  const selectSession = useCallback(
-    async (
-      id: string,
-      summary?: SearchResult,
-      shouldUpdateLocation = true,
-    ) => {
-      setSelectedId(id)
-      setHistoryLimit(150)
-      setError("")
-      if (shouldUpdateLocation) updateLocation(id)
-
-      const generation = ++sessionGeneration.current
-      if (summary) {
-        setSession({
-          session_id: id,
-          project: summary.project,
-          source: summary.source,
-          started_at: summary.ts,
-          ended_at: summary.ts,
-          offset: 0,
-          total: 1,
-          messages: [
-            {
-              role: summary.role,
-              content: summary.snippet || "Loading transcript…",
-              ts: summary.ts,
-              provisional: true,
-            },
-          ],
-        })
-      }
-
-      try {
-        const firstPage = await fetchFirstPage(id)
-        if (generation !== sessionGeneration.current) return
-        setSession(firstPage)
-        const messages = [...firstPage.messages]
-        while (messages.length < firstPage.total) {
-          const page = await api<SessionPayload>(
-            `/api/session?id=${encodeURIComponent(id)}&offset=${messages.length}&limit=100`,
-          )
-          if (generation !== sessionGeneration.current) return
-          messages.push(...page.messages)
-          startTransition(() => setSession({ ...firstPage, messages }))
-        }
-      } catch (requestError) {
-        if (generation !== sessionGeneration.current) return
-        setError(
-          requestError instanceof Error
-            ? requestError.message
-            : "Could not load transcript",
-        )
-      }
-    },
-    [fetchFirstPage, updateLocation],
-  )
-
   useEffect(() => {
+    const generation = ++searchGeneration.current
+    const controller = new AbortController()
+    searchController.current = controller
+    loadingMore.current = false
+    setHasMoreResults(false)
     const timer = window.setTimeout(async () => {
-      const generation = ++searchGeneration.current
       const searchParams = searchParamsFor(0)
       setStatus(query.trim() ? "Searching…" : "Loading recent sessions…")
       setError("")
+      setPageError("")
       setHasMoreResults(false)
       setLoadingMoreResults(false)
 
       try {
-        const data = await api<SearchPayload>(`/api/search?${searchParams}`)
-        if (generation !== searchGeneration.current) return
+        const data = await api<SearchPayload>(
+          `/api/search?${searchParams}`,
+          controller.signal,
+        )
+        if (
+          generation !== searchGeneration.current ||
+          currentIntent.current !== intent
+        )
+          return
+        resultOffset.current = data.offset + data.results.length
         setResults(data.results)
-        setHasMoreResults(data.has_more)
+        setHasMoreResults(data.has_more && data.results.length > 0)
         setStatus(searchStatus(data.results.length, data.has_more))
-
-        if (shellView === "transcript") {
-          const currentId = selectedId
-          const next =
-            data.results.find((item) => item.session_id === currentId) ||
-            data.results[0]
-          if (next) void selectSession(next.session_id, next, false)
-          else {
-            setSelectedId(null)
-            setSession(null)
-          }
-        }
       } catch (requestError) {
-        if (generation !== searchGeneration.current) return
+        if (
+          generation !== searchGeneration.current ||
+          currentIntent.current !== intent
+        )
+          return
         const message =
           requestError instanceof Error ? requestError.message : "Search failed"
         setStatus(message)
         setError(message)
       }
     }, 180)
-    return () => window.clearTimeout(timer)
-  }, [
-    query,
-    searchParamsFor,
-    searchStatus,
-    selectSession,
-    shellView,
-  ])
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+      ++searchGeneration.current
+    }
+  }, [intent, query, searchParamsFor, searchStatus, searchRevision])
 
   const loadMoreResults = useCallback(async () => {
-    if (!hasMoreResults || loadingMoreResults) return
+    if (!hasMoreResults || loadingMore.current) return
+    loadingMore.current = true
     const generation = searchGeneration.current
-    const offset = results.length
+    const offset = resultOffset.current
     setLoadingMoreResults(true)
+    setPageError("")
     try {
       const data = await api<SearchPayload>(
         `/api/search?${searchParamsFor(offset)}`,
+        searchController.current?.signal,
       )
-      if (generation !== searchGeneration.current) return
-      const known = new Set(results.map((result) => result.session_id))
+      if (
+        generation !== searchGeneration.current ||
+        currentIntent.current !== intent
+      )
+        return
+      resultOffset.current = data.offset + data.results.length
+      const known = new Set(
+        results.map(
+          (result) =>
+            `${result.source}:${result.source_path}:${result.session_id}`,
+        ),
+      )
       const additions = data.results.filter(
-        (result) => !known.has(result.session_id),
+        (result) =>
+          !known.has(
+            `${result.source}:${result.source_path}:${result.session_id}`,
+          ),
       )
       const nextCount = results.length + additions.length
       setResults((current) => [...current, ...additions])
-      setHasMoreResults(data.has_more)
+      setHasMoreResults(data.has_more && data.results.length > 0)
       setStatus(searchStatus(nextCount, data.has_more))
     } catch (requestError) {
-      if (generation !== searchGeneration.current) return
-      setError(
+      if (
+        generation !== searchGeneration.current ||
+        currentIntent.current !== intent
+      )
+        return
+      setPageError(
         requestError instanceof Error
           ? requestError.message
           : "Could not load more results",
       )
     } finally {
-      if (generation === searchGeneration.current) setLoadingMoreResults(false)
+      if (generation === searchGeneration.current) {
+        loadingMore.current = false
+        setLoadingMoreResults(false)
+      }
     }
-  }, [
-    hasMoreResults,
-    loadingMoreResults,
-    results,
-    searchParamsFor,
-    searchStatus,
-  ])
+  }, [hasMoreResults, intent, results, searchParamsFor, searchStatus])
 
   useEffect(() => {
     void api<{ documents: number }>("/api/stats")
@@ -853,74 +628,15 @@ function App() {
       .catch(() => {})
   }, [])
 
-  useEffect(
-    () => updateLocation(selectedId),
-    [mode, selectedId, updateLocation],
-  )
-
-  const preview = useMemo(() => {
-    if (!session) return { rows: [] as PreviewRow[], noMatches: false, remaining: 0 }
-    const visible = session.messages
-      .map((message, index) => ({ message, index, context: false }))
-      .filter(({ message }) => {
-        const tool = ["tool_use", "tool_result", "system"].includes(message.role)
-        const thinking = ["reasoning", "thinking"].includes(message.role)
-        return (
-          (message.provisional || showDetails || !tool) &&
-          (showThinking || !thinking)
-        )
-      })
-
-    if (mode === "history") {
-      return {
-        rows: visible.slice(0, historyLimit),
-        noMatches: false,
-        remaining: Math.max(0, visible.length - historyLimit),
-      }
-    }
-
-    const terms = Array.from(
-      new Set(
-        query
-          .toLocaleLowerCase()
-          .split(/\s+/)
-          .map((value) =>
-            value.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ""),
-          )
-          .filter((value) => value.length >= 2),
-      ),
-    )
-    if (!terms.length)
-      return { rows: visible.slice(-12), noMatches: false, remaining: 0 }
-
-    const matches = new Set<number>()
-    visible.forEach(({ message, index }) => {
-      const text = message.content.toLocaleLowerCase()
-      if (terms.some((term) => text.includes(term))) matches.add(index)
-    })
-    if (!matches.size) return { rows: [], noMatches: true, remaining: 0 }
-
-    const included = new Set<number>()
-    matches.forEach((index) => {
-      included.add(index - 1)
-      included.add(index)
-      included.add(index + 1)
-    })
-    return {
-      rows: visible
-        .filter(({ index }) => included.has(index))
-        .map((row) => ({ ...row, context: !matches.has(row.index) })),
-      noMatches: false,
-      remaining: 0,
-    }
-  }, [historyLimit, mode, query, session, showDetails, showThinking])
+  useEffect(() => updateLocation(target), [target, updateLocation])
 
   const homeResults = useMemo(() => {
     const unique = new Map<string, SearchResult>()
     results.forEach((result) => {
-      if (!unique.has(result.session_id)) unique.set(result.session_id, result)
+      const key = `${result.source}:${result.source_path}:${result.session_id}`
+      if (!unique.has(key)) unique.set(key, result)
     })
-    return Array.from(unique.values()).slice(0, 12)
+    return Array.from(unique.values())
   }, [results])
 
   useEffect(() => {
@@ -933,8 +649,8 @@ function App() {
       .filter(Boolean)
     if (!discovered.length) return
     setKnownProjects((current) => {
-      const next = Array.from(new Set([...current, ...discovered])).sort((a, b) =>
-        a.localeCompare(b),
+      const next = Array.from(new Set([...current, ...discovered])).sort(
+        (a, b) => a.localeCompare(b),
       )
       return next.length === current.length &&
         next.every((value, index) => value === current[index])
@@ -945,45 +661,32 @@ function App() {
 
   const openTranscript = useCallback(
     (result: SearchResult) => {
-      const update = () => {
-        setShellView("transcript")
-        setSidebarOpen(true)
-        void selectSession(result.session_id, result)
+      const next = {
+        id: result.session_id,
+        sourcePath: result.source_path,
+        sessionSource: result.source,
+        recordId: query.trim() ? result.record_id : undefined,
       }
-      const startViewTransition = (
-        document as Document & {
-          startViewTransition?: (callback: () => void) => unknown
-        }
-      ).startViewTransition
-
-      if (shellView === "home" && startViewTransition) {
-        startViewTransition.call(document, () => flushSync(update))
-      } else {
-        update()
-      }
+      updateLocation(next, true)
+      setTarget(next)
+      setShellView("transcript")
+      setSidebarOpen(true)
     },
-    [selectSession, shellView],
+    [query, updateLocation],
   )
 
   const returnHome = useCallback(() => {
-    const update = () => {
-      setShellView("home")
-      setSidebarOpen(false)
-      setSelectedId(null)
-      setSession(null)
-    }
-    const startViewTransition = (
-      document as Document & {
-        startViewTransition?: (callback: () => void) => unknown
-      }
-    ).startViewTransition
+    updateLocation(null, true)
+    setShellView("home")
+    setSidebarOpen(false)
+    setTarget(null)
+  }, [updateLocation])
 
-    if (startViewTransition) {
-      startViewTransition.call(document, () => flushSync(update))
-    } else {
-      update()
-    }
-  }, [])
+  useEffect(() => {
+    document
+      .getElementById(`home-result-${homeSelectedIndex}`)
+      ?.scrollIntoView({ block: "nearest" })
+  }, [homeSelectedIndex])
 
   const handleHomeSearchKeyDown = useCallback(
     (event: KeyboardEvent<HTMLInputElement>) => {
@@ -1011,12 +714,16 @@ function App() {
 
   const handleSidebarKeyDown = useCallback(
     (event: KeyboardEvent<HTMLElement>) => {
+      if (event.altKey || event.ctrlKey || event.metaKey) return
       if (event.key === "Enter" || event.key === " ") {
-        const button = (event.target as Element).closest<HTMLButtonElement>(
+        const button = (event.target as Element).closest<HTMLElement>(
           ".session-button",
         )
         const result = results.find(
-          (item) => item.session_id === button?.dataset.sessionId,
+          (item) =>
+            item.session_id === button?.dataset.sessionId &&
+            item.source_path === button?.dataset.sourcePath &&
+            item.source === button?.dataset.sessionSource,
         )
         if (!result) return
         event.preventDefault()
@@ -1041,33 +748,34 @@ function App() {
         return
 
       const buttons = Array.from(
-        event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        event.currentTarget.querySelectorAll<HTMLElement>(
           ".session-button:not(:disabled)",
         ),
       )
       if (!buttons.length) return
 
       event.preventDefault()
-      const target = event.target as Element
+      const focusedElement = event.target as Element
       const focusedIndex = buttons.findIndex(
-        (button) => button === target || button.contains(target),
+        (button) =>
+          button === focusedElement || button.contains(focusedElement),
       )
       const selectedIndex = buttons.findIndex(
-        (button) => button.dataset.sessionId === selectedId,
+        (button) =>
+          button.dataset.sessionId === selectedId &&
+          button.dataset.sourcePath === target?.sourcePath &&
+          button.dataset.sessionSource === target?.sessionSource,
       )
       const currentIndex =
         focusedIndex >= 0 ? focusedIndex : Math.max(0, selectedIndex)
       const nextIndex =
         edge >= 0
           ? Math.min(edge, buttons.length - 1)
-          : Math.min(
-              buttons.length - 1,
-              Math.max(0, currentIndex + direction),
-            )
+          : Math.min(buttons.length - 1, Math.max(0, currentIndex + direction))
       buttons[nextIndex].focus({ preventScroll: true })
       buttons[nextIndex].scrollIntoView({ block: "nearest" })
     },
-    [openTranscript, results, selectedId],
+    [openTranscript, results, selectedId, target],
   )
 
   const filterCount =
@@ -1156,7 +864,9 @@ function App() {
               </SelectContent>
             </Select>
             <Select
-              onValueChange={(value) => setProject(value === "all" ? "" : value)}
+              onValueChange={(value) =>
+                setProject(value === "all" ? "" : value)
+              }
               value={project || "all"}
             >
               <SelectTrigger
@@ -1187,9 +897,18 @@ function App() {
           id="home-results"
           role="listbox"
         >
-          {error ? (
-            <div className="home-results-empty text-destructive">{error}</div>
-          ) : homeResults.length === 0 ? (
+          {error && (
+            <div role="alert" className="home-results-empty text-destructive">
+              {error}
+              <Button
+                variant="ghost"
+                onClick={() => setSearchRevision((value) => value + 1)}
+              >
+                Retry search
+              </Button>
+            </div>
+          )}
+          {homeResults.length === 0 ? (
             <div className="home-results-empty">
               {status === "Searching…" || status === "Loading recent sessions…"
                 ? status
@@ -1199,18 +918,29 @@ function App() {
             </div>
           ) : (
             homeResults.map((result, index) => (
-              <button
+              <a
                 aria-selected={homeSelectedIndex === index}
                 className={cn(
                   "home-result",
                   homeSelectedIndex === index && "is-selected",
                 )}
                 id={`home-result-${index}`}
-                key={result.session_id}
-                onClick={() => openTranscript(result)}
+                key={`${result.source}:${result.source_path}:${result.session_id}`}
+                onClick={(event) => {
+                  if (
+                    event.button !== 0 ||
+                    event.metaKey ||
+                    event.ctrlKey ||
+                    event.shiftKey ||
+                    event.altKey
+                  )
+                    return
+                  event.preventDefault()
+                  openTranscript(result)
+                }}
                 onMouseEnter={() => setHomeSelectedIndex(index)}
                 role="option"
-                type="button"
+                href={resultHref(result)}
               >
                 <span className="home-result-title">
                   {result.project || "Untitled session"}
@@ -1222,60 +952,41 @@ function App() {
                 <span className="home-result-snippet">
                   {result.snippet || "No text preview"}
                 </span>
-              </button>
+              </a>
             ))
           )}
         </div>
+        {pageError && <p role="alert">{pageError}</p>}
+        {hasMoreResults && (
+          <Button
+            disabled={loadingMoreResults}
+            onClick={() => void loadMoreResults()}
+          >
+            Load more results
+          </Button>
+        )}
       </div>
     </main>
   )
 
+  const revealHidden = useCallback(() => {
+    setShowThinking(true)
+    setShowDetails(true)
+  }, [])
   const transcriptSurface = (
-    <div className="transcript-surface">
-      <div className="transcript-scroll">
-        <div className="messages">
-          {error ? (
-            <div className="empty text-destructive">{error}</div>
-          ) : !session ? (
-            <div className="empty">No session to preview.</div>
-          ) : preview.noMatches ? (
-            <div className="empty">
-              This session matched the index, but no literal query terms appear
-              in its stored messages.
-            </div>
-          ) : preview.rows.length === 0 ? (
-            <div className="empty">No visible messages in this preview.</div>
-          ) : (
-            <>
-              {preview.rows.map(({ message, index, context }) => (
-                <article
-                  className={cn("message", context && "context")}
-                  key={`${message.ts}-${index}`}
-                >
-                  <div className="message-meta">
-                    <span>{message.tool_name || message.role || "event"}</span>
-                    <time>{formatDate(message.ts)}</time>
-                  </div>
-                  <MessageContent message={message} />
-                </article>
-              ))}
-              {preview.remaining > 0 && (
-                <Button
-                  className="load-more shadow-none"
-                  onClick={() => setHistoryLimit((limit) => limit + 150)}
-                  variant="outline"
-                >
-                  Show {Math.min(150, preview.remaining)} more
-                </Button>
-              )}
-            </>
-          )}
-        </div>
-      </div>
-    </div>
+    <Transcript
+      resource={resource}
+      target={target}
+      mode={mode}
+      showThinking={showThinking}
+      showDetails={showDetails}
+      onReveal={revealHidden}
+    />
   )
 
-  if (error === authenticationRequiredMessage) {
+  if (
+    [error, pageError, resource.error].includes(authenticationRequiredMessage)
+  ) {
     return (
       <main className="transcript-surface">
         <div className="empty">
@@ -1296,6 +1007,7 @@ function App() {
       open={sidebarOpen}
       style={{ "--sidebar-width": "19rem" } as CSSProperties}
     >
+      <CloseMobileOnNavigation target={target} />
       <Sidebar collapsible="offcanvas">
         <SidebarHeader className="memex-sidebar-header">
           <div className="brand-row">
@@ -1317,35 +1029,56 @@ function App() {
             <SidebarGroupContent>
               <SidebarMenu onKeyDown={handleSidebarKeyDown}>
                 {results.map((result) => (
-                  <SidebarMenuItem key={result.session_id}>
+                  <SidebarMenuItem
+                    key={`${result.source}:${result.source_path}:${result.session_id}`}
+                  >
                     <SidebarMenuButton
                       className="session-button"
+                      asChild
                       data-session-id={result.session_id}
-                      isActive={selectedId === result.session_id}
-                      onClick={() => openTranscript(result)}
-                      onPointerEnter={() =>
-                        void fetchFirstPage(result.session_id).catch(() => {})
+                      data-source-path={result.source_path}
+                      data-session-source={result.source}
+                      isActive={
+                        selectedId === result.session_id &&
+                        (!target?.sourcePath ||
+                          target.sourcePath === result.source_path) &&
+                        (!target?.sessionSource ||
+                          target.sessionSource === result.source)
                       }
+                      onClick={(event) => {
+                        if (
+                          event.button !== 0 ||
+                          event.metaKey ||
+                          event.ctrlKey ||
+                          event.shiftKey ||
+                          event.altKey
+                        )
+                          return
+                        event.preventDefault()
+                        openTranscript(result)
+                      }}
                       size="lg"
                       tooltip={result.project || "Untitled session"}
                     >
-                      <div className="session-copy">
-                        <div className="session-title-row">
-                          <strong>
-                            {result.project || "Untitled session"}
-                          </strong>
-                          <time>{formatDate(result.ts)}</time>
+                      <a href={resultHref(result)}>
+                        <div className="session-copy">
+                          <div className="session-title-row">
+                            <strong>
+                              {result.project || "Untitled session"}
+                            </strong>
+                            <time>{formatDate(result.ts)}</time>
+                          </div>
+                          <div className="session-meta">
+                            {result.source} · {result.role}
+                            {result.score == null
+                              ? ""
+                              : ` · ${result.score.toFixed(2)}`}
+                          </div>
+                          <div className="session-snippet">
+                            {result.snippet || "No text preview"}
+                          </div>
                         </div>
-                        <div className="session-meta">
-                          {result.source} · {result.role}
-                          {result.score == null
-                            ? ""
-                            : ` · ${result.score.toFixed(2)}`}
-                        </div>
-                        <div className="session-snippet">
-                          {result.snippet || "No text preview"}
-                        </div>
-                      </div>
+                      </a>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 ))}
@@ -1377,6 +1110,14 @@ function App() {
             value={mode}
           >
             <header className="command-bar">
+              <Button
+                onClick={returnHome}
+                aria-label="Back to sessions"
+                size="sm"
+                variant="ghost"
+              >
+                Back
+              </Button>
               <SidebarTrigger />
               <InputGroup className="search-group search-morph shadow-none">
                 <InputGroupAddon>
@@ -1449,7 +1190,9 @@ function App() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectGroup>
-                          <SelectItem value="interactive">Interactive</SelectItem>
+                          <SelectItem value="interactive">
+                            Interactive
+                          </SelectItem>
                           <SelectItem value="subagent">Subagent</SelectItem>
                           <SelectItem value="all">All origins</SelectItem>
                         </SelectGroup>
@@ -1490,17 +1233,29 @@ function App() {
               >
                 <ToggleGroupItem
                   aria-label="Show reasoning"
-                  title="Reasoning"
+                  disabled={visibilityCounts.reasoning === 0}
+                  title={
+                    visibilityCounts.reasoning
+                      ? `${showThinking ? "Hide" : "Show"} reasoning (${visibilityCounts.reasoning} in loaded messages)`
+                      : "No reasoning in loaded messages"
+                  }
                   value="reasoning"
                 >
                   <Brain />
+                  <span aria-hidden="true">{visibilityCounts.reasoning}</span>
                 </ToggleGroupItem>
                 <ToggleGroupItem
                   aria-label="Show tool calls"
-                  title="Tool calls"
+                  disabled={visibilityCounts.tools === 0}
+                  title={
+                    visibilityCounts.tools
+                      ? `${showDetails ? "Hide" : "Show"} tool calls (${visibilityCounts.tools} in loaded messages)`
+                      : "No tool calls in loaded messages"
+                  }
                   value="tools"
                 >
                   <TerminalSquare />
+                  <span aria-hidden="true">{visibilityCounts.tools}</span>
                 </ToggleGroupItem>
               </ToggleGroup>
 
@@ -1514,12 +1269,7 @@ function App() {
               </Button>
             </header>
 
-            <TabsContent className="transcript-tab" value="matches">
-              {mode === "matches" && transcriptSurface}
-            </TabsContent>
-            <TabsContent className="transcript-tab" value="history">
-              {mode === "history" && transcriptSurface}
-            </TabsContent>
+            {transcriptSurface}
           </Tabs>
         )}
       </SidebarInset>

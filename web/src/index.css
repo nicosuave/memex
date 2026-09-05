@@ -499,6 +499,12 @@ body {
   flex: none;
 }
 
+.view-toggles [data-pressed]:not(:disabled) {
+  background: var(--foreground);
+  color: var(--background);
+  border-color: var(--foreground);
+}
+
 .transcript-tabs {
   gap: 8px;
   height: 100%;
@@ -859,7 +865,7 @@ body {
   }
 
   .view-toggles {
-    display: none;
+    display: flex;
   }
 
   .command-bar {
@@ -917,3 +923,13 @@ body {
     animation: none;
   }
 }
+
+.transcript-surface { display: flex; flex-direction: column; }
+.transcript-scroll { flex: 1; min-height: 0; overflow-anchor: none; }
+.transcript-status { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.virtual-messages { position: relative; width: 100%; }
+.virtual-message { position: absolute; top: 0; left: 0; width: 100%; contain: layout style; }
+.message-content-preview { max-height: 70vh; overflow: auto; }
+.message-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.message[data-match="true"] { border-left: 3px solid var(--primary); padding-left: 12px; }
+@media (max-width: 720px) { .command-bar { flex-wrap: wrap; } .search-group { flex: 1 1 160px; } }
