@@ -5,13 +5,14 @@ use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, ingest_all};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
-    LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE,
-    MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionPageRequest, UsageSpec,
-    batch_session_contexts, federated_search, federated_usage, record_by_doc_id,
+    BoundedRecord, LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES,
+    MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionPageRequest,
+    UsageSpec, federated_search, federated_usage, read_context, read_record, read_session_pages,
     session_page_context,
 };
+use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
-use crate::retrieval::{ContextOptions, ContextSelector, context_records};
+use crate::retrieval::{ContextOptions, ContextSelector};
 use crate::retrieval_eval::{
     EvaluationDataset, RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace,
     fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k, unique_sessions_at_k,
@@ -335,7 +336,7 @@ EXAMPLES:
         #[command(subcommand)]
         action: IndexServiceCommand,
     },
-    /// Display all messages from a specific session
+    /// Display a bounded page from a specific session
     Session {
         /// Session ID (from search results or TUI)
         session_id: String,
@@ -348,26 +349,40 @@ EXAMPLES:
         /// Number of records to skip before the page
         #[arg(long, default_value_t = 0)]
         offset: usize,
-        /// Return at most this many records (maximum 500)
+        /// Return at most this many records (default 50, maximum 500; --full defaults to all)
         #[arg(long)]
         limit: Option<usize>,
         /// Show human-readable output with timestamps and role labels
         #[arg(short, long)]
         verbose: bool,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Display a single document by its internal ID
+    /// Display a bounded record by document or stable canonical ID
     Show {
         /// Document ID (from search results)
-        doc_id: u64,
+        #[arg(required_unless_present = "record_id", conflicts_with = "record_id")]
+        doc_id: Option<u64>,
+        /// Stable canonical record ID from search output
+        #[arg(long)]
+        record_id: Option<String>,
+        /// Select a content field to continue reading
+        #[arg(long, value_enum)]
+        field: Option<ReadField>,
+        /// Unicode character offset within --field
+        #[arg(long, default_value_t = 0, requires = "field")]
+        offset_chars: usize,
         /// Originating machine for federated search results
         #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
         machine: String,
         /// Pretty-print JSON output
         #[arg(short, long)]
         verbose: bool,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -389,12 +404,20 @@ The input contains at most 32 requests; each page is limited to 500 records."
     Hydrate {
         /// JSONL request file; omit or use '-' to read stdin
         input: Option<PathBuf>,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
     },
     /// Return a bounded context neighborhood around a record, document, or native event ID
     Context {
+        /// Originating machine for the anchor
+        #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
+        machine: String,
+        /// Skip this many records in the selected neighborhood
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Stable canonical record ID
         #[arg(long, conflicts_with_all = ["doc_id", "event_id"])]
         record_id: Option<String>,
@@ -422,6 +445,8 @@ The input contains at most 32 requests; each page is limited to 500 records."
         /// Pretty-print the JSON result
         #[arg(short, long)]
         verbose: bool,
+        #[command(flatten)]
+        read: ReadArgs,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -1047,30 +1072,51 @@ pub fn run() -> Result<()> {
             offset,
             limit,
             verbose,
+            read,
             root,
         } => {
-            run_session(
+            run_session(SessionRunArgs {
                 session_id,
                 machine,
                 source_path,
                 offset,
                 limit,
                 verbose,
+                read,
                 root,
-            )?;
+            })?;
         }
         Commands::Show {
             doc_id,
+            record_id,
+            field,
+            offset_chars,
             machine,
             verbose,
+            read,
             root,
         } => {
-            run_show(doc_id, machine, verbose, root)?;
+            let selector = match (doc_id, record_id) {
+                (Some(id), None) => ContextSelector::doc_id(id),
+                (None, Some(id)) => ContextSelector::record_id(id),
+                _ => return Err(anyhow!("provide a document ID or --record-id")),
+            };
+            run_show(ShowRunArgs {
+                selector,
+                field,
+                offset_chars,
+                machine,
+                verbose,
+                read,
+                root,
+            })?;
         }
-        Commands::Hydrate { input, root } => {
-            run_hydrate(input, root)?;
+        Commands::Hydrate { input, read, root } => {
+            run_hydrate(input, read, root)?;
         }
         Commands::Context {
+            machine,
+            offset,
             record_id,
             doc_id,
             event_id,
@@ -1080,9 +1126,12 @@ pub fn run() -> Result<()> {
             after,
             expand_interactions,
             verbose,
+            read,
             root,
         } => {
             run_context(ContextRunArgs {
+                machine,
+                offset,
                 record_id,
                 doc_id,
                 event_id,
@@ -1092,6 +1141,7 @@ pub fn run() -> Result<()> {
                 after,
                 expand_interactions,
                 verbose,
+                read,
                 root,
             })?;
         }
@@ -1900,7 +1950,29 @@ fn insert_optional_field(
     }
 }
 
+#[derive(Debug, Clone, Args)]
+struct ReadArgs {
+    /// Maximum Unicode characters across text/tool input/tool output (default 16000; metadata excluded)
+    #[arg(long, conflicts_with = "full")]
+    max_chars: Option<usize>,
+    /// Return complete content without a character budget
+    #[arg(long)]
+    full: bool,
+}
+
+impl ReadArgs {
+    fn budget(&self) -> Result<ReadBudget> {
+        ReadBudget::new(if self.full {
+            None
+        } else {
+            Some(self.max_chars.unwrap_or(DEFAULT_MAX_CHARS))
+        })
+    }
+}
+
 struct ContextRunArgs {
+    machine: String,
+    offset: usize,
     record_id: Option<String>,
     doc_id: Option<u64>,
     event_id: Option<String>,
@@ -1910,11 +1982,14 @@ struct ContextRunArgs {
     after: usize,
     expand_interactions: bool,
     verbose: bool,
+    read: ReadArgs,
     root: Option<PathBuf>,
 }
 
 fn run_context(args: ContextRunArgs) -> Result<()> {
     let ContextRunArgs {
+        machine,
+        offset,
         record_id,
         doc_id,
         event_id,
@@ -1924,8 +1999,10 @@ fn run_context(args: ContextRunArgs) -> Result<()> {
         after,
         expand_interactions,
         verbose,
+        read,
         root,
     } = args;
+    let budget = read.budget()?;
     let selector = match (record_id, doc_id, event_id) {
         (Some(id), None, None) => ContextSelector::record_id(id),
         (None, Some(id), None) => ContextSelector::doc_id(id),
@@ -1938,21 +2015,34 @@ fn run_context(args: ContextRunArgs) -> Result<()> {
     };
     let source = source.and_then(|value| crate::types::SourceKind::from_label(value.as_str()));
     let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let result = context_records(
-        &index,
+    let config = UserConfig::load(&paths)?;
+    let result = read_context(
+        &paths,
+        &config,
+        &machine,
         &selector.with_scope(session, source),
         ContextOptions {
             before,
             after,
             expand_interactions,
         },
+        offset,
+        budget.remaining(),
     )?;
-    if verbose {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!("{}", serde_json::to_string(&result)?);
-    }
+    let mut value = serde_json::to_value(result)?;
+    value["machine"] = Value::from(machine);
+    print_json(&value, verbose)
+}
+
+fn print_json(value: &Value, pretty: bool) -> Result<()> {
+    println!(
+        "{}",
+        if pretty {
+            serde_json::to_string_pretty(value)?
+        } else {
+            serde_json::to_string(value)?
+        }
+    );
     Ok(())
 }
 
@@ -1972,6 +2062,7 @@ struct HydrateRecordOutput {
     #[serde(flatten)]
     record: crate::types::Record,
     record_id: String,
+    content: ContentPage,
 }
 
 #[derive(Debug, Serialize)]
@@ -1995,7 +2086,8 @@ struct HydrateErrorOutput {
     error: String,
 }
 
-fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
+fn run_hydrate(input: Option<PathBuf>, read: ReadArgs, root: Option<PathBuf>) -> Result<()> {
+    let budget = read.budget()?;
     let mut contents = String::new();
     let mut reader: Box<dyn Read> = match input {
         Some(path) if path.to_string_lossy() != "-" => Box::new(std::fs::File::open(path)?),
@@ -2049,77 +2141,117 @@ fn run_hydrate(input: Option<PathBuf>, root: Option<PathBuf>) -> Result<()> {
     }
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let mut grouped: HashMap<String, Vec<(usize, SessionPageRequest)>> = HashMap::new();
-    for (index, request) in requests.into_iter().enumerate() {
-        let machine = request
-            .machine
-            .unwrap_or_else(|| crate::machine::LOCAL_MACHINE_ID.to_string());
-        grouped.entry(machine).or_default().push((
-            index,
-            SessionPageRequest {
-                session_id: request.session_id,
-                source_path: request.source_path,
-                offset: request.offset,
-                limit: request.limit,
-            },
-        ));
-    }
-    let total_requests = grouped.values().map(Vec::len).sum();
-    let mut output: Vec<Option<Value>> = vec![None; total_requests];
-    for (machine, batch) in grouped {
-        let page_requests: Vec<_> = batch.iter().map(|(_, request)| request.clone()).collect();
-        match batch_session_contexts(&paths, &config, &machine, &page_requests) {
-            Ok(contexts) => {
-                for ((original_index, _), context) in batch.into_iter().zip(contexts) {
-                    output[original_index] = Some(hydrate_success_value(&machine, context)?);
+    // Contiguous batches preserve input order while allowing the peer to enforce
+    // the remaining command budget before sending record bodies over SSH.
+    let requests: Vec<_> = requests
+        .into_iter()
+        .map(|request| {
+            (
+                request
+                    .machine
+                    .unwrap_or_else(|| crate::machine::LOCAL_MACHINE_ID.to_string()),
+                SessionPageRequest {
+                    session_id: request.session_id,
+                    source_path: request.source_path,
+                    offset: request.offset,
+                    limit: request.limit,
+                },
+            )
+        })
+        .collect();
+    let mut remaining = budget.remaining();
+    let mut position = 0;
+    while position < requests.len() {
+        let machine = &requests[position].0;
+        let end = position
+            + requests[position..]
+                .iter()
+                .take_while(|(id, _)| id == machine)
+                .count();
+        let batch: Vec<_> = requests[position..end]
+            .iter()
+            .map(|(_, request)| request.clone())
+            .collect();
+        match read_session_pages(&paths, &config, machine, &batch, remaining) {
+            Ok(pages) => {
+                for page in pages {
+                    emit_hydrate_page(machine, page, &mut remaining)?;
                 }
             }
-            Err(batch_error) => {
-                eprintln!("Warning: hydrate machine '{machine}' failed: {batch_error}");
-                for (original_index, request) in batch {
-                    let value = if machine == crate::machine::LOCAL_MACHINE_ID {
-                        match session_page_context(&paths, &config, &machine, &request) {
-                            Ok(context) => hydrate_success_value(&machine, context)?,
+            Err(error) => {
+                eprintln!("Warning: hydrate machine '{machine}' failed: {error}");
+                for request in &batch {
+                    if machine == crate::machine::LOCAL_MACHINE_ID {
+                        match read_session_pages(
+                            &paths,
+                            &config,
+                            machine,
+                            std::slice::from_ref(request),
+                            remaining,
+                        ) {
+                            Ok(pages) => {
+                                for page in pages {
+                                    emit_hydrate_page(machine, page, &mut remaining)?;
+                                }
+                                continue;
+                            }
                             Err(error) => {
-                                hydrate_error_value(&machine, &request, &error.to_string())?
+                                print_json(
+                                    &hydrate_error_value(machine, request, &error.to_string())?,
+                                    false,
+                                )?;
+                                continue;
                             }
                         }
-                    } else {
-                        hydrate_error_value(&machine, &request, &batch_error.to_string())?
-                    };
-                    output[original_index] = Some(value);
+                    }
+                    print_json(
+                        &hydrate_error_value(machine, request, &error.to_string())?,
+                        false,
+                    )?;
                 }
             }
         }
-    }
-    for value in output {
-        let value = value.ok_or_else(|| anyhow!("hydrate response missing for request"))?;
-        println!("{}", value);
+        position = end;
     }
     Ok(())
 }
 
-fn hydrate_success_value(
+fn emit_hydrate_page(
     machine: &str,
-    context: crate::machine::SessionPageContext,
-) -> Result<Value> {
-    Ok(serde_json::to_value(HydrateOutput {
-        machine: machine.to_string(),
-        session_id: context.session_id,
-        source_path: context.source_path,
-        cwd: context.cwd,
-        offset: context.offset,
-        total: context.total,
-        next_offset: context.next_offset,
-        records: context
-            .records
-            .into_iter()
-            .map(|record| HydrateRecordOutput {
-                record_id: canonical_record_id(&record),
-                record,
-            })
-            .collect(),
-    })?)
+    page: crate::machine::BoundedSessionPage,
+    remaining: &mut Option<usize>,
+) -> Result<()> {
+    let returned: usize = page
+        .records
+        .iter()
+        .map(|record| record.content.returned_chars)
+        .sum();
+    if let Some(remaining) = remaining {
+        *remaining = remaining
+            .checked_sub(returned)
+            .ok_or_else(|| anyhow!("hydrate response exceeds remaining character budget"))?;
+    }
+    print_json(
+        &serde_json::to_value(HydrateOutput {
+            machine: machine.to_string(),
+            session_id: page.session_id,
+            source_path: page.source_path,
+            cwd: page.cwd,
+            offset: page.offset,
+            total: page.total,
+            next_offset: page.next_offset,
+            records: page
+                .records
+                .into_iter()
+                .map(|item| HydrateRecordOutput {
+                    record: item.record,
+                    record_id: item.record_id,
+                    content: item.content,
+                })
+                .collect(),
+        })?,
+        false,
+    )
 }
 
 fn hydrate_error_value(machine: &str, request: &SessionPageRequest, error: &str) -> Result<Value> {
@@ -2209,80 +2341,145 @@ fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) ->
     Ok(())
 }
 
-fn run_session(
+struct SessionRunArgs {
     session_id: String,
     machine: String,
     source_path: Option<String>,
     offset: usize,
     limit: Option<usize>,
     verbose: bool,
+    read: ReadArgs,
     root: Option<PathBuf>,
-) -> Result<()> {
+}
+
+fn run_session(args: SessionRunArgs) -> Result<()> {
+    let SessionRunArgs {
+        session_id,
+        machine,
+        source_path,
+        offset,
+        limit,
+        verbose,
+        read,
+        root,
+    } = args;
+    let mut budget = read.budget()?;
     if session_id.is_empty() {
         return Err(anyhow!("session_id must not be empty"));
     }
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let records = hydrate_session_records(
-        &paths,
-        &config,
-        &machine,
-        &session_id,
-        source_path.as_deref().unwrap_or_default(),
-        offset,
-        limit,
-    )?;
-    if verbose {
-        for record in records {
-            let ts = format_ts(record.ts);
-            println!("{ts} {}", record.role);
-            if record.text.is_empty() {
-                println!("  <empty>");
-                continue;
-            }
-            for line in record.text.lines() {
+    let source_path = source_path.unwrap_or_default();
+    let (records, page) = if read.full {
+        let records = hydrate_session_records(
+            &paths,
+            &config,
+            &machine,
+            &session_id,
+            &source_path,
+            offset,
+            limit,
+        )?
+        .into_iter()
+        .map(|mut record| {
+            let record_id = canonical_record_id(&record);
+            let content = budget.apply(&mut record, None, 0)?;
+            Ok(BoundedRecord {
+                record_id,
+                record,
+                content,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+        (records, None)
+    } else {
+        let request = SessionPageRequest {
+            session_id: session_id.clone(),
+            source_path: source_path.clone(),
+            offset,
+            limit: limit.unwrap_or(50),
+        };
+        let mut pages =
+            read_session_pages(&paths, &config, &machine, &[request], budget.remaining())?;
+        let page = pages
+            .pop()
+            .ok_or_else(|| anyhow!("session response missing page"))?;
+        (page.records, Some((page.total, page.next_offset)))
+    };
+    for item in records {
+        if verbose {
+            println!("{} {}", format_ts(item.record.ts), item.record.role);
+            for line in item.record.text.lines() {
                 println!("  {line}");
             }
+            for (name, value) in [
+                ("tool_input", &item.record.tool_input),
+                ("tool_output", &item.record.tool_output),
+            ] {
+                if let Some(value) = value {
+                    println!("  {name}: {value}");
+                }
+            }
+            if item.content.truncated {
+                println!(
+                    "  continuation: {}",
+                    serde_json::to_string(
+                        &serde_json::json!({"machine": machine, "record_id": item.record_id, "content": item.content})
+                    )?
+                );
+            }
+        } else {
+            let mut value = serde_json::to_value(item)?;
+            value["machine"] = Value::from(machine.clone());
+            print_json(&value, false)?;
         }
-        return Ok(());
     }
-    for record in records {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "machine": &machine,
-                "record_id": canonical_record_id(&record),
-                "record": record,
-            }))?
-        );
+    if let Some((total, next_offset)) = page {
+        let value = serde_json::json!({ "type": "page", "machine": machine, "session_id": session_id, "source_path": source_path, "offset": offset, "total": total, "next_offset": next_offset });
+        if verbose {
+            println!("page: {value}");
+        } else {
+            print_json(&value, false)?;
+        }
     }
     Ok(())
 }
 
-fn run_show(doc_id: u64, machine: String, verbose: bool, root: Option<PathBuf>) -> Result<()> {
+struct ShowRunArgs {
+    selector: ContextSelector,
+    field: Option<ReadField>,
+    offset_chars: usize,
+    machine: String,
+    verbose: bool,
+    read: ReadArgs,
+    root: Option<PathBuf>,
+}
+
+fn run_show(args: ShowRunArgs) -> Result<()> {
+    let ShowRunArgs {
+        selector,
+        field,
+        offset_chars,
+        machine,
+        verbose,
+        read,
+        root,
+    } = args;
+    let budget = read.budget()?;
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let record = record_by_doc_id(&paths, &config, &machine, doc_id)?;
-    if verbose {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "machine": &machine,
-                "record_id": canonical_record_id(&record),
-                "record": record,
-            }))?
-        );
-        return Ok(());
-    }
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "machine": &machine,
-            "record_id": canonical_record_id(&record),
-            "record": record,
-        }))?
-    );
-    Ok(())
+    let record = read_record(
+        &paths,
+        &config,
+        &machine,
+        &selector,
+        field,
+        offset_chars,
+        budget.remaining(),
+    )?;
+    let mut value = serde_json::to_value(record)?;
+    value["machine"] = Value::from(machine);
+    print_json(&value, verbose)
 }
 
 fn hydrate_session_records(

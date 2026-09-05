@@ -8,6 +8,7 @@ pub mod ingest;
 pub mod lease;
 pub mod machine;
 pub mod progress;
+pub mod read_budget;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;
