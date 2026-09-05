@@ -615,6 +615,14 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
         "same-origin",
         "native approval forms must retain their Origin without leaking external referrers"
     );
+    let approval_policy = approval.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        approval_policy,
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://client.example; frame-ancestors 'none'; base-uri 'none'"
+    );
     let html = text_response(approval, StatusCode::OK);
     assert!(!html.contains("<script>alert('approval')</script>"));
     assert!(html.contains("&lt;script&gt;"), "{html}");
@@ -650,10 +658,12 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
         .send()
         .expect("opaque-origin approval");
     assert_eq!(null_origin.status(), StatusCode::FORBIDDEN);
-    let wrong_owner = text_response(
-        server.approval(&request_id, "wrong-owner-key", "approve"),
-        StatusCode::UNAUTHORIZED,
+    let wrong_owner = server.approval(&request_id, "wrong-owner-key", "approve");
+    assert_eq!(
+        wrong_owner.headers()["content-security-policy"],
+        approval_policy
     );
+    let wrong_owner = text_response(wrong_owner, StatusCode::UNAUTHORIZED);
     assert_eq!(input_value(&wrong_owner, "request_id"), request_id);
     assert!(!wrong_owner.contains(&owner_key));
     let recovered = redirect_params(server.approval(&request_id, &owner_key, "approve"));

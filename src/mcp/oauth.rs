@@ -270,7 +270,7 @@ impl OAuthServer {
         Arc::clone(&self.work_limit).try_acquire_owned().ok()
     }
 
-    fn insert_pending(&self, request: PendingRequest) -> Result<(String, String)> {
+    fn insert_pending(&self, request: PendingRequest) -> Result<(String, Response)> {
         let now = Instant::now();
         let mut pending = self
             .pending
@@ -289,9 +289,9 @@ impl OAuthServer {
             pending.requests.remove(&oldest);
         }
         let request_id = random_token()?;
-        let html = approval_html(&request, &request_id, None);
+        let response = approval_response(&request, &request_id, None);
         pending.requests.insert(request_id.clone(), request);
-        Ok((request_id, html))
+        Ok((request_id, response))
     }
 
     fn take_pending(&self, request_id: &str) -> Option<PendingRequest> {
@@ -306,7 +306,7 @@ impl OAuthServer {
         pending.requests.remove(request_id)
     }
 
-    fn pending_approval_html(&self, request_id: &str, error: &str) -> Option<String> {
+    fn pending_approval_response(&self, request_id: &str, error: &str) -> Option<Response> {
         let now = Instant::now();
         let mut pending = self
             .pending
@@ -318,7 +318,7 @@ impl OAuthServer {
         pending
             .requests
             .get(request_id)
-            .map(|request| approval_html(request, request_id, Some(error)))
+            .map(|request| approval_response(request, request_id, Some(error)))
     }
 
     fn approval_allowed(&self) -> bool {
@@ -398,8 +398,7 @@ fn add_security_headers(mut response: Response) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("same-origin"),
     );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
+    headers.entry(header::CONTENT_SECURITY_POLICY).or_insert(
         HeaderValue::from_static(
             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
         ),
@@ -633,11 +632,11 @@ async fn authorize_get(
         scope,
         state: query.state,
     };
-    let (_request_id, html) = match server.insert_pending(pending) {
+    let (_request_id, response) = match server.insert_pending(pending) {
         Ok(value) => value,
         Err(error) => return internal_error(error),
     };
-    Html(html).into_response()
+    response
 }
 
 async fn authorize_post(
@@ -667,8 +666,8 @@ async fn authorize_post(
                 "Too many failed attempts. Check your owner key and try again shortly.",
             )
         };
-        return match server.pending_approval_html(&form.request_id, message) {
-            Some(html) => (status, Html(html)).into_response(),
+        return match server.pending_approval_response(&form.request_id, message) {
+            Some(response) => (status, response).into_response(),
             None => authorization_error("authorization request is invalid or expired"),
         };
     }
@@ -1490,6 +1489,27 @@ fn now_seconds() -> Result<i64> {
         .as_secs()
         .try_into()
         .context("timestamp overflow")
+}
+
+fn approval_response(request: &PendingRequest, request_id: &str, error: Option<&str>) -> Response {
+    let Ok(callback) = Url::parse(&request.redirect_uri) else {
+        return authorization_error("stored redirect URI is invalid");
+    };
+    // Chrome applies form-action to the callback redirect as well as the POST.
+    // Permit only this validated callback origin alongside the local form action.
+    // Use the parsed origin so paths and queries cannot inject CSP directives.
+    let policy = format!(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' {}; frame-ancestors 'none'; base-uri 'none'",
+        callback.origin().ascii_serialization()
+    );
+    let Ok(policy) = HeaderValue::from_str(&policy) else {
+        return authorization_error("stored redirect origin is invalid");
+    };
+    let mut response = Html(approval_html(request, request_id, error)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_SECURITY_POLICY, policy);
+    response
 }
 
 fn approval_html(request: &PendingRequest, request_id: &str, error: Option<&str>) -> String {
