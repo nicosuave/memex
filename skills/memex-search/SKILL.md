@@ -36,7 +36,7 @@ Choose the cheapest strategy that can answer the request.
 
 | User intent | First move |
 | --- | --- |
-| Has a session ID | `memex session <id>` |
+| Has a session ID | Read the first bounded page with `memex session <id>` |
 | "recent sessions", "resume", "the session from this repo" | `memex sessions` |
 | Exact path/symbol/error/command/PR | lexical `memex search` |
 | Fuzzy concept or remembered topic | hybrid search if vectors exist |
@@ -223,9 +223,22 @@ Do not let ten near-duplicate hits from one session crowd out the rest of the co
 
 ```bash
 memex show <doc_id>
+memex show --record-id <record_id> --machine <machine_id>
 ```
 
-Use its full text and linkage metadata to decide whether more context is necessary.
+The default read budget is 16,000 Unicode content characters across `text`,
+`tool_input`, and `tool_output` together. Metadata and JSON wire bytes do not consume it.
+Inspect the returned `content` object: `returned_chars`, `total_chars`, `truncated`, and
+`continuations`. Continue only the needed field with the reported offset:
+
+```bash
+memex show --record-id <record_id> --machine <machine_id> \
+  --field tool-output --offset-chars <offset_chars>
+```
+
+Field values are `text`, `tool-input`, and `tool-output`; continuation JSON names them
+`text`, `tool_input`, and `tool_output`. `--offset-chars` is a Unicode character offset,
+not a byte offset. Use `--max-chars N` when a different bound is justified.
 
 ### Drill inside a candidate session
 
@@ -241,13 +254,19 @@ memex search "<exact filename/error/decision term>" \
 
 This is often cheaper than immediately loading a giant transcript.
 
-### Fetch the full trajectory when the question requires sequence
+### Read a trajectory progressively when the question requires sequence
 
 ```bash
 memex session <session_id>
 ```
 
-Fetch the full session when you need:
+The default page contains at most 50 records and shares one 16,000-character content
+budget across them. JSONL ends with a `type: "page"` object carrying `offset`, `total`,
+and `next_offset`. Resume later records with `--offset <next_offset>`; if a returned
+record itself is truncated, use its `record_id` and `content.continuations` with
+`memex show` before advancing when that field matters.
+
+Continue far enough to recover:
 
 - decision evolution
 - failure -> changed action -> result
@@ -255,7 +274,9 @@ Fetch the full session when you need:
 - tool-call/result ownership
 - a complete handoff/resume summary
 
-For huge sessions, focus only on the relevant interval after fetching; do not summarize unrelated history.
+Use `memex session <id> --full` only when the complete unbounded transcript is required.
+Adding `--limit` keeps full-content mode record-bounded. All read-command `--full` modes
+conflict with `--max-chars`.
 
 ### Fetch bounded context around a result
 
@@ -269,13 +290,23 @@ memex context --event-id <event_id> --session <session_id> --before 5 --after 5 
 memex context --doc-id <doc_id> --before 5 --after 5
 ```
 
+Pass `--machine <machine_id>` for a remote anchor. Context uses the same shared read budget
+and per-record content continuations as session reads. Its envelope includes `offset`,
+`total`, and `next_offset`; use `--offset <next_offset>` to continue through the selected
+neighborhood. Bounded output uses `order: "anchor_first"`: the anchor comes first, followed
+by the remaining records in chronological order. `--full` uses `order: "chronological"`;
+keep the same mode when continuing by offset.
+
 Use `--expand-interactions` when directly owned tool calls/results matter. It does not
 follow general parent or conversation ancestry. Expansion has a hard cap of 100 additional
 records; if the command reports that cap, narrow `--before`/`--after` or disable expansion.
 Canonical record IDs use an exact field in new indexes and a stored-record fallback scan
-in old indexes until rebuilt. Document/event anchors are indexed, and neighborhoods are
-scoped by session, source, and source path. For a result on another machine, use
-machine-aware `show` or paginated `session`.
+in old indexes until rebuilt. Bounded remote reads require updated peers; on an older
+peer, upgrade it. Legacy document-ID `show`, `session`, and `hydrate` may explicitly use
+`--full` if unbounded content is appropriate; remote context/stable-ID reads need an
+updated peer in either mode.
+Document/event anchors are indexed, and neighborhoods are
+scoped by session, source, and source path.
 
 ## Step 7: Reformulate From Evidence
 
@@ -445,14 +476,21 @@ memex sessions --project <name> --since <date> --json-array
 
 ```bash
 memex show <doc_id>
-memex show <doc_id> --machine <machine_id>
-memex context --record-id <record_id> --before 5 --after 5 --expand-interactions
+memex show --record-id <record_id> --machine <machine_id>
+memex show --record-id <record_id> --machine <machine_id> --field text --offset-chars <n>
+memex context --record-id <record_id> --machine <machine_id> --before 5 --after 5 --expand-interactions
+memex context --record-id <record_id> --machine <machine_id> --offset <next_offset>
 memex session <session_id>
-memex session <session_id> --machine <machine_id> --offset 0 --limit 500
+memex session <session_id> --machine <machine_id> --offset <next_offset>
 memex hydrate requests.jsonl
 ```
 
-`memex hydrate` accepts JSONL requests and fetches bounded session pages in batches. Use it when several federated search results need context; do not use it for a single local hit.
+`memex hydrate` accepts JSONL requests and fetches bounded session pages in batches. Its
+response envelope keeps `offset`, `total`, and `next_offset`, and each record carries
+content metadata. A single 16,000-character budget is shared across requests in input
+order. Use `--max-chars N` to resize it or `--full` for complete content; those flags
+conflict. Use hydrate when several federated search results need context; do not use it
+for a single local hit.
 
 ### Retrieval evaluation
 
@@ -494,8 +532,8 @@ Memex provides native support for:
 1. bounded context around a record, document, or event, with optional interaction expansion
 2. multiple query views fused with reciprocal-rank fusion and session-level diversification
 3. direct working-directory/repository scoping with `memex search --cwd`
-4. machine-aware `show` and paginated `session` access for federated search results
-5. bounded JSONL batch fetching for several trajectory/session pages
+4. machine-aware, character-bounded `show`, `session`, and `context` reads with explicit continuations
+5. bounded JSONL batch fetching with one shared content budget across requested pages
 6. stable canonical record IDs and interaction neighborhoods
 7. metadata-only retrieval tracing and JSONL relevance evaluation
 
