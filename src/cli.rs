@@ -659,6 +659,12 @@ EXAMPLES:
         /// Accepted browser Origin; repeat for multiple origins
         #[arg(long)]
         allowed_origin: Vec<String>,
+        /// Public HTTPS origin enabling built-in OAuth (e.g. https://memex.example.com)
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Revoke all OAuth grants in this data directory and exit
+        #[arg(long)]
+        revoke_all: bool,
     },
 }
 
@@ -1483,11 +1489,23 @@ pub fn run() -> Result<()> {
             listen,
             allowed_host,
             allowed_origin,
+            public_url,
+            revoke_all,
         } => {
+            if revoke_all {
+                let count = crate::mcp::revoke_all(root)?;
+                println!("Revoked {count} OAuth grants");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                transport == McpTransport::Http || public_url.is_none(),
+                "--public-url requires the HTTP transport"
+            );
             let http = (transport == McpTransport::Http).then_some(crate::mcp::HttpOptions {
                 listen,
                 allowed_hosts: allowed_host,
                 allowed_origins: allowed_origin,
+                public_url,
             });
             crate::mcp::run(root, http)?;
         }
