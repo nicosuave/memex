@@ -819,8 +819,7 @@ impl SearchIndex {
         let collector = TopDocs::with_limit(page_limit)
             .and_offset(offset)
             .custom_score(SessionOrderScorerFactory);
-        let top_docs: Vec<(std::cmp::Reverse<(u64, u64, u64)>, tantivy::DocAddress)> =
-            searcher.search(&query, &collector)?;
+        let top_docs = searcher.search(&query, &collector)?;
         let mut records = Vec::with_capacity(top_docs.len());
         for (_order, addr) in top_docs {
             let doc = searcher.doc::<TantivyDocument>(addr)?;
