@@ -30,6 +30,7 @@ use chrono::SecondsFormat;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::RegexBuilder;
+use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -642,6 +643,29 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Run the Model Context Protocol server (Streamable HTTP by default)
+    Mcp {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "http")]
+        transport: McpTransport,
+        /// HTTP socket address
+        #[arg(long, default_value = "127.0.0.1:5363")]
+        listen: std::net::SocketAddr,
+        /// Additional accepted HTTP Host authority; repeat for multiple hosts
+        #[arg(long)]
+        allowed_host: Vec<String>,
+        /// Accepted browser Origin; repeat for multiple origins
+        #[arg(long)]
+        allowed_origin: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum McpTransport {
+    Http,
+    Stdio,
 }
 
 #[derive(Debug, Subcommand)]
@@ -753,12 +777,143 @@ impl From<TransferMode> for CoreTransferMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, JsonSchema)]
 #[value(rename_all = "kebab-case")]
-enum SessionOrigin {
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SessionOrigin {
     Interactive,
     Subagent,
+    #[default]
     All,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpSearchMode {
+    #[default]
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl From<McpSearchMode> for SearchMode {
+    fn from(value: McpSearchMode) -> Self {
+        match value {
+            McpSearchMode::Lexical => SearchMode::Lexical,
+            McpSearchMode::Semantic => SearchMode::Semantic,
+            McpSearchMode::Hybrid => SearchMode::Hybrid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpSearchSort {
+    #[default]
+    Score,
+    Ts,
+}
+
+impl From<McpSearchSort> for SortBy {
+    fn from(value: McpSearchSort) -> Self {
+        match value {
+            McpSearchSort::Score => SortBy::Score,
+            McpSearchSort::Ts => SortBy::Ts,
+        }
+    }
+}
+
+fn default_mcp_limit() -> usize {
+    20
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_recency_weight() -> f32 {
+    1.0
+}
+
+fn default_recency_half_life_days() -> f32 {
+    30.0
+}
+
+/// Parameters for the MCP search tool. Results always use Memex's compact,
+/// bounded search projection; complete transcript text is available through
+/// the bounded read tools.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchRequest {
+    /// Keywords or natural-language query.
+    pub(crate) query: String,
+    /// Additional query views fused with reciprocal-rank fusion.
+    #[serde(default)]
+    pub(crate) additional_queries: Vec<String>,
+    /// Restrict results to sessions from this directory or repository.
+    pub(crate) cwd: Option<String>,
+    /// Repository/project grouping to search.
+    pub(crate) project: Option<String>,
+    /// Record role such as user, assistant, tool_use, or tool_result.
+    pub(crate) role: Option<String>,
+    /// Tool name such as Read, Edit, or Bash.
+    pub(crate) tool: Option<String>,
+    /// Exact session ID.
+    pub(crate) session: Option<String>,
+    /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
+    pub(crate) source: Option<String>,
+    /// Include interactive sessions, subagent sessions, or all sessions.
+    #[serde(default)]
+    pub(crate) origin: SessionOrigin,
+    /// Lexical, semantic, or hybrid retrieval.
+    #[serde(default)]
+    pub(crate) mode: McpSearchMode,
+    /// Earliest timestamp (RFC3339, date, unix seconds, or unix milliseconds).
+    pub(crate) since: Option<String>,
+    /// Latest timestamp (RFC3339, unix seconds, or unix milliseconds).
+    pub(crate) until: Option<String>,
+    /// Maximum returned results (1-500).
+    #[serde(default = "default_mcp_limit")]
+    pub(crate) limit: usize,
+    /// Maximum results from any one session.
+    pub(crate) top_n_per_session: Option<usize>,
+    /// Return at most one result per session unless top_n_per_session is set.
+    #[serde(default = "default_true")]
+    pub(crate) unique_session: bool,
+    /// Sort by retrieval score or record timestamp.
+    #[serde(default)]
+    pub(crate) sort: McpSearchSort,
+    /// Drop results below this retrieval score.
+    pub(crate) min_score: Option<f32>,
+    /// Strength of the recency boost (0 disables it).
+    #[serde(default = "default_recency_weight")]
+    pub(crate) recency_weight: f32,
+    /// Half-life in days for recency decay.
+    #[serde(default = "default_recency_half_life_days")]
+    pub(crate) recency_half_life_days: f32,
+    /// Machine IDs to search. Empty uses the configured defaults.
+    #[serde(default)]
+    pub(crate) machines: Vec<String>,
+}
+
+/// Parameters for the MCP session-listing tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionsRequest {
+    /// Restrict sessions to this directory or repository.
+    pub(crate) cwd: Option<String>,
+    /// Repository/project grouping to list.
+    pub(crate) project: Option<String>,
+    /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
+    pub(crate) source: Option<String>,
+    /// Earliest activity timestamp (RFC3339, date, unix seconds, or unix milliseconds).
+    pub(crate) since: Option<String>,
+    /// Include interactive sessions, subagent sessions, or all sessions.
+    #[serde(default)]
+    pub(crate) origin: SessionOrigin,
+    /// Maximum returned sessions (1-500).
+    #[serde(default = "default_mcp_limit")]
+    pub(crate) limit: usize,
 }
 
 impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
@@ -928,6 +1083,7 @@ pub fn run() -> Result<()> {
             | Commands::Update { .. }
             | Commands::Skill { .. }
             | Commands::Rpc { .. }
+            | Commands::Mcp { .. }
             | Commands::Herdr { .. }
     );
     if should_check && check_updates {
@@ -1321,6 +1477,20 @@ pub fn run() -> Result<()> {
         Commands::Rpc { root } => {
             crate::machine::run_rpc_stdio(root)?;
         }
+        Commands::Mcp {
+            root,
+            transport,
+            listen,
+            allowed_host,
+            allowed_origin,
+        } => {
+            let http = (transport == McpTransport::Http).then_some(crate::mcp::HttpOptions {
+                listen,
+                allowed_hosts: allowed_host,
+                allowed_origins: allowed_origin,
+            });
+            crate::mcp::run(root, http)?;
+        }
     }
     Ok(())
 }
@@ -1647,8 +1817,142 @@ fn run_search(
 ) -> Result<()> {
     let trace_started = Instant::now();
     let trace_started_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let mode = if hybrid {
+        SearchMode::Hybrid
+    } else if semantic {
+        SearchMode::Semantic
+    } else {
+        SearchMode::Lexical
+    };
+    let collected = collect_search(SearchCollectRequest {
+        query,
+        additional_queries,
+        cwd,
+        project,
+        role,
+        tool,
+        session,
+        source,
+        origin,
+        mode,
+        min_score,
+        recency_weight,
+        recency_half_life_days,
+        since,
+        until,
+        limit,
+        top_n_per_session,
+        unique_session,
+        fields: search_fields(fields, full)?,
+        sort,
+        verbose,
+        format: if json_array && !verbose {
+            SearchFormat::Json
+        } else {
+            format
+        },
+        root,
+        machines,
+    })?;
+    for failure in &collected.failures {
+        if let Some((machine, error)) = failure.split_once(": ") {
+            eprintln!("Warning: machine '{machine}' unavailable: {error}");
+        } else {
+            eprintln!("Warning: machine unavailable: {failure}");
+        }
+    }
+    if trace {
+        let mode_label = match (mode, collected.queries.len() > 1) {
+            (SearchMode::Lexical, false) => "lexical",
+            (SearchMode::Semantic, false) => "semantic",
+            (SearchMode::Hybrid, false) => "hybrid",
+            (SearchMode::Lexical, true) => "lexical-rrf",
+            (SearchMode::Semantic, true) => "semantic-rrf",
+            (SearchMode::Hybrid, true) => "hybrid-rrf",
+        };
+        write_retrieval_trace(TraceWriteArgs {
+            paths: &collected.paths,
+            queries: &collected.queries,
+            query_candidate_counts: &collected.query_candidate_counts,
+            cwd: collected.cwd.clone(),
+            results: &collected.results,
+            mode: mode_label,
+            machines: &collected.selected_machines,
+            failures: &collected.failures,
+            started: trace_started,
+            started_at_ms: trace_started_at_ms,
+        })?;
+    }
+    render_located_results(collected.results, &collected.render)
+}
+
+struct SearchCollectRequest {
+    query: String,
+    additional_queries: Vec<String>,
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    role: Option<String>,
+    tool: Option<String>,
+    session: Option<String>,
+    source: Option<SourceFilter>,
+    origin: SessionOrigin,
+    mode: SearchMode,
+    min_score: Option<f32>,
+    recency_weight: f32,
+    recency_half_life_days: f32,
+    since: Option<String>,
+    until: Option<String>,
+    limit: usize,
+    top_n_per_session: Option<usize>,
+    unique_session: bool,
+    fields: Option<HashSet<String>>,
+    sort: SortBy,
+    verbose: bool,
+    format: SearchFormat,
+    root: Option<PathBuf>,
+    machines: Vec<String>,
+}
+
+struct SearchCollection {
+    paths: Paths,
+    queries: Vec<String>,
+    query_candidate_counts: Vec<usize>,
+    cwd: Option<String>,
+    results: Vec<LocatedRecord>,
+    render: RenderOptions,
+    selected_machines: Vec<String>,
+    failures: Vec<String>,
+}
+
+fn collect_search(request: SearchCollectRequest) -> Result<SearchCollection> {
+    let SearchCollectRequest {
+        query,
+        additional_queries,
+        cwd,
+        project,
+        role,
+        tool,
+        session,
+        source,
+        origin,
+        mode,
+        min_score,
+        recency_weight,
+        recency_half_life_days,
+        since,
+        until,
+        limit,
+        top_n_per_session,
+        unique_session,
+        fields,
+        sort,
+        verbose,
+        format,
+        root,
+        machines,
+    } = request;
     let mut queries = vec![query];
-    queries.extend(additional_queries.clone());
+    queries.extend(additional_queries);
     let mut seen_queries = HashSet::new();
     queries.retain(|query| {
         let query = query.trim();
@@ -1680,7 +1984,6 @@ fn run_search(
         .into_iter()
         .flatten()
         .collect();
-    let fields = search_fields(fields, full)?;
     let top_n_per_session = if unique_session && top_n_per_session.is_none() {
         Some(1)
     } else {
@@ -1690,11 +1993,7 @@ fn run_search(
     let render = RenderOptions {
         verbose,
         matchers,
-        format: if json_array && !verbose {
-            SearchFormat::Json
-        } else {
-            format
-        },
+        format,
         fields,
         sort,
         min_score,
@@ -1717,13 +2016,6 @@ fn run_search(
         (limit * 5).max(limit + 10)
     } else {
         limit
-    };
-    let mode = if hybrid {
-        SearchMode::Hybrid
-    } else if semantic {
-        SearchMode::Semantic
-    } else {
-        SearchMode::Lexical
     };
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
     let mut failures = Vec::new();
@@ -1762,7 +2054,6 @@ fn run_search(
             for (machine, error) in federated.failures {
                 let message = format!("{machine}: {error}");
                 if seen_failures.insert(message.clone()) {
-                    eprintln!("Warning: machine '{machine}' unavailable: {error}");
                     failures.push(message);
                 }
             }
@@ -1783,29 +2074,16 @@ fn run_search(
         }
         candidate_limit = candidate_limit.saturating_mul(5);
     }
-    if trace {
-        let mode_label = match (mode, queries.len() > 1) {
-            (SearchMode::Lexical, false) => "lexical",
-            (SearchMode::Semantic, false) => "semantic",
-            (SearchMode::Hybrid, false) => "hybrid",
-            (SearchMode::Lexical, true) => "lexical-rrf",
-            (SearchMode::Semantic, true) => "semantic-rrf",
-            (SearchMode::Hybrid, true) => "hybrid-rrf",
-        };
-        write_retrieval_trace(TraceWriteArgs {
-            paths: &paths,
-            queries: &queries,
-            query_candidate_counts: &query_candidate_counts,
-            cwd,
-            results: &results,
-            mode: mode_label,
-            machines: &selected_machines,
-            failures: &failures,
-            started: trace_started,
-            started_at_ms: trace_started_at_ms,
-        })?;
-    }
-    render_located_results(results, &render)
+    Ok(SearchCollection {
+        paths,
+        queries,
+        query_candidate_counts,
+        cwd,
+        results,
+        render,
+        selected_machines,
+        failures,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1874,6 +2152,26 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
         return Ok(());
     }
 
+    let output = project_located_results(results, render)?;
+    match render.format {
+        SearchFormat::Jsonl => {
+            for value in output {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        }
+        SearchFormat::Json => println!("{}", serde_json::to_string(&output)?),
+        SearchFormat::Toon => println!(
+            "{}",
+            toon_format::encode_default(&serde_json::json!({"results": output}))?
+        ),
+    }
+    Ok(())
+}
+
+fn project_located_results(
+    results: Vec<LocatedRecord>,
+    render: &RenderOptions,
+) -> Result<Vec<Value>> {
     let mut output = Vec::new();
     for LocatedRecord {
         machine,
@@ -2012,22 +2310,103 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
                 links: record.links,
             })?
         };
-        if render.format != SearchFormat::Jsonl {
-            output.push(value);
-        } else {
-            println!("{}", serde_json::to_string(&value)?);
-        }
+        output.push(value);
     }
+    Ok(output)
+}
 
-    match render.format {
-        SearchFormat::Jsonl => {}
-        SearchFormat::Json => println!("{}", serde_json::to_string(&output)?),
-        SearchFormat::Toon => println!(
-            "{}",
-            toon_format::encode_default(&serde_json::json!({"results": output}))?
-        ),
+pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Result<Value> {
+    validate_mcp_search_request(&request)?;
+    let source = parse_source_filter(request.source)?;
+    let collected = collect_search(SearchCollectRequest {
+        query: request.query,
+        additional_queries: request.additional_queries,
+        cwd: request.cwd.map(PathBuf::from),
+        project: request.project,
+        role: request.role,
+        tool: request.tool,
+        session: request.session,
+        source,
+        origin: request.origin,
+        mode: request.mode.into(),
+        min_score: request.min_score,
+        recency_weight: request.recency_weight,
+        recency_half_life_days: request.recency_half_life_days,
+        since: request.since,
+        until: request.until,
+        limit: request.limit,
+        top_n_per_session: request.top_n_per_session,
+        unique_session: request.unique_session,
+        fields: search_fields(None, false)?,
+        sort: request.sort.into(),
+        verbose: false,
+        format: SearchFormat::Json,
+        root,
+        machines: request.machines,
+    })?;
+    let SearchCollection {
+        results,
+        render,
+        selected_machines,
+        failures,
+        ..
+    } = collected;
+    let results = project_located_results(results, &render)?;
+    Ok(serde_json::json!({
+        "results": results,
+        "failures": failures,
+        "selected_machines": selected_machines,
+    }))
+}
+
+fn validate_mcp_search_request(request: &SearchRequest) -> Result<()> {
+    validate_mcp_limit(request.limit)?;
+    let query_count = 1usize.saturating_add(request.additional_queries.len());
+    if query_count > 8 {
+        return Err(anyhow!("search accepts at most 8 queries"));
+    }
+    let query_chars = std::iter::once(&request.query)
+        .chain(request.additional_queries.iter())
+        .map(|query| query.chars().count())
+        .sum::<usize>();
+    if query_chars > 16_000 {
+        return Err(anyhow!(
+            "search query text exceeds the 16000 character limit"
+        ));
+    }
+    if request
+        .top_n_per_session
+        .is_some_and(|value| !(1..=500).contains(&value))
+    {
+        return Err(anyhow!("top_n_per_session must be between 1 and 500"));
+    }
+    if request.min_score.is_some_and(|value| !value.is_finite()) {
+        return Err(anyhow!("min_score must be finite"));
+    }
+    if !request.recency_weight.is_finite() || request.recency_weight < 0.0 {
+        return Err(anyhow!("recency_weight must be finite and non-negative"));
+    }
+    if !request.recency_half_life_days.is_finite() || request.recency_half_life_days <= 0.0 {
+        return Err(anyhow!(
+            "recency_half_life_days must be finite and greater than zero"
+        ));
     }
     Ok(())
+}
+
+fn validate_mcp_limit(limit: usize) -> Result<()> {
+    if !(1..=500).contains(&limit) {
+        return Err(anyhow!("limit must be between 1 and 500"));
+    }
+    Ok(())
+}
+
+fn parse_source_filter(source: Option<String>) -> Result<Option<SourceFilter>> {
+    source
+        .map(|source| {
+            SourceFilter::from_str(&source, true).map_err(|_| anyhow!("unknown source '{source}'"))
+        })
+        .transpose()
 }
 
 fn insert_optional_field(
@@ -3086,6 +3465,28 @@ fn run_sessions(
     json_array: bool,
     root: Option<PathBuf>,
 ) -> Result<()> {
+    let items = collect_sessions(cwd, project, source, since, limit, origin, root)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    if json_array {
+        writeln!(out, "{}", Value::Array(items))?;
+    } else {
+        for value in items {
+            writeln!(out, "{value}")?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_sessions(
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    source: Option<SourceFilter>,
+    since: Option<String>,
+    limit: usize,
+    origin: SessionOrigin,
+    root: Option<PathBuf>,
+) -> Result<Vec<Value>> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let store = open_analytics_read_only(&paths)?;
@@ -3104,8 +3505,6 @@ fn run_sessions(
         Some(limit),
     )?;
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
     let mut items = Vec::new();
     for row in &rows {
         let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
@@ -3121,16 +3520,31 @@ fn run_sessions(
         if let Some(resume_cmd) = resume_cmd {
             object.insert("resume_cmd".into(), Value::String(resume_cmd));
         }
-        if json_array {
-            items.push(value);
-        } else {
-            writeln!(out, "{value}")?;
-        }
+        items.push(value);
     }
-    if json_array {
-        writeln!(out, "{}", Value::Array(items))?;
+    Ok(items)
+}
+
+pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> Result<Value> {
+    validate_mcp_limit(request.limit)?;
+    let source = parse_source_filter(request.source)?;
+    let mut results = collect_sessions(
+        request.cwd.map(PathBuf::from),
+        request.project,
+        source,
+        request.since,
+        request.limit,
+        request.origin,
+        root,
+    )?;
+    for value in &mut results {
+        value["machine"] = Value::String(crate::machine::LOCAL_MACHINE_ID.to_string());
     }
-    Ok(())
+    Ok(serde_json::json!({
+        "results": results,
+        "failures": [],
+        "selected_machines": [crate::machine::LOCAL_MACHINE_ID],
+    }))
 }
 
 fn run_herdr_resume(
@@ -5565,6 +5979,74 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn mcp_search_request_uses_bounded_compact_defaults() {
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "needle"
+        }))
+        .unwrap();
+
+        assert_eq!(request.limit, 20);
+        assert!(request.unique_session);
+        assert_eq!(request.mode, McpSearchMode::Lexical);
+        assert_eq!(request.sort, McpSearchSort::Score);
+        assert_eq!(request.recency_weight, 1.0);
+        assert_eq!(request.recency_half_life_days, 30.0);
+        assert!(request.additional_queries.is_empty());
+        assert!(request.machines.is_empty());
+        assert_eq!(request.origin, SessionOrigin::All);
+    }
+
+    #[test]
+    fn mcp_request_limits_and_source_names_are_validated() {
+        assert!(validate_mcp_limit(1).is_ok());
+        assert!(validate_mcp_limit(500).is_ok());
+        assert!(validate_mcp_limit(0).is_err());
+        assert!(validate_mcp_limit(501).is_err());
+        assert_eq!(
+            parse_source_filter(Some("open-claw".to_string())).unwrap(),
+            Some(SourceFilter::OpenClaw)
+        );
+        assert!(parse_source_filter(Some("unknown".to_string())).is_err());
+
+        let mut request: SearchRequest =
+            serde_json::from_value(serde_json::json!({"query": "needle"})).unwrap();
+        request.additional_queries = (0..8).map(|index| format!("query {index}")).collect();
+        assert!(validate_mcp_search_request(&request).is_err());
+        request.additional_queries.clear();
+        request.top_n_per_session = Some(501);
+        assert!(validate_mcp_search_request(&request).is_err());
+        request.top_n_per_session = None;
+        request.recency_half_life_days = 0.0;
+        assert!(validate_mcp_search_request(&request).is_err());
+
+        assert!(
+            serde_json::from_value::<SessionsRequest>(serde_json::json!({
+                "limit": 20,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_command_accepts_a_custom_root() {
+        let cli = Cli::try_parse_from(["memex", "mcp", "--root", "/tmp/custom-memex"])
+            .expect("parse MCP root");
+        let Some(Commands::Mcp {
+            root,
+            transport,
+            listen,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected MCP command");
+        };
+        assert_eq!(root, Some(PathBuf::from("/tmp/custom-memex")));
+        assert_eq!(transport, McpTransport::Http);
+        assert_eq!(listen.to_string(), "127.0.0.1:5363");
+    }
 
     #[test]
     fn update_interaction_requires_a_human_terminal_and_explicit_opt_out_wins() {
