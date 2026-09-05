@@ -8,7 +8,7 @@
 # with exactly this version.
 id = "nicosuave.memex"
 name = "memex"
-version = "0.15.1"
+version = "0.16.0"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
 description = "Session desk for your agent history: search past Claude Code / Codex / Cursor / Pi / Oh My Pi sessions and resume one into a herdr tab."
