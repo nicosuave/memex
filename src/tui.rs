@@ -5187,8 +5187,9 @@ fn sessions_from_query(
     };
     let results = index.search(&options)?;
     let mut sessions: HashMap<String, SessionSummary> = HashMap::new();
+    let matchers = crate::cli::build_matchers(query)?;
     for (score, record) in results {
-        add_record_to_session(&mut sessions, score, record);
+        add_record_to_session(&mut sessions, score, record, &matchers);
     }
     let mut out: Vec<SessionSummary> = sessions.into_values().collect();
     out.sort_by(|a, b| {
@@ -5240,7 +5241,7 @@ fn sessions_from_recent(
         {
             continue;
         }
-        add_record_to_session(&mut sessions, 0.0, record);
+        add_record_to_session(&mut sessions, 0.0, record, &[]);
         if sessions.len() >= RECENT_SESSIONS_LIMIT {
             break;
         }
@@ -5466,6 +5467,7 @@ fn add_record_to_session(
     sessions: &mut HashMap<String, SessionSummary>,
     score: f32,
     record: Record,
+    matchers: &[regex::Regex],
 ) {
     let label = record.links.conversation_kind.clone();
     let entry = sessions
@@ -5479,7 +5481,7 @@ fn add_record_to_session(
             hit_count: 0,
             top_score: score,
             title: String::new(),
-            snippet: summarize(&record.text, 160),
+            snippet: crate::cli::match_preview(&record.text, matchers, 160),
             source_path: record.source_path.clone(),
             source_dir: parent_dir(&record.source_path),
             label: None,
@@ -5499,7 +5501,7 @@ fn add_record_to_session(
     }
     if score >= entry.top_score {
         entry.top_score = score;
-        let snippet = summarize(&record.text, 160);
+        let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
         }
@@ -5511,6 +5513,7 @@ fn add_record_to_session(
 fn add_located_record_to_session(
     sessions: &mut HashMap<String, SessionSummary>,
     located: crate::machine::LocatedRecord,
+    matchers: &[regex::Regex],
 ) {
     let machine = located.machine;
     let score = located.score;
@@ -5531,7 +5534,7 @@ fn add_located_record_to_session(
         hit_count: 0,
         top_score: score,
         title: String::new(),
-        snippet: summarize(&record.text, 160),
+        snippet: crate::cli::match_preview(&record.text, matchers, 160),
         source_path: record.source_path.clone(),
         source_dir: parent_dir(&record.source_path),
         label: None,
@@ -5549,7 +5552,7 @@ fn add_located_record_to_session(
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
-        let snippet = summarize(&record.text, 160);
+        let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
         }
@@ -5641,6 +5644,7 @@ fn run_search_request(
         };
         let failures = federated.failures;
         let mut by_session = HashMap::new();
+        let matchers = crate::cli::build_matchers(&request.query)?;
         for located in federated.items {
             if request.since.is_some_and(|since| located.record.ts < since) {
                 continue;
@@ -5652,7 +5656,7 @@ fn run_search_request(
             {
                 continue;
             }
-            add_located_record_to_session(&mut by_session, located);
+            add_located_record_to_session(&mut by_session, located, &matchers);
         }
         let mut sessions: Vec<_> = by_session.into_values().collect();
         if request.query.is_empty() {
@@ -7143,14 +7147,67 @@ mod tests {
     }
 
     #[test]
+    fn grouped_search_previews_keep_late_matches_visible() {
+        let theme = Theme::new();
+        let terms = query_terms("fireduck");
+        let matchers = crate::cli::build_matchers("fireduck").unwrap();
+        for federated in [false, true] {
+            let mut sessions = HashMap::new();
+            // Exercise both initial insertion and replacement by a better hit.
+            for (score, word) in [(1.0, "fireduck"), (2.0, "FIREDUCK")] {
+                let text = format!(
+                    "{} {word} matching output",
+                    "Script completed 日志 ".repeat(100)
+                );
+                let hit = record("tool", &text);
+                if federated {
+                    add_located_record_to_session(
+                        &mut sessions,
+                        crate::machine::LocatedRecord {
+                            machine: "remote".to_string(),
+                            score,
+                            record: hit,
+                        },
+                        &matchers,
+                    );
+                } else {
+                    add_record_to_session(&mut sessions, score, hit, &matchers);
+                }
+                let summary = sessions.values().next().unwrap();
+                assert!(summary.snippet.contains(word));
+                assert!(summary.snippet.chars().count() <= 160);
+                let spans = match_context_spans(&summary.snippet, &terms, 50, &theme);
+                assert!(spans.iter().any(|span| {
+                    span.content == word && span.style.add_modifier.contains(Modifier::BOLD)
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_preview_without_literal_match_keeps_prefix() {
+        for query in ["", "project:memex", "absent"] {
+            let matchers = crate::cli::build_matchers(query).unwrap();
+            let mut sessions = HashMap::new();
+            add_record_to_session(
+                &mut sessions,
+                1.0,
+                record("assistant", "Readable message prefix"),
+                &matchers,
+            );
+            assert_eq!(sessions["session"].snippet, "Readable message prefix");
+        }
+    }
+
+    #[test]
     fn grouped_session_prefers_main_over_side_records() {
         let mut sessions = std::collections::HashMap::new();
         let mut side = record("assistant", "sidechain output");
         side.links.conversation_kind = Some("sidechain".to_string());
-        add_record_to_session(&mut sessions, 1.0, side);
+        add_record_to_session(&mut sessions, 1.0, side, &[]);
         let mut main = record("user", "please fix the parser");
         main.links.conversation_kind = Some("main".to_string());
-        add_record_to_session(&mut sessions, 0.5, main);
+        add_record_to_session(&mut sessions, 0.5, main, &[]);
         let summary = sessions.get("session").expect("grouped");
         assert_eq!(summary.conversation_kind.as_deref(), Some("main"));
         assert!(session_matches_kind(

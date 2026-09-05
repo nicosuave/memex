@@ -6018,7 +6018,7 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
     use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
     fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
         match ast {
@@ -6067,7 +6067,7 @@ fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
 }
 
 // Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
-fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
+pub(crate) fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
     let first = matchers
         .iter()
         .filter_map(|matcher| matcher.find(text))
