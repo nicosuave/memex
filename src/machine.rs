@@ -195,6 +195,19 @@ pub struct BoundedSessionPage {
     pub records: Vec<BoundedRecord>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PeerSessionPageError {
+    message: String,
+}
+
+impl std::fmt::Display for PeerSessionPageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "session-page read failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for PeerSessionPageError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSpec {
     pub source: Option<SourceFilter>,
@@ -882,7 +895,7 @@ pub fn read_session_pages(
             validate_bounded_session_pages(&pages, requests, max_chars)?;
             Ok(pages)
         }
-        RpcPayload::Error { message } => Err(anyhow!("session-page read failed: {message}")),
+        RpcPayload::Error { message } => Err(PeerSessionPageError { message }.into()),
         other => Err(anyhow!(
             "session-page read returned an unexpected response; upgrade peer for bounded reads: {other:?}"
         )),

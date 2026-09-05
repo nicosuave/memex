@@ -446,17 +446,29 @@ type = "remote"
     let bin = coordinator.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
+    let rpc_calls = coordinator.path().join("rpc-calls");
     std::fs::write(
         &ssh,
         r#"#!/bin/sh
 for argument in "$@"; do
-  if [ "$argument" = "mcp-integration-offline" ]; then
-    echo "fixture host unavailable" >&2
-    exit 7
+  if [ "$argument" = "mcp-integration-remote" ] || [ "$argument" = "mcp-integration-offline" ]; then
+    target="$argument"
   fi
   remote_command="$argument"
 done
-exec sh -c "$remote_command --root \"$MEMEX_TEST_REMOTE_ROOT\""
+printf '%s\n' "$target" >> "$MEMEX_TEST_RPC_CALLS"
+if [ "$target" = "mcp-integration-offline" ]; then
+  echo "fixture host unavailable" >&2
+  exit 7
+fi
+request=$(cat)
+case "$request" in
+  *invalid-remote-page*)
+    printf '%s' '{"protocol":1,"response":{"kind":"error","message":"invalid remote page"}}'
+    exit 0
+    ;;
+esac
+printf '%s' "$request" | sh -c "$remote_command --root \"$MEMEX_TEST_REMOTE_ROOT\""
 "#,
     )
     .unwrap();
@@ -468,7 +480,8 @@ exec sh -c "$remote_command --root \"$MEMEX_TEST_REMOTE_ROOT\""
     let mut client = Client::command(coordinator.path(), |command| {
         command
             .env("PATH", std::env::join_paths(path).unwrap())
-            .env("MEMEX_TEST_REMOTE_ROOT", root.path());
+            .env("MEMEX_TEST_REMOTE_ROOT", root.path())
+            .env("MEMEX_TEST_RPC_CALLS", &rpc_calls);
     });
     let result = client.call("search", json!({"query":"needle"}));
     assert_eq!(result["results"][0]["machine"], "remote");
@@ -484,6 +497,47 @@ exec sh -c "$remote_command --root \"$MEMEX_TEST_REMOTE_ROOT\""
         {"session_id":"session","machine":"offline"},{"session_id":"session","machine":"remote","offset":1,"limit":1}],"max_chars":7}));
     assert_eq!(batch["failures"].as_array().unwrap().len(), 1);
     assert_eq!(batch["pages"][1]["records"][0]["record"]["text"], "ne");
+
+    let count_calls = |target: &str| {
+        std::fs::read_to_string(&rpc_calls)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == target)
+            .count()
+    };
+    let remote_calls = count_calls("mcp-integration-remote");
+    let offline_calls = count_calls("mcp-integration-offline");
+    let partial = client.call(
+        "hydrate",
+        json!({"requests":[
+            {"session_id":"session","machine":"remote","limit":1},
+            {"session_id":"invalid-remote-page","machine":"remote","limit":1},
+            {"session_id":"session","machine":"remote","offset":1,"limit":1},
+            {"session_id":"session","machine":"offline","limit":1},
+            {"session_id":"session","machine":"offline","offset":1,"limit":1}
+        ],"max_chars":7}),
+    );
+    assert_eq!(partial["pages"].as_array().unwrap().len(), 2);
+    assert_eq!(partial["pages"][0]["machine"], "remote");
+    assert_eq!(partial["pages"][0]["offset"], 0);
+    assert_eq!(partial["pages"][0]["records"][0]["record"]["text"], "αβγδε");
+    assert_eq!(partial["pages"][1]["machine"], "remote");
+    assert_eq!(partial["pages"][1]["offset"], 1);
+    assert_eq!(partial["pages"][1]["records"][0]["record"]["text"], "ne");
+    assert_eq!(partial["remaining_chars"], 0);
+    assert_eq!(partial["failures"].as_array().unwrap().len(), 3);
+    assert_eq!(partial["failures"][0]["request_index"], 1);
+    assert_eq!(partial["failures"][0]["machine"], "remote");
+    assert_eq!(
+        partial["failures"][0]["error"],
+        "session-page read failed: invalid remote page"
+    );
+    assert_eq!(partial["failures"][1]["request_index"], 3);
+    assert_eq!(partial["failures"][1]["machine"], "offline");
+    assert_eq!(partial["failures"][2]["request_index"], 4);
+    assert_eq!(partial["failures"][2]["machine"], "offline");
+    assert_eq!(count_calls("mcp-integration-remote") - remote_calls, 4);
+    assert_eq!(count_calls("mcp-integration-offline") - offline_calls, 1);
     client.stop();
 }
 

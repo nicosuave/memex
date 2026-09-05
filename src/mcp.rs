@@ -428,11 +428,15 @@ fn hydrate_pages(root: Option<PathBuf>, request: HydrateRequest) -> Result<Value
                 }
             }
             Err(error) => {
-                // Match CLI hydration: recover good local pages when one request
-                // failed; do not repeatedly retry an unavailable remote host.
+                // Recover good pages when local processing or a reachable peer
+                // rejects one request. Do not multiply transport failures.
+                let retry_individually = machine == machine::LOCAL_MACHINE_ID
+                    || error
+                        .downcast_ref::<machine::PeerSessionPageError>()
+                        .is_some();
                 for (i, page_request) in batch.iter().enumerate() {
                     let mut message = error.to_string();
-                    if machine == machine::LOCAL_MACHINE_ID {
+                    if retry_individually {
                         match machine::read_session_pages(
                             &paths,
                             &config,
