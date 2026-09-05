@@ -1,3 +1,4 @@
+use memex::analytics::{analytics_path, backfill_from_index};
 use memex::config::Paths;
 use memex::index::SearchIndex;
 use memex::retrieval::canonical_record_id;
@@ -74,6 +75,21 @@ fn values(root: &Path, args: &[&str]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn json_output(root: &Path, args: &[&str]) -> Value {
+    let out = run(root, args);
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{args:?} did not emit one JSON value: {error}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
 }
 
 #[test]
@@ -214,7 +230,13 @@ fn hydrate_applies_one_budget_in_input_order_and_preserves_continuation() {
     std::fs::write(&request, "{\"session_id\":\"session\",\"offset\":0,\"limit\":3}\n{\"session_id\":\"session\",\"offset\":2,\"limit\":1}\n").unwrap();
     let out = values(
         root.path(),
-        &["hydrate", request.to_str().unwrap(), "--max-chars", "7"],
+        &[
+            "session",
+            "batch",
+            request.to_str().unwrap(),
+            "--max-chars",
+            "7",
+        ],
     );
     assert_eq!(out.len(), 2);
     assert_eq!(out[0]["records"].as_array().unwrap().len(), 2);
@@ -222,6 +244,12 @@ fn hydrate_applies_one_budget_in_input_order_and_preserves_continuation() {
     assert_eq!(out[0]["next_offset"], 2);
     assert_eq!(out[1]["records"], serde_json::json!([]));
     assert_eq!(out[1]["next_offset"], 2);
+
+    let legacy = values(
+        root.path(),
+        &["hydrate", request.to_str().unwrap(), "--max-chars", "7"],
+    );
+    assert_eq!(legacy, out);
 }
 
 #[test]
@@ -511,4 +539,243 @@ fn search_formats_preserve_escaping_large_ids_and_existing_flags() {
         .status
         .success()
     );
+}
+
+#[test]
+fn canonical_search_options_match_their_legacy_equivalents() {
+    let (root, _) = fixture();
+    let base = ["search", "late_needle", "--machine", "local"];
+    let lexical = values(root.path(), &base);
+
+    let mut explicit_lexical = base.to_vec();
+    explicit_lexical.extend(["--mode", "lexical"]);
+    assert_eq!(values(root.path(), &explicit_lexical), lexical);
+
+    let mut json = base.to_vec();
+    json.extend(["--format", "json"]);
+    let mut legacy_json = base.to_vec();
+    legacy_json.push("--json-array");
+    assert_eq!(
+        json_output(root.path(), &json),
+        json_output(root.path(), &legacy_json)
+    );
+
+    let mut pretty = json.clone();
+    pretty.push("--pretty");
+    let pretty_out = run(root.path(), &pretty);
+    assert!(pretty_out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&pretty_out.stdout).unwrap(),
+        json_output(root.path(), &json)
+    );
+    assert!(
+        String::from_utf8(pretty_out.stdout)
+            .unwrap()
+            .contains("\n  {")
+    );
+
+    let mut invalid_pretty = base.to_vec();
+    invalid_pretty.push("--pretty");
+    assert!(!run(root.path(), &invalid_pretty).status.success());
+    let mut explicit_invalid_pretty = base.to_vec();
+    explicit_invalid_pretty.extend(["--format", "jsonl", "--pretty"]);
+    assert!(!run(root.path(), &explicit_invalid_pretty).status.success());
+
+    let mut canonical_text = base.to_vec();
+    canonical_text.extend(["--format", "text"]);
+    let mut legacy_text = base.to_vec();
+    legacy_text.push("-v");
+    assert_eq!(
+        run(root.path(), &canonical_text).stdout,
+        run(root.path(), &legacy_text).stdout
+    );
+}
+
+#[test]
+fn bounded_record_and_context_formats_preserve_the_same_json_value() {
+    let (root, records) = fixture();
+    let id = canonical_record_id(&records[1]);
+    for base in [
+        vec!["show", "--record-id", &id, "--max-chars", "4"],
+        vec![
+            "context",
+            "--record-id",
+            &id,
+            "--before",
+            "0",
+            "--after",
+            "0",
+            "--max-chars",
+            "4",
+        ],
+    ] {
+        let expected = json_output(root.path(), &base);
+
+        let mut jsonl = base.clone();
+        jsonl.extend(["--format", "jsonl"]);
+        assert_eq!(json_output(root.path(), &jsonl), expected);
+
+        let mut json = base.clone();
+        json.extend(["--format", "json"]);
+        assert_eq!(json_output(root.path(), &json), expected);
+
+        let mut pretty = base.clone();
+        pretty.push("--pretty");
+        let pretty_out = run(root.path(), &pretty);
+        assert!(pretty_out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&pretty_out.stdout).unwrap(),
+            expected
+        );
+        assert!(
+            String::from_utf8(pretty_out.stdout)
+                .unwrap()
+                .contains("\n  \"")
+        );
+
+        let mut legacy_pretty = base.clone();
+        legacy_pretty.push("-v");
+        assert_eq!(
+            json_output(root.path(), &legacy_pretty),
+            json_output(root.path(), &pretty)
+        );
+
+        let mut text = base;
+        text.extend(["--format", "text"]);
+        let text_out = run(root.path(), &text);
+        assert!(
+            text_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&text_out.stderr)
+        );
+        assert!(!text_out.stdout.is_empty());
+        assert!(serde_json::from_slice::<Value>(&text_out.stdout).is_err());
+        let rendered = String::from_utf8(text_out.stdout).unwrap();
+        assert!(rendered.contains("session"));
+        assert!(rendered.contains("padd"));
+    }
+}
+
+#[test]
+fn session_json_wraps_the_jsonl_entries_including_the_page_marker() {
+    let (root, _) = fixture();
+    let base = ["session", "session", "--max-chars", "5"];
+    let expected = values(root.path(), &base);
+    assert_eq!(expected.len(), 2);
+    assert_eq!(expected[1]["type"], "page");
+
+    let mut explicit_jsonl = base.to_vec();
+    explicit_jsonl.extend(["--format", "jsonl"]);
+    assert_eq!(values(root.path(), &explicit_jsonl), expected);
+
+    let mut json = base.to_vec();
+    json.extend(["--format", "json"]);
+    assert_eq!(json_output(root.path(), &json), serde_json::json!(expected));
+
+    let mut pretty = json.clone();
+    pretty.push("--pretty");
+    let pretty_out = run(root.path(), &pretty);
+    assert!(pretty_out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&pretty_out.stdout).unwrap(),
+        serde_json::json!(expected)
+    );
+
+    let mut invalid_pretty = base.to_vec();
+    invalid_pretty.push("--pretty");
+    assert!(!run(root.path(), &invalid_pretty).status.success());
+    let mut explicit_invalid_pretty = base.to_vec();
+    explicit_invalid_pretty.extend(["--format", "jsonl", "--pretty"]);
+    assert!(!run(root.path(), &explicit_invalid_pretty).status.success());
+
+    let mut text = base.to_vec();
+    text.extend(["--format", "text"]);
+    let mut legacy_text = base.to_vec();
+    legacy_text.push("-v");
+    assert_eq!(
+        run(root.path(), &text).stdout,
+        run(root.path(), &legacy_text).stdout
+    );
+}
+
+#[test]
+fn session_batch_json_wraps_the_same_pages_as_jsonl() {
+    let (root, _) = fixture();
+    let request = root.path().join("requests.jsonl");
+    std::fs::write(
+        &request,
+        "{\"session_id\":\"session\",\"offset\":0,\"limit\":1}\n{\"session_id\":\"session\",\"offset\":2,\"limit\":1}\n",
+    )
+    .unwrap();
+    let input = request.to_str().unwrap();
+    let base = ["session", "batch", input, "--max-chars", "7"];
+    let expected = values(root.path(), &base);
+    assert_eq!(expected.len(), 2);
+
+    let mut json = base.to_vec();
+    json.extend(["--format", "json"]);
+    assert_eq!(json_output(root.path(), &json), serde_json::json!(expected));
+
+    let mut pretty = json;
+    pretty.push("--pretty");
+    assert_eq!(
+        json_output(root.path(), &pretty),
+        serde_json::json!(expected)
+    );
+
+    let mut invalid_pretty = base.to_vec();
+    invalid_pretty.push("--pretty");
+    assert!(!run(root.path(), &invalid_pretty).status.success());
+
+    let mut text = base.to_vec();
+    text.extend(["--format", "text"]);
+    let text_out = run(root.path(), &text);
+    assert!(text_out.status.success());
+    assert!(serde_json::from_slice::<Value>(&text_out.stdout).is_err());
+    let rendered = String::from_utf8(text_out.stdout).unwrap();
+    assert!(rendered.contains("session"));
+}
+
+#[test]
+fn sessions_json_wraps_the_same_entries_as_jsonl() {
+    let (root, _) = fixture();
+    let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    backfill_from_index(analytics_path(&paths.state), &index).unwrap();
+
+    let base = ["sessions", "--limit", "5"];
+    let expected = values(root.path(), &base);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(expected[0]["session_id"], "session");
+
+    let mut json = base.to_vec();
+    json.extend(["--format", "json"]);
+    assert_eq!(json_output(root.path(), &json), serde_json::json!(expected));
+
+    let mut legacy_json = base.to_vec();
+    legacy_json.push("--json-array");
+    assert_eq!(
+        json_output(root.path(), &legacy_json),
+        serde_json::json!(expected)
+    );
+
+    let mut pretty = json;
+    pretty.push("--pretty");
+    assert_eq!(
+        json_output(root.path(), &pretty),
+        serde_json::json!(expected)
+    );
+
+    let mut invalid_pretty = base.to_vec();
+    invalid_pretty.push("--pretty");
+    assert!(!run(root.path(), &invalid_pretty).status.success());
+
+    let mut text = base.to_vec();
+    text.extend(["--format", "text"]);
+    let text_out = run(root.path(), &text);
+    assert!(text_out.status.success());
+    assert!(serde_json::from_slice::<Value>(&text_out.stdout).is_err());
+    let rendered = String::from_utf8(text_out.stdout).unwrap();
+    assert!(rendered.contains("session"));
+    assert!(rendered.contains("test"));
 }

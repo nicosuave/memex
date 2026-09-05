@@ -127,7 +127,7 @@ async function exchangeBootstrapToken() {
   })
   if (!response.ok) {
     throw new Error(
-      "Authentication failed. Run `memex index-service open` for a new link.",
+      "Authentication failed. Run `memex web open` for a new link.",
     )
   }
   const payload = (await response.json()) as { token?: string }

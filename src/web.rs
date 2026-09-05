@@ -192,7 +192,7 @@ fn bearer_token(request: &Request) -> Option<&str> {
 
 fn respond_unauthorized(request: Request) -> Result<()> {
     let body = serde_json::to_vec(&ErrorPayload {
-        error: "authentication required; run `memex index-service open`",
+        error: "authentication required; run `memex web open`",
     })?;
     respond_with_headers(
         request,

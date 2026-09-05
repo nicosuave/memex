@@ -1019,7 +1019,7 @@ enum StaleSchemaPolicy {
 
 fn stale_schema_error(dir: &Path) -> anyhow::Error {
     anyhow!(
-        "index schema at {} is stale; run `memex index` or `memex reindex` to rebuild it",
+        "index schema at {} is stale; run `memex index` or `memex index rebuild` to rebuild it",
         dir.display()
     )
 }

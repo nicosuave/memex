@@ -284,7 +284,8 @@ fn agent_and_non_interactive_ptys_show_help_without_prompting() {
         }
         let output = run_pty(&mut command, b"");
         assert!(output.status.success(), "{}", output.output);
-        assert!(output.output.contains("Fast local history search"));
+        assert!(output.output.contains("Usage: memex"));
+        assert!(output.output.contains("Find and read:"));
         assert!(output.output.contains("update: memex v99.0.0 is available"));
         assert!(
             !output

@@ -29,10 +29,10 @@ identify the mechanism or task shape; topic similarity alone is insufficient.
 | Request | First move |
 | --- | --- |
 | Known record or session | Read it directly; skip discovery |
-| Recent work or resumption | `memex sessions --cwd . --limit 20 --json-array`; use its `resume_cmd` |
+| Recent work or resumption | `memex sessions --cwd . --limit 20 --format json`; use its `resume_cmd` |
 | Exact path, symbol, error, command, PR, URL, or quoted phrase | Lexical search |
-| Uncertain wording with some literal anchors | `--hybrid` |
-| Abstract similarity with few literal anchors | `--semantic` |
+| Uncertain wording with some literal anchors | `--mode hybrid` |
+| Abstract similarity with few literal anchors | `--mode semantic` |
 | Decision, fix, or session narrative | Find an anchor, then reconstruct its surrounding sequence |
 | Cross-session comparison | Decompose the information needs and diversify by session |
 
@@ -45,7 +45,7 @@ Stop after two reformulation rounds unless the user requests exhaustive research
 
 ```bash
 memex search "exact anchor" --cwd . --unique-session --limit 20 --format toon
-memex search "remembered concept" --hybrid --project <project> --unique-session --format toon
+memex search "remembered concept" --mode hybrid --project <project> --unique-session --format toon
 memex search "anchor" --query "another view" --unique-session --format toon
 ```
 
@@ -75,14 +75,15 @@ identifiers, user phrasing, or selected/rejected alternatives:
 - Too sparse: use corpus terminology, try hybrid/semantic, relax role/tool/source
   filters, then widen time. Drop project scope only when cross-project evidence fits.
 - If vectors are unavailable, continue with lexical results when adequate. Mention
-  `memex embed` only when semantic recall matters; keep maintenance out of the lookup.
+  `memex index embed` only when semantic recall matters; keep maintenance out of the lookup.
 
 Search returns compact references and excerpts around literal matches; semantic-only
 hits use a prefix. Use `--fields` for a custom projection and `--full` only when all
 stored fields are needed. **Default to `--format toon` for agent-consumed search
 results.** It preserves the selected values in a TOON `results` array. Use JSONL
 (the CLI default) for scripts, or `--format json` when a JSON array is required.
-Explicit `--format` conflicts with `--json-array` and `-v`.
+Use `--format text` for human-readable output and `--format json --pretty` for
+pretty JSON.
 
 ## Read progressively
 
@@ -117,6 +118,11 @@ memex context --record-id <record_id> --machine <machine_id> --offset <next_offs
   and `tool-output`; continuation metadata uses `text`, `tool_input`, `tool_output`.
 - Session pages default to at most 50 records. Their JSONL ends with `type: "page"`
   and `offset`, `total`, `next_offset`. Context returns these pagination fields too.
+- `sessions`, `session`, and `session batch` default to JSONL; `--format json` wraps
+  the unchanged entries in an array. For `session`, this includes its final page
+  marker. Use `--format text`
+  for human-readable output and add `--pretty` only with JSON. `show` and `context`
+  default to one JSON object and accept `--pretty` directly.
 - `next_offset` resumes later records. Finish any relevant truncated field with
   `show` before moving on; page offsets do not recover omitted field content.
 - Bounded context returns the anchor first, then remaining records chronologically.
@@ -124,8 +130,8 @@ memex context --record-id <record_id> --machine <machine_id> --offset <next_offs
 - `--max-chars N` changes the budget; `--full` disables it and conflicts with that
   flag. Use a complete transcript only when the question requires it; `--limit`
   still bounds the record count in full session reads.
-- For several session pages, use `memex hydrate requests.jsonl`; consult
-  `memex hydrate --help` for the request schema. One budget is shared in input order,
+- For several session pages, use `memex session batch requests.jsonl`; consult
+  `memex session batch --help` for the request schema. One budget is shared in input order,
   with per-record continuations and per-request page offsets. Avoid batching one hit.
 
 For sequence-dependent questions, read far enough to recover decisions, corrections,
@@ -134,7 +140,7 @@ session can locate the relevant interval before paging through it.
 
 Older indexes remain readable but stable-ID lookup may scan until rebuilt; current
 indexes use exact IDs and session/source/path scope. Bounded remote reads need updated
-peers. Legacy document-ID `show`, `session`, and `hydrate` may use `--full` when
+peers. Legacy document-ID `show` and `session` reads may use `--full` when
 unbounded content is appropriate; remote context/stable-ID reads need an updated peer
 in either mode. Do not substitute an unbounded read without considering its scope.
 
@@ -172,12 +178,14 @@ leave missing copies uninstalled, and require restarting the agent to load chang
 ## Specialized tasks
 
 - For retrieval debugging or relevance evaluation, use `memex search --help` for
-  `--trace` and `memex eval-retrieval --help`. Traces omit transcript contents;
+  `--trace` and `memex debug eval-retrieval --help`. Traces omit transcript contents;
   relevance evaluation reports recall, MRR, nDCG, and session diversity.
 - For indexing, privacy, or embedding configuration, inspect `memex index --help`
-  and `memex index-service status`. Agent subprocesses are indexed and filtered at
+  and `memex service status`. Agent subprocesses are indexed and filtered at
   query time. Plaintext reasoning is excluded by default; encrypted/redacted
-  reasoning remains excluded. Check `--exclude`, `--include-reasoning`, and
-  `--embeddings --model` only when that configuration is in scope.
+  reasoning remains excluded. Use repeatable `--only-source` and `--exclude-source`
+  options for provider scope, and `--claude-path` for an alternate Claude projects
+  directory. Check `--exclude`, `--include-reasoning`, and `--embeddings --model`
+  only when that configuration is in scope.
 - Hermes primarily contributes usage data; source support alone does not establish
   that searchable transcripts are available.
