@@ -1455,12 +1455,12 @@ fn token_hash(token: &str) -> [u8; 32] {
 }
 
 fn now_seconds() -> Result<i64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_secs()
         .try_into()
-        .context("timestamp overflow")?)
+        .context("timestamp overflow")
 }
 
 fn approval_html(request: &PendingRequest, request_id: &str) -> String {
