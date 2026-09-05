@@ -204,6 +204,11 @@ Search already returns a compact projection by default: `machine`, `score`, `ts`
 fall back to a compact prefix. Use `--fields` only when a different explicit projection
 helps, and `--full` only when discovery itself requires all stored fields.
 
+Use `memex search "query" --format toon` for TOON-encoded agent input. It preserves
+search fields in a `results` array and works with `--fields` or `--full`. JSONL remains
+the default for scripts; `--format json` returns a JSON array. Do not combine explicit
+`--format` with `--json-array` or `-v`.
+
 Use `--top-n-per-session 2` when two nuclei per session are helpful.
 
 Rank candidate sessions using more than raw score:

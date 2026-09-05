@@ -153,6 +153,17 @@ semantic-only hits use a compact prefix. Use `--fields` for an explicit projecti
 `--full` to restore every legacy search field, including full record text and linkage
 metadata.
 
+Agent-facing TOON output is available for search:
+
+```sh
+memex search "your query" --format toon
+```
+
+It returns one TOON document with a `results` array and preserves the same values as
+JSON output, including custom `--fields` and `--full`. `--format jsonl` is the default;
+`--format json` returns one JSON array, like `--json-array`. Explicit `--format`
+conflicts with `--json-array` and verbose output (`-v`).
+
 TUI:
 ```
 memex tui

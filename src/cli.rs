@@ -284,6 +284,9 @@ OUTPUT FIELDS (--fields):
         /// Output results as a single JSON array instead of newline-delimited JSON
         #[arg(long)]
         json_array: bool,
+        /// Search output encoding (JSONL by default)
+        #[arg(long, value_enum, default_value = "jsonl", conflicts_with_all = ["json_array", "verbose"])]
+        format: SearchFormat,
         /// Comma-separated list of fields to include in output
         #[arg(long, value_name = "FIELDS")]
         fields: Option<String>,
@@ -940,6 +943,7 @@ pub fn run() -> Result<()> {
             top_n_per_session,
             unique_session,
             json_array,
+            format,
             fields,
             full,
             sort,
@@ -969,6 +973,7 @@ pub fn run() -> Result<()> {
                 top_n_per_session,
                 unique_session,
                 json_array,
+                format,
                 fields,
                 full,
                 sort,
@@ -1560,6 +1565,7 @@ fn run_search(
     top_n_per_session: Option<usize>,
     unique_session: bool,
     json_array: bool,
+    format: SearchFormat,
     fields: Option<String>,
     full: bool,
     sort: SortBy,
@@ -1613,7 +1619,11 @@ fn run_search(
     let render = RenderOptions {
         verbose,
         matchers,
-        json_array: json_array && !verbose,
+        format: if json_array && !verbose {
+            SearchFormat::Json
+        } else {
+            format
+        },
         fields,
         sort,
         min_score,
@@ -1727,11 +1737,18 @@ fn run_search(
     render_located_results(results, &render)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SearchFormat {
+    Jsonl,
+    Json,
+    Toon,
+}
+
 #[derive(Clone)]
 struct RenderOptions {
     verbose: bool,
     matchers: Vec<regex::Regex>,
-    json_array: bool,
+    format: SearchFormat,
     fields: Option<HashSet<String>>,
     sort: SortBy,
     min_score: Option<f32>,
@@ -1924,15 +1941,20 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
                 links: record.links,
             })?
         };
-        if render.json_array {
+        if render.format != SearchFormat::Jsonl {
             output.push(value);
         } else {
             println!("{}", serde_json::to_string(&value)?);
         }
     }
 
-    if render.json_array {
-        println!("{}", serde_json::to_string(&output)?);
+    match render.format {
+        SearchFormat::Jsonl => {}
+        SearchFormat::Json => println!("{}", serde_json::to_string(&output)?),
+        SearchFormat::Toon => println!(
+            "{}",
+            toon_format::encode_default(&serde_json::json!({"results": output}))?
+        ),
     }
     Ok(())
 }
