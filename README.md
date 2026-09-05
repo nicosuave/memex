@@ -114,12 +114,34 @@ The shared `memex-search` skill is installed once at
 For Claude Code, use `memex skill install --target claude`; its copy lives at
 `~/.claude/skills/memex-search/SKILL.md`.
 
-Use `memex skill status` to compare installed copies with the current Memex binary,
-`memex skill update` after upgrading Memex, and `memex skill cleanup` to explicitly
-remove obsolete paths left by older releases. Install never overwrites a differing file;
-update only replaces copies that are already installed.
+Launching `memex` in a human terminal offers an update when a newer release is
+available. Press Enter to update Memex and refresh its installed skill copies, or
+choose no to continue into the TUI. Homebrew installs run `brew update` followed by
+`brew upgrade nicosuave/tap/memex`; skills are refreshed by the newly installed binary.
+After updating, run `memex` again to start that version.
 
-Restart Claude, Codex, OpenCode, Pi, or Oh My Pi after installing or updating the skill.
+Agents and scripts still receive update notices but never a startup prompt. Memex
+recognizes CI, Codex, and Claude Code environment markers; use `--non-interactive`
+explicitly for other agents, including those using a PTY. Bare noninteractive
+`memex` prints help, while `search` and other data commands run normally. To update:
+
+```bash
+memex update --yes
+```
+
+Without `--yes`, explicit `memex update` requires a human terminal and confirmation.
+Both update paths replace existing shared/Claude skill copies, including local edits;
+they do not install missing copies. Restart your agent after its skill is updated.
+
+Searches warn on stderr when an installed skill differs from the running binary
+(outdated or locally modified). `memex skill status` shows which copies differ;
+`memex skill update` refreshes skills without upgrading Memex. Searches never update
+anything or prompt, and JSONL/TOON output on stdout stays clean. Use
+`memex skill cleanup` to explicitly remove obsolete paths from older releases.
+
+Release checks have a two-second network timeout and are cached for six hours
+(failed checks retry after five minutes). `--no-update-check` skips release checks
+without hiding stale-skill warnings. Install never overwrites a differing skill file.
 
 ## Quickstart
 
