@@ -156,7 +156,7 @@ struct PtyOutput {
 fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 30,
         ws_col: 120,
         ws_xpixel: 0,
@@ -167,8 +167,8 @@ fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &size,
+            std::ptr::null_mut(),
+            &mut size,
         )
     };
     assert_eq!(
@@ -188,7 +188,7 @@ fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
