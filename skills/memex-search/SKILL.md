@@ -1,6 +1,6 @@
 ---
 name: memex-search
-description: Search prior agent-session history with memex when a request depends on earlier work, decisions, investigations, fixes, commands, errors, or project context, including details lost or summarized across context-compaction boundaries. Invoke proactively to recover exact evidence, resume prior work, avoid repeating work, or find an analogous solution.
+description: Discover prior agent work across sessions, projects, providers, and machines. Use for historical investigations and analogous solutions, or as a fallback when native conversation and history tools cannot recover the needed evidence.
 allowed-tools: Bash(memex:*)
 ---
 
@@ -11,6 +11,11 @@ Use memex as an episodic retrieval system, not as a one-shot search box.
 The goal is to recover the smallest set of source-grounded records or trajectories that actually answer the user's question. Search iteratively when needed, but stop once the evidence is sufficient.
 
 ## Core Rules
+
+For recovery within the current active task, use native notes/history and the task worklog
+first. Read known Codex or ChatGPT conversations with native conversation tools when
+available. Use Memex when those sources are unavailable or insufficient, and for discovery
+across prior sessions, projects, providers, or machines.
 
 1. **Retrieve adaptively.** A known session ID needs no search. An exact filename or error may need one lexical query. An ambiguous historical question may need several query views and one or two reformulation rounds.
 2. **Search for evidence, not an answer-shaped snippet.** Search rank is only a candidate generator. Inspect the record or trajectory before making claims.
@@ -190,9 +195,14 @@ During discovery, default to one hit per session:
 ```bash
 memex search "query" \
   --unique-session \
-  --limit 20 \
-  --fields machine,score,ts,doc_id,session_id,project,role,source,snippet,event_id,parent_event_id,parent_tool_use_id
+  --limit 20
 ```
+
+Search already returns a compact projection by default: `machine`, `score`, `ts`,
+`doc_id`, `record_id`, `project`, `role`, `session_id`, `source`, `source_path`,
+`snippet`, and `matches`. Lexical snippets center a literal match; semantic-only results
+fall back to a compact prefix. Use `--fields` only when a different explicit projection
+helps, and `--full` only when discovery itself requires all stored fields.
 
 Use `--top-n-per-session 2` when two nuclei per session are helpful.
 

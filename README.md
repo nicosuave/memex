@@ -146,6 +146,13 @@ Search (JSONL default):
 memex search "your query" --limit 20
 ```
 
+Search output is compact by default. Each hit contains `machine`, `score`, `ts`,
+`doc_id`, `record_id`, `project`, `role`, `session_id`, `source`, `source_path`,
+`snippet`, and `matches`. Lexical snippets center the earliest literal match;
+semantic-only hits use a compact prefix. Use `--fields` for an explicit projection or
+`--full` to restore every legacy search field, including full record text and linkage
+metadata.
+
 TUI:
 ```
 memex tui
@@ -323,10 +330,12 @@ Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh 
 - `--sort score|ts`
 - `--top-n-per-session <n>`
 - `--unique-session`
-- `--fields score,ts,doc_id,session_id,snippet`
+- `--fields score,ts,doc_id,record_id,session_id,snippet`
+- `--full` (all legacy search fields; conflicts with `--fields`)
 - `--json-array`
 
-JSON output also includes `source` and, when available, tree/linkage metadata:
+Default JSON search output uses the compact fields documented above. Full or explicit
+projections can also include tree/linkage metadata:
 `event_id`, `parent_event_id`, `logical_parent_event_id`,
 `parent_session_id`, `thread_source`, `conversation_kind`,
 `parent_tool_use_id`, `source_tool_use_id`, and
