@@ -35,6 +35,7 @@ simd-json = { version = "0.13", features = ["serde"] }
 tantivy = "0.22"
 usearch = "2"
 toml = "0.8"
+toml_edit = "0.22"
 walkdir = "2.5"
 globset = "0.4"
 indicatif = "0.17"

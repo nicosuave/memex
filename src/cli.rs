@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 use std::time::Instant;
+use toml_edit::{DocumentMut, Item as TomlItem, value};
 
 mod surface;
 use surface::{
@@ -1804,8 +1805,8 @@ fn run_index(
     )?;
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
-    if reindex && paths.root.exists() {
-        std::fs::remove_dir_all(&paths.root)?;
+    if reindex {
+        reset_reindex_artifacts(&paths)?;
     }
     paths.ensure_dirs()?;
     let index = if continuous {
@@ -1864,6 +1865,50 @@ fn run_index(
         );
     }
     Ok(())
+}
+
+fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
+    remove_generated_path(&paths.index)?;
+    remove_generated_path(&paths.vectors)?;
+
+    for name in [
+        "ingest.json",
+        "ingest.pending.json",
+        "scan_cache.json",
+        "analytics.sqlite",
+        "analytics.sqlite-wal",
+        "analytics.sqlite-shm",
+        "analytics.sqlite-journal",
+        "usage-cache.sqlite3",
+        "usage-cache.sqlite3-wal",
+        "usage-cache.sqlite3-shm",
+        "usage-cache.sqlite3-journal",
+    ] {
+        let path = paths.state.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove reindex artifact {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_generated_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.with_context(|| format!("remove reindex artifact {}", path.display()))
 }
 
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
@@ -4341,6 +4386,22 @@ fn run_index_service_enable(
         ));
     }
 
+    let config_updates = IndexServiceConfigUpdates {
+        label: label.clone(),
+        stdout: config_path_setting(stdout.as_deref(), "--stdout")?,
+        stderr: config_path_setting(stderr.as_deref(), "--stderr")?,
+        plist: config_path_setting(plist.as_deref(), "--plist")?,
+        systemd_dir: config_path_setting(systemd_dir.as_deref(), "--systemd-dir")?,
+        ..IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp_args,
+        )?
+    };
+
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
     let mcp = mcp_args.resolve(&config);
@@ -4417,6 +4478,7 @@ fn run_index_service_enable(
     };
 
     result?;
+    persist_index_service_config(&paths, &config_updates)?;
     disable_auto_index_on_search_by_default(&paths, &config)?;
     if web_ui {
         wait_for_web_ui(&web_listen, Duration::from_secs(5))?;
@@ -4432,6 +4494,160 @@ fn run_index_service_enable(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct IndexServiceConfigUpdates {
+    mode: Option<&'static str>,
+    poll_interval: Option<i64>,
+    interval: Option<i64>,
+    web_ui: Option<bool>,
+    web_listen: Option<String>,
+    mcp: Option<bool>,
+    mcp_listen: Option<std::net::SocketAddr>,
+    label: Option<String>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    plist: Option<String>,
+    systemd_dir: Option<String>,
+}
+
+fn config_path_setting(path: Option<&Path>, option: &str) -> Result<Option<String>> {
+    path.map(|path| {
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("{option} must be valid UTF-8 to store in config.toml"))
+    })
+    .transpose()
+}
+
+impl IndexServiceConfigUpdates {
+    fn from_cli(
+        continuous: bool,
+        poll_interval: Option<u64>,
+        interval: Option<u64>,
+        web_ui: bool,
+        web_listen: Option<&str>,
+        mcp_args: &DaemonMcpArgs,
+    ) -> Result<Self> {
+        let mode = if continuous
+            || poll_interval.is_some()
+            || web_ui
+            || web_listen.is_some()
+            || mcp_args.mcp
+            || mcp_args.mcp_listen.is_some()
+        {
+            Some("continuous")
+        } else if interval.is_some() {
+            Some("interval")
+        } else {
+            None
+        };
+        Ok(Self {
+            mode,
+            poll_interval: poll_interval
+                .map(i64::try_from)
+                .transpose()
+                .context("--poll-interval is too large to store in config.toml")?,
+            interval: interval
+                .map(i64::try_from)
+                .transpose()
+                .context("--interval is too large to store in config.toml")?,
+            web_ui: (web_ui || web_listen.is_some()).then_some(true),
+            web_listen: web_listen.map(str::to_owned),
+            mcp: if mcp_args.no_mcp {
+                Some(false)
+            } else if mcp_args.mcp || mcp_args.mcp_listen.is_some() {
+                Some(true)
+            } else {
+                None
+            },
+            mcp_listen: mcp_args.mcp_listen,
+            ..Default::default()
+        })
+    }
+}
+
+fn persist_index_service_config(paths: &Paths, updates: &IndexServiceConfigUpdates) -> Result<()> {
+    if updates.mode.is_none()
+        && updates.poll_interval.is_none()
+        && updates.interval.is_none()
+        && updates.web_ui.is_none()
+        && updates.web_listen.is_none()
+        && updates.mcp.is_none()
+        && updates.mcp_listen.is_none()
+        && updates.label.is_none()
+        && updates.stdout.is_none()
+        && updates.stderr.is_none()
+        && updates.plist.is_none()
+        && updates.systemd_dir.is_none()
+    {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&paths.root)?;
+    let path = paths.root.join("config.toml");
+    let contents = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut document = contents
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parse {} before updating daemon settings", path.display()))?;
+
+    if let Some(mode) = updates.mode {
+        replace_toml_value(&mut document["index_service_mode"], value(mode));
+    }
+    if let Some(interval) = updates.poll_interval {
+        replace_toml_value(
+            &mut document["index_service_poll_interval"],
+            value(interval),
+        );
+    }
+    if let Some(interval) = updates.interval {
+        replace_toml_value(&mut document["index_service_interval"], value(interval));
+    }
+    if let Some(enabled) = updates.web_ui {
+        replace_toml_value(&mut document["index_service_web_ui"], value(enabled));
+    }
+    if let Some(listen) = &updates.web_listen {
+        replace_toml_value(
+            &mut document["index_service_web_listen"],
+            value(listen.as_str()),
+        );
+    }
+    if let Some(enabled) = updates.mcp {
+        replace_toml_value(&mut document["index_service_mcp"], value(enabled));
+    }
+    if let Some(listen) = updates.mcp_listen {
+        replace_toml_value(&mut document["mcp"]["listen"], value(listen.to_string()));
+    }
+    for (key, setting) in [
+        ("index_service_label", updates.label.as_deref()),
+        ("index_service_stdout", updates.stdout.as_deref()),
+        ("index_service_stderr", updates.stderr.as_deref()),
+        ("index_service_plist", updates.plist.as_deref()),
+        ("index_service_systemd_dir", updates.systemd_dir.as_deref()),
+    ] {
+        if let Some(setting) = setting {
+            replace_toml_value(&mut document[key], value(setting));
+        }
+    }
+
+    std::fs::write(&path, document.to_string())?;
+    println!("updated daemon settings: {}", path.display());
+    Ok(())
+}
+
+fn replace_toml_value(item: &mut TomlItem, replacement: TomlItem) {
+    let decor = item.as_value().map(|value| value.decor().clone());
+    *item = replacement;
+    if let Some(decor) = decor
+        && let Some(value) = item.as_value_mut()
+    {
+        *value.decor_mut() = decor;
+    }
 }
 
 fn disable_auto_index_on_search_by_default(paths: &Paths, config: &UserConfig) -> Result<()> {
@@ -6909,6 +7125,264 @@ arguments = {
 
         let contents = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
         assert_eq!(contents, "auto_index_on_search = true\n");
+    }
+
+    #[test]
+    fn reindex_resets_only_derived_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::create_dir_all(paths.root.join("embed-cache")).unwrap();
+
+        let preserved = [
+            (paths.root.join("config.toml"), "index_service_mcp = true"),
+            (paths.root.join("web-auth-token"), "owner-secret"),
+            (paths.root.join("mcp-oauth.sqlite3"), "oauth registrations"),
+            (paths.root.join("index-service.plist"), "launch config"),
+            (paths.root.join("unrelated-user-file"), "keep me"),
+            (
+                paths.state.join("retrieval-traces.jsonl"),
+                "recorded evaluation",
+            ),
+            (paths.state.join("unrelated-state"), "keep this too"),
+            (paths.root.join("embed-cache/model.bin"), "cached model"),
+        ];
+        for (path, contents) in &preserved {
+            std::fs::write(path, contents).unwrap();
+        }
+
+        std::fs::write(paths.index.join("derived-index"), "index").unwrap();
+        std::fs::write(paths.vectors.join("derived-vectors"), "vectors").unwrap();
+        for name in [
+            "ingest.json",
+            "ingest.pending.json",
+            "scan_cache.json",
+            "analytics.sqlite",
+            "analytics.sqlite-wal",
+            "analytics.sqlite-shm",
+            "analytics.sqlite-journal",
+            "usage-cache.sqlite3",
+            "usage-cache.sqlite3-wal",
+            "usage-cache.sqlite3-shm",
+            "usage-cache.sqlite3-journal",
+        ] {
+            std::fs::write(paths.state.join(name), "derived").unwrap();
+        }
+
+        reset_reindex_artifacts(&paths).unwrap();
+
+        assert!(!paths.index.exists());
+        assert!(!paths.vectors.exists());
+        for name in [
+            "ingest.json",
+            "ingest.pending.json",
+            "scan_cache.json",
+            "analytics.sqlite",
+            "analytics.sqlite-wal",
+            "analytics.sqlite-shm",
+            "analytics.sqlite-journal",
+            "usage-cache.sqlite3",
+            "usage-cache.sqlite3-wal",
+            "usage-cache.sqlite3-shm",
+            "usage-cache.sqlite3-journal",
+        ] {
+            assert!(!paths.state.join(name).exists(), "preserved {name}");
+        }
+        for (path, expected) in preserved {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                expected,
+                "changed preserved file {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_cli_settings_override_config_without_discarding_other_content() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "# user preferences\nindex_service_mode = \"interval\" # choose scheduling\nindex_service_web_ui = false\nindex_service_mcp = false\ninclude_reasoning = true\n\n[mcp]\n# keep this policy\nlisten = \"127.0.0.1:5363\"\nallowed_hosts = [\"localhost\"]\n",
+        )
+        .unwrap();
+        let web_listen = "127.0.0.1:6464".to_string();
+        let mcp_listen = "127.0.0.1:5464".parse().unwrap();
+
+        persist_index_service_config(
+            &paths,
+            &IndexServiceConfigUpdates {
+                mode: Some("continuous"),
+                poll_interval: Some(12),
+                web_ui: Some(true),
+                web_listen: Some(web_listen.clone()),
+                mcp: Some(true),
+                mcp_listen: Some(mcp_listen),
+                plist: Some("/tmp/com.memex.index.plist".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let updated = UserConfig::load(&paths).unwrap();
+        assert_eq!(updated.index_service_mode(), Some("continuous"));
+        assert_eq!(updated.index_service_poll_interval(), 12);
+        assert_eq!(updated.index_service_web_ui, Some(true));
+        assert_eq!(
+            updated.index_service_web_listen.as_deref(),
+            Some(web_listen.as_str())
+        );
+        assert_eq!(updated.index_service_mcp, Some(true));
+        assert_eq!(updated.mcp.listen, Some(mcp_listen));
+        assert_eq!(updated.include_reasoning, Some(true));
+        assert_eq!(
+            updated.index_service_plist.as_deref(),
+            Some(Path::new("/tmp/com.memex.index.plist"))
+        );
+        let contents = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(contents.contains("# user preferences"));
+        assert!(contents.contains("# choose scheduling"));
+        assert!(contents.contains("# keep this policy"));
+        assert!(contents.contains("allowed_hosts = [\"localhost\"]"));
+    }
+
+    #[test]
+    fn explicit_no_mcp_persists_over_configured_enablement() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "index_service_mode = \"continuous\"\nindex_service_mcp = true\n",
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from(["memex", "index-service", "restart", "--no-mcp"]).unwrap();
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Restart {
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    mcp,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected index service restart command");
+        };
+        let updates = IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp,
+        )
+        .unwrap();
+        persist_index_service_config(&paths, &updates).unwrap();
+
+        let updated = UserConfig::load(&paths).unwrap();
+        assert_eq!(updated.index_service_mcp, Some(false));
+        assert!(
+            DaemonMcpArgs {
+                mcp: false,
+                no_mcp: false,
+                mcp_listen: None,
+            }
+            .resolve(&updated)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn plain_restart_reuses_previously_persisted_daemon_settings() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        let mcp_listen = "127.0.0.1:5565".parse().unwrap();
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index-service",
+            "enable",
+            "--continuous",
+            "--poll-interval",
+            "9",
+            "--web-listen",
+            "127.0.0.1:6565",
+            "--mcp-listen",
+            "127.0.0.1:5565",
+        ])
+        .unwrap();
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Enable {
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    mcp,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected index service enable command");
+        };
+        let updates = IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp,
+        )
+        .unwrap();
+        persist_index_service_config(&paths, &updates).unwrap();
+        let before_restart = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        let restart = Cli::try_parse_from(["memex", "index-service", "restart"]).unwrap();
+        let Some(Commands::IndexService {
+            action:
+                IndexServiceCommand::Restart {
+                    continuous,
+                    poll_interval,
+                    interval,
+                    web_ui,
+                    web_listen,
+                    mcp,
+                    ..
+                },
+        }) = restart.command
+        else {
+            panic!("expected plain index service restart command");
+        };
+        let restart_updates = IndexServiceConfigUpdates::from_cli(
+            continuous,
+            poll_interval,
+            interval,
+            web_ui,
+            web_listen.as_deref(),
+            &mcp,
+        )
+        .unwrap();
+        persist_index_service_config(&paths, &restart_updates).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            before_restart
+        );
+        let restarted = UserConfig::load(&paths).unwrap();
+        assert_eq!(restarted.index_service_mode(), Some("continuous"));
+        assert_eq!(restarted.index_service_poll_interval(), 9);
+        assert!(restarted.index_service_web_ui_default());
+        assert_eq!(
+            restarted.index_service_web_listen.as_deref(),
+            Some("127.0.0.1:6565")
+        );
+        let mcp = DaemonMcpArgs::default().resolve(&restarted).unwrap();
+        assert_eq!(mcp.listen, mcp_listen);
     }
 
     fn make_vector(dims: usize) -> Vec<f32> {

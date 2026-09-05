@@ -2402,6 +2402,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "toml",
+ "toml_edit 0.22.27",
  "toon-format",
  "tower-http",
  "tui-markdown",
