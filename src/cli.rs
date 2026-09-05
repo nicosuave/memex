@@ -27,14 +27,14 @@ use crate::usage::{CostMode, UsageQuery, scan_usage};
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result, anyhow};
 use chrono::SecondsFormat;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -58,6 +58,12 @@ LEARN MORE:
     memex <command> --help          # Detailed help for each command"
 )]
 pub struct Cli {
+    /// Never prompt or open the TUI (agents may use this even with a PTY)
+    #[arg(long, global = true)]
+    non_interactive: bool,
+    /// Skip release availability checks; does not disable stale-skill warnings
+    #[arg(long, global = true)]
+    no_update_check: bool,
     /// Defaults to the interactive TUI when no command is given
     #[command(subcommand)]
     command: Option<Commands>,
@@ -571,9 +577,12 @@ EXAMPLES:
         #[arg(short, long)]
         force: bool,
     },
-    /// Update memex to the latest version
+    /// Update memex and refresh existing memex-search skill copies
+    #[command(
+        after_help = "Use --yes for agents and scripts, including shells with a PTY.\nWithout --yes, update requires a terminal and asks for confirmation.\nExisting skill copies are replaced; missing copies are not installed."
+    )]
     Update {
-        /// Skip confirmation prompt
+        /// Update without prompting (for agents and scripts)
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -877,21 +886,55 @@ enum IndexServiceCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let interactive = interaction_allowed(
+        cli.non_interactive,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+        agent_or_ci_environment(),
+    );
+    let check_updates = !cli.no_update_check;
+    if cli.command.is_none() && !interactive {
+        if check_updates {
+            print_update_notice(available_update().as_deref());
+        }
+        warn_if_skill_outdated();
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
     // Bare `memex` opens the TUI home screen.
     let command = cli.command.unwrap_or(Commands::Tui {
         query: None,
         project: None,
         root: None,
     });
+    if !interactive
+        && matches!(
+            command,
+            Commands::Setup { .. }
+                | Commands::Skill {
+                    command: SkillCommand::Install { target: None }
+                }
+        )
+    {
+        return Err(anyhow!(
+            "skill installation requires a destination without interactive selection; use `memex skill install --target shared`, `--target claude`, or `--target all`"
+        ));
+    }
     let should_check = !matches!(
         command,
         Commands::Tui { .. }
             | Commands::Update { .. }
+            | Commands::Skill { .. }
             | Commands::Rpc { .. }
             | Commands::Herdr { .. }
     );
-    if should_check {
-        check_for_update_async(None);
+    if should_check && check_updates {
+        print_update_notice(available_update().as_deref());
+    }
+    if matches!(command, Commands::Search { .. }) {
+        warn_if_skill_outdated();
     }
     match command {
         Commands::Index {
@@ -988,9 +1031,26 @@ pub fn run() -> Result<()> {
             project,
             root,
         } => {
-            let (update_tx, update_rx) = std::sync::mpsc::channel();
-            check_for_update_async(Some(update_tx));
-            tui::run(root, Some(update_rx), query, project)?;
+            if !interactive {
+                return Err(anyhow!(
+                    "TUI requires an interactive human terminal; use `memex search` or `memex sessions` for agent/script output"
+                ));
+            }
+            let latest = check_updates.then(available_update).flatten();
+            if let Some(latest) = latest.as_deref() {
+                print_update_notice(Some(latest));
+                if confirm_update()? {
+                    perform_update(Some(latest))?;
+                    println!("Update finished. Run `memex` again to start the installed version.");
+                    return Ok(());
+                }
+            }
+            let update_rx = latest.map(|latest| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(format!("update: v{latest} (memex update)"));
+                rx
+            });
+            tui::run(root, update_rx, query, project)?;
         }
         Commands::Web { listen, root } => {
             crate::web::serve(root, &listen)?;
@@ -1227,7 +1287,18 @@ pub fn run() -> Result<()> {
             run_skill_install(None, force.then_some(SkillWriteMode::Replace))?;
         }
         Commands::Update { yes } => {
-            run_update(yes)?;
+            if !yes {
+                if !interactive {
+                    return Err(anyhow!(
+                        "update requires confirmation; use `memex update --yes` for a noninteractive update of memex and installed skills"
+                    ));
+                }
+                if !confirm_update()? {
+                    println!("Update cancelled.");
+                    return Ok(());
+                }
+            }
+            perform_update(None)?;
         }
         Commands::Share {
             session_id,
@@ -3222,6 +3293,37 @@ fn run_skill_status(target: SkillTarget) -> Result<()> {
     Ok(())
 }
 
+fn skill_warnings(home: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut differing = Vec::new();
+    for (label, path) in skill_destinations(home, SkillTarget::All) {
+        match std::fs::read(&path) {
+            Ok(contents) if contents != MEMEX_SEARCH_SKILL.as_bytes() => differing.push(label),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warnings.push(format!(
+                "cannot check {label} memex-search skill ({}): {err}",
+                path.display()
+            )),
+        }
+    }
+    if !differing.is_empty() {
+        warnings.push(format!(
+            "memex-search skill is outdated or locally modified ({}). Run `memex skill status` to inspect, or `memex skill update` to replace installed copies with this version. Use `memex update --yes` to update both memex and its skills.",
+            differing.join(", ")
+        ));
+    }
+    warnings
+}
+
+fn warn_if_skill_outdated() {
+    if let Ok(home) = home_dir() {
+        for warning in skill_warnings(&home) {
+            eprintln!("warning: {warning}");
+        }
+    }
+}
+
 fn run_skill_install(
     target: Option<SkillTarget>,
     mode_override: Option<SkillWriteMode>,
@@ -5096,106 +5198,220 @@ fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Resul
 
 const REPO: &str = "nicosuave/memex";
 
+const HOMEBREW_FORMULA: &str = "nicosuave/tap/memex";
+
+fn interaction_allowed(
+    explicitly_disabled: bool,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    stderr_tty: bool,
+    agent_or_ci: bool,
+) -> bool {
+    !explicitly_disabled && stdin_tty && stdout_tty && stderr_tty && !agent_or_ci
+}
+
+fn agent_or_ci_environment() -> bool {
+    [
+        "CI",
+        "CODEX_CI",
+        "CODEX_THREAD_ID",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var_os(name).is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+    })
+}
+
+fn homebrew_executable(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    components
+        .windows(2)
+        .any(|pair| pair[0].as_os_str() == "Cellar" && pair[1].as_os_str() == "memex")
+}
+
 fn is_homebrew_install() -> bool {
     std::env::current_exe()
         .ok()
-        .and_then(|p| {
-            p.to_str()
-                .map(|s| s.contains("/Cellar/") || s.contains("/homebrew/"))
-        })
-        .unwrap_or(false)
+        .and_then(|path| path.canonicalize().ok())
+        .is_some_and(|path| homebrew_executable(&path))
 }
 
-fn run_update(skip_confirm: bool) -> Result<()> {
+fn confirm_update() -> Result<bool> {
+    use dialoguer::{Confirm, theme::ColorfulTheme};
     if is_homebrew_install() {
-        println!("memex was installed via Homebrew.");
-        println!("Run 'brew upgrade memex' to update.");
-        return Ok(());
+        eprintln!("brew update && brew upgrade {HOMEBREW_FORMULA}");
     }
+    eprintln!(
+        "Existing memex-search skill copies will also be replaced with the installed version; missing copies stay uninstalled."
+    );
+    Ok(Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Update memex and its installed skills now?")
+        .default(true)
+        .interact()?)
+}
 
-    let current = env!("CARGO_PKG_VERSION");
-    let latest = fetch_latest_version()?;
-
-    if !is_newer_version(current, &latest) {
-        println!("memex is already up to date (v{current})");
-        return Ok(());
+fn refresh_installed_skills(binary: &Path) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(["skill", "update", "--target", "all"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("run installed skill updater {}", binary.display()))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "memex is installed, but refreshing its skills failed ({status}); run `memex skill update` to retry"
+        ));
     }
+    Ok(())
+}
 
-    println!("Current version: v{current}");
-    println!("Latest version:  v{latest}");
-    println!();
-
-    if !skip_confirm {
-        use dialoguer::{Confirm, theme::ColorfulTheme};
-        let confirm = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!("Update to v{latest}?"))
-            .default(true)
-            .interact()?;
-        if !confirm {
-            println!("Update cancelled.");
-            return Ok(());
+fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBuf> {
+    for args in [vec!["update"], vec!["upgrade", HOMEBREW_FORMULA]] {
+        let status = std::process::Command::new(brew)
+            .args(&args)
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("run brew {}", args.join(" ")))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "brew {} failed ({status}); update stopped",
+                args.join(" ")
+            ));
         }
     }
+    // The running executable can live in an old Cellar version that brew just removed.
+    let output = std::process::Command::new(brew)
+        .args(["--prefix", HOMEBREW_FORMULA])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("locate the installed Homebrew memex")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Homebrew upgrade finished, but `brew --prefix {HOMEBREW_FORMULA}` failed; run `memex skill update` after resolving the installation"
+        ));
+    }
+    let prefix = std::str::from_utf8(&output.stdout)
+        .context("Homebrew returned a non-UTF-8 memex prefix")?
+        .trim();
+    if prefix.is_empty() || prefix.lines().count() != 1 || !Path::new(prefix).is_absolute() {
+        return Err(anyhow!(
+            "Homebrew returned an invalid memex installation prefix"
+        ));
+    }
+    let binary = Path::new(prefix).join("bin/memex");
+    let version = std::process::Command::new(&binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("check installed memex {}", binary.display()))?;
+    if !version.status.success() {
+        return Err(anyhow!(
+            "Homebrew upgrade finished, but the installed memex version check failed"
+        ));
+    }
+    let version = std::str::from_utf8(&version.stdout)?.trim();
+    let installed_version = version
+        .strip_prefix("memex ")
+        .filter(|value| parse_version_parts(value).is_some())
+        .ok_or_else(|| anyhow!("unexpected installed memex version: {version}"))?;
+    println!("Installed {version}");
+    refresh_installed_skills(&binary)?;
+    if expected_version.is_some_and(|latest| is_newer_version(installed_version, latest)) {
+        return Err(anyhow!(
+            "Homebrew still provides memex v{installed_version}; release v{} is newer. The tap may not have caught up or the formula may be pinned. Installed skills were refreshed; retry `memex update` later",
+            expected_version.unwrap()
+        ));
+    }
+    Ok(binary)
+}
 
+fn replace_binary(new_binary: &Path, current_exe: &Path) -> Result<()> {
+    let parent = current_exe
+        .parent()
+        .ok_or_else(|| anyhow!("binary has no parent directory"))?;
+    // Stage in the destination filesystem so a failed copy leaves the running binary intact.
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    let mut source = std::fs::File::open(new_binary)?;
+    std::io::copy(&mut source, &mut staged)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    staged.as_file().sync_all()?;
+    staged.persist(current_exe).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn update_release(current_exe: &Path, latest: &str) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    if !is_newer_version(current, latest) {
+        println!("memex is already up to date (v{current}); refreshing installed skills");
+        return refresh_installed_skills(current_exe);
+    }
     let (os, arch) = detect_platform()?;
     let url = format!(
         "https://github.com/{REPO}/releases/download/v{latest}/memex-{latest}-{os}-{arch}.tar.gz"
     );
-
-    println!("Downloading {url}...");
-
+    println!("Downloading memex v{latest}...");
     let tmp_dir = tempfile::tempdir()?;
     let archive_path = tmp_dir.path().join("memex.tar.gz");
-
-    // Download using curl
     let status = std::process::Command::new("curl")
-        .args(["-fsSL", "-o"])
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
+            "-o",
+        ])
         .arg(&archive_path)
         .arg(&url)
+        .stdin(std::process::Stdio::null())
         .status()?;
     if !status.success() {
         return Err(anyhow!("Failed to download release"));
     }
-
-    // Extract
     let status = std::process::Command::new("tar")
         .args(["-xzf"])
         .arg(&archive_path)
         .arg("-C")
         .arg(tmp_dir.path())
+        .stdin(std::process::Stdio::null())
         .status()?;
     if !status.success() {
         return Err(anyhow!("Failed to extract release"));
     }
-
-    let new_binary = tmp_dir.path().join("memex");
-    if !new_binary.exists() {
-        return Err(anyhow!("Binary not found in release archive"));
-    }
-
-    // Replace current binary
-    let current_exe = std::env::current_exe()?;
-    let backup = current_exe.with_extension("old");
-
-    // Move current to backup, move new to current
-    if backup.exists() {
-        std::fs::remove_file(&backup)?;
-    }
-    std::fs::rename(&current_exe, &backup)?;
-    std::fs::copy(&new_binary, &current_exe)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    // Remove backup
-    let _ = std::fs::remove_file(&backup);
-
+    replace_binary(&tmp_dir.path().join("memex"), current_exe)?;
     println!("Updated memex to v{latest}");
-    println!();
-    println!("Run 'memex skill update' to update installed skill copies.");
+    refresh_installed_skills(current_exe)
+}
+
+fn perform_update(known_latest: Option<&str>) -> Result<()> {
+    let current_exe = std::env::current_exe()?.canonicalize()?;
+    if homebrew_executable(&current_exe) {
+        let brew = find_in_path("brew").ok_or_else(|| {
+            anyhow!("Homebrew manages this installation, but brew is not on PATH")
+        })?;
+        update_homebrew(&brew, known_latest)?;
+    } else {
+        let fetched;
+        let latest = match known_latest {
+            Some(latest) => latest,
+            None => {
+                fetched = fetch_latest_version()?;
+                &fetched
+            }
+        };
+        update_release(&current_exe, latest)?;
+    }
     Ok(())
 }
 
@@ -5203,8 +5419,13 @@ fn fetch_latest_version() -> Result<String> {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
+            "--connect-timeout",
+            "1",
+            "--max-time",
+            "2",
             &format!("https://api.github.com/repos/{REPO}/releases/latest"),
         ])
+        .stdin(std::process::Stdio::null())
         .output()?;
 
     if !output.status.success() {
@@ -5239,31 +5460,70 @@ fn detect_platform() -> Result<(&'static str, &'static str)> {
     Ok((os, arch))
 }
 
-/// Check for updates in the background and print a warning if outdated.
-/// This is non-blocking and fails silently.
-pub fn check_for_update_async(sender: Option<std::sync::mpsc::Sender<String>>) {
-    let is_brew = is_homebrew_install();
-    std::thread::spawn(move || {
-        if let Ok(latest) = fetch_latest_version() {
-            let current = env!("CARGO_PKG_VERSION");
-            if is_newer_version(current, &latest) {
-                let upgrade_cmd = if is_brew {
-                    "brew upgrade memex"
-                } else {
-                    "memex update"
-                };
-                if let Some(sender) = sender {
-                    let message = format!("update: v{latest} ({upgrade_cmd})");
-                    let _ = sender.send(message);
-                } else {
-                    eprintln!(
-                        "\x1b[33mA new version of memex is available: v{latest} (current: v{current})\x1b[0m"
-                    );
-                    eprintln!("\x1b[33mRun '{upgrade_cmd}' to upgrade.\x1b[0m");
-                }
-            }
+#[derive(Serialize, Deserialize)]
+struct UpdateCheck {
+    checked_at: u64,
+    latest: Option<String>,
+}
+
+fn latest_version_cached(
+    cache_path: &Path,
+    now: u64,
+    fetch: impl FnOnce() -> Result<String>,
+) -> Option<String> {
+    if let Ok(contents) = std::fs::read(cache_path)
+        && let Ok(cached) = serde_json::from_slice::<UpdateCheck>(&contents)
+    {
+        // Retry a failed check sooner, without delaying every command while offline.
+        let ttl = if cached.latest.is_some() {
+            6 * 60 * 60
+        } else {
+            5 * 60
+        };
+        if cached.checked_at <= now && now - cached.checked_at < ttl {
+            return cached.latest;
         }
-    });
+    }
+    let latest = fetch().ok();
+    let check = UpdateCheck {
+        checked_at: now,
+        latest: latest.clone(),
+    };
+    // Cache writes are best effort and atomic; concurrent launches never read a partial file.
+    let _ = (|| -> Result<()> {
+        let parent = cache_path
+            .parent()
+            .ok_or_else(|| anyhow!("cache has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(file.as_file_mut(), &check)?;
+        file.persist(cache_path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+    latest
+}
+
+fn available_update() -> Option<String> {
+    let home = home_dir().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    latest_version_cached(
+        &home.join(".memex/update-check.json"),
+        now,
+        fetch_latest_version,
+    )
+    .filter(|latest| is_newer_version(env!("CARGO_PKG_VERSION"), latest))
+}
+
+fn print_update_notice(latest: Option<&str>) {
+    if let Some(latest) = latest {
+        eprintln!(
+            "update: memex v{latest} is available (current v{}). Run `memex update` or `memex update --yes` for a noninteractive update of memex and installed skills.",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
 }
 
 fn is_newer_version(current: &str, latest: &str) -> bool {
@@ -5305,6 +5565,139 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn update_interaction_requires_a_human_terminal_and_explicit_opt_out_wins() {
+        assert!(interaction_allowed(false, true, true, true, false));
+        for (disabled, stdin, stdout, stderr, agent) in [
+            (true, true, true, true, false),
+            (false, false, true, true, false),
+            (false, true, false, true, false),
+            (false, true, true, false, false),
+            (false, true, true, true, true),
+        ] {
+            assert!(!interaction_allowed(disabled, stdin, stdout, stderr, agent));
+        }
+        for args in [
+            vec!["memex", "--non-interactive", "update", "--yes"],
+            vec!["memex", "update", "--yes", "--non-interactive"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.non_interactive);
+            assert!(matches!(cli.command, Some(Commands::Update { yes: true })));
+        }
+        let cli = Cli::try_parse_from(["memex", "update", "--non-interactive"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Update { yes: false })));
+    }
+
+    #[test]
+    fn update_install_detection_requires_the_memex_cellar_entry() {
+        for path in [
+            "/opt/homebrew/Cellar/memex/0.14.0/bin/memex",
+            "/usr/local/Cellar/memex/0.14.0/bin/memex",
+            "/home/linuxbrew/.linuxbrew/Cellar/memex/0.14.0/bin/memex",
+        ] {
+            assert!(homebrew_executable(Path::new(path)));
+        }
+        for path in [
+            "/home/me/homebrew/project/target/debug/memex",
+            "/opt/homebrew/Cellar/other/0.14.0/bin/memex",
+            "/home/me/.local/bin/memex",
+        ] {
+            assert!(!homebrew_executable(Path::new(path)));
+        }
+    }
+
+    #[test]
+    fn update_cache_reuses_notices_and_retries_expired_or_failed_checks() {
+        let temp = TempDir::new().unwrap();
+        let cache = temp.path().join("cache.json");
+        assert_eq!(
+            latest_version_cached(&cache, 100, || Ok("99.0.0".into())),
+            Some("99.0.0".into())
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 200, || panic!("fresh cache must avoid network")),
+            Some("99.0.0".into())
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 100 + 6 * 60 * 60, || Ok("100.0.0".into())),
+            Some("100.0.0".into())
+        );
+        std::fs::write(&cache, "partial invalid cache").unwrap();
+        assert_eq!(
+            latest_version_cached(&cache, 30_000, || Err(anyhow!("offline"))),
+            None
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 30_001, || panic!(
+                "failure backoff must avoid network"
+            )),
+            None
+        );
+        assert_eq!(
+            latest_version_cached(&cache, 30_300, || Ok("101.0.0".into())),
+            Some("101.0.0".into())
+        );
+        // A clock correction must not make a future-dated cache permanent.
+        assert_eq!(
+            latest_version_cached(&cache, 20_000, || Ok("102.0.0".into())),
+            Some("102.0.0".into())
+        );
+        assert_eq!(
+            latest_version_cached(&temp.path().join("missing/other.json"), 1, || Ok(
+                "99.0.0".into()
+            )),
+            Some("99.0.0".into())
+        );
+    }
+
+    #[test]
+    fn skill_warnings_are_quiet_for_missing_or_matching_copies_and_clear_after_update() {
+        let home = TempDir::new().unwrap();
+        assert!(skill_warnings(home.path()).is_empty());
+        write_skill_targets(home.path(), &[SkillTarget::Shared], SkillWriteMode::Install).unwrap();
+        assert!(skill_warnings(home.path()).is_empty());
+        let shared = home.path().join(".agents/skills/memex-search/SKILL.md");
+        std::fs::write(&shared, "older or edited skill").unwrap();
+        let warning = skill_warnings(home.path());
+        assert_eq!(warning.len(), 1);
+        assert!(warning[0].contains("outdated or locally modified (shared)"));
+        assert_eq!(
+            std::fs::read_to_string(&shared).unwrap(),
+            "older or edited skill"
+        );
+        write_skill_targets(home.path(), &[SkillTarget::Claude], SkillWriteMode::Install).unwrap();
+        let claude = home.path().join(".claude/skills/memex-search/SKILL.md");
+        std::fs::write(&claude, "edited Claude copy").unwrap();
+        assert!(skill_warnings(home.path())[0].contains("shared, claude"));
+        write_skill_targets(home.path(), &[SkillTarget::All], SkillWriteMode::Update).unwrap();
+        assert!(skill_warnings(home.path()).is_empty());
+    }
+
+    #[test]
+    fn skill_warnings_do_not_fail_on_unreadable_paths() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".agents/skills/memex-search/SKILL.md")).unwrap();
+        let warnings = skill_warnings(home.path());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cannot check shared"));
+        assert!(!warnings[0].contains("outdated"));
+    }
+
+    #[test]
+    fn update_binary_replacement_leaves_old_binary_intact_on_copy_failure() {
+        let temp = TempDir::new().unwrap();
+        let installed = temp.path().join("memex");
+        let release = temp.path().join("release-memex");
+        std::fs::write(&installed, "old binary").unwrap();
+        assert!(replace_binary(&release, &installed).is_err());
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "old binary");
+        std::fs::write(&release, "new binary").unwrap();
+        replace_binary(&release, &installed).unwrap();
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "new binary");
+        assert!(!temp.path().join("memex.old").exists());
+    }
 
     #[test]
     fn previews_use_positive_text_literals_and_bound_unicode() {

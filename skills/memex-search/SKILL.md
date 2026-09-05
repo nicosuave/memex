@@ -151,6 +151,15 @@ results. Cite session IDs or timestamps where useful, preserve exact resumption
 identifiers, and flag outcomes supported only by narration. Do not invent missing
 turns or expose irrelevant private transcript content.
 
+## Updates
+
+Use `--non-interactive` when invoking Memex from an agent, especially in a PTY.
+Update notices and stale-skill warnings still appear on stderr; searches never prompt
+or update anything. When updating is authorized, run `memex update --yes` to upgrade
+Memex and refresh existing skills. `memex skill status` inspects differing copies;
+`memex skill update` refreshes just the skills. Updates replace local skill edits,
+leave missing copies uninstalled, and require restarting the agent to load changes.
+
 ## Specialized tasks
 
 - For retrieval debugging or relevance evaluation, use `memex search --help` for
