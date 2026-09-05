@@ -191,6 +191,7 @@ impl OAuthMcpServer {
     fn approval(&self, request_id: &str, owner_key: &str, decision: &str) -> Response {
         self.client
             .post(self.endpoint("/oauth/authorize"))
+            .header("Origin", &self.public_url)
             .form(&[
                 ("request_id", request_id),
                 ("owner_key", owner_key),
@@ -609,6 +610,11 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
         VERIFIER,
         "approval-state",
     );
+    assert_eq!(
+        approval.headers().get("referrer-policy").unwrap(),
+        "same-origin",
+        "native approval forms must retain their Origin without leaking external referrers"
+    );
     let html = text_response(approval, StatusCode::OK);
     assert!(!html.contains("<script>alert('approval')</script>"));
     assert!(html.contains("&lt;script&gt;"), "{html}");
@@ -632,6 +638,18 @@ fn authorization_pkce_refresh_rotation_and_replay_protection() {
         .send()
         .expect("foreign-origin approval");
     assert_eq!(foreign_approval.status(), StatusCode::FORBIDDEN);
+    let null_origin = server
+        .client
+        .post(server.endpoint("/oauth/authorize"))
+        .header("Origin", "null")
+        .form(&[
+            ("request_id", request_id.as_str()),
+            ("owner_key", owner_key.as_str()),
+            ("decision", "approve"),
+        ])
+        .send()
+        .expect("opaque-origin approval");
+    assert_eq!(null_origin.status(), StatusCode::FORBIDDEN);
     let wrong_owner = text_response(
         server.approval(&request_id, "wrong-owner-key", "approve"),
         StatusCode::UNAUTHORIZED,

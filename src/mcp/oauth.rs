@@ -391,9 +391,12 @@ fn add_security_headers(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    // Native form POSTs use Origin: null under no-referrer, breaking the
+    // approval page's own origin check. Keep same-origin form submissions
+    // identifiable without sending referrers to external OAuth callbacks.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
