@@ -2,8 +2,8 @@
 //!
 //! This module deliberately sits above the current Tantivy projection.  It does not require a
 //! catalog migration: records are read through `SearchIndex`, while the canonical identity is
-//! reconstructed from source-native fields.  A future catalog can use the same identity and
-//! ordering contract without changing callers of this module.
+//! reconstructed from source-native fields. New indexes also project that identity into an exact
+//! lookup field; older indexes remain readable with a scoped fallback until they are rebuilt.
 
 use crate::index::SearchIndex;
 use crate::types::{Record, SourceKind};
@@ -20,10 +20,13 @@ const CANONICAL_RECORD_ID_VERSION: &str = "rid1";
 /// cannot turn a neighborhood request into an unbounded transcript dump.
 pub const MAX_CONTEXT_WINDOW: usize = 1_000;
 
+/// Maximum number of records that direct tool-interaction expansion may add.
+pub const MAX_INTERACTION_EXPANSION: usize = 100;
+
 /// A selector for a context anchor.  Session and source scopes are optional for all selector
 /// kinds; they are especially useful for event IDs, which are commonly only unique within one
 /// source/session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextSelector {
     RecordId {
         id: String,
@@ -88,7 +91,7 @@ impl ContextSelector {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextOptions {
     pub before: usize,
     pub after: usize,
@@ -96,7 +99,7 @@ pub struct ContextOptions {
 }
 
 impl ContextOptions {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         if self.before > MAX_CONTEXT_WINDOW {
             bail!(
                 "context before window {} exceeds maximum {}",
@@ -213,57 +216,18 @@ pub fn context_records(
     options: ContextOptions,
 ) -> Result<ContextResult> {
     options.validate()?;
-    let mut all_records = Vec::new();
-    index.for_each_record(|record| {
-        all_records.push(record);
-        Ok(())
-    })?;
-
-    // A current index can contain duplicate projections from older versions.  Collapse those by
-    // canonical identity before resolving an anchor, preferring the greatest local doc ID as the
-    // deterministic latest projection.
-    let mut unique = HashMap::<String, Record>::new();
-    for record in all_records {
-        let key = canonical_record_id(&record);
-        match unique.get(&key) {
-            Some(previous) if projection_order(previous, &record).is_ge() => {}
-            _ => {
-                unique.insert(key, record);
-            }
-        }
-    }
-    let mut records: Vec<Record> = unique.into_values().collect();
-    records.sort_by(record_order);
-
-    let candidates: Vec<Record> = records
-        .iter()
-        .filter(|record| selector_matches(record, selector))
-        .cloned()
-        .collect();
-    let anchor = match candidates.as_slice() {
-        [] => bail!("context anchor not found"),
-        [anchor] => anchor.clone(),
-        _ => {
-            let ids = candidates
-                .iter()
-                .map(canonical_record_id)
-                .collect::<Vec<_>>();
-            return Err(anyhow!(
-                "context selector is ambiguous; matching record IDs: {}",
-                ids.join(", ")
-            ));
-        }
-    };
-
+    let anchor = resolve_record(index, selector)?;
     let anchor_id = canonical_record_id(&anchor);
-    let session_records: Vec<Record> = records
-        .into_iter()
-        .filter(|record| {
-            record.session_id == anchor.session_id
-                && record.source_path == anchor.source_path
-                && record.source == anchor.source
-        })
-        .collect();
+    let session_records = deduplicate_records(
+        index
+            .records_by_session_path(anchor.source, &anchor.session_id, &anchor.source_path)?
+            .into_iter()
+            // Keep this check even though current indexes include `source` in the query. It
+            // preserves the old in-memory isolation contract for legacy projections where the
+            // source field is absent and `record_from_doc` infers it from the path.
+            .filter(|record| record.source == anchor.source)
+            .collect(),
+    );
     let anchor_position = session_records
         .iter()
         .position(|record| canonical_record_id(record) == anchor_id)
@@ -289,32 +253,32 @@ pub fn context_records(
     }
 
     if options.expand_interactions {
-        let mut interaction_ids = identifier_set(&anchor);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for record in &session_records {
-                if !identifier_set(record)
-                    .iter()
-                    .any(|identifier| interaction_ids.contains(identifier))
-                {
-                    continue;
-                }
-                for identifier in identifier_set(record) {
-                    changed |= interaction_ids.insert(identifier);
-                }
-            }
+        let interaction_ids = selected
+            .values()
+            .filter_map(|(record, _, _)| tool_interaction_id(record))
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let expanded = session_records
+            .iter()
+            .filter(|record| {
+                !selected.contains_key(&canonical_record_id(record))
+                    && tool_interaction_id(record)
+                        .is_some_and(|identifier| interaction_ids.contains(identifier))
+            })
+            .collect::<Vec<_>>();
+        if expanded.len() > MAX_INTERACTION_EXPANSION {
+            bail!(
+                "interaction expansion matched {} records, exceeding maximum {}; use a narrower \
+                 context window or disable --expand-interactions",
+                expanded.len(),
+                MAX_INTERACTION_EXPANSION
+            );
         }
-        for record in &session_records {
-            let key = canonical_record_id(record);
-            if selected.contains_key(&key)
-                || !identifier_set(record)
-                    .iter()
-                    .any(|identifier| interaction_ids.contains(identifier))
-            {
-                continue;
-            }
-            selected.insert(key, (record.clone(), ContextRelation::Interaction, 0));
+        for record in expanded {
+            selected.insert(
+                canonical_record_id(record),
+                (record.clone(), ContextRelation::Interaction, 0),
+            );
         }
     }
 
@@ -333,6 +297,62 @@ pub fn context_records(
         anchor_record_id: anchor_id,
         records,
     })
+}
+
+/// Resolve exactly one context selector without loading its surrounding conversation.
+///
+/// Canonical IDs use an indexed field on new indexes. On legacy indexes the fallback scans only
+/// the supplied session/source scope when present; an unscoped canonical ID necessarily scans the
+/// stored records until the index is rebuilt.
+pub fn resolve_record(index: &SearchIndex, selector: &ContextSelector) -> Result<Record> {
+    let raw_candidates = match selector {
+        ContextSelector::RecordId {
+            id,
+            session_id,
+            source,
+        } => match index.records_by_canonical_id(id)? {
+            Some(records) => records,
+            None => index.records_by_context_scope(session_id.as_deref(), *source)?,
+        },
+        ContextSelector::DocId { id, .. } => index.records_by_doc_id(*id)?,
+        ContextSelector::EventId { id, .. } => index.records_by_event_id(id)?,
+    };
+    let candidates = deduplicate_records(
+        raw_candidates
+            .into_iter()
+            .filter(|record| selector_matches(record, selector))
+            .collect(),
+    );
+    match candidates.as_slice() {
+        [] => bail!("context anchor not found"),
+        [anchor] => Ok(anchor.clone()),
+        _ => Err(anyhow!(
+            "context selector is ambiguous; matching record IDs: {}",
+            candidates
+                .iter()
+                .map(canonical_record_id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn deduplicate_records(records: Vec<Record>) -> Vec<Record> {
+    // Older indexes can contain duplicate projections. Collapse them by canonical identity,
+    // preferring the deterministic latest projection before resolving selectors or neighborhoods.
+    let mut unique = HashMap::<String, Record>::new();
+    for record in records {
+        let key = canonical_record_id(&record);
+        match unique.get(&key) {
+            Some(previous) if projection_order(previous, &record).is_ge() => {}
+            _ => {
+                unique.insert(key, record);
+            }
+        }
+    }
+    let mut records = unique.into_values().collect::<Vec<_>>();
+    records.sort_by(record_order);
+    records
 }
 
 fn selector_matches(record: &Record, selector: &ContextSelector) -> bool {
@@ -379,35 +399,12 @@ fn projection_order(left: &Record, right: &Record) -> std::cmp::Ordering {
         .then_with(|| left.doc_id.cmp(&right.doc_id))
 }
 
-fn identifier_set(record: &Record) -> HashSet<String> {
-    let identifiers: Vec<String> = [
-        record.links.event_id.as_deref(),
-        record.links.parent_event_id.as_deref(),
-        record.links.logical_parent_event_id.as_deref(),
-        record.links.parent_tool_use_id.as_deref(),
-        record.links.source_tool_use_id.as_deref(),
-        record.links.source_tool_assistant_uuid.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::to_string)
-    .collect();
-    let mut result: HashSet<String> = identifiers.iter().cloned().collect();
-
-    // Conversation labels are not identifiers: using one by itself would join every record in
-    // a session. When both labels are present, pair them with a real event/tool identifier so
-    // they only strengthen an existing interaction edge.
-    if let (Some(thread_source), Some(conversation_kind)) = (
-        record.links.thread_source.as_deref(),
-        record.links.conversation_kind.as_deref(),
-    ) {
-        for identifier in identifiers {
-            result.insert(format!(
-                "__interaction_scope:{thread_source}:{conversation_kind}:{identifier}"
-            ));
-        }
+fn tool_interaction_id(record: &Record) -> Option<&str> {
+    match record.role.as_str() {
+        "tool_use" => record.links.event_id.as_deref(),
+        "tool_result" | "tool" => record.links.parent_tool_use_id.as_deref(),
+        _ => None,
     }
-    result
 }
 
 #[cfg(test)]
@@ -626,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn interaction_expansion_is_transitive_and_stays_in_session_path() {
+    fn interaction_expansion_pairs_tool_records_without_following_ancestry() {
         let mut anchor = record(1, 1, "assistant");
         anchor.links.event_id = Some("assistant".to_string());
         let mut call = record(2, 2, "call");
@@ -643,7 +640,7 @@ mod tests {
         other_path.links.parent_event_id = Some("assistant".to_string());
         let index = indexed(&[anchor, call, result, unrelated, other_path]);
 
-        let result = context_records(
+        let from_assistant = context_records(
             &index,
             &ContextSelector::event_id("assistant"),
             ContextOptions {
@@ -654,38 +651,55 @@ mod tests {
         )
         .expect("expanded context");
         assert_eq!(
-            result
+            from_assistant
                 .records
                 .iter()
                 .map(|item| item.record.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["assistant", "call", "result"]
+            vec!["assistant"]
         );
+
+        let from_call = context_records(
+            &index,
+            &ContextSelector::event_id("call"),
+            ContextOptions {
+                before: 0,
+                after: 0,
+                expand_interactions: true,
+            },
+        )
+        .expect("expanded tool pair");
         assert!(
-            result
+            from_call
                 .records
                 .iter()
                 .all(|item| item.record.text != "other path")
         );
-        assert!(
-            result
+        assert_eq!(
+            from_call
                 .records
                 .iter()
-                .filter(|item| item.record.text == "call" || item.record.text == "result")
-                .all(|item| item.relation == ContextRelation::Interaction)
+                .map(|item| (item.record.text.as_str(), item.relation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("call", ContextRelation::Anchor),
+                ("result", ContextRelation::Interaction)
+            ]
         );
     }
 
     #[test]
     fn interaction_expansion_deduplicates_window_members() {
         let mut anchor = record(1, 1, "anchor");
-        anchor.links.event_id = Some("a".to_string());
+        anchor.role = "tool_use".to_string();
+        anchor.links.event_id = Some("call-a".to_string());
         let mut linked = record(2, 2, "linked");
-        linked.links.parent_event_id = Some("a".to_string());
+        linked.role = "tool_result".to_string();
+        linked.links.parent_tool_use_id = Some("call-a".to_string());
         let index = indexed(&[anchor, linked]);
         let result = context_records(
             &index,
-            &ContextSelector::event_id("a"),
+            &ContextSelector::event_id("call-a"),
             ContextOptions {
                 before: 0,
                 after: 1,
@@ -705,23 +719,99 @@ mod tests {
     }
 
     #[test]
-    fn interaction_expansion_does_not_join_on_parent_session_id() {
-        let mut anchor = record(1, 1, "anchor");
-        anchor.links.event_id = Some("anchor-event".to_string());
-        anchor.links.parent_session_id = Some("parent-session".to_string());
+    fn interaction_expansion_finds_invocation_from_result_anchor() {
+        let mut call = record(1, 1, "call");
+        call.role = "tool_use".to_string();
+        call.links.event_id = Some("call-a".to_string());
+        let mut result = record(2, 2, "result");
+        result.role = "tool_result".to_string();
+        result.links.parent_tool_use_id = Some("call-a".to_string());
+        let index = indexed(&[call, result]);
 
-        let mut linked = record(2, 2, "linked");
-        linked.links.parent_event_id = Some("anchor-event".to_string());
+        let context = context_records(
+            &index,
+            &ContextSelector::doc_id(2),
+            ContextOptions {
+                before: 0,
+                after: 0,
+                expand_interactions: true,
+            },
+        )
+        .expect("reverse tool pair");
+        assert_eq!(
+            context
+                .records
+                .iter()
+                .map(|item| (item.record.text.as_str(), item.relation))
+                .collect::<Vec<_>>(),
+            vec![
+                ("call", ContextRelation::Interaction),
+                ("result", ContextRelation::Anchor)
+            ]
+        );
+    }
+
+    #[test]
+    fn interaction_expansion_does_not_guess_from_containing_message_parent() {
+        // When a source omits a native call ID, a tool record can inherit its containing message
+        // ID while the result points back to that message through ordinary conversation ancestry.
+        // Only parent_tool_use_id is a sound direct interaction edge.
+        let mut call = record(1, 1, "call without native ID");
+        call.role = "tool_use".to_string();
+        call.links.event_id = Some("assistant-message".to_string());
+        let mut result = record(2, 2, "result without native ID");
+        result.role = "tool_result".to_string();
+        result.links.event_id = Some("result-message".to_string());
+        result.links.parent_event_id = Some("assistant-message".to_string());
+        let index = indexed(&[call, result]);
+
+        let context = context_records(
+            &index,
+            &ContextSelector::doc_id(1),
+            ContextOptions {
+                before: 0,
+                after: 0,
+                expand_interactions: true,
+            },
+        )
+        .expect("bounded context");
+        assert_eq!(context.records.len(), 1);
+        assert_eq!(context.records[0].record.text, "call without native ID");
+    }
+
+    #[test]
+    fn interaction_expansion_ignores_non_tool_link_fields() {
+        let mut anchor = record(1, 1, "anchor tool");
+        anchor.role = "tool_use".to_string();
+        anchor.links.event_id = Some("call-a".to_string());
+        anchor.links.parent_session_id = Some("parent-session".to_string());
+        anchor.links.logical_parent_event_id = Some("conversation-parent".to_string());
+        anchor.links.source_tool_use_id = Some("spawning-call".to_string());
+        anchor.links.source_tool_assistant_uuid = Some("spawning-assistant".to_string());
+
+        let mut linked = record(2, 2, "linked result");
+        linked.role = "tool_result".to_string();
+        linked.links.parent_tool_use_id = Some("call-a".to_string());
         linked.links.parent_session_id = Some("parent-session".to_string());
 
-        let mut unrelated = record(3, 3, "unrelated");
-        unrelated.links.event_id = Some("unrelated-event".to_string());
+        let mut unrelated = record(3, 3, "unrelated tool");
+        unrelated.role = "tool_use".to_string();
+        unrelated.links.event_id = Some("call-b".to_string());
         unrelated.links.parent_session_id = Some("parent-session".to_string());
+        unrelated.links.logical_parent_event_id = Some("conversation-parent".to_string());
+        unrelated.links.source_tool_use_id = Some("spawning-call".to_string());
+        unrelated.links.source_tool_assistant_uuid = Some("spawning-assistant".to_string());
 
-        let index = indexed(&[anchor, linked, unrelated]);
+        let mut unrelated_result = record(4, 4, "unrelated result");
+        unrelated_result.role = "tool_result".to_string();
+        unrelated_result.links.parent_tool_use_id = Some("call-b".to_string());
+        unrelated_result.links.source_tool_use_id = Some("spawning-call".to_string());
+        unrelated_result.links.source_tool_assistant_uuid = Some("spawning-assistant".to_string());
+
+        let index = indexed(&[anchor, linked, unrelated, unrelated_result]);
         let result = context_records(
             &index,
-            &ContextSelector::event_id("anchor-event"),
+            &ContextSelector::event_id("call-a"),
             ContextOptions {
                 before: 0,
                 after: 0,
@@ -736,7 +826,57 @@ mod tests {
                 .iter()
                 .map(|item| item.record.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["anchor", "linked"]
+            vec!["anchor tool", "linked result"]
+        );
+    }
+
+    #[test]
+    fn interaction_expansion_has_an_actionable_hard_cap() {
+        let mut call = record(1, 1, "call");
+        call.role = "tool_use".to_string();
+        call.links.event_id = Some("call-a".to_string());
+        let mut records = vec![call];
+        for offset in 0..=MAX_INTERACTION_EXPANSION {
+            let mut result = record((offset + 2) as u64, (offset + 2) as u32, "result");
+            result.role = "tool_result".to_string();
+            result.links.parent_tool_use_id = Some("call-a".to_string());
+            records.push(result);
+        }
+        let index = indexed(&records);
+        let error = context_records(
+            &index,
+            &ContextSelector::event_id("call-a"),
+            ContextOptions {
+                before: 0,
+                after: 0,
+                expand_interactions: true,
+            },
+        )
+        .expect_err("expansion cap");
+        let message = error.to_string();
+        assert!(message.contains("exceeding maximum 100"));
+        assert!(message.contains("disable --expand-interactions"));
+    }
+
+    #[test]
+    fn selector_and_options_round_trip_for_machine_requests() {
+        let selector = ContextSelector::event_id("event-a")
+            .with_scope(Some("session-a".to_string()), Some(SourceKind::Codex));
+        let selector_json = serde_json::to_string(&selector).expect("serialize selector");
+        assert_eq!(
+            serde_json::from_str::<ContextSelector>(&selector_json).expect("deserialize selector"),
+            selector
+        );
+
+        let options = ContextOptions {
+            before: 2,
+            after: 3,
+            expand_interactions: true,
+        };
+        let options_json = serde_json::to_string(&options).expect("serialize options");
+        assert_eq!(
+            serde_json::from_str::<ContextOptions>(&options_json).expect("deserialize options"),
+            options
         );
     }
 }

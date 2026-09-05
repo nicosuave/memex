@@ -146,6 +146,13 @@ Search (JSONL default):
 memex search "your query" --limit 20
 ```
 
+Search output is compact by default. Each hit contains `machine`, `score`, `ts`,
+`doc_id`, `record_id`, `project`, `role`, `session_id`, `source`, `source_path`,
+`snippet`, and `matches`. Lexical snippets center the earliest literal match;
+semantic-only hits use a compact prefix. Use `--fields` for an explicit projection or
+`--full` to restore every legacy search field, including full record text and linkage
+metadata.
+
 TUI:
 ```
 memex tui
@@ -161,15 +168,42 @@ Notes:
   finish. Explicit `index`, `reindex`, `embed`, and analytics backfill commands wait up to 30
   seconds for another index mutation to finish and report its holder on timeout.
 
-Full transcript:
+Bounded transcript page:
 ```
 memex session <session_id>
 ```
 
-Single record:
+Single bounded record:
 ```
 memex show <doc_id>
+memex show --record-id <record_id> --machine <machine_id>
 ```
+
+Read commands return at most 16,000 Unicode content characters by default. The budget
+counts `text`, `tool_input`, and `tool_output` together; JSON metadata and wire bytes do
+not count. Each record includes content metadata shaped like:
+
+```json
+{"returned_chars":16000,"total_chars":24000,"truncated":true,"continuations":[{"field":"tool_output","offset_chars":12000,"total_chars":20000}]}
+```
+
+Continue a truncated field from its reported Unicode character offset:
+
+```sh
+memex show --record-id <record_id> --machine <machine_id> \
+  --field tool-output --offset-chars 12000
+```
+
+`--field` accepts `text`, `tool-input`, or `tool-output`. Use `--max-chars N` to
+choose another shared budget. `--full` disables the content budget and conflicts with
+`--max-chars`.
+
+`memex session` returns 50 records by default and shares the 16,000-character budget
+across them. Its JSONL stream ends with a `{"type":"page",...}` object containing
+`offset`, `total`, and `next_offset`. Use `next_offset` with `--offset` to read later
+records, and use `memex show` with a record's continuation metadata to finish a field
+that was truncated within a record. `memex session --full` preserves the unbounded
+transcript behavior; adding `--limit` bounds its record count.
 
 Human output:
 ```
@@ -230,12 +264,35 @@ session from another machine:
 
 ~~~sh
 memex show 123 --machine mini
+memex show --record-id rid1_example --machine mini
 memex session SESSION_ID --machine mini --source-path /path/on/mini/session.jsonl
-memex session SESSION_ID --machine mini --offset 500 --limit 500
+memex session SESSION_ID --machine mini --offset 50
+memex context --record-id rid1_example --machine mini --before 5 --after 5
 ~~~
 
-Session pages are limited to 500 records. To fetch several sessions in one bounded
-request, provide JSONL on stdin or as a file:
+`memex context` selects a source/session/path neighborhood around a stable record ID,
+document ID, or native event ID. It accepts `--offset` into that neighborhood and returns
+`offset`, `total`, and `next_offset`, while applying the same shared content budget and
+per-record continuation metadata as `session`. Bounded pages use `order: "anchor_first"`
+so the requested record cannot be crowded out by preceding content; remaining records
+stay chronological. `--full` uses `order: "chronological"`. Keep the same mode when
+following `next_offset`. `--expand-interactions` adds only directly
+owned tool calls/results; it does not follow conversation ancestry. Expansion is capped at
+100 additional records and reports an actionable error when the cap is exceeded.
+
+New indexes provide exact canonical record-ID lookup plus indexed document/event lookup.
+Bounded remote reads require a peer with the new read RPC operations. If a peer is older,
+update it. Legacy document-ID `show`, `session`, and `hydrate` can explicitly use
+`--full` for complete-content reads; remote context and stable-ID reads need an updated
+peer in either mode. Memex does not silently fetch unbounded bodies as a fallback. Character limits apply before the peer
+serializes content. They are not limits on JSON metadata or total network bytes.
+
+Existing indexes remain readable: canonical record IDs fall back to a stored-record scan
+until the index is rebuilt. Neighborhood reads use indexed session, source, and source-path
+scope.
+
+Session and hydrate pages are limited to 500 records. To fetch several sessions in one
+bounded request, provide JSONL on stdin or as a file:
 
 ~~~json
 {"machine":"mini","session_id":"SESSION_ID","source_path":"/path/on/mini/session.jsonl","offset":0,"limit":500}
@@ -246,9 +303,12 @@ memex hydrate requests.jsonl
 cat requests.jsonl | memex hydrate
 ~~~
 
-The batch input accepts at most 32 requests and returns one JSONL response per request,
-including machine provenance, pagination metadata, and stable record_id values where
-available.
+The batch input accepts at most 32 requests and returns one JSONL response per request in
+input order, including machine provenance, `offset`, `total`, `next_offset`, stable
+`record_id` values, and per-record content metadata. One 16,000-character budget is shared
+across all requests in input order. Use `--max-chars N` to change it or `--full` for full
+record content; `--full` conflicts with `--max-chars`. The request envelope's
+`next_offset` resumes later records.
 
 ## Token usage
 
@@ -323,10 +383,12 @@ Omit `--target` for an interactive menu of detected Claude/Codex/OpenCode/Pi/Oh 
 - `--sort score|ts`
 - `--top-n-per-session <n>`
 - `--unique-session`
-- `--fields score,ts,doc_id,session_id,snippet`
+- `--fields score,ts,doc_id,record_id,session_id,snippet`
+- `--full` (all legacy search fields; conflicts with `--fields`)
 - `--json-array`
 
-JSON output also includes `source` and, when available, tree/linkage metadata:
+Default JSON search output uses the compact fields documented above. Full or explicit
+projections can also include tree/linkage metadata:
 `event_id`, `parent_event_id`, `logical_parent_event_id`,
 `parent_session_id`, `thread_source`, `conversation_kind`,
 `parent_tool_use_id`, `source_tool_use_id`, and
@@ -597,3 +659,19 @@ description = "memex session palette"
 
 The plugin is listed in the herdr marketplace through the `herdr-plugin` GitHub topic on this
 repo.
+
+### Retrieval workflow evaluation
+
+`memex eval-retrieval dataset.jsonl --outcomes outcomes.jsonl` adds an optional workflow
+outcome summary to the existing search-ranking metrics. Supply externally judged outcomes
+and measured context-token counts, keyed by the dataset case's `id`:
+
+```json
+{"case_id":"investigation-a","correct_conclusion":true,"context_tokens":2000}
+{"case_id":"investigation-b","correct_conclusion":false,"context_tokens":3000}
+```
+
+The `outcomes` object reports evaluated-case coverage, accuracy, total context tokens,
+and correct conclusions per 1,000 context tokens. Missing judgments are not counted as
+failures or successes. Unknown/duplicate case IDs and zero token counts are rejected.
+Memex does not generate correctness judgments or estimate tokens from character counts.

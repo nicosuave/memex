@@ -329,6 +329,70 @@ pub struct EvaluationCase {
     pub relevant: Vec<EvaluationRelevance>,
 }
 
+/// Measured workflow outcomes are supplied by an external evaluator, never inferred
+/// from relevance scores or estimated from character counts.
+#[derive(Debug, Serialize)]
+pub struct OutcomeSummary {
+    pub evaluated_cases: usize,
+    pub correct_conclusions: usize,
+    pub total_context_tokens: u64,
+    pub accuracy: f64,
+    pub correct_conclusions_per_1000_context_tokens: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgedOutcome {
+    case_id: String,
+    correct_conclusion: bool,
+    context_tokens: u64,
+}
+
+pub fn evaluate_outcomes(path: &Path, cases: &[EvaluationCase]) -> Result<OutcomeSummary> {
+    use std::io::BufRead;
+    let mut known = HashSet::new();
+    for id in cases.iter().filter_map(|case| case.id.as_deref()) {
+        if id.trim().is_empty() || !known.insert(id) {
+            bail!("outcome evaluation requires unique non-empty dataset case IDs");
+        }
+    }
+    let reader = std::io::BufReader::new(fs::File::open(path)?);
+    let mut seen = HashSet::new();
+    let mut correct = 0;
+    let mut tokens = 0u64;
+    for (line, raw) in reader.lines().enumerate() {
+        let raw = raw?;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let outcome: JudgedOutcome = serde_json::from_str(&raw)
+            .with_context(|| format!("parse outcome line {}", line + 1))?;
+        if !known.contains(outcome.case_id.as_str()) {
+            bail!("unknown outcome case ID: {}", outcome.case_id);
+        }
+        if !seen.insert(outcome.case_id.clone()) {
+            bail!("duplicate outcome case ID: {}", outcome.case_id);
+        }
+        if outcome.context_tokens == 0 {
+            bail!("context_tokens must be positive for {}", outcome.case_id);
+        }
+        tokens = tokens
+            .checked_add(outcome.context_tokens)
+            .ok_or_else(|| anyhow!("outcome context token total overflows u64"))?;
+        correct += usize::from(outcome.correct_conclusion);
+    }
+    if seen.is_empty() {
+        bail!("outcome file contains no judgments");
+    }
+    Ok(OutcomeSummary {
+        evaluated_cases: seen.len(),
+        correct_conclusions: correct,
+        total_context_tokens: tokens,
+        accuracy: correct as f64 / seen.len() as f64,
+        correct_conclusions_per_1000_context_tokens: correct as f64 * 1000.0 / tokens as f64,
+    })
+}
+
 impl EvaluationCase {
     pub fn query_views(&self) -> Result<Vec<String>> {
         if self.query.is_some() && !self.queries.is_empty() {
@@ -691,6 +755,41 @@ mod tests {
             doc_id: result.record.doc_id,
             record_id: None,
             relevance: value,
+        }
+    }
+
+    #[test]
+    fn outcomes_use_only_judged_cases_and_measured_tokens() {
+        let cases: Vec<EvaluationCase> = ["a", "b", "unjudged"]
+            .into_iter()
+            .map(|id| EvaluationCase {
+                id: Some(id.into()),
+                query: Some("needle".into()),
+                queries: vec![],
+                cwd: None,
+                relevant: vec![],
+            })
+            .collect();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), "{\"case_id\":\"a\",\"correct_conclusion\":true,\"context_tokens\":2000}\n{\"case_id\":\"b\",\"correct_conclusion\":false,\"context_tokens\":3000}\n").unwrap();
+        let summary = evaluate_outcomes(file.path(), &cases).unwrap();
+        assert_eq!(summary.evaluated_cases, 2);
+        assert_eq!(summary.correct_conclusions, 1);
+        assert_eq!(summary.total_context_tokens, 5000);
+        assert_eq!(summary.accuracy, 0.5);
+        assert_eq!(summary.correct_conclusions_per_1000_context_tokens, 0.2);
+        for invalid in [
+            "",
+            "{}",
+            "{\"case_id\":\"missing\",\"correct_conclusion\":true,\"context_tokens\":1}",
+            "{\"case_id\":\"a\",\"correct_conclusion\":true,\"context_tokens\":0}",
+            "{\"case_id\":\"a\",\"correct_conclusion\":true,\"context_tokens\":1}\n{\"case_id\":\"a\",\"correct_conclusion\":false,\"context_tokens\":1}",
+        ] {
+            fs::write(file.path(), invalid).unwrap();
+            assert!(
+                evaluate_outcomes(file.path(), &cases).is_err(),
+                "accepted {invalid}"
+            );
         }
     }
 
