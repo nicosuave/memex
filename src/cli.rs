@@ -44,8 +44,8 @@ use std::time::Instant;
 
 mod surface;
 use surface::{
-    CliSearchMode, DebugCommand, IndexCommand, IndexSource, OutputArgs, OutputFormat,
-    OutputOptions, SessionCommand, WebCommand,
+    CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
+    OutputFormat, OutputOptions, SessionCommand, WebCommand,
 };
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -54,7 +54,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history\n  sessions     List sessions\n  session      Read a session or batch of pages\n  show         Read a record\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history; rebuild, gc, embed, stats\n  service      Enable, restart, inspect, or disable indexing\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history\n  sessions     List sessions\n  session      Read a session or batch of pages\n  show         Read a record\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history",
     after_help = "\
 QUICK START:
@@ -210,6 +210,12 @@ EXAMPLES:
         web_ui: bool,
         #[arg(long, hide = true, value_name = "ADDRESS")]
         web_listen: Option<String>,
+        #[arg(long, hide = true, conflicts_with = "no_mcp")]
+        mcp: bool,
+        #[arg(long, hide = true, conflicts_with = "mcp_listen")]
+        no_mcp: bool,
+        #[arg(long, hide = true)]
+        mcp_listen: Option<std::net::SocketAddr>,
     },
     /// Delete existing index and rebuild from scratch
     #[command(hide = true)]
@@ -226,7 +232,7 @@ EXAMPLES:
         /// Report what would be removed without changing the index
         #[arg(long)]
         dry_run: bool,
-        /// Confirm the index service and all Memex readers are stopped
+        /// Confirm the daemon and all Memex readers are stopped
         #[arg(long)]
         offline: bool,
     },
@@ -378,8 +384,8 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Manage background indexing (launchd on macOS, systemd on Linux)
-    #[command(name = "service", alias = "index-service")]
+    /// Manage the Memex daemon: indexing, web UI, and MCP
+    #[command(name = "daemon", aliases = ["service", "index-service"])]
     IndexService {
         #[command(subcommand)]
         action: IndexServiceCommand,
@@ -712,9 +718,9 @@ EXAMPLES:
         root: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "http")]
         transport: McpTransport,
-        /// HTTP socket address
-        #[arg(long, default_value = "127.0.0.1:5363")]
-        listen: std::net::SocketAddr,
+        /// HTTP socket address (default: [mcp].listen or 127.0.0.1:5363)
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
         /// Additional accepted HTTP Host authority; repeat for multiple hosts
         #[arg(long)]
         allowed_host: Vec<String>,
@@ -996,7 +1002,23 @@ impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
 
 #[derive(Subcommand)]
 enum IndexServiceCommand {
-    /// Enable automatic background indexing (launchd on macOS, systemd on Linux)
+    /// Run the configured daemon in the foreground
+    Run {
+        #[command(flatten)]
+        index: IndexArgs,
+        /// Serve the browser (also configurable with index_service_web_ui)
+        #[arg(long)]
+        web_ui: bool,
+        /// Browser listener (implies --web-ui)
+        #[arg(long)]
+        web_listen: Option<String>,
+        /// Seconds between index refreshes (default: config or 30)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_interval: Option<u64>,
+        #[command(flatten)]
+        mcp: DaemonMcpArgs,
+    },
+    /// Enable the background daemon (launchd on macOS, systemd on Linux)
     Enable {
         #[command(flatten)]
         index: IndexArgs,
@@ -1030,8 +1052,10 @@ enum IndexServiceCommand {
         /// Path to systemd user directory (Linux only) [default: ~/.config/systemd/user]
         #[arg(long)]
         systemd_dir: Option<PathBuf>,
+        #[command(flatten)]
+        mcp: DaemonMcpArgs,
     },
-    /// Regenerate and restart the background indexing service using current config
+    /// Regenerate and restart the daemon using current config
     Restart {
         #[command(flatten)]
         index: IndexArgs,
@@ -1065,6 +1089,8 @@ enum IndexServiceCommand {
         /// Path to systemd user directory (Linux only) [default: ~/.config/systemd/user]
         #[arg(long)]
         systemd_dir: Option<PathBuf>,
+        #[command(flatten)]
+        mcp: DaemonMcpArgs,
     },
     /// Open the authenticated Web UI in the default browser
     #[command(hide = true)]
@@ -1078,7 +1104,7 @@ enum IndexServiceCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Show the registered service state and Web UI status
+    /// Show daemon, web UI, and MCP status
     Status {
         /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
         #[arg(long)]
@@ -1093,7 +1119,7 @@ enum IndexServiceCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Disable and remove the background indexing service
+    /// Disable and remove the background daemon
     Disable {
         /// Service label/name [default: com.memex.index (macOS) or memex-index (Linux)]
         #[arg(long)]
@@ -1174,13 +1200,23 @@ pub fn run() -> Result<()> {
             watch_interval,
             web_ui,
             web_listen,
+            mcp,
+            no_mcp,
+            mcp_listen,
         } => {
             if watch {
                 let listen = (web_ui || web_listen.is_some())
                     .then(|| web_listen.unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string()));
-                run_index_loop(&index, watch_interval, listen)?;
-            } else if web_ui || web_listen.is_some() {
-                return Err(anyhow!("--web-ui requires --watch"));
+                let config = UserConfig::load(&Paths::new(index.root.clone())?)?;
+                let mcp = DaemonMcpArgs {
+                    mcp,
+                    no_mcp,
+                    mcp_listen,
+                }
+                .resolve(&config);
+                run_index_loop(&index, watch_interval, listen, mcp)?;
+            } else if web_ui || web_listen.is_some() || mcp || no_mcp || mcp_listen.is_some() {
+                return Err(anyhow!("server options require `memex daemon run`"));
             } else {
                 run_index_args(&index, false, false)?;
             }
@@ -1290,8 +1326,27 @@ pub fn run() -> Result<()> {
             crate::web::serve(root, &listen)?;
         }
         Commands::IndexService { action } => match action {
+            IndexServiceCommand::Run {
+                index,
+                web_ui,
+                web_listen,
+                poll_interval,
+                mcp,
+            } => {
+                let config = UserConfig::load(&Paths::new(index.root.clone())?)?;
+                let web = (web_ui || web_listen.is_some() || config.index_service_web_ui_default())
+                    .then(|| {
+                        web_listen
+                            .or_else(|| config.index_service_web_listen.clone())
+                            .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string())
+                    });
+                let interval = poll_interval.unwrap_or(config.index_service_poll_interval());
+                anyhow::ensure!(interval > 0, "poll interval must be positive");
+                run_index_loop(&index, interval, web, mcp.resolve(&config))?;
+            }
             IndexServiceCommand::Enable {
                 index,
+                mcp,
                 label,
                 continuous,
                 poll_interval,
@@ -1305,6 +1360,7 @@ pub fn run() -> Result<()> {
             } => {
                 run_index_service_enable(
                     &index,
+                    mcp,
                     label,
                     continuous,
                     poll_interval,
@@ -1319,6 +1375,7 @@ pub fn run() -> Result<()> {
             }
             IndexServiceCommand::Restart {
                 index,
+                mcp,
                 label,
                 continuous,
                 poll_interval,
@@ -1332,6 +1389,7 @@ pub fn run() -> Result<()> {
             } => {
                 run_index_service_enable(
                     &index,
+                    mcp,
                     label,
                     continuous,
                     poll_interval,
@@ -1617,19 +1675,33 @@ pub fn run() -> Result<()> {
                 transport == McpTransport::Http || public_url.is_none(),
                 "--public-url requires the HTTP transport"
             );
-            let http = (transport == McpTransport::Http).then_some(crate::mcp::HttpOptions {
-                listen,
-                allowed_hosts: allowed_host,
-                allowed_origins: allowed_origin,
-                public_url,
-            });
+            let http = if transport == McpTransport::Http {
+                let config = UserConfig::load(&Paths::new(root.clone())?)?;
+                Some(surface::mcp_http_options(
+                    &config,
+                    listen,
+                    allowed_host,
+                    allowed_origin,
+                    public_url,
+                ))
+            } else {
+                None
+            };
             crate::mcp::run(root, http)?;
         }
     }
     Ok(())
 }
 
-fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<String>) -> Result<()> {
+fn run_index_loop(
+    index: &IndexArgs,
+    interval_secs: u64,
+    web_listen: Option<String>,
+    mcp: Option<crate::mcp::HttpOptions>,
+) -> Result<()> {
+    let mcp_server = mcp
+        .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
+        .transpose()?;
     let _web_thread = initialize_index_loop(
         || run_index_args(index, false, true),
         || {
@@ -1640,7 +1712,13 @@ fn run_index_loop(index: &IndexArgs, interval_secs: u64, web_listen: Option<Stri
         },
     )?;
     loop {
-        std::thread::sleep(Duration::from_secs(interval_secs));
+        if let Some(server) = &mcp_server {
+            if !server.wait_timeout(Duration::from_secs(interval_secs))? {
+                return Ok(());
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(interval_secs));
+        }
         run_index_args(index, false, true)?;
         std::io::stdout().flush().ok();
     }
@@ -1791,7 +1869,7 @@ fn run_index(
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
     if !dry_run && !offline {
         return Err(anyhow!(
-            "index GC requires offline confirmation; stop the Memex index service and all Memex \
+            "index GC requires offline confirmation; stop the Memex daemon and all Memex \
              readers, then rerun with `--offline` (or use `--dry-run`)"
         ));
     }
@@ -4240,6 +4318,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn run_index_service_enable(
     index: &IndexArgs,
+    mcp_args: DaemonMcpArgs,
     label: Option<String>,
     continuous: bool,
     poll_interval: Option<u64>,
@@ -4264,6 +4343,8 @@ fn run_index_service_enable(
 
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
+    let mcp = mcp_args.resolve(&config);
+    let mcp_listen = mcp.as_ref().map(|options| options.listen);
     let cli_web_ui = web_ui || web_listen.is_some();
     let web_ui = cli_web_ui || config.index_service_web_ui_default();
     let web_listen = web_listen
@@ -4280,7 +4361,7 @@ fn run_index_service_enable(
         }
         None => config.index_service_continuous_default(),
     };
-    let continuous = if cli_continuous || web_ui {
+    let continuous = if cli_continuous || web_ui || mcp.is_some() {
         true
     } else if interval.is_some() {
         false
@@ -4294,8 +4375,14 @@ fn run_index_service_enable(
     }
 
     let exe = std::env::current_exe()?;
-    let program_args =
-        build_index_command_args(index, continuous, poll_interval, web_ui, &web_listen);
+    let program_args = build_index_command_args(
+        index,
+        continuous,
+        poll_interval,
+        web_ui,
+        &web_listen,
+        mcp_listen,
+    );
 
     std::fs::create_dir_all(&paths.root)?;
 
@@ -4333,7 +4420,16 @@ fn run_index_service_enable(
     disable_auto_index_on_search_by_default(&paths, &config)?;
     if web_ui {
         wait_for_web_ui(&web_listen, Duration::from_secs(5))?;
-        println!("web UI: http://{web_listen}");
+        println!("web UI: running on {web_listen}");
+        println!("open: memex web open --listen {web_listen}");
+    }
+    if let Some(listen) = mcp_listen {
+        let address = mcp_health_address(listen);
+        wait_for_http_health(&address, "memex-mcp", Duration::from_secs(5))?;
+        println!("MCP: http://{address}/mcp");
+        if let Some(public_url) = config.mcp.public_url.as_deref() {
+            println!("MCP OAuth: {public_url}/mcp");
+        }
     }
     Ok(())
 }
@@ -4351,16 +4447,9 @@ fn disable_auto_index_on_search_by_default(paths: &Paths, config: &UserConfig) -
         String::new()
     };
 
-    if !contents.trim().is_empty() {
-        if !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push('\n');
-    }
-    contents.push_str(
-        "# Background indexing handles freshness; avoid duplicate scan work during search.\n",
+    contents = format!(
+        "# Background indexing handles freshness; avoid duplicate scan work during search.\nauto_index_on_search = false\n\n{contents}"
     );
-    contents.push_str("auto_index_on_search = false\n");
 
     std::fs::write(&path, contents)?;
     println!(
@@ -4632,7 +4721,7 @@ fn run_index_service_status_launchd(
 
     if !output.status.success() {
         if launchctl_not_found(&output) {
-            println!("index service: stopped");
+            println!("Memex daemon: stopped");
             println!("label: {label}");
             println!("definition: {}", plist_path.display());
             return Ok(());
@@ -4645,7 +4734,7 @@ fn run_index_service_status_launchd(
 
     let state = String::from_utf8_lossy(&output.stdout);
     let service_state = service_output_value(&state, "state").unwrap_or("loaded");
-    println!("index service: {service_state}");
+    println!("Memex daemon: {service_state}");
     println!("label: {label}");
     println!(
         "mode: {}",
@@ -4656,6 +4745,7 @@ fn run_index_service_status_launchd(
         }
     );
     print_service_web_ui_status(&state);
+    print_service_mcp_status(&state);
     println!("definition: {}", plist_path.display());
     Ok(())
 }
@@ -4676,7 +4766,7 @@ fn run_index_service_status_systemd(
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
     if !service_path.exists() && !timer_path.exists() {
-        println!("index service: stopped");
+        println!("Memex daemon: stopped");
         println!("label: {label}");
         println!("definition: {}", service_path.display());
         return Ok(());
@@ -4689,7 +4779,7 @@ fn run_index_service_status_systemd(
         SystemdServiceMode::Interval => format!("{}.timer", label),
     };
     let state = systemd_unit_state(&unit)?;
-    println!("index service: {state}");
+    println!("Memex daemon: {state}");
     println!("label: {label}");
     println!(
         "mode: {}",
@@ -4705,6 +4795,7 @@ fn run_index_service_status_systemd(
         String::new()
     };
     print_service_web_ui_status(&definition);
+    print_service_mcp_status(&definition);
     println!("definition: {}", service_path.display());
     if mode == SystemdServiceMode::Interval {
         println!("timer: {}", timer_path.display());
@@ -4856,6 +4947,10 @@ fn web_ui_addresses(listen: &str) -> Result<Vec<std::net::SocketAddr>> {
 }
 
 fn web_ui_is_healthy(listen: &str) -> bool {
+    http_is_healthy(listen, "ok")
+}
+
+fn http_is_healthy(listen: &str, expected: &str) -> bool {
     web_ui_addresses(listen).is_ok_and(|addresses| {
         addresses.iter().any(|address| {
             let Ok(mut stream) = TcpStream::connect_timeout(address, Duration::from_millis(100))
@@ -4884,19 +4979,19 @@ fn web_ui_is_healthy(listen: &str) -> bool {
                     Ok(0) => break,
                     Ok(read) => {
                         response.extend_from_slice(&chunk[..read]);
-                        if is_memex_health_response(&response) {
+                        if is_http_health_response(&response, expected) {
                             return true;
                         }
                     }
                     Err(_) => return false,
                 }
             }
-            is_memex_health_response(&response)
+            is_http_health_response(&response, expected)
         })
     })
 }
 
-fn is_memex_health_response(response: &[u8]) -> bool {
+fn is_http_health_response(response: &[u8], expected: &str) -> bool {
     let Ok(response) = std::str::from_utf8(response) else {
         return false;
     };
@@ -4907,7 +5002,49 @@ fn is_memex_health_response(response: &[u8]) -> bool {
         .lines()
         .next()
         .is_some_and(|status| status.ends_with(" 200 OK"))
-        && body == "ok"
+        && body == expected
+}
+
+fn mcp_health_address(mut listen: std::net::SocketAddr) -> String {
+    if listen.ip().is_unspecified() {
+        listen.set_ip(if listen.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    listen.to_string()
+}
+
+fn wait_for_http_health(listen: &str, expected: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !http_is_healthy(listen, expected) {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "{expected} did not become ready at {listen} within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+fn print_service_mcp_status(output: &str) {
+    if service_output_has_arg(output, "--mcp") || output.contains(" --mcp ") {
+        let listen = service_output_arg_value(output, "--mcp-listen").unwrap_or("127.0.0.1:5363");
+        let address = listen
+            .parse()
+            .map(mcp_health_address)
+            .unwrap_or_else(|_| listen.to_string());
+        if http_is_healthy(&address, "memex-mcp") {
+            println!("MCP: http://{address}/mcp");
+        } else {
+            println!("MCP: unavailable (configured at {address})");
+        }
+    } else {
+        println!("MCP: disabled");
+    }
 }
 
 fn wait_for_web_ui(listen: &str, timeout: Duration) -> Result<()> {
@@ -5120,6 +5257,7 @@ fn build_index_command_args(
     poll_interval: u64,
     web_ui: bool,
     web_listen: &str,
+    mcp_listen: Option<std::net::SocketAddr>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     args.push("index".to_string());
@@ -5182,6 +5320,13 @@ fn build_index_command_args(
     }
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
+    }
+    if let Some(listen) = mcp_listen {
+        args.push("--mcp".to_string());
+        args.push("--mcp-listen".to_string());
+        args.push(listen.to_string());
+    } else if continuous {
+        args.push("--no-mcp".to_string());
     }
     if index.embeddings {
         args.push("--embeddings".to_string());
@@ -6227,7 +6372,7 @@ mod tests {
         };
         assert_eq!(root, Some(PathBuf::from("/tmp/custom-memex")));
         assert_eq!(transport, McpTransport::Http);
-        assert_eq!(listen.to_string(), "127.0.0.1:5363");
+        assert_eq!(listen, None);
     }
 
     #[test]
@@ -6440,7 +6585,8 @@ mod tests {
             diagnostics: false,
         };
 
-        let args = build_index_command_args(&index, false, 30, false, crate::web::DEFAULT_LISTEN);
+        let args =
+            build_index_command_args(&index, false, 30, false, crate::web::DEFAULT_LISTEN, None);
 
         assert!(args.contains(&"--no-codex".to_string()));
         assert!(args.contains(&"--no-opencode".to_string()));
@@ -6489,7 +6635,7 @@ mod tests {
             diagnostics: false,
         };
 
-        let args = build_index_command_args(&index, false, 30, false, "127.0.0.1:7777");
+        let args = build_index_command_args(&index, false, 30, false, "127.0.0.1:7777", None);
 
         let mut pairs = args.windows(2);
         assert!(pairs.any(|w| w == ["--exclude", "~/work/**"]));
@@ -6532,7 +6678,7 @@ mod tests {
             diagnostics: false,
         };
 
-        let args = build_index_command_args(&index, true, 30, true, "127.0.0.1:6363");
+        let args = build_index_command_args(&index, true, 30, true, "127.0.0.1:6363", None);
 
         assert!(
             args.windows(2)
@@ -6729,6 +6875,22 @@ arguments = {
         let config_path = tmp.path().join("config.toml");
         let contents = std::fs::read_to_string(config_path).unwrap();
         assert!(contents.contains("auto_index_on_search = false"));
+    }
+
+    #[test]
+    fn disabling_auto_index_preserves_nested_mcp_config() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[mcp]\nlisten = \"127.0.0.1:4567\"\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        disable_auto_index_on_search_by_default(&paths, &config).unwrap();
+        let updated = UserConfig::load(&paths).unwrap();
+        assert_eq!(updated.auto_index_on_search, Some(false));
+        assert_eq!(updated.mcp.listen, Some("127.0.0.1:4567".parse().unwrap()));
     }
 
     #[test]

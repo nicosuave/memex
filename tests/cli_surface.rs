@@ -82,7 +82,7 @@ fn assert_directory_empty(path: &Path) {
 #[test]
 fn top_level_help_shows_only_the_canonical_command_surface() {
     let rows = command_rows(&successful_stdout(&["--help"]));
-    for command in ["index", "service", "web", "session", "debug"] {
+    for command in ["index", "daemon", "web", "session", "debug"] {
         assert!(
             rows.contains(command),
             "missing command row {command:?}: {rows:?}"
@@ -94,6 +94,7 @@ fn top_level_help_shows_only_the_canonical_command_surface() {
         "embed",
         "stats",
         "index-service",
+        "service",
         "hydrate",
         "hydrate-batch",
         "eval-retrieval",
@@ -116,11 +117,11 @@ fn nested_help_exposes_the_approved_command_groups_without_side_effects() {
         &["index", "gc", "--root", root_arg, "--help"],
         &["index", "embed", "--root", root_arg, "--help"],
         &["index", "stats", "--root", root_arg, "--help"],
-        &["service", "--help"],
-        &["service", "enable", "--root", root_arg, "--help"],
-        &["service", "restart", "--root", root_arg, "--help"],
-        &["service", "status", "--root", root_arg, "--help"],
-        &["service", "disable", "--root", root_arg, "--help"],
+        &["daemon", "--help"],
+        &["daemon", "enable", "--root", root_arg, "--help"],
+        &["daemon", "restart", "--root", root_arg, "--help"],
+        &["daemon", "status", "--root", root_arg, "--help"],
+        &["daemon", "disable", "--root", root_arg, "--help"],
         &["web", "--help"],
         &["web", "serve", "--root", root_arg, "--help"],
         &["web", "open", "--root", root_arg, "--help"],
@@ -144,8 +145,8 @@ fn nested_command_rows_match_the_canonical_layout() {
             &["rebuild", "gc", "embed", "stats"][..],
         ),
         (
-            vec!["service", "--help"],
-            &["enable", "restart", "status", "disable"][..],
+            vec!["daemon", "--help"],
+            &["run", "enable", "restart", "status", "disable"][..],
         ),
         (vec!["web", "--help"], &["serve", "open"][..]),
         (vec!["session", "--help"], &["batch"][..]),
@@ -159,7 +160,7 @@ fn nested_command_rows_match_the_canonical_layout() {
                 "{args:?} omitted {command:?}: {rows:?}"
             );
         }
-        if args[0] == "service" {
+        if args[0] == "daemon" {
             assert!(
                 !rows.contains("open"),
                 "legacy service open is visible: {rows:?}"
@@ -213,8 +214,8 @@ fn index_source_help_uses_positive_repeatable_filters() {
     for args in [
         vec!["index", "--help"],
         vec!["index", "rebuild", "--help"],
-        vec!["service", "enable", "--help"],
-        vec!["service", "restart", "--help"],
+        vec!["daemon", "enable", "--help"],
+        vec!["daemon", "restart", "--help"],
     ] {
         let help = successful_stdout(&args);
         assert_help_has_options(
@@ -242,7 +243,7 @@ fn web_open_can_print_a_login_link_without_launching_a_browser() {
         "--root",
         root.path().to_str().unwrap(),
     ]);
-    assert!(url.trim().starts_with("http://localhost:4567/#bootstrap="));
+    assert!(url.trim().starts_with("http://127.0.0.1:4567/#bootstrap="));
     assert_eq!(url.lines().count(), 1);
     assert!(!url.contains("opened"));
 }

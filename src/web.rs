@@ -5,8 +5,10 @@ use crate::types::SourceFilter;
 use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
 use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chrono::{Duration, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,8 +26,10 @@ pub fn serve(root: Option<PathBuf>, listen: &str) -> Result<()> {
     let paths = Paths::new(root)?;
     let auth = Arc::new(WebAuth::load_or_create(&paths)?);
     let server = bind(listen)?;
-    println!("memex web UI: http://{listen}");
-    serve_requests(server, paths, restrict_hosts(listen), auth);
+    let login_url = bootstrap_url_for_auth(&auth, listen)?;
+    println!("memex web UI: {login_url}");
+    let cookie_name = session_cookie_name(&paths, listen)?;
+    serve_requests(server, paths, restrict_hosts(listen), cookie_name, auth);
     Ok(())
 }
 
@@ -34,13 +38,15 @@ pub fn spawn(root: Option<PathBuf>, listen: &str) -> Result<JoinHandle<()>> {
     let paths = Paths::new(root)?;
     let auth = Arc::new(WebAuth::load_or_create(&paths)?);
     let server = bind(listen)?;
+    let cookie_name = session_cookie_name(&paths, listen)?;
     let listen = listen.to_string();
     let restrict_hosts = restrict_hosts(&listen);
     let handle = std::thread::Builder::new()
         .name("memex-web".to_string())
         .spawn(move || {
             println!("memex web UI: http://{listen}");
-            serve_requests(server, paths, restrict_hosts, auth);
+            println!("Open it with: memex web open --listen {listen}");
+            serve_requests(server, paths, restrict_hosts, cookie_name, auth);
         })
         .context("failed to start web UI thread")?;
     Ok(handle)
@@ -54,10 +60,14 @@ pub fn bootstrap_url(root: Option<PathBuf>, listen: &str) -> Result<String> {
     validate_listener(listen)?;
     let paths = Paths::new(root)?;
     let auth = WebAuth::load_or_create(&paths)?;
+    bootstrap_url_for_auth(&auth, listen)
+}
+
+fn bootstrap_url_for_auth(auth: &WebAuth, listen: &str) -> Result<String> {
     let bootstrap = auth.create_bootstrap_token()?;
     let (host, port) = listen_host_port(listen)?;
     let browser_host = match host {
-        "127.0.0.1" | "localhost" => "localhost".to_string(),
+        "127.0.0.1" | "localhost" => host.to_string(),
         "::1" => "[::1]".to_string(),
         _ => unreachable!("listener validation rejected unsupported loopback host"),
     };
@@ -66,13 +76,25 @@ pub fn bootstrap_url(root: Option<PathBuf>, listen: &str) -> Result<String> {
     ))
 }
 
-fn serve_requests(server: Server, paths: Paths, restrict_hosts: bool, auth: Arc<WebAuth>) {
+fn serve_requests(
+    server: Server,
+    paths: Paths,
+    restrict_hosts: bool,
+    cookie_name: String,
+    auth: Arc<WebAuth>,
+) {
     for request in server.incoming_requests() {
         let request_paths = paths.clone();
         let request_auth = Arc::clone(&auth);
+        let request_cookie_name = cookie_name.clone();
         std::thread::spawn(move || {
-            if let Err(err) = handle_request(request, &request_paths, restrict_hosts, &request_auth)
-            {
+            if let Err(err) = handle_request(
+                request,
+                &request_paths,
+                restrict_hosts,
+                &request_cookie_name,
+                &request_auth,
+            ) {
                 eprintln!("web UI request failed: {err:#}");
             }
         });
@@ -83,6 +105,7 @@ fn handle_request(
     request: Request,
     paths: &Paths,
     restrict_hosts: bool,
+    cookie_name: &str,
     auth: &WebAuth,
 ) -> Result<()> {
     if restrict_hosts && !has_local_host(&request) {
@@ -100,6 +123,14 @@ fn handle_request(
         if request.method() != &Method::Post {
             return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
         }
+        if !browser_request_is_same_origin(&request) {
+            return respond_text(
+                request,
+                StatusCode(403),
+                "cross-origin request denied",
+                "text/plain",
+            );
+        }
         let Some(token) = bearer_token(&request) else {
             return respond_unauthorized(request);
         };
@@ -107,10 +138,11 @@ fn handle_request(
             Ok(session) => session,
             Err(_) => return respond_unauthorized(request),
         };
-        return respond_json(
+        return respond_json_with_headers(
             request,
             StatusCode(200),
             &SessionTokenPayload { token: &session },
+            vec![session_cookie_header(cookie_name, &session)?],
         );
     }
 
@@ -118,7 +150,7 @@ fn handle_request(
         return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
     }
     if (parsed.path() == "/api" || parsed.path().starts_with("/api/"))
-        && !request_is_authorized(&request, auth)
+        && !request_is_authorized(&request, cookie_name, auth)
     {
         return respond_unauthorized(request);
     }
@@ -176,9 +208,78 @@ fn handle_request(
     }
 }
 
-fn request_is_authorized(request: &Request, auth: &WebAuth) -> bool {
-    bearer_token(request)
-        .is_some_and(|token| auth.authorize_bearer(token) || auth.authorize_session(token))
+fn request_is_authorized(request: &Request, cookie_name: &str, auth: &WebAuth) -> bool {
+    if let Some(token) = bearer_token(request) {
+        return auth.authorize_bearer(token) || auth.authorize_session(token);
+    }
+    cookie_request_is_same_origin(request)
+        && cookie_value(request, cookie_name).is_some_and(|token| auth.authorize_session(token))
+}
+
+fn request_header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
+fn browser_request_is_same_origin(request: &Request) -> bool {
+    let origin_ok = request_header(request, "Origin").is_none_or(|origin| {
+        request_header(request, "Host").is_some_and(|host| origin == format!("http://{host}"))
+    });
+    let fetch_site_ok = request_header(request, "Sec-Fetch-Site")
+        .is_none_or(|site| matches!(site, "same-origin" | "none"));
+    origin_ok && fetch_site_ok
+}
+
+fn cookie_request_is_same_origin(request: &Request) -> bool {
+    (request_header(request, "Origin").is_some()
+        || request_header(request, "Sec-Fetch-Site").is_some())
+        && browser_request_is_same_origin(request)
+}
+
+fn cookie_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    for header in request
+        .headers()
+        .iter()
+        .filter(|header| header.field.equiv("Cookie"))
+    {
+        for pair in header.value.as_str().split(';') {
+            let Some((key, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if key == name {
+                if found.is_some() || value.is_empty() {
+                    return None;
+                }
+                found = Some(value);
+            }
+        }
+    }
+    found
+}
+
+fn session_cookie_name(paths: &Paths, listen: &str) -> Result<String> {
+    let root = std::fs::canonicalize(&paths.root)
+        .with_context(|| format!("failed to resolve {}", paths.root.display()))?;
+    let (_, port) = listen_host_port(listen)?;
+    let digest = Sha256::digest(format!("{}\0{port}", root.display()).as_bytes());
+    Ok(format!(
+        "memex_session_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..9])
+    ))
+}
+
+fn session_cookie_header(name: &str, value: &str) -> Result<Header> {
+    header(
+        "Set-Cookie",
+        &format!(
+            "{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+            crate::web_auth::SESSION_TTL.as_secs()
+        ),
+    )
 }
 
 fn bearer_token(request: &Request) -> Option<&str> {
@@ -856,6 +957,23 @@ fn respond_json<T: Serialize>(request: Request, status: StatusCode, value: &T) -
     )
 }
 
+fn respond_json_with_headers<T: Serialize>(
+    request: Request,
+    status: StatusCode,
+    value: &T,
+    headers: Vec<Header>,
+) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    respond_with_headers(
+        request,
+        status,
+        body,
+        "application/json; charset=utf-8",
+        false,
+        headers,
+    )
+}
+
 #[derive(Serialize)]
 struct ErrorPayload<'a> {
     error: &'a str,
@@ -944,8 +1062,19 @@ mod tests {
             response
         });
         let request = server.recv().unwrap();
-        handle_request(request, paths, true, auth).unwrap();
+        let cookie_name = session_cookie_name(paths, DEFAULT_LISTEN).unwrap();
+        handle_request(request, paths, true, &cookie_name, auth).unwrap();
         client.join().unwrap()
+    }
+
+    fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+        response
+            .split("\r\n\r\n")
+            .next()?
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
     }
 
     #[test]
@@ -1335,6 +1464,28 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_urls_preserve_the_listener_host() {
+        let temp = TempDir::new().unwrap();
+        let root = Some(temp.path().to_path_buf());
+
+        assert!(
+            bootstrap_url(root.clone(), "127.0.0.1:6363")
+                .unwrap()
+                .starts_with("http://127.0.0.1:6363/#bootstrap=")
+        );
+        assert!(
+            bootstrap_url(root.clone(), "localhost:6363")
+                .unwrap()
+                .starts_with("http://localhost:6363/#bootstrap=")
+        );
+        assert!(
+            bootstrap_url(root, "[::1]:6363")
+                .unwrap()
+                .starts_with("http://[::1]:6363/#bootstrap=")
+        );
+    }
+
+    #[test]
     fn private_api_requires_authentication_and_accepts_single_use_bootstrap_session() {
         let temp = TempDir::new().unwrap();
         let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
@@ -1375,10 +1526,16 @@ mod tests {
             &paths,
             &auth,
             format!(
-                "POST /auth/exchange HTTP/1.1\r\nHost: localhost:6363\r\nAuthorization: Bearer {bootstrap}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "POST /auth/exchange HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:6363\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer {bootstrap}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             ),
         );
         assert!(exchange.starts_with("HTTP/1.1 200"));
+        let set_cookie = response_header(&exchange, "Set-Cookie").unwrap();
+        let cookie = set_cookie.split(';').next().unwrap();
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Strict"));
+        assert!(set_cookie.contains("Path=/"));
+        assert!(set_cookie.contains("Max-Age=43200"));
         let body = exchange.split("\r\n\r\n").nth(1).unwrap();
         let session = serde_json::from_str::<serde_json::Value>(body).unwrap()["token"]
             .as_str()
@@ -1394,6 +1551,15 @@ mod tests {
         );
         assert!(authorized.starts_with("HTTP/1.1 200"));
 
+        let cookie_authorized = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:6363\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(cookie_authorized.starts_with("HTTP/1.1 200"));
+
         let replay = http_round_trip(
             &paths,
             &auth,
@@ -1402,6 +1568,105 @@ mod tests {
             ),
         );
         assert!(replay.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn browser_auth_rejects_cross_origin_invalid_expired_and_ambiguous_credentials() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        SearchIndex::open_or_create_for_ingest(&paths.index)
+            .unwrap()
+            .publish_generation()
+            .unwrap();
+        let auth = WebAuth::load_or_create(&paths).unwrap();
+        let cookie_name = session_cookie_name(&paths, DEFAULT_LISTEN).unwrap();
+
+        for token in ["invalid".to_string(), auth.create_expired_bootstrap_token()] {
+            let response = http_round_trip(
+                &paths,
+                &auth,
+                format!(
+                    "POST /auth/exchange HTTP/1.1\r\nHost: 127.0.0.1:6363\r\nOrigin: http://127.0.0.1:6363\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            assert!(response.starts_with("HTTP/1.1 401"));
+        }
+
+        let bootstrap = auth.create_bootstrap_token().unwrap();
+        let cross_origin = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "POST /auth/exchange HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:7777\r\nSec-Fetch-Site: same-site\r\nAuthorization: Bearer {bootstrap}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(cross_origin.starts_with("HTTP/1.1 403"));
+
+        let exchange = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "POST /auth/exchange HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:6363\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer {bootstrap}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(exchange.starts_with("HTTP/1.1 200"));
+        let cookie = response_header(&exchange, "Set-Cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+
+        let cross_port = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:7777\r\nSec-Fetch-Site: same-site\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(cross_port.starts_with("HTTP/1.1 401"));
+
+        let duplicate = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:6363\r\nSec-Fetch-Site: same-origin\r\nCookie: {cookie}; {cookie_name}=other\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(duplicate.starts_with("HTTP/1.1 401"));
+
+        let invalid_bearer = http_round_trip(
+            &paths,
+            &auth,
+            format!(
+                "GET /api/stats HTTP/1.1\r\nHost: localhost:6363\r\nOrigin: http://localhost:6363\r\nSec-Fetch-Site: same-origin\r\nAuthorization: Bearer invalid\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(invalid_bearer.starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn cookie_namespace_varies_by_root_and_port_and_sessions_end_on_restart() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let first_paths = Paths::new(Some(first.path().to_path_buf())).unwrap();
+        let second_paths = Paths::new(Some(second.path().to_path_buf())).unwrap();
+        let first_auth = WebAuth::load_or_create(&first_paths).unwrap();
+        let second_auth = WebAuth::load_or_create(&first_paths).unwrap();
+        let _other_root_auth = WebAuth::load_or_create(&second_paths).unwrap();
+        let session = first_auth
+            .exchange_bootstrap_token(&first_auth.create_bootstrap_token().unwrap())
+            .unwrap();
+
+        assert_ne!(
+            session_cookie_name(&first_paths, "127.0.0.1:6363").unwrap(),
+            session_cookie_name(&first_paths, "127.0.0.1:6364").unwrap()
+        );
+        assert_ne!(
+            session_cookie_name(&first_paths, DEFAULT_LISTEN).unwrap(),
+            session_cookie_name(&second_paths, DEFAULT_LISTEN).unwrap()
+        );
+        assert!(!second_auth.authorize_session(&session));
     }
 
     #[test]

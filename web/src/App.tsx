@@ -113,7 +113,16 @@ const initialShellView: ShellView = paramsAtLoad.has("session")
   ? "transcript"
   : "home"
 
-let sessionToken: string | null = null
+const authenticationRequiredMessage = "Authentication required"
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message)
+  }
+}
 
 async function exchangeBootstrapToken() {
   const fragment = new URLSearchParams(window.location.hash.slice(1))
@@ -124,15 +133,16 @@ async function exchangeBootstrapToken() {
   const response = await fetch("/auth/exchange", {
     method: "POST",
     headers: { Authorization: `Bearer ${bootstrap}` },
+    credentials: "same-origin",
   })
   if (!response.ok) {
-    throw new Error(
-      "Authentication failed. Run `memex web open` for a new link.",
-    )
+    const existingSession = await fetch("/api/stats", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    })
+    if (existingSession.status !== 401) return
+    throw new ApiError(authenticationRequiredMessage, 401)
   }
-  const payload = (await response.json()) as { token?: string }
-  if (!payload.token) throw new Error("Authentication response did not include a token.")
-  sessionToken = payload.token
 }
 
 const authenticationReady = exchangeBootstrapToken()
@@ -146,18 +156,27 @@ const formatDate = (timestamp: number) =>
     : ""
 
 async function api<T>(path: string): Promise<T> {
-  await authenticationReady
-  const headers: Record<string, string> = { Accept: "application/json" }
-  if (sessionToken) headers.Authorization = `Bearer ${sessionToken}`
+  try {
+    await authenticationReady
+  } catch (error) {
+    if (error instanceof ApiError) throw error
+    throw new ApiError(authenticationRequiredMessage, 401)
+  }
   const response = await fetch(path, {
-    headers,
+    headers: { Accept: "application/json" },
+    credentials: "same-origin",
   })
   const data = (await response
     .json()
     .catch(() => ({ error: `HTTP ${response.status}` }))) as T & {
     error?: string
   }
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
+  if (!response.ok) {
+    if (response.status === 401) {
+      throw new ApiError(authenticationRequiredMessage, response.status)
+    }
+    throw new ApiError(data.error || `HTTP ${response.status}`, response.status)
+  }
   return data
 }
 
@@ -1255,6 +1274,19 @@ function App() {
       </div>
     </div>
   )
+
+  if (error === authenticationRequiredMessage) {
+    return (
+      <main className="transcript-surface">
+        <div className="empty">
+          <strong>Open Memex from your terminal</strong>
+          <p>
+            Run <code>memex web open</code> to create a new browser session.
+          </p>
+        </div>
+      </main>
+    )
+  }
 
   return (
     <SidebarProvider

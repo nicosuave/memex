@@ -181,7 +181,7 @@ leave missing copies uninstalled, and require restarting the agent to load chang
   `--trace` and `memex debug eval-retrieval --help`. Traces omit transcript contents;
   relevance evaluation reports recall, MRR, nDCG, and session diversity.
 - For indexing, privacy, or embedding configuration, inspect `memex index --help`
-  and `memex service status`. Agent subprocesses are indexed and filtered at
+  and `memex daemon status`. Agent subprocesses are indexed and filtered at
   query time. Plaintext reasoning is excluded by default; encrypted/redacted
   reasoning remains excluded. Use repeatable `--only-source` and `--exclude-source`
   options for provider scope, and `--claude-path` for an alternate Claude projects

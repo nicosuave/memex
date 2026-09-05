@@ -18,8 +18,8 @@ const ACCESS_TOKEN_BYTES: usize = 32;
 const BOOTSTRAP_NONCE_BYTES: usize = 16;
 const BOOTSTRAP_PAYLOAD_BYTES: usize = 8 + BOOTSTRAP_NONCE_BYTES;
 const BOOTSTRAP_TOKEN_BYTES: usize = BOOTSTRAP_PAYLOAD_BYTES + 32;
-const BOOTSTRAP_TTL: Duration = Duration::from_secs(60);
-const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const BOOTSTRAP_TTL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const TOKEN_FILE: &str = "web-auth-token";
 type HmacSha256 = Hmac<Sha256>;
 
@@ -125,6 +125,22 @@ impl WebAuth {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         sessions.retain(|_, created_at| now.duration_since(*created_at) <= SESSION_TTL);
         sessions.contains_key(&fingerprint)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_expired_bootstrap_token(&self) -> String {
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(1);
+        let mut payload = [0_u8; BOOTSTRAP_PAYLOAD_BYTES];
+        payload[..8].copy_from_slice(&expires_at.to_be_bytes());
+        let signature = sign_bootstrap(&self.secret, &payload);
+        let mut token = [0_u8; BOOTSTRAP_TOKEN_BYTES];
+        token[..BOOTSTRAP_PAYLOAD_BYTES].copy_from_slice(&payload);
+        token[BOOTSTRAP_PAYLOAD_BYTES..].copy_from_slice(&signature);
+        URL_SAFE_NO_PAD.encode(token)
     }
 }
 

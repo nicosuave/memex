@@ -157,7 +157,7 @@ The main search, indexing, and maintenance commands are organized as follows:
 | Index maintenance | `memex index`, `memex index rebuild`, `memex index gc`, `memex index embed`, `memex index stats` |
 | Search and reading | `memex search`, `memex sessions`, `memex session`, `memex show`, `memex context` |
 | Batch session reads | `memex session batch [requests.jsonl]` |
-| Background indexing | `memex service enable`, `memex service restart`, `memex service status`, `memex service disable` |
+| Background processes | `memex daemon run`, `memex daemon enable`, `memex daemon restart`, `memex daemon status`, `memex daemon disable` |
 | Browser UI | `memex web serve`, `memex web open` (`memex web` also serves) |
 | Retrieval diagnostics | `memex debug eval-retrieval DATASET` |
 
@@ -427,6 +427,30 @@ Run `memex mcp` to serve the Model Context Protocol over **Streamable HTTP** at
 `--listen 127.0.0.1:5364` to change the socket and `--root /path/to/memex-data`
 for a custom data directory. This is separate from Memex's internal `rpc` protocol.
 
+MCP can also share the long-running indexing daemon:
+
+```bash
+memex daemon run --mcp
+memex daemon enable --mcp
+```
+
+`--mcp-listen <address>` implies `--mcp`. MCP forces the daemon into continuous
+mode. Set `index_service_mcp = true` in `config.toml` to opt in by default, or
+pass `--no-mcp` to disable configured MCP serving for one daemon invocation.
+Standalone HTTP and daemon-hosted MCP share the `[mcp]` configuration:
+
+```toml
+index_service_mcp = true
+
+[mcp]
+listen = "127.0.0.1:5363"
+allowed_hosts = ["memex.example.com"]
+allowed_origins = ["https://chat.example.com"]
+public_url = "https://memex.example.com"
+```
+
+Command-line values override the corresponding shared configuration values.
+
 For self-hosted ChatGPT or Claude access, enable the built-in single-owner OAuth
 flow with the public origin of your instance:
 
@@ -535,7 +559,7 @@ configuration and requires peers that support bounded reads.
 
 Search retains configured auto-index behavior on local and remote machines.
 Handshake, session discovery, and transcript reads do not trigger ingestion;
-semantic search may load an embedding model. Run the index service separately
+semantic search may load an embedding model. Run the daemon separately
 when predictable search latency matters. Up to four retrieval calls run at once;
 MCP cancellation stops waiting but synchronous work can finish under its existing
 timeouts. Index readers are opened per call so a running server sees newly
@@ -579,25 +603,31 @@ projections can also include tree/linkage metadata:
 `parent_tool_use_id`, `source_tool_use_id`, and
 `source_tool_assistant_uuid`.
 
-## Background index service
+## Memex daemon
 
 Works on macOS (launchd) and Linux (systemd).
 
+Run indexing and any configured Web UI or MCP server in the foreground:
+
+```
+memex daemon run
+```
+
 Enable:
 ```
-memex service enable
-memex service enable --continuous
-memex service enable --web-ui
+memex daemon enable
+memex daemon enable --continuous
+memex daemon enable --web-ui
 ```
 
-Regenerate the service from current config and restart it:
+Regenerate the daemon from current config and restart it:
 ```
-memex service restart
+memex daemon restart
 ```
 
-Inspect the registered service and whether it is serving the Web UI:
+Inspect the registered daemon and whether it is serving the Web UI or MCP:
 ```
-memex service status
+memex daemon status
 ```
 
 Open an authenticated browser session:
@@ -607,10 +637,11 @@ memex web open
 
 Disable:
 ```
-memex service disable
+memex daemon disable
 ```
 
-`service` reads config defaults (mode, interval, log paths). Flags override.
+The daemon reads config defaults for its mode, interval, listeners, and log paths.
+Flags override those defaults.
 
 ### Reclaiming obsolete index generations
 
@@ -619,13 +650,13 @@ pre-lease generations. It preserves the committed Tantivy segments without rebui
 conversation history. No user action is required.
 
 For diagnostics or to reclaim space immediately without waiting for the next index run, stop the
-background service and close TUI/Web readers, then preview and run GC:
+background daemon and close TUI/Web readers, then preview and run GC:
 
 ```bash
-memex service disable
+memex daemon disable
 memex index gc --dry-run
 memex index gc --offline
-memex service enable --web-ui # or restore the mode you previously used
+memex daemon enable --web-ui # or restore the mode you previously used
 ```
 
 `memex index gc` validates the committed index, hard-links only its live Tantivy segments into a clean
@@ -646,26 +677,27 @@ remote access is required, use an authenticated TLS reverse proxy to `127.0.0.1`
 injects the installation bearer token into upstream requests. To use a different local port:
 
 ```
-memex service enable --web-listen 127.0.0.1:8080
+memex daemon enable --web-listen 127.0.0.1:8080
 memex web open --listen 127.0.0.1:8080
 ```
 
 The first Web UI start creates `~/.memex/web-auth-token` with mode `0600`. Private API
 routes require that token as `Authorization: Bearer ...` or a browser session established
 by `web open`. Browser links carry a signed, one-time credential in the URL
-fragment, remove it before navigation continues, and exchange it for an ephemeral bearer
-token held only in page memory. The browser token is never stored in a cookie,
-`localStorage`, or session storage. Browser sessions expire after 12 hours, disappear when
-the page closes, and are invalidated whenever the daemon restarts.
+fragment, remove it before navigation continues, and exchange it for an `HttpOnly`,
+same-origin cookie. JavaScript cannot read the cookie, and Memex does not store browser
+credentials in `localStorage` or session storage. Browser sessions survive refreshes and
+reopened tabs, expire after 12 hours, and are invalidated whenever the daemon restarts.
 
-To run the same UI in the foreground without changing the background service:
+To run the same UI in the foreground without changing the background daemon:
 
 ```
 memex web serve
 ```
 
-`memex web` is shorthand for `memex web serve`. Run `memex web open` from another
-terminal to open an authenticated browser session.
+`memex web` is shorthand for `memex web serve`; foreground startup prints a one-time
+login URL. A background `memex daemon` never writes that credential to its service logs.
+Run `memex web open` from a terminal to open an authenticated browser session.
 
 The browser frontend lives in `web/`, uses React and shadcn components, and is
 built with `cd web && bun install && bun run build`. The generated static assets
@@ -680,7 +712,7 @@ memex index --embeddings
 ```
 
 Recommended when embeddings are on (especially non-`potion` models): run the background
-index service with `memex service enable --continuous`, and consider setting `auto_index_on_search = false`
+daemon with `memex daemon enable --continuous`, and consider setting `auto_index_on_search = false`
 to keep searches fast.
 
 ## Embedding model
@@ -745,6 +777,7 @@ index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
 index_service_web_ui = false  # serve local browser; forces continuous mode when true
+index_service_mcp = false  # serve MCP from the daemon; forces continuous mode when true
 index_service_web_listen = "127.0.0.1:6363"
 index_service_label = "memex-index"  # service name (default: com.memex.index on macOS)
 index_service_systemd_dir = "~/.config/systemd/user"  # Linux only
@@ -758,9 +791,15 @@ grok_resume_cmd = "cd {cwd_shell} && grok --resume {session_id}"
 jcode_resume_cmd = "cd {cwd_shell} && jcode --resume {session_id}"
 muse_resume_cmd = "cd {cwd_shell} && muse resume {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"
+
+[mcp]
+listen = "127.0.0.1:5363"
+allowed_hosts = []
+allowed_origins = []
+# public_url = "https://memex.example.com"
 ```
 
-Service logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
+Daemon logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
 
 `scan_cache_ttl` controls how long auto-indexing considers scans fresh.
 `include_reasoning` defaults to false. Set it to true (or pass `memex index

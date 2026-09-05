@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -141,6 +142,8 @@ pub struct UserConfig {
     pub index_service_poll_interval: Option<u64>,
     /// Serve the local Web UI from the continuous background index service.
     pub index_service_web_ui: Option<bool>,
+    /// Serve MCP from the continuous background index service.
+    pub index_service_mcp: Option<bool>,
     /// Address and port for the background Web UI.
     pub index_service_web_listen: Option<String>,
     /// Background index service launchd label.
@@ -184,6 +187,19 @@ pub struct UserConfig {
     /// Other machines whose indexes can be queried through a backend.
     #[serde(default)]
     pub machines: Vec<MachineConfig>,
+    /// Shared MCP HTTP configuration for standalone and background service modes.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct McpConfig {
+    pub listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -500,6 +516,48 @@ mod tests {
     #[test]
     fn token_usage_is_disabled_by_default() {
         assert!(!UserConfig::default().token_usage_enabled());
+    }
+
+    #[test]
+    fn mcp_defaults_preserve_disabled_service_and_empty_options() {
+        let config = UserConfig::default();
+
+        assert_eq!(config.index_service_mcp, None);
+        assert_eq!(config.mcp.listen, None);
+        assert!(config.mcp.allowed_hosts.is_empty());
+        assert!(config.mcp.allowed_origins.is_empty());
+        assert_eq!(config.mcp.public_url, None);
+    }
+
+    #[test]
+    fn parses_background_mcp_configuration() {
+        let config: UserConfig = toml::from_str(
+            r#"
+                index_service_mcp = true
+
+                [mcp]
+                listen = "127.0.0.1:5363"
+                allowed_hosts = ["memex.example", "127.0.0.1:5363"]
+                allowed_origins = ["https://chat.example"]
+                public_url = "https://memex.example"
+            "#,
+        )
+        .expect("parse MCP config");
+
+        assert_eq!(config.index_service_mcp, Some(true));
+        assert_eq!(
+            config.mcp.listen,
+            Some("127.0.0.1:5363".parse().expect("socket address"))
+        );
+        assert_eq!(
+            config.mcp.allowed_hosts,
+            ["memex.example", "127.0.0.1:5363"]
+        );
+        assert_eq!(config.mcp.allowed_origins, ["https://chat.example"]);
+        assert_eq!(
+            config.mcp.public_url.as_deref(),
+            Some("https://memex.example")
+        );
     }
 
     #[test]

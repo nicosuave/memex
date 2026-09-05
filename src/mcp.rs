@@ -1,5 +1,11 @@
 //! MCP transport over the same retrieval paths used by the CLI.
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow, bail, ensure};
 use rmcp::{
@@ -487,18 +493,134 @@ pub fn revoke_all(root: Option<PathBuf>) -> Result<usize> {
     oauth::revoke_all(&Paths::new(root)?)
 }
 
-/// Start MCP without running an index refresh or opening a UI during handshake.
-pub fn run(root: Option<PathBuf>, http: Option<HttpOptions>) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+pub struct BackgroundServer {
+    local_addr: SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    state: Mutex<BackgroundState>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct BackgroundState {
+    done: mpsc::Receiver<Result<()>>,
+    terminal: Option<std::result::Result<(), String>>,
+}
+
+impl BackgroundServer {
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Wait for the HTTP listener to stop. `true` means it is still running
+    /// after the timeout; `false` means it shut down cleanly.
+    pub fn wait_timeout(&self, timeout: Duration) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(terminal) = &state.terminal {
+            return match terminal {
+                Ok(()) => Ok(false),
+                Err(error) => Err(anyhow!(error.clone())),
+            };
+        }
+        match state.done.recv_timeout(timeout) {
+            Ok(Ok(())) => {
+                state.terminal = Some(Ok(()));
+                Ok(false)
+            }
+            Ok(Err(error)) => {
+                let error = error.to_string();
+                state.terminal = Some(Err(error.clone()));
+                Err(anyhow!(error))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(true),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let error = "MCP server thread exited without reporting a result".to_owned();
+                state.terminal = Some(Err(error.clone()));
+                Err(anyhow!(error))
+            }
+        }
+    }
+}
+
+impl Drop for BackgroundServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         // Leave blocking capacity for Tokio's stdin/stdout adapters in addition
         // to the four retrieval workers guarded by the semaphore.
         .max_blocking_threads(8)
         .enable_all()
-        .build()?;
+        .build()?)
+}
+
+/// Start MCP HTTP on a dedicated bounded runtime. This returns only after all
+/// auth, OAuth, router and listener setup has succeeded.
+pub fn spawn_http(root: Option<PathBuf>, options: HttpOptions) -> Result<BackgroundServer> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let thread = thread::Builder::new()
+        .name("memex-mcp-http".to_owned())
+        .spawn(move || {
+            let result = runtime().and_then(|runtime| {
+                let result = runtime.block_on(http::run(
+                    root,
+                    options,
+                    Some(ready_tx),
+                    http::Shutdown::Receiver(shutdown_rx),
+                ));
+                runtime.shutdown_timeout(Duration::from_secs(1));
+                result
+            });
+            let _ = done_tx.send(result);
+        })?;
+
+    match ready_rx.recv() {
+        Ok(Ok(local_addr)) => Ok(BackgroundServer {
+            local_addr,
+            shutdown: Some(shutdown_tx),
+            state: Mutex::new(BackgroundState {
+                done: done_rx,
+                terminal: None,
+            }),
+            thread: Some(thread),
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(anyhow!(error))
+        }
+        Err(_) => {
+            let outcome = done_rx.recv().unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "MCP server thread exited before reporting startup status"
+                ))
+            });
+            let _ = thread.join();
+            outcome?;
+            Err(anyhow!(
+                "MCP server stopped before reporting startup readiness"
+            ))
+        }
+    }
+}
+
+/// Start MCP without running an index refresh or opening a UI during handshake.
+pub fn run(root: Option<PathBuf>, http: Option<HttpOptions>) -> Result<()> {
+    let runtime = runtime()?;
     let result = runtime.block_on(async {
         if let Some(options) = http {
-            return http::run(root, options).await;
+            return http::run(root, options, None, http::Shutdown::Signal).await;
         }
         let service = MemexServer::new(root)
             .serve(rmcp::transport::stdio())
@@ -510,4 +632,109 @@ pub fn run(root: Option<PathBuf>, http: Option<HttpOptions>) -> Result<()> {
     // stop this process while outstanding SSH calls finish under their own timeout.
     runtime.shutdown_timeout(Duration::from_secs(1));
     result
+}
+
+#[cfg(test)]
+mod background_tests {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::time::Instant;
+
+    use super::*;
+
+    fn options(listen: SocketAddr) -> HttpOptions {
+        HttpOptions {
+            listen,
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+            public_url: None,
+        }
+    }
+
+    #[test]
+    fn background_startup_propagates_bind_failure() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy listener");
+        let listen = occupied.local_addr().expect("occupied address");
+        let root = tempfile::tempdir().expect("temporary MCP root");
+
+        let error = spawn_http(Some(root.path().to_owned()), options(listen))
+            .err()
+            .expect("occupied listener must fail startup");
+
+        assert!(
+            error.to_string().contains("address already in use")
+                || error.to_string().contains("Address already in use"),
+            "unexpected bind error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn background_startup_is_ready_and_serves_health_marker() {
+        let root = tempfile::tempdir().expect("temporary MCP root");
+        let server = spawn_http(
+            Some(root.path().to_owned()),
+            options(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        )
+        .expect("start background MCP");
+        assert!(
+            server
+                .wait_timeout(Duration::from_millis(10))
+                .expect("check running server")
+        );
+
+        let mut stream = TcpStream::connect(server.local_addr()).expect("connect health check");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set health timeout");
+        write!(
+            stream,
+            "GET /healthz HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            server.local_addr()
+        )
+        .expect("write health request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read health response");
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("memex-mcp"), "{response}");
+    }
+
+    #[test]
+    fn dropping_background_server_releases_listener() {
+        let root = tempfile::tempdir().expect("temporary MCP root");
+        let server = spawn_http(
+            Some(root.path().to_owned()),
+            options(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        )
+        .expect("start background MCP");
+        let listen = server.local_addr();
+
+        drop(server);
+
+        TcpListener::bind(listen).expect("listener should be released after drop");
+    }
+
+    #[test]
+    fn dropping_background_server_is_bounded_with_incomplete_request() {
+        let root = tempfile::tempdir().expect("temporary MCP root");
+        let server = spawn_http(
+            Some(root.path().to_owned()),
+            options(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        )
+        .expect("start background MCP");
+        let mut stalled = TcpStream::connect(server.local_addr()).expect("connect stalled client");
+        stalled
+            .write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n")
+            .expect("write incomplete request");
+
+        let started = Instant::now();
+        drop(server);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "background MCP drop must not wait for a stalled client"
+        );
+    }
 }

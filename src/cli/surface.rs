@@ -393,8 +393,14 @@ mod tests {
             "--claude-path",
             "/tmp/custom projects",
         ]);
-        let args =
-            super::super::build_index_command_args(&selected, true, 17, true, "127.0.0.1:4567");
+        let args = super::super::build_index_command_args(
+            &selected,
+            true,
+            17,
+            true,
+            "127.0.0.1:4567",
+            None,
+        );
         let mut command = vec!["memex"];
         command.extend(args.iter().map(String::as_str));
         let reparsed = index_args(&command);
@@ -459,5 +465,124 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(&args).is_err(), "accepted {args:?}");
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub(super) struct DaemonMcpArgs {
+    /// Serve MCP in the daemon (implies continuous mode)
+    #[arg(long, conflicts_with = "no_mcp", help_heading = "MCP")]
+    pub(super) mcp: bool,
+    /// Disable configured MCP serving for this daemon invocation
+    #[arg(long, conflicts_with = "mcp_listen", help_heading = "MCP")]
+    pub(super) no_mcp: bool,
+    /// MCP socket (implies --mcp; default: [mcp].listen or 127.0.0.1:5363)
+    #[arg(long, help_heading = "MCP")]
+    pub(super) mcp_listen: Option<std::net::SocketAddr>,
+}
+
+impl DaemonMcpArgs {
+    pub(super) fn resolve(
+        &self,
+        config: &crate::config::UserConfig,
+    ) -> Option<crate::mcp::HttpOptions> {
+        (!self.no_mcp
+            && (self.mcp || self.mcp_listen.is_some() || config.index_service_mcp.unwrap_or(false)))
+        .then(|| mcp_http_options(config, self.mcp_listen, Vec::new(), Vec::new(), None))
+    }
+}
+
+pub(super) fn mcp_http_options(
+    config: &crate::config::UserConfig,
+    listen: Option<std::net::SocketAddr>,
+    hosts: Vec<String>,
+    origins: Vec<String>,
+    public_url: Option<String>,
+) -> crate::mcp::HttpOptions {
+    crate::mcp::HttpOptions {
+        listen: listen
+            .or(config.mcp.listen)
+            .unwrap_or_else(|| "127.0.0.1:5363".parse().expect("default MCP socket")),
+        allowed_hosts: if hosts.is_empty() {
+            config.mcp.allowed_hosts.clone()
+        } else {
+            hosts
+        },
+        allowed_origins: if origins.is_empty() {
+            config.mcp.allowed_origins.clone()
+        } else {
+            origins
+        },
+        public_url: public_url.or_else(|| config.mcp.public_url.clone()),
+    }
+}
+
+#[cfg(test)]
+mod mcp_options_tests {
+    use super::*;
+    use crate::config::{McpConfig, UserConfig};
+
+    #[test]
+    fn daemon_mcp_enablement_and_cli_overrides() {
+        let mut config = UserConfig::default();
+        assert!(DaemonMcpArgs::default().resolve(&config).is_none());
+        assert_eq!(
+            mcp_http_options(&config, None, vec![], vec![], None).listen,
+            "127.0.0.1:5363".parse().unwrap()
+        );
+        config.index_service_mcp = Some(true);
+        config.mcp = McpConfig {
+            listen: Some("127.0.0.1:4567".parse().unwrap()),
+            allowed_hosts: vec!["configured.example".into()],
+            allowed_origins: vec!["https://configured.example".into()],
+            public_url: Some("https://configured.example/mcp".into()),
+        };
+        let configured = DaemonMcpArgs::default().resolve(&config).unwrap();
+        assert_eq!(configured.listen, config.mcp.listen.unwrap());
+        assert_eq!(configured.allowed_hosts, config.mcp.allowed_hosts);
+        assert_eq!(configured.allowed_origins, config.mcp.allowed_origins);
+        assert_eq!(configured.public_url, config.mcp.public_url);
+        assert!(
+            DaemonMcpArgs {
+                no_mcp: true,
+                ..Default::default()
+            }
+            .resolve(&config)
+            .is_none()
+        );
+        config.index_service_mcp = Some(false);
+        assert!(
+            DaemonMcpArgs {
+                mcp: true,
+                ..Default::default()
+            }
+            .resolve(&config)
+            .is_some()
+        );
+        let socket = "127.0.0.1:4568".parse().unwrap();
+        assert_eq!(
+            DaemonMcpArgs {
+                mcp_listen: Some(socket),
+                ..Default::default()
+            }
+            .resolve(&config)
+            .unwrap()
+            .listen,
+            socket
+        );
+        let overridden = mcp_http_options(
+            &config,
+            Some(socket),
+            vec!["override.example".into()],
+            vec!["https://override.example".into()],
+            Some("https://override.example/mcp".into()),
+        );
+        assert_eq!(overridden.listen, socket);
+        assert_eq!(overridden.allowed_hosts, ["override.example"]);
+        assert_eq!(overridden.allowed_origins, ["https://override.example"]);
+        assert_eq!(
+            overridden.public_url.as_deref(),
+            Some("https://override.example/mcp")
+        );
     }
 }
