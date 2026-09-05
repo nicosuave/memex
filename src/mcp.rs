@@ -25,6 +25,7 @@ use crate::{
 
 const MAX_READ_CHARS: usize = 64_000;
 mod http;
+mod oauth;
 pub use http::HttpOptions;
 const INSTRUCTIONS: &str = "Recover the smallest set of source-grounded records that answers the question. \
 Read known record/session IDs directly. Otherwise search using exact anchors first, hybrid for uncertain wording, \
@@ -479,6 +480,11 @@ fn push_page(
         .ok_or_else(|| anyhow!("hydrate exceeded shared character budget"))?;
     pages.push(with_machine(page, machine)?);
     Ok(())
+}
+
+/// Revoke OAuth grants without starting a listener or refreshing the index.
+pub fn revoke_all(root: Option<PathBuf>) -> Result<usize> {
+    oauth::revoke_all(&Paths::new(root)?)
 }
 
 /// Start MCP without running an index refresh or opening a UI during handshake.

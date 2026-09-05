@@ -402,11 +402,44 @@ Run `memex mcp` to serve the Model Context Protocol over **Streamable HTTP** at
 `--listen 127.0.0.1:5364` to change the socket and `--root /path/to/memex-data`
 for a custom data directory. This is separate from Memex's internal `rpc` protocol.
 
-The HTTP endpoint requires `Authorization: Bearer <token>` on every MCP request.
-The token is stored in `<root>/web-auth-token` (normally `~/.memex/web-auth-token`),
-the same restricted token file used by Memex's web server. Startup prints its
-path, never the token. Configure the endpoint URL and bearer token in your client.
-For a browser that calls Memex directly, allow its exact origin:
+For self-hosted ChatGPT or Claude access, enable the built-in single-owner OAuth
+flow with the public origin of your instance:
+
+```bash
+memex mcp --public-url https://memex.example.com
+```
+
+Point your existing HTTPS reverse proxy at `http://127.0.0.1:5363`, forwarding
+both `/mcp` and the OAuth/discovery routes at the root. The public URL must be an
+origin, without a path prefix, query, or fragment. Plain HTTP is accepted only
+for loopback development. Memex automatically allows the configured public Host.
+
+Add `https://memex.example.com/mcp` as a custom connector in ChatGPT or Claude,
+select OAuth where prompted, and leave client credentials empty to use automatic
+registration. Memex presents one approval page showing the requesting client and
+its redirect destination. Enter your instance's owner key on that page and
+approve access. There is no separate login, signup, gateway, or identity provider.
+Client names are supplied by the requesting app; inspect the redirect destination
+before approving. Approval grants access to the history this instance can read,
+including its configured remote machines.
+
+The owner key is in `<root>/web-auth-token` (normally `~/.memex/web-auth-token`),
+the same restricted key file used by Memex's web server. Startup prints its path,
+never the key. Enter it only on your Memex instance's approval page; the chat
+client receives its own access and refresh tokens. Grants survive server restarts.
+To disconnect all OAuth clients, run:
+
+```bash
+memex mcp --revoke-all
+```
+
+Use the same `--root` as the server if customized. Revocation invalidates issued
+OAuth grants without rotating the owner key. Existing direct bearer clients can
+still use that key, so revoke-all does not disconnect those clients.
+
+Without `--public-url`, HTTP uses the existing static bearer configuration:
+`Authorization: Bearer <token>` from `web-auth-token`. For a browser that calls
+Memex directly, allow its exact origin:
 
 ```bash
 memex mcp --allowed-origin https://chat.example.com
@@ -418,8 +451,10 @@ CORS preflights do not require authentication. Remote clients need a reachable
 HTTPS URL, typically through a TLS reverse proxy to the loopback listener; add
 `--allowed-host memex.example.com` when the proxy preserves that Host header.
 Binding to loopback alone does not make the server reachable by hosted chat apps.
-This server supports clients that accept a configured bearer token; it does not
-provide an OAuth login flow for clients that require one.
+For private ChatGPT setups, [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+can instead connect to `memex mcp --transport stdio`; this requires OpenAI tunnel
+access and a running tunnel client. It is an alternative connection path, separate
+from the public HTTPS/OAuth setup above.
 
 The transport follows the [2026-07-28 Streamable HTTP specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http):
 one POST endpoint with request-scoped SSE responses and no protocol sessions or
