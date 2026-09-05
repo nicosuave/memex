@@ -4600,10 +4600,14 @@ fn persist_index_service_config(paths: &Paths, updates: &IndexServiceConfigUpdat
         replace_toml_value(&mut document["index_service_mode"], value(mode));
     }
     if let Some(interval) = updates.poll_interval {
-        replace_toml_value(
-            &mut document["index_service_poll_interval"],
-            value(interval),
-        );
+        // Both names deserialize into one field; keep the existing spelling
+        // rather than introducing a duplicate field into a legacy config.
+        let key = if document.contains_key("index_service_watch_interval") {
+            "index_service_watch_interval"
+        } else {
+            "index_service_poll_interval"
+        };
+        replace_toml_value(&mut document[key], value(interval));
     }
     if let Some(interval) = updates.interval {
         replace_toml_value(&mut document["index_service_interval"], value(interval));
@@ -7245,6 +7249,56 @@ arguments = {
         assert!(contents.contains("# choose scheduling"));
         assert!(contents.contains("# keep this policy"));
         assert!(contents.contains("allowed_hosts = [\"localhost\"]"));
+    }
+
+    #[test]
+    fn daemon_poll_interval_updates_preserve_supported_key_spelling() {
+        for key in [
+            "index_service_watch_interval",
+            "index_service_poll_interval",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+            let path = paths.root.join("config.toml");
+            std::fs::write(
+                &path,
+                format!("# polling preference\n{key} = 30 # seconds\nindex_service_watch = true\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                UserConfig::load(&paths)
+                    .unwrap()
+                    .index_service_poll_interval(),
+                30
+            );
+
+            let updates = IndexServiceConfigUpdates::from_cli(
+                false,
+                Some(12),
+                None,
+                false,
+                None,
+                &DaemonMcpArgs::default(),
+            )
+            .unwrap();
+            persist_index_service_config(&paths, &updates).unwrap();
+            let updated = UserConfig::load(&paths).unwrap();
+            assert_eq!(updated.index_service_poll_interval(), 12);
+            assert_eq!(updated.index_service_continuous, Some(true));
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(contents.contains(&format!("{key} = 12 # seconds")));
+            assert!(contents.contains("# polling preference"));
+
+            // A plain restart must leave the valid saved configuration intact.
+            persist_index_service_config(&paths, &IndexServiceConfigUpdates::default()).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(
+                UserConfig::load(&paths)
+                    .unwrap()
+                    .index_service_poll_interval(),
+                12
+            );
+        }
     }
 
     #[test]
