@@ -1,6 +1,6 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analytics_path};
 use crate::config::{Paths, UserConfig};
-use crate::index::{QueryOptions, SearchIndex};
+use crate::index::{QueryOptions, SearchIndex, SessionScopeKey, TimestampOrder};
 use crate::types::SourceFilter;
 use crate::usage::{CostMode, UsageQuery, scan_usage, scan_usage_activity};
 use crate::web_auth::WebAuth;
@@ -1092,6 +1092,14 @@ struct SearchRequest {
     limit: usize,
     origin: SessionKindFilter,
     range: TimeRange,
+    sort: SearchSort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchSort {
+    Relevance,
+    Newest,
+    Oldest,
 }
 
 impl SearchRequest {
@@ -1103,6 +1111,7 @@ impl SearchRequest {
         let mut limit = 50;
         let mut origin = SessionKindFilter::Primary;
         let mut range = TimeRange::All;
+        let mut requested_sort = None;
 
         for (key, value) in url.query_pairs() {
             match key {
@@ -1115,6 +1124,18 @@ impl SearchRequest {
                 }
                 "origin" => origin = parse_origin(value)?,
                 "range" => range = TimeRange::parse(value)?,
+                "sort" if !value.is_empty() => {
+                    requested_sort = Some(match value {
+                        "relevance" => SearchSort::Relevance,
+                        "newest" => SearchSort::Newest,
+                        "oldest" => SearchSort::Oldest,
+                        _ => {
+                            return Err(anyhow!(
+                                "unknown sort: {value} (expected relevance, newest, or oldest)"
+                            ));
+                        }
+                    });
+                }
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -1130,14 +1151,25 @@ impl SearchRequest {
             }
         }
 
+        let query = query.trim().to_string();
+        let sort = if query.is_empty() {
+            match requested_sort {
+                Some(SearchSort::Oldest) => SearchSort::Oldest,
+                _ => SearchSort::Newest,
+            }
+        } else {
+            requested_sort.unwrap_or(SearchSort::Relevance)
+        };
+
         Ok(Self {
-            query: query.trim().to_string(),
+            query,
             source,
             project,
             offset,
             limit,
             origin,
             range,
+            sort,
         })
     }
 }
@@ -1222,10 +1254,27 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let target = params.offset.saturating_add(params.limit).saturating_add(1);
     let document_count = index.doc_count()?.max(1);
     let mut candidate_limit = target.saturating_mul(4).max(100).min(document_count);
-
+    let query_options = |limit| QueryOptions {
+        query: params.query.clone(),
+        project: params.project.clone(),
+        role: None,
+        tool: None,
+        session_id: None,
+        session_scope: None,
+        source: params.source,
+        since,
+        until: None,
+        limit,
+    };
+    let mut main_scope_cache = HashMap::new();
     let summaries = loop {
-        let records: Vec<(Option<f32>, crate::types::Record)> = if params.query.is_empty() {
-            index
+        let records: Vec<(Option<f32>, crate::types::Record)> = match params.sort {
+            SearchSort::Relevance => index
+                .search(&query_options(candidate_limit))?
+                .into_iter()
+                .map(|(score, record)| (Some(score), record))
+                .collect(),
+            SearchSort::Newest if params.query.is_empty() => index
                 .recent_records_filtered_since(
                     candidate_limit,
                     params.source,
@@ -1234,24 +1283,19 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 )?
                 .into_iter()
                 .map(|record| (None, record))
-                .collect()
-        } else {
-            index
-                .search(&QueryOptions {
-                    query: params.query.clone(),
-                    project: params.project.clone(),
-                    role: None,
-                    tool: None,
-                    session_id: None,
-                    session_scope: None,
-                    source: params.source,
-                    since,
-                    until: None,
-                    limit: candidate_limit,
-                })?
+                .collect(),
+            SearchSort::Newest | SearchSort::Oldest => index
+                .search_by_timestamp(
+                    &query_options(candidate_limit),
+                    if params.sort == SearchSort::Newest {
+                        TimestampOrder::Newest
+                    } else {
+                        TimestampOrder::Oldest
+                    },
+                )?
                 .into_iter()
-                .map(|(score, record)| (Some(score), record))
-                .collect()
+                .map(|record| (None, record))
+                .collect(),
         };
 
         let raw_count = records.len();
@@ -1273,6 +1317,50 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                     }
                 })
                 .or_insert_with(|| record.links.conversation_kind.clone());
+        }
+        if params.origin != SessionKindFilter::All
+            && matches!(params.sort, SearchSort::Newest | SearchSort::Oldest)
+            && (params.sort == SearchSort::Oldest || !params.query.is_empty())
+        {
+            let candidate_scopes = records
+                .iter()
+                .filter_map(|(_, record)| {
+                    let key = (
+                        record.source.storage_label().to_string(),
+                        record.session_id.clone(),
+                        record.source_path.clone(),
+                    );
+                    (group_kind.get(&key).and_then(|kind| kind.as_deref()) != Some("main")).then(
+                        || SessionScopeKey {
+                            source: record.source,
+                            session_id: record.session_id.clone(),
+                            source_path: record.source_path.clone(),
+                        },
+                    )
+                })
+                .collect::<HashSet<_>>();
+            for scope in candidate_scopes {
+                let has_main = if let Some(has_main) = main_scope_cache.get(&scope) {
+                    *has_main
+                } else {
+                    let has_main = index.session_scope_has_matching_conversation_kind(
+                        &query_options(1),
+                        &scope,
+                        "main",
+                    )?;
+                    main_scope_cache.insert(scope.clone(), has_main);
+                    has_main
+                };
+                if has_main
+                    && let Some(kind) = group_kind.get_mut(&(
+                        scope.source.storage_label().to_string(),
+                        scope.session_id,
+                        scope.source_path,
+                    ))
+                {
+                    *kind = Some("main".to_string());
+                }
+            }
         }
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
@@ -1933,6 +2021,27 @@ mod tests {
         assert_eq!(request.project.as_deref(), Some("memex"));
         assert_eq!(request.offset, 200);
         assert_eq!(request.limit, 100);
+        assert_eq!(request.sort, SearchSort::Relevance);
+
+        assert_eq!(
+            SearchRequest::from_url(&parse_url("/api/search").unwrap())
+                .unwrap()
+                .sort,
+            SearchSort::Newest
+        );
+        assert_eq!(
+            SearchRequest::from_url(&parse_url("/api/search?sort=relevance").unwrap())
+                .unwrap()
+                .sort,
+            SearchSort::Newest
+        );
+        assert_eq!(
+            SearchRequest::from_url(&parse_url("/api/search?q=needle&sort=oldest").unwrap())
+                .unwrap()
+                .sort,
+            SearchSort::Oldest
+        );
+        assert!(SearchRequest::from_url(&parse_url("/api/search?sort=sideways").unwrap()).is_err());
     }
 
     #[test]
@@ -1965,7 +2074,7 @@ mod tests {
         drop(analytics);
         publish_records(&paths, records);
         for (range, expected) in [("24h", 2), ("7d", 3), ("30d", 4), ("all", 5)] {
-            for query in ["", "needle"] {
+            for query in ["", "needle", "needle&sort=oldest"] {
                 let request = SearchRequest::from_url(
                     &parse_url(&format!("/api/search?range={range}&q={query}")).unwrap(),
                 )
@@ -2564,6 +2673,7 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2581,6 +2691,7 @@ mod tests {
                 limit: 1,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2597,6 +2708,7 @@ mod tests {
                 limit: 1,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2637,10 +2749,118 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Newest,
             },
         )
         .unwrap();
         assert!(filtered.results.is_empty());
+    }
+
+    #[test]
+    fn search_sort_orders_complete_filtered_session_set_before_pagination() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut records = (1..=110)
+            .map(|doc_id| {
+                let mut value = record(doc_id, "dense", "/tmp/dense.jsonl", "needle".to_string());
+                value.ts = 10_000 + doc_id;
+                value
+            })
+            .collect::<Vec<_>>();
+        for (doc_id, session_id, ts, text) in [
+            (200, "second", 9_000, "needle".to_string()),
+            (201, "third", 8_000, "needle".to_string()),
+            (300, "relevant", 100, "needle ".repeat(12)),
+        ] {
+            let mut value = record(
+                doc_id,
+                session_id,
+                &format!("/tmp/{session_id}.jsonl"),
+                text,
+            );
+            value.ts = ts;
+            records.push(value);
+        }
+        let mut outsider = record(400, "outsider", "/tmp/outsider.jsonl", "needle".to_string());
+        outsider.source = SourceKind::Codex;
+        outsider.project = "other".to_string();
+        outsider.ts = 50_000;
+        records.push(outsider);
+        publish_records(&paths, records);
+
+        let payload = |query: &str| {
+            search_payload(
+                &paths,
+                &SearchRequest::from_url(&parse_url(query).unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+        let relevance = payload(
+            "/api/search?q=needle&sort=relevance&source=claude&project=memex&origin=all&limit=1",
+        );
+        assert_eq!(relevance.results[0].session_id, "relevant");
+        assert!(relevance.results[0].score.is_some());
+
+        let newest = payload(
+            "/api/search?q=needle&sort=newest&source=claude&project=memex&origin=all&limit=1",
+        );
+        assert_eq!(newest.results[0].session_id, "dense");
+        assert_eq!(newest.results[0].ts, 10_110);
+        assert!(newest.has_more);
+
+        // The first 100 timestamp-ordered matching records all belong to `dense`. Page two must
+        // still be selected from the globally grouped session order, not from a loaded UI page.
+        let second_page = payload(
+            "/api/search?q=needle&sort=newest&source=claude&project=memex&origin=all&offset=1&limit=1",
+        );
+        assert_eq!(second_page.results[0].session_id, "second");
+        assert_eq!(second_page.results[0].ts, 9_000);
+        assert!(second_page.has_more);
+
+        let oldest =
+            payload("/api/search?sort=oldest&source=claude&project=memex&origin=all&limit=1");
+        assert_eq!(oldest.results[0].session_id, "relevant");
+        assert_eq!(oldest.results[0].ts, 100);
+    }
+
+    #[test]
+    fn chronological_representative_survives_prefer_main_origin_classification() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut records = (1..=110)
+            .map(|doc_id| {
+                let mut value = record(doc_id, "mixed", "/tmp/mixed.jsonl", "needle".to_string());
+                value.ts = doc_id;
+                value.links.conversation_kind = Some("sidechain".to_string());
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut other = record(200, "other", "/tmp/other.jsonl", "needle".to_string());
+        other.ts = 200;
+        other.links.conversation_kind = Some("main".to_string());
+        records.push(other);
+        let mut main = record(300, "mixed", "/tmp/mixed.jsonl", "needle".to_string());
+        main.ts = 10_000;
+        main.links.conversation_kind = Some("main".to_string());
+        records.push(main);
+        let expected_record_id = crate::retrieval::canonical_record_id(&records[0]);
+        publish_records(&paths, records);
+
+        let payload = search_payload(
+            &paths,
+            &SearchRequest::from_url(
+                &parse_url("/api/search?q=needle&sort=oldest&origin=interactive&limit=1").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload.results[0].session_id, "mixed");
+        assert_eq!(payload.results[0].ts, 1);
+        assert_eq!(payload.results[0].record_id, expected_record_id);
+        assert!(payload.has_more);
     }
 
     #[test]
@@ -2667,6 +2887,7 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2696,6 +2917,7 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Newest,
             },
         )
         .unwrap();
@@ -2829,6 +3051,7 @@ mod tests {
                 limit: 10,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -3058,6 +3281,7 @@ mod tests {
                     limit: 30,
                     origin,
                     range: TimeRange::All,
+                    sort: SearchSort::Relevance,
                 },
             )
             .unwrap()

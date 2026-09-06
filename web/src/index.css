@@ -394,6 +394,7 @@ body {
 
 .home-results-heading {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -419,6 +420,7 @@ body {
 
 .home-result-filters {
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .home-filter-select {

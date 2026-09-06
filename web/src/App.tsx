@@ -79,11 +79,35 @@ type SearchPayload = {
 type PreviewMode = "matches" | "history"
 type ShellView = "home" | "transcript"
 type TimeRange = "24h" | "7d" | "30d" | "all"
+type SearchSort = "relevance" | "newest" | "oldest"
+
+function parseSearchSort(value: string | null): SearchSort | null {
+  return value === "relevance" || value === "newest" || value === "oldest" ? value : null
+}
+
+function SortControl({ value, hasQuery, onChange }: {
+  value: SearchSort; hasQuery: boolean; onChange: (value: string) => void
+}) {
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger aria-label="Sort results" className="home-filter-select" size="sm" variant="ghost">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectItem value="relevance" disabled={!hasQuery}>Relevance</SelectItem>
+          <SelectItem value="newest">Newest</SelectItem>
+          <SelectItem value="oldest">Oldest</SelectItem>
+        </SelectGroup>
+      </SelectContent>
+    </Select>
+  )
+}
 
 const timeRanges: TimeRange[] = ["24h", "7d", "30d", "all"]
 const defaultTimeRange: TimeRange = "30d"
 
-function SidebarSnippet({ result }: { result: SearchResult }) {
+function ResultSnippet({ result }: { result: SearchResult }) {
   if (!result.snippet) return <>No text preview</>
   const characters = Array.from(result.snippet)
   const matches = result.snippet_matches || []
@@ -507,12 +531,19 @@ function ResultContinuation({
   useEffect(() => {
     const element = boundary.current
     if (!element || !visible || !hasMore || loading || error) return
+    const scrollContainer = element.parentElement
+    if (!scrollContainer) return
     // Both continuations live directly inside their list's scroll container.
+    // Start the next request one viewport ahead so network and search time overlap
+    // with the user's remaining scroll distance, including taller search matches.
     const observer = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) void loadMore()
       },
-      { root: element.parentElement, rootMargin: "0px 0px 240px 0px" },
+      {
+        root: scrollContainer,
+        rootMargin: `0px 0px ${Math.max(240, scrollContainer.clientHeight)}px 0px`,
+      },
     )
     observer.observe(element)
     return () => observer.disconnect()
@@ -542,6 +573,9 @@ function App() {
   const [timeRange, setTimeRange] = useState(() =>
     parseTimeRange(paramsAtLoad.get("range")),
   )
+  const [selectedSort, setSelectedSort] = useState(() => parseSearchSort(paramsAtLoad.get("sort")))
+  const sort: SearchSort = !query.trim() && selectedSort === "relevance"
+    ? "newest" : selectedSort ?? (query.trim() ? "relevance" : "newest")
   const [shellView, setShellView] = useState<ShellView>(initialShellView)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [mode, setMode] = useState<PreviewMode>(initialMode)
@@ -572,18 +606,17 @@ function App() {
     }),
     [resource.session],
   )
-  const [status, setStatus] = useState("Loading recent sessions…")
+  const [status, setStatus] = useState("Loading sessions…")
   const [error, setError] = useState("")
   const [pageError, setPageError] = useState("")
   const [searchRevision, setSearchRevision] = useState(0)
-  const [documentCount, setDocumentCount] = useState<number | null>(null)
   const [theme, setTheme] = useState(getPreferredTheme)
   const searchGeneration = useRef(0)
   const searchController = useRef<AbortController | null>(null)
   const resultOffset = useRef(0)
   const resultIntent = useRef("")
   const loadingMore = useRef(false)
-  const intent = JSON.stringify([query, source, project, origin, timeRange])
+  const intent = JSON.stringify([query, source, project, origin, timeRange, sort])
   const currentIntent = useRef(intent)
   currentIntent.current = intent
 
@@ -600,6 +633,7 @@ function App() {
     (
       nextTarget: SessionTarget | null,
       nextTimeRange: TimeRange = timeRange,
+      nextSort: SearchSort | null = selectedSort,
     ) => {
       const next = new URLSearchParams()
       if (query.trim()) next.set("q", query.trim())
@@ -607,6 +641,7 @@ function App() {
       if (project.trim()) next.set("project", project.trim())
       if (origin !== "interactive") next.set("origin", origin)
       if (nextTimeRange !== defaultTimeRange) next.set("range", nextTimeRange)
+      if (nextSort) next.set("sort", nextSort)
       if (nextTarget) {
         next.set("session", nextTarget.id)
         if (nextTarget.sourcePath) next.set("path", nextTarget.sourcePath)
@@ -618,7 +653,7 @@ function App() {
       const url = next.size ? `?${next}` : location.pathname
       return url
     },
-    [mode, origin, project, query, source, timeRange],
+    [mode, origin, project, query, source, timeRange, selectedSort],
   )
 
   const updateLocation = useCallback(
@@ -647,6 +682,13 @@ function App() {
     [locationForTarget, target, timeRange],
   )
 
+  const changeSort = useCallback((value: string) => {
+    const nextSort = parseSearchSort(value)
+    if (!nextSort || nextSort === sort) return
+    history.pushState({}, "", locationForTarget(target, timeRange, nextSort))
+    setSelectedSort(nextSort)
+  }, [locationForTarget, sort, target, timeRange])
+
   useEffect(() => {
     const restore = () => {
       const params = new URLSearchParams(location.search)
@@ -655,6 +697,7 @@ function App() {
       setProject(params.get("project") || "")
       setOrigin(params.get("origin") || "interactive")
       setTimeRange(parseTimeRange(params.get("range")))
+      setSelectedSort(parseSearchSort(params.get("sort")))
       setMode(params.get("mode") === "history" ? "history" : "matches")
       setTarget(
         params.has("session")
@@ -683,15 +726,16 @@ function App() {
       if (project.trim()) searchParams.set("project", project.trim())
       if (origin !== "interactive") searchParams.set("origin", origin)
       searchParams.set("range", timeRange)
+      searchParams.set("sort", sort)
       return searchParams
     },
-    [origin, project, query, source, timeRange],
+    [origin, project, query, source, timeRange, sort],
   )
 
   const searchStatus = useCallback(
-    (count: number, hasMore: boolean) =>
+    (count: number) =>
       count
-        ? `${count}${hasMore ? "+" : ""} ${query.trim() ? "matching" : "recent"} session${count === 1 ? "" : "s"}`
+        ? query.trim() ? "Search results" : "Sessions"
         : "No sessions found",
     [query],
   )
@@ -704,7 +748,7 @@ function App() {
     setHasMoreResults(false)
     const timer = window.setTimeout(async () => {
       const searchParams = searchParamsFor(0)
-      setStatus(query.trim() ? "Searching…" : "Loading recent sessions…")
+      setStatus(query.trim() ? "Searching…" : "Loading sessions…")
       setError("")
       setPageError("")
       setHasMoreResults(false)
@@ -724,7 +768,7 @@ function App() {
         resultIntent.current = intent
         setResults(data.results)
         setHasMoreResults(data.has_more && data.results.length > 0)
-        setStatus(searchStatus(data.results.length, data.has_more))
+        setStatus(searchStatus(data.results.length))
       } catch (requestError) {
         if (
           generation !== searchGeneration.current ||
@@ -783,7 +827,7 @@ function App() {
       const nextCount = results.length + additions.length
       setResults((current) => [...current, ...additions])
       setHasMoreResults(data.has_more && data.results.length > 0)
-      setStatus(searchStatus(nextCount, data.has_more))
+      setStatus(searchStatus(nextCount))
     } catch (requestError) {
       if (
         generation !== searchGeneration.current ||
@@ -803,12 +847,6 @@ function App() {
     }
   }, [hasMoreResults, intent, results, searchParamsFor, searchStatus])
 
-  useEffect(() => {
-    void api<{ documents: number }>("/api/stats")
-      .then((data) => setDocumentCount(data.documents))
-      .catch(() => {})
-  }, [])
-
   useEffect(() => updateLocation(target), [target, updateLocation])
 
   const homeResults = useMemo(() => {
@@ -822,7 +860,7 @@ function App() {
 
   useEffect(() => {
     setHomeSelectedIndex(0)
-  }, [origin, project, query, source, timeRange])
+  }, [origin, project, query, source, timeRange, sort])
 
   useEffect(() => {
     const discovered = results
@@ -1001,13 +1039,14 @@ function App() {
 
         <div className="home-results-heading">
           <div>
-            <strong>{query.trim() ? "matches" : "recent"}</strong>
+            <strong>{query.trim() ? "matches" : "sessions"}</strong>
             <span>
               {results.length}
               {hasMoreResults ? "+" : ""}
             </span>
           </div>
           <div className="home-result-filters">
+            <SortControl value={sort} hasQuery={Boolean(query.trim())} onChange={changeSort} />
             <Select onValueChange={setSource} value={source}>
               <SelectTrigger
                 aria-label="Source"
@@ -1076,7 +1115,7 @@ function App() {
         </div>
 
         <div
-          aria-label={query.trim() ? "Matching sessions" : "Recent sessions"}
+          aria-label={query.trim() ? "Matching sessions" : "Sessions"}
           className="home-results"
           id="home-results"
           role="listbox"
@@ -1094,7 +1133,7 @@ function App() {
           )}
           {homeResults.length === 0 ? (
             <div className="home-results-empty">
-              {status === "Searching…" || status === "Loading recent sessions…"
+              {status === "Searching…" || status === "Loading sessions…"
                 ? status
                 : query.trim()
                   ? "No matching sessions"
@@ -1133,8 +1172,11 @@ function App() {
                   {result.source} · {result.role}
                 </span>
                 <time>{formatDate(result.ts)}</time>
-                <span className="home-result-snippet">
-                  {result.snippet || "No text preview"}
+                <span
+                  className="home-result-snippet"
+                  style={result.snippet_matches?.length ? { whiteSpace: "normal", overflowWrap: "anywhere" } : undefined}
+                >
+                  <ResultSnippet result={result} />
                 </span>
               </a>
             ))
@@ -1194,11 +1236,7 @@ function App() {
           </div>
           <div className="sidebar-summary">
             <span className={cn(error && "text-destructive")}>{status}</span>
-            <span>
-              {documentCount === null
-                ? "— records"
-                : `${documentCount.toLocaleString()} records`}
-            </span>
+            <SortControl value={sort} hasQuery={Boolean(query.trim())} onChange={changeSort} />
           </div>
         </SidebarHeader>
         <SidebarContent>
@@ -1259,7 +1297,7 @@ function App() {
                                 : undefined
                             }
                           >
-                            <SidebarSnippet result={result} />
+                            <ResultSnippet result={result} />
                           </div>
                         </div>
                       </a>

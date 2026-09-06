@@ -169,6 +169,12 @@ pub struct QueryOptions {
     pub limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampOrder {
+    Newest,
+    Oldest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionScopeKey {
     pub source: crate::types::SourceKind,
@@ -949,6 +955,45 @@ impl SearchIndex {
         Ok(results)
     }
 
+    /// Search matching records in timestamp order without changing the relevance-ordered search
+    /// used by the CLI and TUI. `doc_id` makes equal timestamps deterministic across pages.
+    pub fn search_by_timestamp(
+        &self,
+        options: &QueryOptions,
+        order: TimestampOrder,
+    ) -> Result<Vec<Record>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let query = build_query(&self.fields, options, &self.index)?;
+        let addresses: Vec<tantivy::DocAddress> = match order {
+            TimestampOrder::Newest => searcher
+                .search(
+                    &query,
+                    &TopDocs::with_limit(options.limit.max(1))
+                        .custom_score(TimestampDescendingScorerFactory),
+                )?
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect(),
+            TimestampOrder::Oldest => searcher
+                .search(
+                    &query,
+                    &TopDocs::with_limit(options.limit.max(1))
+                        .custom_score(TimestampAscendingScorerFactory),
+                )?
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect(),
+        };
+        addresses
+            .into_iter()
+            .map(|address| {
+                let doc = searcher.doc::<TantivyDocument>(address)?;
+                Ok(record_from_doc(&self.fields, &doc))
+            })
+            .collect()
+    }
+
     /// Collect every exact session identity matching a lexical query without retaining scores,
     /// document addresses, or full records. Current indexes read identity fast fields while
     /// older compatible indexes fall back to hydrating one stored document at a time.
@@ -972,6 +1017,32 @@ impl SearchIndex {
                 fast_session_identity,
             },
         )??)
+    }
+
+    pub fn session_scope_has_matching_conversation_kind(
+        &self,
+        options: &QueryOptions,
+        scope: &SessionScopeKey,
+        kind: &str,
+    ) -> Result<bool> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let mut scoped_options = options.clone();
+        scoped_options.session_scope = Some(vec![scope.clone()]);
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                build_query(&self.fields, &scoped_options, &self.index)?,
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.conversation_kind, kind),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        Ok(!searcher.search(&query, &TopDocs::with_limit(1))?.is_empty())
     }
 
     pub(crate) fn doc_ids_matching_filters(&self, options: &QueryOptions) -> Result<HashSet<u64>> {
@@ -1623,14 +1694,72 @@ fn session_query(
 
 type SessionOrder = std::cmp::Reverse<(u64, u64, u64)>;
 type SessionReverseOrder = (u64, u64, u64);
+type TimestampAscending = std::cmp::Reverse<(u64, u64)>;
+type TimestampDescending = (u64, u64);
 
 struct SessionOrderScorerFactory;
 struct SessionReverseOrderScorerFactory;
+struct TimestampAscendingScorerFactory;
+struct TimestampDescendingScorerFactory;
 
 struct SessionOrderScorer {
     turn_ids: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
     timestamps: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
     doc_ids: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
+}
+
+struct TimestampScorer {
+    timestamps: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
+    doc_ids: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
+}
+
+impl TimestampScorer {
+    fn for_segment(segment_reader: &tantivy::SegmentReader) -> tantivy::Result<Self> {
+        Ok(Self {
+            timestamps: segment_reader
+                .fast_fields()
+                .u64("ts")?
+                .first_or_default_col(0),
+            doc_ids: segment_reader
+                .fast_fields()
+                .u64("doc_id")?
+                .first_or_default_col(0),
+        })
+    }
+}
+
+impl tantivy::collector::CustomScorer<TimestampAscending> for TimestampAscendingScorerFactory {
+    type Child = TimestampScorer;
+
+    fn segment_scorer(
+        &self,
+        segment_reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        TimestampScorer::for_segment(segment_reader)
+    }
+}
+
+impl tantivy::collector::CustomScorer<TimestampDescending> for TimestampDescendingScorerFactory {
+    type Child = TimestampScorer;
+
+    fn segment_scorer(
+        &self,
+        segment_reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        TimestampScorer::for_segment(segment_reader)
+    }
+}
+
+impl tantivy::collector::CustomSegmentScorer<TimestampAscending> for TimestampScorer {
+    fn score(&mut self, doc: tantivy::DocId) -> TimestampAscending {
+        std::cmp::Reverse((self.timestamps.get_val(doc), self.doc_ids.get_val(doc)))
+    }
+}
+
+impl tantivy::collector::CustomSegmentScorer<TimestampDescending> for TimestampScorer {
+    fn score(&mut self, doc: tantivy::DocId) -> TimestampDescending {
+        (self.timestamps.get_val(doc), self.doc_ids.get_val(doc))
+    }
 }
 
 impl tantivy::collector::CustomScorer<SessionOrder> for SessionOrderScorerFactory {
@@ -2585,6 +2714,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(101, "after".to_string()), (100, "boundary".to_string())]
         );
+    }
+
+    #[test]
+    fn timestamp_search_orders_ties_by_doc_id_across_segments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        for doc_id in [1, 3, 2] {
+            let mut record = test_record(doc_id, "shared needle");
+            record.session_id = format!("session-{doc_id}");
+            record.source_path = format!("session-{doc_id}.jsonl");
+            record.ts = 42;
+            index.add_record(&mut writer, &record).expect("add record");
+            writer.commit().expect("commit segment");
+        }
+
+        let options = QueryOptions {
+            query: "needle".to_string(),
+            project: Some("memex".to_string()),
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 3,
+        };
+        let doc_ids = |order| {
+            index
+                .search_by_timestamp(&options, order)
+                .expect("timestamp search")
+                .into_iter()
+                .map(|record| record.doc_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(doc_ids(TimestampOrder::Newest), vec![3, 2, 1]);
+        assert_eq!(doc_ids(TimestampOrder::Oldest), vec![1, 2, 3]);
     }
 
     #[test]
