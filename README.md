@@ -182,8 +182,10 @@ keeps the last good copy and marks its freshness instead of treating an error as
 a deletion. Memory snapshots are stored under the Memex data root's `memory/`
 directory, separately from conversation records and session analytics.
 
-Search defaults remain conversation-only. Use `--content memories` for memories
-or `--content all` to include both. Provider selection remains independent:
+For recall of prior decisions, preferences, project conventions, or previous work,
+use `--content all` to search memories and conversations together. Use
+`--content memories` to inspect saved notes specifically. Search without
+`--content` remains conversation-only. Provider selection remains independent:
 `--source claude` selects the provider, not the content type. Memory results carry
 document/section references, source paths, scope, freshness, and content versions.
 Their timestamp filters use file modification time; dates explicitly recorded
@@ -203,8 +205,8 @@ consuming agent. Explicit links can provide supporting documents or conversation
 conflicting notes remain separately attributable rather than being silently merged.
 
 ```bash
-memex search "deployment decision" --content memories --source codex
 memex search "deployment decision" --content all
+memex search "deployment decision" --content memories --source codex
 memex show --memory-id <memory_id> --section <section_ref> --content-version <content_version> --machine <machine>
 ```
 
