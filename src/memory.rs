@@ -255,6 +255,7 @@ impl MemoryStore {
             .map(|document| (document.stable_id.clone(), document))
             .collect::<HashMap<_, _>>();
         let mut documents = Vec::with_capacity(discovery.candidates.len());
+        let mut repository_projects = HashMap::new();
 
         for candidate in discovery.candidates {
             let stable_id = memory_stable_id(candidate.provider, &candidate.source_path);
@@ -267,10 +268,20 @@ impl MemoryStore {
                             && document.version_sha256 == version
                     }) {
                         document.mtime_ms = modified_millis(&metadata)?;
+                        document.scope = resolve_memory_scope(
+                            &candidate,
+                            &parse_source_metadata(&content),
+                            &mut repository_projects,
+                        );
                         documents.push(document);
                         report.unchanged += 1;
                     } else {
-                        documents.push(parse_memory_content(&candidate, content, &metadata)?);
+                        documents.push(parse_memory_content(
+                            &candidate,
+                            content,
+                            &metadata,
+                            &mut repository_projects,
+                        )?);
                         report.parsed += 1;
                     }
                 }
@@ -413,7 +424,7 @@ pub fn discover_memory_documents(options: &MemoryDiscoveryOptions) -> Result<Mem
 
 pub fn parse_memory_document(candidate: &MemoryCandidate) -> Result<MemoryDocument> {
     let (content, metadata) = read_consistent(&candidate.source_path)?;
-    parse_memory_content(candidate, content, &metadata)
+    parse_memory_content(candidate, content, &metadata, &mut HashMap::new())
 }
 
 /// Re-read a snapshot-known source without mutating either the source or memory snapshot.
@@ -437,28 +448,14 @@ fn parse_memory_content(
     candidate: &MemoryCandidate,
     content: String,
     metadata: &fs::Metadata,
+    repository_projects: &mut HashMap<PathBuf, Option<String>>,
 ) -> Result<MemoryDocument> {
     let mtime_ms = modified_millis(metadata)?;
     let version_sha256 = sha256_hex(content.as_bytes());
     let stable_id = memory_stable_id(candidate.provider, &candidate.source_path);
     let (sections, title) = parse_sections(&content);
     let source_metadata = parse_source_metadata(&content);
-    let mut scope = candidate.scope.clone();
-    if candidate.provider == SourceKind::Codex && candidate.kind == MemoryDocumentKind::Summary {
-        if scope.cwd.is_none() {
-            scope.cwd = source_metadata.cwd.clone();
-        }
-        if scope.project.is_none() {
-            scope.project = scope
-                .cwd
-                .as_deref()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                .map(str::to_string);
-        }
-    }
-
-    scope.cwd = scope.cwd.map(|cwd| canonicalize_with_missing(&cwd));
+    let scope = resolve_memory_scope(candidate, &source_metadata, repository_projects);
 
     Ok(MemoryDocument {
         provider: candidate.provider,
@@ -481,6 +478,36 @@ fn parse_memory_content(
         sections,
         freshness: MemoryFreshness::Fresh,
     })
+}
+
+fn resolve_memory_scope(
+    candidate: &MemoryCandidate,
+    source_metadata: &ParsedSourceMetadata,
+    repository_projects: &mut HashMap<PathBuf, Option<String>>,
+) -> MemoryScope {
+    let mut scope = candidate.scope.clone();
+    if candidate.provider == SourceKind::Codex && candidate.kind == MemoryDocumentKind::Summary {
+        // Source metadata owns summary scope, including when live reads reparse an old snapshot.
+        scope.cwd = source_metadata.cwd.clone();
+        scope.project = scope
+            .cwd
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(str::to_string);
+    }
+    if let Some(cwd) = scope.cwd.as_mut() {
+        *cwd = canonicalize_with_missing(cwd);
+        // Share the session repository resolver, but retain the exact checkout for cwd filters.
+        // One Git lookup per cwd per refresh avoids repeating it for every note in a project.
+        if let Some(project) = repository_projects
+            .entry(cwd.clone())
+            .or_insert_with(|| crate::analytics::repository_project_for_cwd(&cwd.to_string_lossy()))
+        {
+            scope.project = Some(project.clone());
+        }
+    }
+    scope
 }
 
 pub fn memory_stable_id(provider: SourceKind, canonical_source_path: &Path) -> String {

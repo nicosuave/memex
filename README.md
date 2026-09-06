@@ -188,6 +188,8 @@ use `--content all` to search memories and conversations together. Use
 `--content` remains conversation-only. Provider selection remains independent:
 `--source claude` selects the provider, not the content type. Memory results carry
 document/section references, source paths, scope, freshness, and content versions.
+For scoped memories, `--project` uses the repository name across Git worktrees;
+`--cwd` selects the exact checkout. Each memory keeps its own source path and ID.
 Their timestamp filters use file modification time; dates explicitly recorded
 inside a note are separate metadata and do not imply that its claims are current.
 
