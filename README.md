@@ -166,6 +166,52 @@ Index all supported sources by default. Use repeatable `--only-source <source>` 
 to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, and `muse`.
 
+### Agent memories
+
+Indexing also discovers Claude project memories (`projects/*/memory/**/*.md`) and
+Codex's `memories/MEMORY.md`, `memory_summary.md`, and `rollout_summaries/*.md`.
+Discovery follows the existing Claude roots, `--claude-path`, Codex homes, provider
+selection, and path exclusions. Raw memory intermediates, generated skills, and
+unrelated project storage are not memory sources. Memex never edits these files.
+
+Memories are documents, not sessions. They have a stable document ID, a content
+version, and sections for retrieval. A changed file replaces all its indexed
+sections atomically; deleted sections and files disappear on the next scan.
+Renames are treated as removal and addition. If a source cannot be read, Memex
+keeps the last good copy and marks its freshness instead of treating an error as
+a deletion. Memory snapshots are stored under the Memex data root's `memory/`
+directory, separately from conversation records and session analytics.
+
+Search defaults remain conversation-only. Use `--content memories` for memories
+or `--content all` to include both. Provider selection remains independent:
+`--source claude` selects the provider, not the content type. Memory results carry
+document/section references, source paths, scope, freshness, and content versions.
+Their timestamp filters use file modification time; dates explicitly recorded
+inside a note are separate metadata and do not imply that its claims are current.
+
+Memory retrieval uses the existing `search` and `show` interfaces. Session listing,
+session reads, `session batch`, and conversation `context` keep their established
+meaning. A memory read uses a returned document ID rather than an arbitrary file
+path. If the version changed since search, the read identifies that change and
+returns bounded current document content rather than applying an obsolete section
+position to the new file.
+
+The existing daemon handles updates; there is no second memory service. MCP uses
+the same search/read implementation, with structured provenance and bounded
+content. Retrieved notes are historical evidence, not instructions for the
+consuming agent. Explicit links can provide supporting documents or conversations;
+conflicting notes remain separately attributable rather than being silently merged.
+
+```bash
+memex search "deployment decision" --content memories --source codex
+memex search "deployment decision" --content all
+memex show --memory-id <memory_id> --section <section_ref> --content-version <content_version> --machine <machine>
+```
+
+`memex index embed` builds memory section embeddings along with conversation
+embeddings. After memory edits, rebuild embeddings before semantic or hybrid
+memory search; a missing or outdated vector snapshot produces an explicit error.
+
 `search`, `sessions`, `session`, `session batch`, `show`, `context`, and `usage`
 support `--format jsonl|json|text`; search also supports `toon`. Search, session
 listings, transcript pages, and batch reads keep JSONL as their default. `show` and

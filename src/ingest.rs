@@ -551,6 +551,10 @@ pub fn ingest_if_stale(
     let cache = ScanCache::load(&cache_path)?;
 
     if can_skip_fresh_scan(&cache, paths, index, options, ttl_seconds)? {
+        // The transcript scan cache cannot detect edits in a Markdown memory
+        // file. Refresh these small documents even when transcript discovery is
+        // still within its TTL, under the same ingestion lease.
+        refresh_memories(paths, options)?;
         return Ok(None);
     }
 
@@ -667,6 +671,7 @@ pub fn ingest_all(
     options: &IngestOptions,
     _lease: &IngestLease,
 ) -> Result<IngestReport> {
+    refresh_memories(paths, options)?;
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let state_path = paths.state.join("ingest.json");
@@ -1693,6 +1698,53 @@ pub fn ingest_all(
     outcome
 }
 
+fn refresh_memories(paths: &Paths, options: &IngestOptions) -> Result<()> {
+    let mut enabled_sources = HashSet::new();
+    if !options.claude_sources.is_empty() {
+        enabled_sources.insert(SourceKind::Claude);
+    }
+    if options.include_codex {
+        enabled_sources.insert(SourceKind::Codex);
+    }
+    let discovery = crate::memory::MemoryDiscoveryOptions {
+        claude_project_roots: options.claude_sources.clone(),
+        codex_homes: if options.include_codex {
+            crate::sources::codex::homes()
+        } else {
+            Vec::new()
+        },
+        enabled_sources,
+        exclude_patterns: options.exclude_patterns.clone(),
+    };
+    let store = crate::memory::MemoryStore::new(paths.root.join("memory/documents.json"));
+    let report = store.refresh(&discovery)?;
+    if report.changed && (report.document_count > 0 || report.deleted > 0) {
+        eprintln!(
+            "memory index: {} documents, {} sections ({} updated, {} deleted, {} stale)",
+            report.document_count,
+            report.section_count,
+            report.parsed,
+            report.deleted,
+            report.stale_count,
+        );
+    }
+    for failure in &report.failures {
+        eprintln!(
+            "memory index: {}: {}",
+            failure.path.display(),
+            failure.error
+        );
+    }
+    if options.embeddings {
+        let count =
+            crate::memory_search::embed_memory(paths, options.model, &options.embed_runtime)?;
+        if count > 0 {
+            eprintln!("memory index: embedded {count} sections");
+        }
+    }
+    Ok(())
+}
+
 fn update_scan_cache(paths: &Paths, files_scanned: usize, total_bytes: u64) -> Result<()> {
     let cache_path = paths.state.join("scan_cache.json");
     let mut cache = ScanCache::load(&cache_path)?;
@@ -2676,6 +2728,67 @@ mod tests {
             state.files.keys().all(|k| !k.contains("-client-")),
             "excluded paths must be pruned from ingest state"
         );
+    }
+
+    #[test]
+    fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude = tmp.path().join("claude/projects");
+        let project = claude.join("-work-project");
+        let memory = project.join("memory/MEMORY.md");
+        fs::create_dir_all(memory.parent().unwrap()).unwrap();
+        fs::write(project.join("session.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"a conversation\"},\"uuid\":\"u1\"}\n"
+        ).unwrap();
+        fs::write(
+            &memory,
+            "# Decisions\n\nOriginal middle paragraph.\n\n## Retired\nOld decision.\n",
+        )
+        .unwrap();
+        let paths = Paths::new(Some(tmp.path().join("data"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![claude];
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let store = crate::memory::MemoryStore::new(paths.root.join("memory/documents.json"));
+        let original = store.load().unwrap();
+        assert_eq!(original.documents.len(), 1);
+        let original_id = original.documents[0].stable_id.clone();
+        let original_version = original.documents[0].version_sha256.clone();
+        let published = SearchIndex::open_or_create(&paths.index).unwrap();
+        assert_eq!(
+            published.doc_count().unwrap(),
+            1,
+            "memories must not become transcript records"
+        );
+
+        fs::write(&memory, "# Decisions\n\nRevised middle paragraph.\n").unwrap();
+        assert!(
+            can_skip_fresh_scan(
+                &ScanCache::load(&paths.state.join("scan_cache.json")).unwrap(),
+                &paths,
+                &published,
+                &options,
+                3600,
+            )
+            .unwrap()
+        );
+        assert!(
+            ingest_if_stale(&paths, &published, &options, 3600, &lease)
+                .unwrap()
+                .is_none()
+        );
+        let updated = store.load().unwrap();
+        assert_eq!(updated.documents[0].stable_id, original_id);
+        assert_ne!(updated.documents[0].version_sha256, original_version);
+        assert!(!updated.documents[0].content.contains("Retired"));
+        assert!(updated.documents[0].content.contains("Revised middle"));
+        assert_eq!(published.doc_count().unwrap(), 1);
+
+        fs::remove_file(memory).unwrap();
+        ingest_if_stale(&paths, &published, &options, 3600, &lease).unwrap();
+        assert!(store.load().unwrap().documents.is_empty());
     }
 
     #[test]

@@ -5,10 +5,15 @@ use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, ingest_all};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
-    BoundedRecord, LocatedRecord, MAX_HYDRATE_INPUT_BYTES, MAX_HYDRATE_LINE_BYTES,
-    MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec, SessionPageRequest,
-    UsageSpec, federated_search, federated_usage, read_context, read_record, read_session_pages,
-    session_page_context,
+    BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
+    MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
+    SessionPageRequest, UsageSpec, federated_memory_search, federated_search, federated_usage,
+    read_context, read_memory, read_record, read_session_pages, session_page_context,
+};
+use crate::memory::{MemoryFreshness, MemoryStore};
+use crate::memory_search::{
+    MAX_MEMORY_READ_CHARS, MemoryReadRequest, MemoryReadValue, MemorySearchMode,
+    MemorySearchOptions, embed_memory, gc_memory_vectors,
 };
 use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
@@ -55,8 +60,8 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history\n  sessions     List sessions\n  session      Read a session or batch of pages\n  show         Read a record\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
-    about = "Search, browse, and reuse local agent history",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
     memex                           # Browse sessions interactively
@@ -247,10 +252,12 @@ EXAMPLES:
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Search indexed conversation history
+    /// Search indexed conversation history and memory
     #[command(after_help = "\
 EXAMPLES:
     memex search \"error handling\"
+    memex search \"release checklist\" --content memories
+    memex search \"authentication decision\" --content all
     memex search \"API design\" --source claude --limit 50
     memex search \"auth\" --since 2024-01-01T00:00:00Z --mode semantic
     memex search \"bug\" --fields score,session_id,snippet --format json
@@ -261,12 +268,16 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    memory_id, content_version, section_ref, title, heading, cwd, mtime_ms, event_dates, start_line, end_line, document_kind, refs, freshness, changed_since_search
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
+        /// Content corpus to search (conversation history by default)
+        #[arg(long, value_enum, default_value_t = SearchContent::Conversations, help_heading = "Search")]
+        content: SearchContent,
         /// Additional independent query view to fuse with reciprocal-rank fusion (repeatable)
         #[arg(long = "query", value_name = "QUERY", help_heading = "Tuning")]
         additional_queries: Vec<String>,
@@ -422,19 +433,28 @@ EXAMPLES:
         #[command(flatten)]
         output: OutputArgs,
     },
-    /// Read a record by document or stable canonical ID
+    /// Read a record or memory document by stable ID
     Show {
         /// Document ID (from search results)
-        #[arg(required_unless_present = "record_id", conflicts_with = "record_id")]
+        #[arg(required_unless_present_any = ["record_id", "memory_id"], conflicts_with_all = ["record_id", "memory_id"])]
         doc_id: Option<u64>,
         /// Stable canonical record ID from search output
-        #[arg(long)]
+        #[arg(long, conflicts_with = "memory_id")]
         record_id: Option<String>,
+        /// Stable memory document ID from memory search output
+        #[arg(long)]
+        memory_id: Option<String>,
+        /// Read one section of a memory document
+        #[arg(long, requires = "memory_id")]
+        section: Option<String>,
+        /// Version returned by search; reports if the document changed before this read
+        #[arg(long, requires = "memory_id")]
+        content_version: Option<String>,
         /// Select a content field to continue reading
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "memory_id")]
         field: Option<ReadField>,
-        /// Unicode character offset within --field
-        #[arg(long, default_value_t = 0, requires = "field")]
+        /// Unicode character offset within the selected record field or memory document/section
+        #[arg(long, default_value_t = 0)]
         offset_chars: usize,
         /// Originating machine for federated search results
         #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
@@ -871,6 +891,16 @@ pub(crate) enum McpSearchMode {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, JsonSchema)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SearchContent {
+    #[default]
+    Conversations,
+    Memories,
+    All,
+}
+
 impl From<McpSearchMode> for SearchMode {
     fn from(value: McpSearchMode) -> Self {
         match value {
@@ -922,6 +952,9 @@ fn default_recency_half_life_days() -> f32 {
 pub(crate) struct SearchRequest {
     /// Keywords or natural-language query.
     pub(crate) query: String,
+    /// Search conversations, memories, or both. Defaults to conversations.
+    #[serde(default)]
+    pub(crate) content: SearchContent,
     /// Additional query views fused with reciprocal-rank fusion.
     #[serde(default)]
     pub(crate) additional_queries: Vec<String>,
@@ -1235,6 +1268,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Search {
             query,
+            content,
             additional_queries,
             cwd,
             project,
@@ -1267,6 +1301,7 @@ pub fn run() -> Result<()> {
         } => {
             run_search(
                 query,
+                content,
                 additional_queries,
                 cwd,
                 project,
@@ -1457,6 +1492,9 @@ pub fn run() -> Result<()> {
         Commands::Show {
             doc_id,
             record_id,
+            memory_id,
+            section,
+            content_version,
             field,
             offset_chars,
             machine,
@@ -1465,20 +1503,41 @@ pub fn run() -> Result<()> {
             read,
             root,
         } => {
-            let selector = match (doc_id, record_id) {
-                (Some(id), None) => ContextSelector::doc_id(id),
-                (None, Some(id)) => ContextSelector::record_id(id),
-                _ => return Err(anyhow!("provide a document ID or --record-id")),
-            };
-            run_show(ShowRunArgs {
-                selector,
-                field,
-                offset_chars,
-                machine,
-                output: output.resolve(OutputFormat::Json, None, verbose)?,
-                read,
-                root,
-            })?;
+            let output = output.resolve(OutputFormat::Json, None, verbose)?;
+            if let Some(memory_id) = memory_id {
+                run_show_memory(MemoryShowRunArgs {
+                    memory_id,
+                    section,
+                    content_version,
+                    offset_chars,
+                    machine,
+                    output,
+                    read,
+                    root,
+                })?;
+            } else {
+                if offset_chars != 0 && field.is_none() {
+                    return Err(anyhow!("--offset-chars requires --field for record reads"));
+                }
+                let selector = match (doc_id, record_id) {
+                    (Some(id), None) => ContextSelector::doc_id(id),
+                    (None, Some(id)) => ContextSelector::record_id(id),
+                    _ => {
+                        return Err(anyhow!(
+                            "provide a document ID, --record-id, or --memory-id"
+                        ));
+                    }
+                };
+                run_show(ShowRunArgs {
+                    selector,
+                    field,
+                    offset_chars,
+                    machine,
+                    output,
+                    read,
+                    root,
+                })?;
+            }
         }
         Commands::Hydrate {
             input,
@@ -1870,6 +1929,7 @@ fn run_index(
 fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
     remove_generated_path(&paths.index)?;
     remove_generated_path(&paths.vectors)?;
+    remove_generated_path(&paths.root.join("memory"))?;
 
     for name in [
         "ingest.json",
@@ -1921,19 +1981,22 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
     let paths = Paths::new(root)?;
     let _lease = IngestLease::acquire(&paths, "index-gc", INGEST_LEASE_TIMEOUT)?;
     let report = SearchIndex::garbage_collect_generations_offline(&paths.index, dry_run)?;
+    let memory_generations = gc_memory_vectors(&paths, dry_run)?;
     if report.dry_run {
         println!(
-            "would remove {} unreachable generations, {} abandoned generation work directories, and {} legacy index files; no rebuild required",
+            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; no rebuild required",
             report.generations_removed,
             report.abandoned_workdirs_removed,
-            report.legacy_files_removed
+            report.legacy_files_removed,
+            memory_generations
         );
     } else {
         println!(
-            "removed {} unreachable generations, {} abandoned generation work directories, and {} legacy index files; retained the committed index without rebuilding",
+            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
             report.generations_removed,
             report.abandoned_workdirs_removed,
-            report.legacy_files_removed
+            report.legacy_files_removed,
+            memory_generations
         );
     }
     Ok(())
@@ -2027,10 +2090,12 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     )?;
 
     vector.save()?;
+    let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
     progress.finish();
     println!(
-        "embedded {} vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {})",
+        "embedded {} conversation vectors and {} memory section vectors (claude {}, codex {}, opencode {}, cursor {}, pi {}, openclaw {}, copilot {}, jcode {}, muse {}, grok {})",
         embedded_total,
+        memory_embedded,
         embedded_counts[crate::types::SourceKind::Claude.idx()],
         embedded_counts[crate::types::SourceKind::Codex.idx()],
         embedded_counts[crate::types::SourceKind::Opencode.idx()],
@@ -2050,6 +2115,7 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_search(
     query: String,
+    content: SearchContent,
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
@@ -2096,6 +2162,36 @@ fn run_search(
     } else {
         SearchMode::Lexical
     };
+    if content != SearchContent::Conversations {
+        return run_search_with_memories(MemorySurfaceSearchArgs {
+            query,
+            additional_queries,
+            cwd,
+            project,
+            role,
+            tool,
+            session,
+            source,
+            origin,
+            mode,
+            min_score,
+            recency_weight,
+            recency_half_life_days,
+            since,
+            until,
+            limit,
+            top_n_per_session,
+            unique_session,
+            fields: search_fields(fields, full)?,
+            sort,
+            format,
+            pretty,
+            root,
+            machines,
+            content,
+            trace,
+        });
+    }
     let mut collected = collect_search(SearchCollectRequest {
         query,
         additional_queries,
@@ -2157,6 +2253,342 @@ fn run_search(
         })?;
     }
     render_located_results(collected.results, &collected.render)
+}
+
+struct MemorySurfaceSearchArgs {
+    query: String,
+    additional_queries: Vec<String>,
+    cwd: Option<PathBuf>,
+    project: Option<String>,
+    role: Option<String>,
+    tool: Option<String>,
+    session: Option<String>,
+    source: Option<SourceFilter>,
+    origin: SessionOrigin,
+    mode: SearchMode,
+    min_score: Option<f32>,
+    recency_weight: f32,
+    recency_half_life_days: f32,
+    since: Option<String>,
+    until: Option<String>,
+    limit: usize,
+    top_n_per_session: Option<usize>,
+    unique_session: bool,
+    fields: Option<HashSet<String>>,
+    sort: SortBy,
+    format: SearchFormat,
+    pretty: bool,
+    root: Option<PathBuf>,
+    machines: Vec<String>,
+    content: SearchContent,
+    trace: bool,
+}
+
+enum UnifiedSearchResult {
+    Conversation(LocatedRecord),
+    Memory(LocatedMemoryHit),
+}
+
+impl UnifiedSearchResult {
+    fn score(&self) -> f32 {
+        match self {
+            Self::Conversation(result) => result.score,
+            Self::Memory(result) => result.hit.score,
+        }
+    }
+
+    fn set_score(&mut self, score: f32) {
+        match self {
+            Self::Conversation(result) => result.score = score,
+            Self::Memory(result) => result.hit.score = score,
+        }
+    }
+
+    fn timestamp(&self) -> u64 {
+        match self {
+            Self::Conversation(result) => result.record.ts,
+            Self::Memory(result) => result.hit.mtime_ms,
+        }
+    }
+
+    fn tie_key(&self) -> (&str, &str) {
+        match self {
+            Self::Conversation(result) => (&result.machine, &result.record.session_id),
+            Self::Memory(result) => (&result.machine, &result.hit.section_ref),
+        }
+    }
+}
+
+fn run_search_with_memories(args: MemorySurfaceSearchArgs) -> Result<()> {
+    let format = args.format;
+    let pretty = args.pretty;
+    let (values, failures, _) = collect_search_with_memories(args)?;
+    for failure in &failures {
+        eprintln!("Warning: machine unavailable: {failure}");
+    }
+    render_unified_search(values, format, pretty)
+}
+
+fn collect_search_with_memories(
+    args: MemorySurfaceSearchArgs,
+) -> Result<(Vec<Value>, Vec<String>, Vec<String>)> {
+    let MemorySurfaceSearchArgs {
+        query,
+        additional_queries,
+        cwd,
+        project,
+        role,
+        tool,
+        session,
+        source,
+        origin,
+        mode,
+        min_score,
+        recency_weight,
+        recency_half_life_days,
+        since,
+        until,
+        limit,
+        top_n_per_session,
+        unique_session,
+        fields,
+        sort,
+        format,
+        pretty,
+        root,
+        machines,
+        content,
+        trace,
+    } = args;
+    if limit == 0 || limit > 500 {
+        return Err(anyhow!("limit must be between 1 and 500"));
+    }
+    let conversation_only_filters =
+        role.is_some() || tool.is_some() || session.is_some() || origin != SessionOrigin::All;
+    if content == SearchContent::Memories && conversation_only_filters {
+        return Err(anyhow!(
+            "--role, --tool, --session, and --origin filter conversations; use --content conversations or all"
+        ));
+    }
+    if trace {
+        return Err(anyhow!(
+            "retrieval traces currently record conversation searches only"
+        ));
+    }
+
+    let paths = Paths::new(root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let memory_cwd = canonical_cwd_filter(cwd.clone()).map(PathBuf::from);
+    let mut failures = Vec::new();
+    let include_conversations = content == SearchContent::All;
+    let include_memories = !conversation_only_filters;
+    let mut conversation_results = Vec::new();
+    if include_conversations {
+        let collected = collect_search(SearchCollectRequest {
+            query: query.clone(),
+            additional_queries: additional_queries.clone(),
+            cwd: cwd.clone(),
+            project: project.clone(),
+            role,
+            tool,
+            session,
+            source,
+            origin,
+            mode,
+            min_score,
+            recency_weight,
+            recency_half_life_days,
+            since: since.clone(),
+            until: until.clone(),
+            limit,
+            top_n_per_session,
+            unique_session,
+            fields: fields.clone(),
+            sort,
+            verbose: false,
+            format: SearchFormat::Json,
+            root: root.clone(),
+            machines: machines.clone(),
+        })?;
+        failures.extend(collected.failures);
+        conversation_results = collected.results;
+    }
+
+    let mut memory_results = Vec::new();
+    if include_memories {
+        let memory_mode = match mode {
+            SearchMode::Lexical => MemorySearchMode::Lexical,
+            SearchMode::Semantic => MemorySearchMode::Semantic,
+            SearchMode::Hybrid => MemorySearchMode::Hybrid,
+        };
+        let max_per_document = if unique_session && top_n_per_session.is_none() {
+            1
+        } else {
+            top_n_per_session.unwrap_or(2)
+        };
+        let options = MemorySearchOptions {
+            query: query.clone(),
+            additional_queries,
+            mode: memory_mode,
+            project,
+            cwd: memory_cwd,
+            source: source.and_then(|value| crate::types::SourceKind::from_label(value.as_str())),
+            since: parse_ts_millis(since)?,
+            until: parse_ts_millis(until)?,
+            min_score,
+            recency_weight,
+            recency_half_life_days,
+            limit,
+            max_per_document: max_per_document.min(limit),
+            sort_by_timestamp: sort == SortBy::Ts,
+            include_text: fields.as_ref().is_none_or(|fields| fields.contains("text")),
+        };
+        options.validate()?;
+        let federated = federated_memory_search(
+            &paths,
+            &config,
+            &machines,
+            &options,
+            content == SearchContent::Memories,
+        )?;
+        for (machine, error) in federated.failures {
+            failures.push(format!("{machine}: {error}"));
+        }
+        memory_results = federated.items;
+        if content == SearchContent::Memories && memory_results.is_empty() && !failures.is_empty() {
+            return Err(anyhow!("memory search failed: {}", failures.join("; ")));
+        }
+    }
+
+    let mut results = if content == SearchContent::Memories {
+        memory_results
+            .into_iter()
+            .map(UnifiedSearchResult::Memory)
+            .collect::<Vec<_>>()
+    } else {
+        // Scores from independent conversation and memory indexes are not comparable. Rank each
+        // corpus with reciprocal-rank fusion before merging them.
+        let mut merged = Vec::with_capacity(conversation_results.len() + memory_results.len());
+        for (rank, result) in conversation_results.into_iter().enumerate() {
+            let mut result = UnifiedSearchResult::Conversation(result);
+            result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
+            merged.push(result);
+        }
+        for (rank, result) in memory_results.into_iter().enumerate() {
+            let mut result = UnifiedSearchResult::Memory(result);
+            result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
+            merged.push(result);
+        }
+        merged.sort_by(|left, right| {
+            let order = if sort == SortBy::Ts {
+                right.timestamp().cmp(&left.timestamp())
+            } else {
+                right.score().total_cmp(&left.score())
+            };
+            order.then_with(|| left.tie_key().cmp(&right.tie_key()))
+        });
+        merged.truncate(limit);
+        merged
+    };
+    results.truncate(limit);
+    let mut values = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            UnifiedSearchResult::Conversation(result) => {
+                let mut projected = project_located_results(
+                    vec![result],
+                    &RenderOptions {
+                        verbose: false,
+                        pretty,
+                        matchers: build_matchers(&query)?,
+                        format,
+                        fields: fields.clone(),
+                        sort,
+                        min_score: None,
+                        top_n_per_session: None,
+                        limit: 1,
+                        kind_filter: crate::analytics::SessionKindFilter::All,
+                    },
+                )?;
+                if content == SearchContent::All
+                    && fields.as_ref().is_none_or(|set| set.contains("kind"))
+                {
+                    projected[0]["kind"] = Value::from("conversation");
+                }
+                values.extend(projected);
+            }
+            UnifiedSearchResult::Memory(result) => {
+                let mut projected = project_memory_result(result, &fields)?;
+                if content == SearchContent::All
+                    && fields.as_ref().is_none_or(|set| set.contains("kind"))
+                {
+                    projected["kind"] = Value::from("memory");
+                }
+                values.push(projected);
+            }
+        }
+    }
+    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
+    Ok((values, failures, selected_machines))
+}
+
+fn project_memory_result(
+    result: LocatedMemoryHit,
+    fields: &Option<HashSet<String>>,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(result)?;
+    if let Some(fields) = fields {
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("memory search result was not an object"))?;
+        object.retain(|key, _| fields.contains(key));
+    }
+    Ok(value)
+}
+
+fn render_unified_search(values: Vec<Value>, format: SearchFormat, pretty: bool) -> Result<()> {
+    match format {
+        SearchFormat::Jsonl => {
+            for value in values {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        }
+        SearchFormat::Json => print_json(&Value::Array(values), pretty)?,
+        SearchFormat::Toon => println!(
+            "{}",
+            toon_format::encode_default(&serde_json::json!({"results": values}))?
+        ),
+        SearchFormat::Text => {
+            for value in values {
+                let score = value
+                    .get("score")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default();
+                let machine = value
+                    .get("machine")
+                    .and_then(Value::as_str)
+                    .unwrap_or("local");
+                let kind = value
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        if value.get("memory_id").is_some() {
+                            "memory"
+                        } else {
+                            "conversation"
+                        }
+                    });
+                let identity = value
+                    .get("memory_id")
+                    .or_else(|| value.get("record_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let snippet = value.get("snippet").and_then(Value::as_str).unwrap_or("");
+                println!("[{score:.3}] {machine} {kind} {identity} {snippet}");
+            }
+        }
+    }
+    Ok(())
 }
 
 struct SearchCollectRequest {
@@ -2595,6 +3027,42 @@ fn project_located_results(
 pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Result<Value> {
     validate_mcp_search_request(&request)?;
     let source = parse_source_filter(request.source)?;
+    if request.content != SearchContent::Conversations {
+        let (results, failures, selected_machines) =
+            collect_search_with_memories(MemorySurfaceSearchArgs {
+                query: request.query,
+                additional_queries: request.additional_queries,
+                cwd: request.cwd.map(PathBuf::from),
+                project: request.project,
+                role: request.role,
+                tool: request.tool,
+                session: request.session,
+                source,
+                origin: request.origin,
+                mode: request.mode.into(),
+                min_score: request.min_score,
+                recency_weight: request.recency_weight,
+                recency_half_life_days: request.recency_half_life_days,
+                since: request.since,
+                until: request.until,
+                limit: request.limit,
+                top_n_per_session: request.top_n_per_session,
+                unique_session: request.unique_session,
+                fields: search_fields(None, false)?,
+                sort: request.sort.into(),
+                format: SearchFormat::Json,
+                pretty: false,
+                root,
+                machines: request.machines,
+                content: request.content,
+                trace: false,
+            })?;
+        return Ok(serde_json::json!({
+            "results": results,
+            "failures": failures,
+            "selected_machines": selected_machines,
+        }));
+    }
     let collected = collect_search(SearchCollectRequest {
         query: request.query,
         additional_queries: request.additional_queries,
@@ -3214,6 +3682,91 @@ struct ShowRunArgs {
     root: Option<PathBuf>,
 }
 
+struct MemoryShowRunArgs {
+    memory_id: String,
+    section: Option<String>,
+    content_version: Option<String>,
+    offset_chars: usize,
+    machine: String,
+    output: OutputOptions,
+    read: ReadArgs,
+    root: Option<PathBuf>,
+}
+
+fn run_show_memory(args: MemoryShowRunArgs) -> Result<()> {
+    let paths = Paths::new(args.root)?;
+    let config = UserConfig::load(&paths)?;
+    if args
+        .read
+        .max_chars
+        .is_some_and(|max_chars| max_chars > MAX_MEMORY_READ_CHARS)
+    {
+        return Err(anyhow!(
+            "memory --max-chars cannot exceed {MAX_MEMORY_READ_CHARS}"
+        ));
+    }
+    let request = MemoryReadRequest {
+        memory_id: args.memory_id,
+        section_ref: args.section,
+        content_version: args.content_version,
+        offset_chars: args.offset_chars,
+        max_chars: args.read.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
+    };
+    let result = if args.read.full {
+        read_full_memory(&paths, &config, &args.machine, &request)?
+    } else {
+        read_memory(&paths, &config, &args.machine, &request)?
+    };
+    let mut value = serde_json::to_value(result)?;
+    value["machine"] = Value::from(args.machine);
+    args.output.print_value(&value)
+}
+
+fn read_full_memory(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    original: &MemoryReadRequest,
+) -> Result<MemoryReadValue> {
+    const MAX_VERSION_RESTARTS: usize = 2;
+    for attempt in 0..=MAX_VERSION_RESTARTS {
+        let mut request = original.clone();
+        request.max_chars = MAX_MEMORY_READ_CHARS;
+        let mut first = read_memory(paths, config, machine, &request)?;
+        let version = first.content_version.clone();
+        let mut text = first.text.clone();
+        let mut next = first.next_offset_chars;
+        let mut changed_mid_read = false;
+        while let Some(offset_chars) = next {
+            request.section_ref = first.section_ref.clone();
+            request.content_version = Some(version.clone());
+            request.offset_chars = offset_chars;
+            let page = read_memory(paths, config, machine, &request)?;
+            if page.changed_since_search || page.content_version != version {
+                changed_mid_read = true;
+                break;
+            }
+            text.push_str(&page.text);
+            next = page.next_offset_chars;
+        }
+        if changed_mid_read {
+            if attempt == MAX_VERSION_RESTARTS {
+                return Err(anyhow!(
+                    "memory changed repeatedly while reading; search again and retry with the new content_version"
+                ));
+            }
+            continue;
+        }
+        first.text = text;
+        first.content.returned_chars = first.text.chars().count();
+        first.content.truncated = false;
+        first.content.continuations.clear();
+        first.next_offset_chars = None;
+        return Ok(first);
+    }
+    unreachable!("bounded memory read retry loop always returns")
+}
+
 fn run_show(args: ShowRunArgs) -> Result<()> {
     let ShowRunArgs {
         selector,
@@ -3282,8 +3835,22 @@ fn hydrate_session_records(
 fn run_stats(root: Option<PathBuf>) -> Result<()> {
     let paths = Paths::new(root)?;
     let index = SearchIndex::open_or_create(&paths.index)?;
+    let memory = MemoryStore::new(paths.root.join("memory/documents.json")).load()?;
+    let memory_sections = memory
+        .documents
+        .iter()
+        .map(|document| document.sections.len())
+        .sum::<usize>();
+    let stale_memories = memory
+        .documents
+        .iter()
+        .filter(|document| matches!(document.freshness, MemoryFreshness::Stale { .. }))
+        .count();
     println!("index: {}", paths.index.display());
     println!("documents: {}", index.doc_count()?);
+    println!("memory documents: {}", memory.documents.len());
+    println!("memory sections: {memory_sections}");
+    println!("stale memory documents: {stale_memories}");
     print_vector_stats(&paths.vectors)?;
     Ok(())
 }
@@ -5841,14 +6408,13 @@ fn summarize(text: &str, max: usize) -> String {
     out.trim().to_string()
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SortBy {
     Score,
     Ts,
 }
 
-const DEFAULT_SEARCH_FIELDS: &str =
-    "machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches";
+const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
 
 fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
     if full {
@@ -6535,6 +7101,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.limit, 20);
+        assert_eq!(request.content, SearchContent::Conversations);
         assert!(request.unique_session);
         assert_eq!(request.mode, McpSearchMode::Lexical);
         assert_eq!(request.sort, McpSearchSort::Score);
@@ -7157,6 +7724,8 @@ arguments = {
 
         std::fs::write(paths.index.join("derived-index"), "index").unwrap();
         std::fs::write(paths.vectors.join("derived-vectors"), "vectors").unwrap();
+        std::fs::create_dir_all(paths.root.join("memory")).unwrap();
+        std::fs::write(paths.root.join("memory/documents.json"), "memory snapshot").unwrap();
         for name in [
             "ingest.json",
             "ingest.pending.json",
@@ -7177,6 +7746,7 @@ arguments = {
 
         assert!(!paths.index.exists());
         assert!(!paths.vectors.exists());
+        assert!(!paths.root.join("memory").exists());
         for name in [
             "ingest.json",
             "ingest.pending.json",
@@ -7530,6 +8100,37 @@ arguments = {
     }
 
     #[test]
+    fn search_content_defaults_to_conversations_and_accepts_memory_corpora() {
+        let default = Cli::try_parse_from(["memex", "search", "needle"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Some(Commands::Search {
+                content: SearchContent::Conversations,
+                ..
+            })
+        ));
+
+        for (value, expected) in [
+            ("memories", SearchContent::Memories),
+            ("all", SearchContent::All),
+        ] {
+            let cli =
+                Cli::try_parse_from(["memex", "search", "needle", "--content", value]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Search { content, .. }) if content == expected
+            ));
+        }
+
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "needle",
+            "content": "memories"
+        }))
+        .unwrap();
+        assert_eq!(request.content, SearchContent::Memories);
+    }
+
+    #[test]
     fn show_session_and_hydrate_accept_machine_scoped_requests() {
         let show = Cli::try_parse_from(["memex", "show", "42", "--machine", "mini"])
             .expect("parse machine-scoped show");
@@ -7537,6 +8138,52 @@ arguments = {
             panic!("expected show command");
         };
         assert_eq!(machine, "mini");
+
+        let memory = Cli::try_parse_from([
+            "memex",
+            "show",
+            "--memory-id",
+            "memory_sha256",
+            "--section",
+            "heading-2",
+            "--content-version",
+            "version_sha256",
+            "--offset-chars",
+            "120",
+            "--max-chars",
+            "400",
+            "--machine",
+            "mini",
+        ])
+        .expect("parse memory read");
+        let Some(Commands::Show {
+            memory_id,
+            section,
+            content_version,
+            offset_chars,
+            machine,
+            ..
+        }) = memory.command
+        else {
+            panic!("expected show command");
+        };
+        assert_eq!(memory_id.as_deref(), Some("memory_sha256"));
+        assert_eq!(section.as_deref(), Some("heading-2"));
+        assert_eq!(content_version.as_deref(), Some("version_sha256"));
+        assert_eq!(offset_chars, 120);
+        assert_eq!(machine, "mini");
+
+        assert!(
+            Cli::try_parse_from([
+                "memex",
+                "show",
+                "--memory-id",
+                "memory",
+                "--record-id",
+                "record"
+            ])
+            .is_err()
+        );
 
         let session = Cli::try_parse_from([
             "memex",

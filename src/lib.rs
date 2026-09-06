@@ -9,6 +9,7 @@ pub mod lease;
 pub mod machine;
 pub mod mcp;
 pub mod memory;
+pub mod memory_search;
 pub mod progress;
 pub mod read_budget;
 pub mod resume;

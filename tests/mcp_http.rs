@@ -1,6 +1,12 @@
+use memex::{
+    config::Paths,
+    memory::{MemoryDiscoveryOptions, MemoryStore},
+    types::SourceKind,
+};
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -205,6 +211,27 @@ fn read_token(path: &Path) -> String {
         .to_owned()
 }
 
+fn seed_memory(root: &Path) {
+    std::fs::write(root.join("config.toml"), "auto_index_on_search = false\n").unwrap();
+    let paths = Paths::new(Some(root.to_path_buf())).unwrap();
+    let projects = root.join("fixture-claude/projects");
+    let source = projects.join("-work-http-memory/memory/MEMORY.md");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(
+        source,
+        "# HTTP memory\n\nProtocol memory evidence with unicode café 🦀.\n",
+    )
+    .unwrap();
+    MemoryStore::new(paths.root.join("memory/documents.json"))
+        .refresh(&MemoryDiscoveryOptions {
+            claude_project_roots: vec![projects],
+            codex_homes: vec![],
+            enabled_sources: HashSet::from([SourceKind::Claude]),
+            exclude_patterns: vec![],
+        })
+        .unwrap();
+}
+
 #[test]
 fn bearer_origin_and_cors_are_enforced() {
     let server = McpHttpServer::start(&[ALLOWED_ORIGIN]);
@@ -407,6 +434,54 @@ fn latest_protocol_is_stateless_and_serves_tools_over_sse() {
         .expect("GET MCP endpoint");
     assert_eq!(get.status(), 405);
     assert!(get.headers().get("mcp-session-id").is_none());
+}
+
+#[test]
+fn latest_http_protocol_searches_and_reads_memory_documents() {
+    let root = tempfile::tempdir().expect("temporary MCP root");
+    seed_memory(root.path());
+    let server = McpHttpServer::start_with_root(root, &[ALLOWED_ORIGIN], &[]);
+
+    let searched = response_payload(
+        server
+            .latest_request(
+                30,
+                "tools/call",
+                json!({"name":"search","arguments":{
+                    "query":"protocol memory",
+                    "content":"memories",
+                    "source":"claude",
+                    "machines":["local"]
+                }}),
+            )
+            .send()
+            .expect("HTTP memory search"),
+    );
+    assert_eq!(searched["result"]["isError"], false, "{searched}");
+    let hit = &searched["result"]["structuredContent"]["results"][0];
+    assert!(hit["memory_id"].as_str().is_some(), "{searched}");
+
+    let shown = response_payload(
+        server
+            .latest_request(
+                31,
+                "tools/call",
+                json!({"name":"show","arguments":{
+                    "memory_id":hit["memory_id"],
+                    "section_ref":hit["section_ref"],
+                    "content_version":hit["content_version"],
+                    "max_chars":9,
+                    "machine":"local"
+                }}),
+            )
+            .send()
+            .expect("HTTP memory read"),
+    );
+    assert_eq!(shown["result"]["isError"], false, "{shown}");
+    let document = &shown["result"]["structuredContent"];
+    assert!(document["text"].as_str().unwrap().chars().count() <= 9);
+    assert_eq!(document["content"]["truncated"], true);
+    assert_eq!(document["changed_since_search"], false);
 }
 
 #[test]

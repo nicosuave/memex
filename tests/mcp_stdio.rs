@@ -2,11 +2,13 @@ use memex::{
     analytics::{AnalyticsStore, analytics_path, backfill_from_index},
     config::Paths,
     index::SearchIndex,
+    memory::{MemoryDiscoveryOptions, MemoryStore},
     retrieval::canonical_record_id,
     types::{Record, RecordLinks, SourceKind},
 };
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
@@ -150,6 +152,70 @@ fn fixture() -> (tempfile::TempDir, Vec<Record>) {
     ];
     seed_index(root.path(), &records);
     (root, records)
+}
+
+fn seed_memory(root: &Path) {
+    let paths = Paths::new(Some(root.to_path_buf())).unwrap();
+    let projects = root.join("fixture-claude/projects");
+    let source = projects.join("-work-mcp-test/memory/MEMORY.md");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(
+        &source,
+        "# Durable decision\n\nNeedle memory evidence with unicode café 🦀.\n",
+    )
+    .unwrap();
+    MemoryStore::new(paths.root.join("memory/documents.json"))
+        .refresh(&MemoryDiscoveryOptions {
+            claude_project_roots: vec![projects],
+            codex_homes: vec![],
+            enabled_sources: HashSet::from([SourceKind::Claude]),
+            exclude_patterns: vec![],
+        })
+        .unwrap();
+}
+
+#[test]
+fn memory_search_and_versioned_reads_use_real_documents_over_stdio() {
+    let (root, _) = fixture();
+    seed_memory(root.path());
+    let mut client = Client::start(root.path());
+
+    let searched = client.call(
+        "search",
+        json!({"query":"needle memory","content":"memories","source":"claude","machines":["local"]}),
+    );
+    let hit = &searched["results"][0];
+    assert!(hit["memory_id"].as_str().is_some(), "{searched}");
+    assert!(hit["section_ref"].as_str().is_some(), "{searched}");
+    assert!(hit.get("session_id").is_none(), "{searched}");
+
+    let first = client.call(
+        "show",
+        json!({
+            "memory_id": hit["memory_id"],
+            "section_ref": hit["section_ref"],
+            "content_version": hit["content_version"],
+            "max_chars": 8,
+            "machine": "local"
+        }),
+    );
+    assert!(first["text"].as_str().unwrap().chars().count() <= 8);
+    assert_eq!(first["content"]["truncated"], true);
+    assert!(first["next_offset_chars"].as_u64().is_some());
+    assert_eq!(first["changed_since_search"], false);
+
+    let mixed = client.call(
+        "search",
+        json!({"query":"needle","content":"all","machines":["local"],"unique_session":false}),
+    );
+    let kinds = mixed["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value["kind"].as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(kinds, HashSet::from(["conversation", "memory"]), "{mixed}");
+    client.stop();
 }
 
 #[test]

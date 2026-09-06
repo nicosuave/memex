@@ -1,9 +1,11 @@
 use memex::analytics::{analytics_path, backfill_from_index};
 use memex::config::Paths;
 use memex::index::SearchIndex;
+use memex::memory::{MemoryDiscoveryOptions, MemoryStore};
 use memex::retrieval::canonical_record_id;
 use memex::types::{Record, RecordLinks, SourceKind};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -31,6 +33,199 @@ fn fixture() -> (tempfile::TempDir, Vec<Record>) {
     writer.commit().unwrap();
     writer.wait_merging_threads().unwrap();
     (temp, records)
+}
+
+fn seed_memory(root: &Path) -> (String, std::path::PathBuf) {
+    let paths = Paths::new(Some(root.to_path_buf())).unwrap();
+    let projects = root.join("fixture-claude/projects");
+    let source = projects.join("-work-retrieval-cli/memory/MEMORY.md");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let workspace = root.join("work/retrieval-cli");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        projects.join("-work-retrieval-cli/session.jsonl"),
+        format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "sessionId": "memory-scope-session",
+                "timestamp": "2026-09-01T00:00:00Z",
+                "cwd": workspace.to_string_lossy(),
+                "message": {"role":"user","content":"memory scope"}
+            })
+        ),
+    )
+    .unwrap();
+    let content = format!(
+        "# CLI memory\n\nlate_needle durable memory evidence.\n{}",
+        "café 🦀 ".repeat(10_000)
+    );
+    std::fs::write(&source, &content).unwrap();
+    MemoryStore::new(paths.root.join("memory/documents.json"))
+        .refresh(&MemoryDiscoveryOptions {
+            claude_project_roots: vec![projects],
+            codex_homes: vec![],
+            enabled_sources: HashSet::from([SourceKind::Claude]),
+            exclude_patterns: vec![],
+        })
+        .unwrap();
+    (content, workspace)
+}
+
+#[test]
+fn memory_cli_search_formats_mixed_discriminators_and_full_reads() {
+    let (root, _) = fixture();
+    let (expected_document, workspace) = seed_memory(root.path());
+
+    let memories = values(
+        root.path(),
+        &[
+            "search",
+            "late_needle memory",
+            "--content",
+            "memories",
+            "--source",
+            "claude",
+            "--machine",
+            "local",
+            "--recency-weight",
+            "0",
+        ],
+    );
+    assert!(!memories.is_empty());
+    let hit = &memories[0];
+    assert!(hit["memory_id"].as_str().is_some());
+    assert!(hit["content_version"].as_str().is_some());
+    assert!(hit["section_ref"].as_str().is_some());
+    assert!(hit.get("session_id").is_none());
+
+    let absolute = values(
+        root.path(),
+        &[
+            "search",
+            "late_needle",
+            "--content",
+            "memories",
+            "--cwd",
+            workspace.to_str().unwrap(),
+            "--machine",
+            "local",
+            "--recency-weight",
+            "0",
+        ],
+    );
+    let relative_output = Command::new(env!("CARGO_BIN_EXE_memex"))
+        .current_dir(&workspace)
+        .args([
+            "search",
+            "late_needle",
+            "--content",
+            "memories",
+            "--cwd",
+            ".",
+            "--machine",
+            "local",
+            "--recency-weight",
+            "0",
+            "--root",
+        ])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        relative_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relative_output.stderr)
+    );
+    let relative = String::from_utf8(relative_output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(!absolute.is_empty());
+    assert_eq!(relative, absolute);
+
+    for projection in [vec!["--fields", "memory_id,text"], vec!["--full"]] {
+        let mut args = vec![
+            "search",
+            "late_needle memory",
+            "--content",
+            "memories",
+            "--machine",
+            "local",
+            "--recency-weight",
+            "0",
+        ];
+        args.extend(projection);
+        let projected = values(root.path(), &args);
+        assert!(
+            projected[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("late_needle durable memory evidence")),
+            "{projected:?}"
+        );
+    }
+
+    let memory_id = hit["memory_id"].as_str().unwrap();
+    let content_version = hit["content_version"].as_str().unwrap();
+    let full = json_output(
+        root.path(),
+        &[
+            "show",
+            "--memory-id",
+            memory_id,
+            "--content-version",
+            content_version,
+            "--full",
+        ],
+    );
+    assert_eq!(full["text"], expected_document);
+    assert_eq!(full["content"]["truncated"], false);
+    assert_eq!(full["next_offset_chars"], Value::Null);
+
+    let toon = run(
+        root.path(),
+        &[
+            "search",
+            "late_needle memory",
+            "--content",
+            "memories",
+            "--source",
+            "claude",
+            "--machine",
+            "local",
+            "--recency-weight",
+            "0",
+            "--format",
+            "toon",
+        ],
+    );
+    assert!(
+        toon.status.success(),
+        "{}",
+        String::from_utf8_lossy(&toon.stderr)
+    );
+    let decoded: Value =
+        toon_format::decode_default(std::str::from_utf8(&toon.stdout).unwrap()).unwrap();
+    assert_eq!(decoded["results"], serde_json::json!(memories));
+
+    let mixed = values(
+        root.path(),
+        &[
+            "search",
+            "late_needle",
+            "--content",
+            "all",
+            "--machine",
+            "local",
+            "--no-update-check",
+        ],
+    );
+    let kinds = mixed
+        .iter()
+        .filter_map(|value| value["kind"].as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(kinds, HashSet::from(["conversation", "memory"]));
 }
 
 fn record(id: u64, text: String) -> Record {

@@ -4,6 +4,9 @@ use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
+use crate::memory_search::{
+    MemoryReadRequest, MemoryReadValue, MemorySearchHit, MemorySearchOptions,
+};
 use crate::read_budget::{ContentPage, ReadBudget, ReadField};
 use crate::retrieval::{
     ContextOptions, ContextRelation, ContextResult, ContextSelector, canonical_record_id,
@@ -131,6 +134,15 @@ pub struct LocatedRecord {
     pub machine: String,
     pub score: f32,
     pub record: Record,
+}
+
+/// Memory results keep document identity and provenance without acquiring a
+/// synthetic conversation/session identity for federation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocatedMemoryHit {
+    pub machine: String,
+    #[serde(flatten)]
+    pub hit: MemorySearchHit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +297,12 @@ pub struct Federated<T> {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum RpcOperation {
     Ping,
+    MemorySearch {
+        options: MemorySearchOptions,
+    },
+    MemoryRead {
+        request: MemoryReadRequest,
+    },
     Search {
         spec: SearchSpec,
     },
@@ -351,6 +369,12 @@ struct RpcRequest {
 enum RpcPayload {
     Pong {
         version: String,
+    },
+    MemoryHits {
+        hits: Vec<MemorySearchHit>,
+    },
+    MemoryDocument {
+        document: Box<MemoryReadValue>,
     },
     Records {
         records: Vec<(f32, Record)>,
@@ -537,6 +561,147 @@ pub fn federated_search(
         failures,
         candidate_count,
     })
+}
+
+/// Query each selected machine's memory snapshot using the same routing and
+/// timeout policy as conversation search. Older peers report an explicit
+/// unsupported-operation failure rather than silently omitting memories.
+pub fn federated_memory_search(
+    paths: &Paths,
+    config: &UserConfig,
+    requested: &[String],
+    options: &MemorySearchOptions,
+    auto_index_local: bool,
+) -> Result<Federated<LocatedMemoryHit>> {
+    options.validate()?;
+    let ids = selected_machine_ids(config, requested)?;
+    let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let tx = tx.clone();
+            let options = options.clone();
+            if id == LOCAL_MACHINE_ID {
+                scope.spawn(move || {
+                    let result = (|| {
+                        if auto_index_local {
+                            ensure_local_index(paths, config)?;
+                        }
+                        crate::memory_search::search_memory(paths, &options)
+                    })();
+                    let _ = tx.send((LOCAL_MACHINE_ID.to_string(), result));
+                });
+            } else {
+                let machine = machine_by_id(config, id).expect("selected machines validated");
+                scope.spawn(move || {
+                    let result = (|| match rpc(
+                        machine,
+                        RpcOperation::MemorySearch { options },
+                        timeout,
+                    )? {
+                        RpcPayload::MemoryHits { hits } => Ok(hits),
+                        RpcPayload::Error { message } => bail!("memory search failed: {message}"),
+                        _ => bail!(
+                            "unexpected memory search response; upgrade peer for memory retrieval"
+                        ),
+                    })()
+                    .with_context(|| {
+                        format!(
+                            "memory retrieval on '{}'; upgrade peers that do not support memories",
+                            machine.id
+                        )
+                    });
+                    let _ = tx.send((machine.id.clone(), result));
+                });
+            }
+        }
+        drop(tx);
+    });
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for (machine, result) in rx {
+        match result {
+            Ok(hits) if hits.len() <= options.limit => successes.push((machine, hits)),
+            Ok(_) => failures.push((
+                machine,
+                "memory search exceeded requested result limit".into(),
+            )),
+            Err(error) => failures.push((machine, format!("{error:#}"))),
+        }
+    }
+    let use_rrf = successes.len() > 1;
+    let mut items = Vec::new();
+    for (machine, hits) in successes {
+        for (rank, mut hit) in hits.into_iter().enumerate() {
+            if use_rrf {
+                hit.score = 1.0 / (RRF_K + rank as f32 + 1.0);
+            }
+            items.push(LocatedMemoryHit {
+                machine: machine.clone(),
+                hit,
+            });
+        }
+    }
+    items.sort_by(|left, right| {
+        let order = if options.sort_by_timestamp {
+            right.hit.mtime_ms.cmp(&left.hit.mtime_ms)
+        } else {
+            right.hit.score.total_cmp(&left.hit.score)
+        };
+        order
+            .then_with(|| right.hit.mtime_ms.cmp(&left.hit.mtime_ms))
+            .then_with(|| left.machine.cmp(&right.machine))
+            .then_with(|| left.hit.section_ref.cmp(&right.hit.section_ref))
+    });
+    let candidate_count = items.len();
+    items.truncate(options.limit);
+    failures.sort();
+    Ok(Federated {
+        items,
+        failures,
+        candidate_count,
+    })
+}
+
+pub fn read_memory(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_id: &str,
+    request: &MemoryReadRequest,
+) -> Result<MemoryReadValue> {
+    request.validate()?;
+    let value = if machine_id == LOCAL_MACHINE_ID {
+        crate::memory_search::read_memory(paths, request)?
+    } else {
+        let machine = machine_by_id(config, machine_id)
+            .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
+        match rpc(
+            machine,
+            RpcOperation::MemoryRead {
+                request: request.clone(),
+            },
+            Duration::from_secs(config.multi_machine.timeout_seconds()),
+        )
+        .with_context(|| {
+            format!("memory read on '{machine_id}'; upgrade peer for memory retrieval")
+        })? {
+            RpcPayload::MemoryDocument { document } => *document,
+            RpcPayload::Error { message } => bail!("memory read failed: {message}"),
+            _ => bail!("unexpected memory read response; upgrade peer for memory retrieval"),
+        }
+    };
+    if value.memory_id != request.memory_id {
+        bail!("memory read returned a different document");
+    }
+    if value.text.chars().count() > request.max_chars {
+        bail!("memory read exceeded requested content budget");
+    }
+    if value.content.returned_chars != value.text.chars().count()
+        || value.content.returned_chars > value.content.total_chars
+    {
+        bail!("memory read returned inconsistent content metadata");
+    }
+    Ok(value)
 }
 
 pub fn federated_recent(
@@ -1668,6 +1833,16 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
     match request {
         RpcOperation::Ping => Ok(RpcPayload::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+        RpcOperation::MemorySearch { options } => {
+            options.validate()?;
+            ensure_local_index(paths, config)?;
+            Ok(RpcPayload::MemoryHits {
+                hits: crate::memory_search::search_memory(paths, &options)?,
+            })
+        }
+        RpcOperation::MemoryRead { request } => Ok(RpcPayload::MemoryDocument {
+            document: Box::new(read_memory(paths, config, LOCAL_MACHINE_ID, &request)?),
         }),
         RpcOperation::Search { spec } => Ok(RpcPayload::Records {
             records: search_local(paths, config, &spec, true)?,
