@@ -210,9 +210,6 @@ memex search "deployment decision" --content memories --source codex
 memex show --memory-id <memory_id> --section <section_ref> --content-version <content_version> --machine <machine>
 ```
 
-When embeddings are enabled, indexing and the daemon refresh memory embeddings
-along with conversation embeddings.
-
 `search`, `sessions`, `session`, `session batch`, `show`, `context`, and `usage`
 support `--format jsonl|json|text`; search also supports `toon`. Search, session
 listings, transcript pages, and batch reads keep JSONL as their default. `show` and
