@@ -438,6 +438,7 @@ fn replay_opencode_spool(
     tx_record: &RecordSender,
     database_path: &Path,
     owned_session_ids: &HashSet<String>,
+    progress: &Progress,
 ) -> Result<()> {
     spool.as_file_mut().seek(SeekFrom::Start(0))?;
     let reader = BufReader::new(spool.as_file_mut());
@@ -455,6 +456,7 @@ fn replay_opencode_spool(
             )
         })?;
         if owned_session_ids.contains(&record.session_id) {
+            progress.add_produced(SourceKind::Opencode, 1);
             tx_record.send(record)?;
         }
     }
@@ -1605,6 +1607,7 @@ pub fn ingest_all(
                 &tx_record,
                 &database.path,
                 &owned_session_ids,
+                &progress,
             )?;
         }
         Ok(())
@@ -1613,6 +1616,10 @@ pub fn ingest_all(
     drop(tx_record);
     drop(tx_update);
 
+    // Parsers are done; what follows is commit/merge/publish plus analytics
+    // and state writes, none of which is per-source work. Keep one spinner
+    // visible so the tail doesn't read as hung.
+    let tail = progress.tail_spinner("committing index…");
     pending_ingest.next_doc_id = next_doc_id.load(Ordering::SeqCst);
     let pending_update_error = pending_ingest
         .save(&pending_path)
@@ -1625,59 +1632,65 @@ pub fn ingest_all(
     };
     // A failed writer may have already closed the channel. Joining below keeps that root cause.
     let _ = decision_tx.send(decision);
-    let writer_result = writer_handle
-        .join()
-        .map_err(|_| anyhow!("writer thread panicked"))?;
+    let writer_result = writer_handle.join().map_err(|_| {
+        tail.finish_and_clear();
+        anyhow!("writer thread panicked")
+    })?;
     progress.finish();
-    let writer_outcome =
-        writer_result.context("index writer stopped before ingestion completed")?;
-    parser_result?;
-    if let Some(error) = pending_update_error {
-        return Err(error);
-    }
-    let (records_added, records_embedded) = match writer_outcome {
-        WriterOutcome::Published {
+    tail.set_message("updating analytics…");
+    let outcome = (|| -> Result<IngestReport> {
+        let writer_outcome =
+            writer_result.context("index writer stopped before ingestion completed")?;
+        parser_result?;
+        if let Some(error) = pending_update_error {
+            return Err(error);
+        }
+        let (records_added, records_embedded) = match writer_outcome {
+            WriterOutcome::Published {
+                records_added,
+                records_embedded,
+            } => (records_added, records_embedded),
+            WriterOutcome::Cancelled => {
+                return Err(anyhow!(
+                    "index writer cancelled a successful ingest publication"
+                ));
+            }
+        };
+        if analytics_needs_backfill {
+            let published_index = SearchIndex::open_or_create(&paths.index)?;
+            backfill_from_index(&analytics_db, &published_index)?;
+        } else {
+            AnalyticsStore::open(&analytics_db)?.mark_complete()?;
+        }
+
+        let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
+        let mut updated_files = HashMap::new();
+        while let Ok(update) = rx_update.recv() {
+            updated_files.insert(update.path.clone(), update.state.clone());
+            diagnostics.merge(update.diagnostics);
+            let _ = update.session_id;
+        }
+
+        for (path, update) in updated_files {
+            state.files.insert(path, update);
+        }
+        state.opencode_databases = installed_opencode_states;
+        state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
+        state.save(&state_path)?;
+
+        update_scan_cache(paths, files_scanned, total_bytes)?;
+        finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
+
+        Ok(IngestReport {
             records_added,
             records_embedded,
-        } => (records_added, records_embedded),
-        WriterOutcome::Cancelled => {
-            return Err(anyhow!(
-                "index writer cancelled a successful ingest publication"
-            ));
-        }
-    };
-    if analytics_needs_backfill {
-        let published_index = SearchIndex::open_or_create(&paths.index)?;
-        backfill_from_index(&analytics_db, &published_index)?;
-    } else {
-        AnalyticsStore::open(&analytics_db)?.mark_complete()?;
-    }
-
-    let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
-    let mut updated_files = HashMap::new();
-    while let Ok(update) = rx_update.recv() {
-        updated_files.insert(update.path.clone(), update.state.clone());
-        diagnostics.merge(update.diagnostics);
-        let _ = update.session_id;
-    }
-
-    for (path, update) in updated_files {
-        state.files.insert(path, update);
-    }
-    state.opencode_databases = installed_opencode_states;
-    state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
-    state.save(&state_path)?;
-
-    update_scan_cache(paths, files_scanned, total_bytes)?;
-    finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
-
-    Ok(IngestReport {
-        records_added,
-        records_embedded,
-        files_scanned,
-        files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
-        diagnostics,
-    })
+            files_scanned,
+            files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
+            diagnostics,
+        })
+    })();
+    tail.finish_and_clear();
+    outcome
 }
 
 fn update_scan_cache(paths: &Paths, files_scanned: usize, total_bytes: u64) -> Result<()> {
