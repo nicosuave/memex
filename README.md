@@ -210,9 +210,8 @@ memex search "deployment decision" --content memories --source codex
 memex show --memory-id <memory_id> --section <section_ref> --content-version <content_version> --machine <machine>
 ```
 
-`memex index embed` builds memory section embeddings along with conversation
-embeddings. After memory edits, rebuild embeddings before semantic or hybrid
-memory search; a missing or outdated vector snapshot produces an explicit error.
+When embeddings are enabled, indexing and the daemon refresh memory embeddings
+along with conversation embeddings.
 
 `search`, `sessions`, `session`, `session batch`, `show`, `context`, and `usage`
 support `--format jsonl|json|text`; search also supports `toon`. Search, session
