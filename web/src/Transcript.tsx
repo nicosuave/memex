@@ -1,10 +1,10 @@
 import {
   memo,
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
-  useState,
 } from "react"
 import { useVirtualizer, type VirtualItem } from "@tanstack/react-virtual"
 import { Button } from "./components/ui/button"
@@ -24,50 +24,45 @@ const dateFormatter = new Intl.DateTimeFormat(undefined, {
 })
 type ScrollPosition = { offset: number; recordId?: string; delta: number }
 const scrollPositions = new Map<string, ScrollPosition>()
-const previewCharacters = 8_000
-const expandedMessages = new Set<string>()
 const measurements = new Map<string, VirtualItem[]>()
 
 const MessageRow = memo(function MessageRow({
   message,
   match,
-  version,
   loadContent,
+  busy,
   loading,
+  error,
 }: {
   message: Message
   match: boolean
-  version: string
   loadContent: (id: string) => Promise<void>
+  busy: boolean
   loading: boolean
+  error: string
 }) {
-  const preferenceKey = `${version}:${message.record_id}`
-  const [expanded, setExpanded] = useState(() =>
-    expandedMessages.has(preferenceKey),
-  )
-  const toggleExpanded = () => {
-    if (expanded) expandedMessages.delete(preferenceKey)
-    else {
-      expandedMessages.add(preferenceKey)
-      if (expandedMessages.size > 1000)
-        expandedMessages.delete(expandedMessages.values().next().value!)
-    }
-    setExpanded((value) => !value)
-  }
-  const fullContent = message.content
-  const displayed = useMemo(
-    () => ({
-      ...message,
-      content: expanded ? fullContent : fullContent.slice(0, previewCharacters),
-    }),
-    [message, expanded, fullContent],
-  )
+  const continuation = useRef<HTMLDivElement>(null)
   const loadedBytes = useMemo(
-    () => new TextEncoder().encode(fullContent).length,
-    [fullContent],
+    () => new TextEncoder().encode(message.content).length,
+    [message.content],
   )
   const truncated =
     message.truncated && loadedBytes < (message.content_bytes || 0)
+  useEffect(() => {
+    const element = continuation.current
+    if (!element || !truncated || busy || error) return
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting) void loadContent(message.record_id)
+      },
+      {
+        root: element.closest(".transcript-scroll"),
+        rootMargin: "0px 0px 320px 0px",
+      },
+    )
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [truncated, busy, error, loadedBytes, loadContent, message.record_id])
   return (
     <article
       className="message"
@@ -80,32 +75,23 @@ const MessageRow = memo(function MessageRow({
           {message.ts ? dateFormatter.format(new Date(message.ts)) : ""}
         </time>
       </div>
-      <div className={expanded ? undefined : "message-content-preview"}>
-        <MessageContent message={displayed} />
-      </div>
-      <div className="message-actions">
-        {fullContent.length > previewCharacters && (
-          <Button size="sm" variant="outline" onClick={toggleExpanded}>
-            {expanded ? "Collapse message" : "Expand message"}
-          </Button>
-        )}
-        {truncated && (
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={loading}
-            onClick={() => void loadContent(message.record_id)}
-          >
-            {loading ? "Loading…" : "Load more message content"}
-          </Button>
-        )}
-        {truncated && (
-          <span>
-            {loadedBytes.toLocaleString()} of{" "}
-            {message.content_bytes?.toLocaleString()} bytes loaded
-          </span>
-        )}
-      </div>
+      <MessageContent message={message} />
+      {truncated && (
+        <div ref={continuation} className="message-actions">
+          {error ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={loading}
+              onClick={() => void loadContent(message.record_id)}
+            >
+              Retry loading message
+            </Button>
+          ) : (
+            <span role="status">Loading message…</span>
+          )}
+        </div>
+      )}
     </article>
   )
 })
@@ -113,12 +99,14 @@ const MessageRow = memo(function MessageRow({
 const VirtualMessages = memo(function VirtualMessages({
   rows,
   target,
-  version,
   positionKey,
   loadContent,
   loadPage,
   loading,
   paginationFailed,
+  error,
+  contentErrorRecordId,
+  contentLoadingRecordId,
   canLoadEarlier,
   canLoadLater,
   initialAtTail,
@@ -126,12 +114,14 @@ const VirtualMessages = memo(function VirtualMessages({
 }: {
   rows: Message[]
   target: SessionTarget
-  version: string
   positionKey: string
   loadContent: (id: string) => Promise<void>
   loadPage: (direction: "earlier" | "later") => Promise<void>
   loading: boolean
   paginationFailed: boolean
+  error: string
+  contentErrorRecordId: string | null
+  contentLoadingRecordId: string | null
   canLoadEarlier: boolean
   canLoadLater: boolean
   initialAtTail: boolean
@@ -146,7 +136,9 @@ const VirtualMessages = memo(function VirtualMessages({
     getScrollElement: () => parent.current,
     estimateSize: () => 220,
     getItemKey: getKey,
-    overscan: 3,
+    overscan: 5,
+    anchorTo: "end",
+    directDomUpdates: true,
     useFlushSync: false,
     initialOffset: scrollPositions.get(positionKey)?.offset || 0,
     initialMeasurementsCache: measurements
@@ -231,6 +223,12 @@ const VirtualMessages = memo(function VirtualMessages({
     const old = previousRows.current
     if (!rows.length) return
     const initial = !old.length || old === rows
+    previousRows.current = rows
+    // Changes to an existing list are anchored by the virtualizer itself.
+    // Replaying an imperative restoration after every prepend, filter change,
+    // or content continuation fights its measurement corrections and causes
+    // visible back-and-forth movement while the user is scrolling.
+    if (!initial) return
     const saved = initial
       ? initialPosition.current
       : scrollPositions.get(positionKey)
@@ -240,9 +238,6 @@ const VirtualMessages = memo(function VirtualMessages({
       : -1
     if (index >= 0) {
       virtualizer.scrollToIndex(index, { align: "start" })
-      // The anchor may initially be estimated/offscreen. Apply its saved intra-row
-      // offset after mounting and ResizeObserver measurements settle.
-      let attempts = 0
       const restore = () => {
         const anchor = virtualizer
           .getVirtualItems()
@@ -253,30 +248,20 @@ const VirtualMessages = memo(function VirtualMessages({
               Math.min(saved?.delta || 0, Math.max(0, anchor.size - 1)),
             { align: "start" },
           )
-        if (++attempts < 4)
-          restoreFrame.current = requestAnimationFrame(restore)
-        else {
-          restoreFrame.current = null
-          scheduleBoundaryCheck()
-        }
+        restoreFrame.current = null
+        scheduleBoundaryCheck()
       }
       restoreFrame.current = requestAnimationFrame(restore)
     } else if (initial && initialAtTail && !saved) {
-      let attempts = 0
       const restoreTail = () => {
         virtualizer.scrollToOffset(virtualizer.getTotalSize(), {
           align: "end",
         })
-        if (++attempts < 4)
-          restoreFrame.current = requestAnimationFrame(restoreTail)
-        else {
-          restoreFrame.current = null
-          scheduleBoundaryCheck()
-        }
+        restoreFrame.current = null
+        scheduleBoundaryCheck()
       }
       restoreFrame.current = requestAnimationFrame(restoreTail)
     }
-    previousRows.current = rows
     return () => {
       if (restoreFrame.current !== null) {
         cancelAnimationFrame(restoreFrame.current)
@@ -335,8 +320,8 @@ const VirtualMessages = memo(function VirtualMessages({
     >
       <div className="messages">
         <div
+          ref={virtualizer.containerRef}
           className="virtual-messages"
-          style={{ height: virtualizer.getTotalSize() }}
         >
           {virtualizer.getVirtualItems().map((item) => (
             <div
@@ -344,14 +329,20 @@ const VirtualMessages = memo(function VirtualMessages({
               ref={virtualizer.measureElement}
               data-index={item.index}
               className="virtual-message"
-              style={{ transform: `translateY(${item.start}px)` }}
             >
               <MessageRow
                 message={rows[item.index]}
                 match={rows[item.index].record_id === target.recordId}
-                version={version}
                 loadContent={loadContent}
-                loading={loading}
+                busy={loading || Boolean(error)}
+                loading={
+                  rows[item.index].record_id === contentLoadingRecordId
+                }
+                error={
+                  rows[item.index].record_id === contentErrorRecordId
+                    ? error
+                    : ""
+                }
               />
             </div>
           ))}
@@ -367,47 +358,42 @@ export const Transcript = memo(function Transcript({
   mode,
   showThinking,
   showDetails,
-  onReveal,
 }: {
   resource: SessionResource
   target: SessionTarget | null
   mode: "history" | "matches"
   showThinking: boolean
   showDetails: boolean
-  onReveal: () => void
 }) {
   const {
     session,
     error,
+    notice,
     loading,
     pageErrorDirection,
+    contentErrorRecordId,
+    contentLoadingRecordId,
+    refreshRequired,
     loadPage,
     loadContent,
     refresh,
   } = resource
-  const { rows, hiddenHit } = useMemo(() => {
-    if (!session) return { rows: [], hiddenHit: false }
+  const rows = useMemo(() => {
+    if (!session) return []
     const visible = session.messages.filter(
       (message) =>
-        (showThinking || !isThinkingMessage(message)) &&
-        (showDetails || !isToolMessage(message)),
+        message.record_id === target?.recordId ||
+        ((showThinking || !isThinkingMessage(message)) &&
+          (showDetails || !isToolMessage(message))),
     )
-    const hit = session.messages.find(
-      (message) => message.record_id === target?.recordId,
-    )
-    const hiddenHit = Boolean(hit && !visible.includes(hit))
-    if (mode === "history") return { rows: visible, hiddenHit }
-    if (!target?.recordId) return { rows: visible.slice(-12), hiddenHit }
+    if (mode === "history") return visible
+    if (!target?.recordId) return visible.slice(-12)
     const match = visible.findIndex(
       (message) => message.record_id === target.recordId,
     )
-    return {
-      rows:
-        match >= 0
-          ? visible.slice(Math.max(0, match - 1), match + 2)
-          : visible.slice(-12),
-      hiddenHit,
-    }
+    return match >= 0
+      ? visible.slice(Math.max(0, match - 1), match + 2)
+      : visible.slice(-12)
   }, [session, target?.recordId, mode, showThinking, showDetails])
   const key = `${targetKey(target)}:${session?.version}:${mode}`
   const canLoadEarlier = Boolean(session && session.offset > 0)
@@ -431,13 +417,10 @@ export const Transcript = memo(function Transcript({
         {mode === "matches" && target?.recordId && (
           <span>Selected search hit and context</span>
         )}
-        {session &&
-          !session.messages.some(
-            (message) => isThinkingMessage(message) || isToolMessage(message),
-          ) && <span>This window has no reasoning or tool messages.</span>}
-        {loading && <span>Loading transcript…</span>}
+        {loading && !session && <span>Loading transcript…</span>}
+        {notice && <span>{notice}</span>}
         {error && <span role="alert">{error}</span>}
-        {error && pageErrorDirection && (
+        {error && pageErrorDirection && !refreshRequired && (
           <Button
             size="sm"
             variant="outline"
@@ -447,31 +430,25 @@ export const Transcript = memo(function Transcript({
             Retry loading {pageErrorDirection} messages
           </Button>
         )}
-        {(error || session) && (
+        {error && refreshRequired && (
           <Button
             size="sm"
             variant="ghost"
             disabled={loading}
             onClick={refresh}
           >
-            Reload latest transcript
+            Refresh transcript
           </Button>
-        )}
-        {hiddenHit && (
-          <>
-            <span>Match in hidden content.</span>
-            <Button size="sm" onClick={onReveal}>
-              Reveal hidden match
-            </Button>
-          </>
         )}
       </div>
       {!session && !loading && <p className="empty">No session to preview.</p>}
       {session && !rows.length && (
         <p className="empty">
-          {mode === "history"
-            ? "No visible messages in this window. Scroll paging will continue until visible messages are found, or enable tools and reasoning."
-            : "No visible messages in this window. Enable tools and reasoning to inspect hidden matches."}
+          {mode === "history" &&
+          (canLoadEarlier || canLoadLater) &&
+          !pageErrorDirection
+            ? "Loading messages…"
+            : "No messages match these filters."}
         </p>
       )}
       {session && target && (
@@ -479,12 +456,14 @@ export const Transcript = memo(function Transcript({
           key={key}
           rows={rows}
           target={target}
-          version={session.version}
           positionKey={key}
           loadContent={loadContent}
           loadPage={loadPage}
           loading={loading}
-          paginationFailed={Boolean(pageErrorDirection)}
+          error={error}
+          contentErrorRecordId={contentErrorRecordId}
+          contentLoadingRecordId={contentLoadingRecordId}
+          paginationFailed={Boolean(error)}
           canLoadEarlier={canLoadEarlier}
           canLoadLater={canLoadLater}
           initialAtTail={

@@ -66,6 +66,7 @@ type SearchResult = {
   ts: number
   score?: number | null
   snippet: string
+  snippet_matches?: Array<{ start: number; end: number }>
 }
 
 type SearchPayload = {
@@ -81,6 +82,35 @@ type TimeRange = "24h" | "7d" | "30d" | "all"
 
 const timeRanges: TimeRange[] = ["24h", "7d", "30d", "all"]
 const defaultTimeRange: TimeRange = "30d"
+
+function SidebarSnippet({ result }: { result: SearchResult }) {
+  if (!result.snippet) return <>No text preview</>
+  const characters = Array.from(result.snippet)
+  const matches = result.snippet_matches || []
+  if (!matches.length) return <>{result.snippet}</>
+
+  const parts = []
+  let cursor = 0
+  for (const [index, match] of matches.entries()) {
+    const start = Math.max(cursor, Math.min(characters.length, match.start))
+    const end = Math.max(start, Math.min(characters.length, match.end))
+    if (start > cursor) parts.push(characters.slice(cursor, start).join(""))
+    if (end > start) {
+      parts.push(
+        <mark
+          className="rounded-sm bg-primary/20 text-inherit"
+          key={`match-${index}`}
+        >
+          {characters.slice(start, end).join("")}
+        </mark>,
+      )
+    }
+    cursor = end
+  }
+  if (cursor < characters.length)
+    parts.push(characters.slice(cursor).join(""))
+  return <>{parts}</>
+}
 
 function parseTimeRange(value: string | null): TimeRange {
   return timeRanges.includes(value as TimeRange)
@@ -266,6 +296,7 @@ function buildBrailleChart(payload: ActivityPayload | null): BrailleChartData {
 
 function HomeActivityChart({
   active,
+  query,
   onRangeChange,
   project,
   range,
@@ -273,6 +304,7 @@ function HomeActivityChart({
   origin,
 }: {
   active: boolean
+  query: string
   onRangeChange: (value: string) => void
   project: string
   range: TimeRange
@@ -280,45 +312,57 @@ function HomeActivityChart({
   origin: string
 }) {
   const [metric, setMetric] = useState<ActivityMetric>("sessions")
-  const [payload, setPayload] = useState<ActivityPayload | null>(null)
+  const [payload, setPayload] = useState<{
+    data: ActivityPayload
+    intent: string
+  } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
   const requestGeneration = useRef(0)
+  const searchQuery = query.trim()
+  const intent = JSON.stringify([
+    searchQuery, metric, project, range, source, origin,
+  ])
 
   useEffect(() => {
     if (!active) return
     const controller = new AbortController()
     const generation = ++requestGeneration.current
     const params = new URLSearchParams({ range, metric })
+    if (searchQuery) params.set("q", searchQuery)
     if (source !== "all") params.set("source", source)
     if (project.trim()) params.set("project", project.trim())
     if (origin !== "interactive") params.set("origin", origin)
     setLoading(true)
     setPayload(null)
     setError("")
-    void api<ActivityPayload>(`/api/activity?${params}`, controller.signal)
-      .then((data) => {
-        if (generation === requestGeneration.current) setPayload(data)
-      })
-      .catch((requestError) => {
-        if (generation !== requestGeneration.current) return
-        setError(
-          requestError instanceof Error
-            ? requestError.message
-            : "Could not load activity",
-        )
-      })
-      .finally(() => {
-        if (generation === requestGeneration.current) setLoading(false)
-      })
+    const timer = window.setTimeout(() => {
+      void api<ActivityPayload>(`/api/activity?${params}`, controller.signal)
+        .then((data) => {
+          if (generation === requestGeneration.current)
+            setPayload({ data, intent })
+        })
+        .catch((requestError) => {
+          if (generation !== requestGeneration.current) return
+          setError(
+            requestError instanceof Error
+              ? requestError.message
+              : "Could not load activity",
+          )
+        })
+        .finally(() => {
+          if (generation === requestGeneration.current) setLoading(false)
+        })
+    }, 180)
     return () => {
+      window.clearTimeout(timer)
       ++requestGeneration.current
       controller.abort()
     }
-  }, [active, metric, project, range, source, origin])
+  }, [active, metric, project, range, source, origin, searchQuery, intent])
 
   const currentPayload =
-    payload?.metric === metric && payload.range === range ? payload : null
+    payload?.intent === intent ? payload.data : null
 
   const chart = useMemo(
     () => buildBrailleChart(currentPayload),
@@ -923,6 +967,7 @@ function App() {
     <main className="home-surface">
       <div className="home-column">
         <HomeActivityChart
+          query={query}
           active={shellView === "home"}
           onRangeChange={changeTimeRange}
           project={project}
@@ -1106,10 +1151,6 @@ function App() {
     </main>
   )
 
-  const revealHidden = useCallback(() => {
-    setShowThinking(true)
-    setShowDetails(true)
-  }, [])
   const transcriptSurface = (
     <Transcript
       resource={resource}
@@ -1117,7 +1158,6 @@ function App() {
       mode={mode}
       showThinking={showThinking}
       showDetails={showDetails}
-      onReveal={revealHidden}
     />
   )
 
@@ -1211,8 +1251,15 @@ function App() {
                               ? ""
                               : ` · ${result.score.toFixed(2)}`}
                           </div>
-                          <div className="session-snippet">
-                            {result.snippet || "No text preview"}
+                          <div
+                            className="session-snippet"
+                            style={
+                              result.snippet_matches?.length
+                                ? { WebkitLineClamp: "unset" }
+                                : undefined
+                            }
+                          >
+                            <SidebarSnippet result={result} />
                           </div>
                         </div>
                       </a>

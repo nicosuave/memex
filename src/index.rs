@@ -12,7 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Count, DocSetCollector, TopDocs};
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
@@ -768,6 +768,45 @@ impl SearchIndex {
             results.push((score, record_from_doc(&self.fields, &doc)));
         }
         Ok(results)
+    }
+
+    /// Collect every exact session identity matching a lexical query without retaining scores or
+    /// full records. Stored documents are hydrated one at a time only to read identity fields.
+    pub fn session_scopes_matching_query(
+        &self,
+        options: &QueryOptions,
+    ) -> Result<HashSet<(crate::types::SourceKind, String, String)>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let query = build_query(&self.fields, options, &self.index)?;
+        let mut addresses = searcher
+            .search(&query, &DocSetCollector)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        let mut scopes = HashSet::new();
+        for address in addresses {
+            let doc = searcher.doc::<TantivyDocument>(address)?;
+            let source_path = doc
+                .get_first(self.fields.source_path)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let session_id = doc
+                .get_first(self.fields.session_id)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let source = self
+                .fields
+                .source
+                .and_then(|field| doc.get_first(field))
+                .and_then(|value| value.as_str())
+                .and_then(crate::types::SourceKind::from_label)
+                .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
+            scopes.insert((source, session_id, source_path));
+        }
+        Ok(scopes)
     }
 
     pub(crate) fn doc_ids_matching_filters(&self, options: &QueryOptions) -> Result<HashSet<u64>> {

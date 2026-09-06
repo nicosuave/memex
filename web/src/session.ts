@@ -97,9 +97,17 @@ function paramsFor(target: SessionTarget) {
 export function useSessionResource(target: SessionTarget | null) {
   const [session, setSession] = useState<SessionPayload | null>(null)
   const [error, setError] = useState("")
+  const [notice, setNotice] = useState("")
   const [pageErrorDirection, setPageErrorDirection] = useState<
     "earlier" | "later" | null
   >(null)
+  const [contentErrorRecordId, setContentErrorRecordId] = useState<
+    string | null
+  >(null)
+  const [contentLoadingRecordId, setContentLoadingRecordId] = useState<
+    string | null
+  >(null)
+  const [refreshRequired, setRefreshRequired] = useState(false)
   const [loading, setLoading] = useState(false)
   const [revision, setRevision] = useState(0)
   const cache = useRef(new Map<string, CachedSession>())
@@ -155,7 +163,11 @@ export function useSessionResource(target: SessionTarget | null) {
     setDisplayKey(key)
     busy.current = false
     setError("")
+    setNotice("")
     setPageErrorDirection(null)
+    setContentErrorRecordId(null)
+    setContentLoadingRecordId(null)
+    setRefreshRequired(false)
     setLoading(false)
     if (!target) {
       current.current = null
@@ -206,7 +218,7 @@ export function useSessionResource(target: SessionTarget | null) {
           request.signal,
         )
         if (!request.signal.aborted && activeKey.current === key)
-          setError(
+          setNotice(
             "Selected hit is no longer available. Showing latest messages.",
           )
         return latest
@@ -225,10 +237,12 @@ export function useSessionResource(target: SessionTarget | null) {
         else publish(cacheKey, data)
       })
       .catch((err) => {
-        if (!request.signal.aborted && activeKey.current === key)
+        if (!request.signal.aborted && activeKey.current === key) {
+          setRefreshRequired(true)
           setError(
             err instanceof Error ? err.message : "Could not load transcript",
           )
+        }
       })
       .finally(() => {
         if (!request.signal.aborted && activeKey.current === key) {
@@ -245,7 +259,11 @@ export function useSessionResource(target: SessionTarget | null) {
   const refresh = useCallback(() => {
     const cached = cache.current.get(cacheKey)
     if (cached) cache.current.set(cacheKey, { ...cached, at: 0 })
+    setNotice("")
     setPageErrorDirection(null)
+    setContentErrorRecordId(null)
+    setContentLoadingRecordId(null)
+    setRefreshRequired(false)
     setRevision((value) => value + 1)
   }, [cacheKey])
   const loadPage = useCallback(
@@ -260,6 +278,9 @@ export function useSessionResource(target: SessionTarget | null) {
       setLoading(true)
       setError("")
       setPageErrorDirection(null)
+      setContentErrorRecordId(null)
+      setContentLoadingRecordId(null)
+      setRefreshRequired(false)
       const params = paramsFor(target)
       params.set(
         direction === "earlier" ? "before" : "offset",
@@ -284,7 +305,7 @@ export function useSessionResource(target: SessionTarget | null) {
           throw new ApiError("session changed", 409)
         if (!page.messages.length)
           throw new Error(
-            "No further messages returned. Reload latest transcript to reconcile.",
+            "No further messages returned. Refresh transcript to reconcile.",
           )
         const adjacent =
           direction === "earlier"
@@ -292,7 +313,7 @@ export function useSessionResource(target: SessionTarget | null) {
             : page.offset === end
         if (!adjacent)
           throw new Error(
-            "Transcript page was not contiguous. Reload latest transcript to reconcile.",
+            "Transcript page was not contiguous. Refresh transcript to reconcile.",
           )
         const messages =
           direction === "earlier"
@@ -310,6 +331,11 @@ export function useSessionResource(target: SessionTarget | null) {
           controller.current?.signal.aborted
         )
           return
+        const mustRefresh =
+          (err instanceof ApiError && err.status === 409) ||
+          (err instanceof Error &&
+            err.message.includes("Refresh transcript to reconcile."))
+        setRefreshRequired(mustRefresh)
         setError(
           err instanceof ApiError && err.status === 409
             ? "Transcript changed on disk."
@@ -349,6 +375,9 @@ export function useSessionResource(target: SessionTarget | null) {
       setLoading(true)
       setError("")
       setPageErrorDirection(null)
+      setContentErrorRecordId(null)
+      setContentLoadingRecordId(recordId)
+      setRefreshRequired(false)
       try {
         const data = await api<{
           version: string
@@ -388,7 +417,10 @@ export function useSessionResource(target: SessionTarget | null) {
           activeKey.current === key &&
           generation.current === requestGeneration &&
           !controller.current?.signal.aborted
-        )
+        ) {
+          const mustRefresh = err instanceof ApiError && err.status === 409
+          setRefreshRequired(mustRefresh)
+          setContentErrorRecordId(mustRefresh ? null : recordId)
           setError(
             err instanceof ApiError && err.status === 409
               ? "Transcript changed on disk."
@@ -396,11 +428,13 @@ export function useSessionResource(target: SessionTarget | null) {
                 ? err.message
                 : "Could not load message content",
           )
+        }
       } finally {
         if (
           activeKey.current === key &&
           generation.current === requestGeneration
         ) {
+          setContentLoadingRecordId(null)
           busy.current = false
           setLoading(false)
         }
@@ -412,8 +446,12 @@ export function useSessionResource(target: SessionTarget | null) {
     () => ({
       session: displayKey === key ? session : null,
       error: displayKey === key ? error : "",
+      notice: displayKey === key ? notice : "",
       loading,
       pageErrorDirection,
+      contentErrorRecordId,
+      contentLoadingRecordId,
+      refreshRequired,
       loadPage,
       loadContent,
       refresh,
@@ -423,8 +461,12 @@ export function useSessionResource(target: SessionTarget | null) {
       displayKey,
       session,
       error,
+      notice,
       loading,
       pageErrorDirection,
+      contentErrorRecordId,
+      contentLoadingRecordId,
+      refreshRequired,
       loadPage,
       loadContent,
       refresh,

@@ -210,7 +210,6 @@ test("mode and visibility toggles stay local and responsive for a large transcri
     element.setAttribute("data-mount-token", "same"),
   )
   const expandedRow = transcript.locator('[data-record-id="large-r2"]')
-  await expandedRow.getByRole("button", { name: "Expand message" }).click()
   await expect(expandedRow.getByText(/END large message 2/)).toBeVisible()
 
   for (let index = 0; index < 3; index += 1) {
@@ -350,7 +349,7 @@ test("a stale 401 from a canceled session cannot replace current content", async
   await expect(page.getByText("Open Memex from your terminal")).toHaveCount(0)
 })
 
-test("a hidden reasoning hit can be revealed without another request", async ({
+test("a selected reasoning hit stays visible without changing visibility filters", async ({
   page,
 }) => {
   const hidden = sessionPage("hidden", 4980, 40, 10_000)
@@ -366,16 +365,21 @@ test("a hidden reasoning hit can be revealed without another request", async ({
   await page.goto(
     "/?q=needle&session=hidden&path=%2Fhistory%2Fcodex%2Fhidden.jsonl&record=hidden-r5000",
   )
-  await expect(page.getByText("Match in hidden content.")).toBeVisible()
   const settledSessions = api.sessionCalls("hidden").length
-  await page.getByRole("button", { name: "Reveal hidden match" }).click()
   await expect(page.getByText("needle hidden message 5000")).toBeVisible()
+  await expect(
+    page.getByRole("button", { name: "Reveal hidden match" }),
+  ).toHaveCount(0)
+  await expect(
+    page.getByRole("button", { name: "Show reasoning" }),
+  ).toHaveAttribute("aria-pressed", "false")
   expect(api.sessionCalls("hidden")).toHaveLength(settledSessions)
 })
 
 test("a 10k-message session opens one bounded tail page and loads earlier near the boundary", async ({
   page,
 }) => {
+  let releaseEarlier: (() => void) | undefined
   const api = await mockApi(page, (url) => {
     if (url.pathname === "/api/search")
       return searchReply([result("huge", "Huge Project")])
@@ -385,7 +389,9 @@ test("a 10k-message session opens one bounded tail page and loads earlier near t
         const offset = url.searchParams.has("before")
           ? Number(url.searchParams.get("before")) - limit
           : Number(url.searchParams.get("offset"))
-        return { body: sessionPage("huge", offset, limit, 10_000), delay: 100 }
+        return new Promise<MockReply>((resolve) => {
+          releaseEarlier = () => resolve({ body: sessionPage("huge", offset, limit, 10_000) })
+        })
       }
       return { body: sessionPage("huge", 9960, 40, 10_000) }
     }
@@ -410,6 +416,7 @@ test("a 10k-message session opens one bounded tail page and loads earlier near t
   await scrollTranscriptTo(page, "start")
   await scrollTranscriptTo(page, "start")
   await expect.poll(() => api.sessionCalls("huge").length).toBe(2)
+  releaseEarlier?.()
   const earlier = api.sessionCalls("huge")[1]
   const earlierBoundary = earlier.searchParams.has("before")
     ? Number(earlier.searchParams.get("before"))
@@ -493,6 +500,9 @@ test("page failures and stale versions preserve loaded transcript content", asyn
 
   await scrollTranscriptTo(page, "start")
   await expect(page.getByRole("alert")).toContainText("Older page failed")
+  await expect(
+    page.getByRole("button", { name: "Refresh transcript" }),
+  ).toHaveCount(0)
   await page.waitForTimeout(150)
   expect(api.sessionCalls("stale")).toHaveLength(2)
   await expect(page.getByText("needle stale message 9960")).toBeVisible()
@@ -502,7 +512,7 @@ test("page failures and stale versions preserve loaded transcript content", asyn
     .click()
   await expect(page.getByText("Transcript changed on disk.")).toBeVisible()
   await expect(
-    page.getByRole("button", { name: "Reload latest transcript" }),
+    page.getByRole("button", { name: "Refresh transcript" }),
   ).toBeVisible()
   await expect(page.getByText("needle stale message 9960")).toBeVisible()
   expect(api.sessionCalls("stale")).toHaveLength(3)
@@ -560,9 +570,6 @@ test("different hit anchors reuse one cached window and retain loaded message by
   )
   const firstRow = page.locator('[data-record-id="shared-r100"]')
   await expect(firstRow).toBeVisible()
-  await firstRow
-    .getByRole("button", { name: "Load more message content" })
-    .click()
   await expect(
     firstRow.getByText(/Loaded continuation survives cache navigation/),
   ).toBeVisible()
@@ -628,7 +635,6 @@ test("intra-message scroll position survives prepend, mode changes, and route re
   const transcript = page.getByRole("region", { name: "Transcript" })
   const scroller = transcript.locator(".transcript-scroll")
   const anchor = transcript.locator('[data-record-id="scroll-r40"]')
-  await anchor.getByRole("button", { name: "Expand message" }).click()
   await expect(anchor.getByText(/END scroll 40/)).toBeVisible()
   const before = await scroller.evaluate((element) => {
     element.scrollTop = 500
@@ -695,8 +701,12 @@ test("history wheel scrolling reaches both ends and stops fetching at exhaustion
   await scroller.hover()
   await page.mouse.wheel(0, -100000)
   await expect(page.getByText(/1–80 of 80 messages/)).toBeVisible()
-  await page.mouse.wheel(0, -100000)
-  await expect(page.locator('[data-record-id="ends-r0"]')).toBeInViewport()
+  await expect(async () => {
+    await page.mouse.wheel(0, -600)
+    await expect(page.locator('[data-record-id="ends-r0"]')).toBeInViewport({
+      timeout: 100,
+    })
+  }).toPass({ timeout: 10000, intervals: [100] })
   await expect(async () => {
     await page.mouse.wheel(0, 600)
     await expect(page.locator('[data-record-id="ends-r79"]')).toBeInViewport({
@@ -705,6 +715,92 @@ test("history wheel scrolling reaches both ends and stops fetching at exhaustion
   }).toPass({ timeout: 10000, intervals: [100] })
   await page.waitForTimeout(200)
   expect(api.sessionCalls("ends")).toHaveLength(2)
+})
+
+test("mixed-height transcript scrolling stays filled and moves in one direction", async ({
+  page,
+}) => {
+  const payload = sessionPage("mixed-height", 0, 80)
+  payload.messages = payload.messages.map((message, index) => ({
+    ...message,
+    content:
+      index % 5 === 0
+        ? `Long message ${index}\n\n${"Variable height content. ".repeat(900)}`
+        : index % 3 === 0
+          ? `Medium message ${index}\n\n${"A few wrapped lines. ".repeat(45)}`
+          : `Short message ${index}`,
+  }))
+  await mockApi(page, (url) => {
+    if (url.pathname === "/api/search") return searchReply([])
+    if (url.pathname === "/api/session") return { body: payload }
+  })
+  await page.goto(
+    "/?session=mixed-height&record=mixed-height-r0&mode=history",
+  )
+  const scroller = page.locator(".transcript-scroll")
+  await expect(page.locator('[data-record-id="mixed-height-r0"]')).toBeInViewport()
+  await scroller.hover()
+
+  type ScrollSample = { offset: number; filled: boolean }
+  const startSampling = () =>
+    scroller.evaluate((element) => {
+      const monitored = element as HTMLDivElement & {
+        __scrollSamples?: Array<{ offset: number; filled: boolean }>
+        __sampleScroll?: boolean
+      }
+      monitored.__scrollSamples = []
+      monitored.__sampleScroll = true
+      const sample = () => {
+        const viewport = monitored.getBoundingClientRect()
+        const filled = Array.from(
+          monitored.querySelectorAll<HTMLElement>(".virtual-message"),
+        ).some((row) => {
+          const bounds = row.getBoundingClientRect()
+          return bounds.bottom > viewport.top && bounds.top < viewport.bottom
+        })
+        monitored.__scrollSamples?.push({
+          offset: monitored.scrollTop,
+          filled,
+        })
+        if (monitored.__sampleScroll) requestAnimationFrame(sample)
+      }
+      requestAnimationFrame(sample)
+    })
+  const stopSampling = () =>
+    scroller.evaluate((element) => {
+      const monitored = element as HTMLDivElement & {
+        __scrollSamples?: ScrollSample[]
+        __sampleScroll?: boolean
+      }
+      monitored.__sampleScroll = false
+      return monitored.__scrollSamples || []
+    })
+
+  await startSampling()
+  for (let step = 0; step < 30; step += 1) {
+    await page.mouse.wheel(0, 450)
+    await page.waitForTimeout(20)
+  }
+  const downward = await stopSampling()
+  expect(downward.length).toBeGreaterThan(20)
+  expect(downward.every((sample) => sample.filled)).toBe(true)
+  for (let index = 1; index < downward.length; index += 1)
+    expect(downward[index].offset).toBeGreaterThanOrEqual(
+      downward[index - 1].offset - 2,
+    )
+
+  await startSampling()
+  for (let step = 0; step < 30; step += 1) {
+    await page.mouse.wheel(0, -450)
+    await page.waitForTimeout(20)
+  }
+  const upward = await stopSampling()
+  expect(upward.length).toBeGreaterThan(20)
+  expect(upward.every((sample) => sample.filled)).toBe(true)
+  for (let index = 1; index < upward.length; index += 1)
+    expect(upward[index].offset).toBeLessThanOrEqual(
+      upward[index - 1].offset + 2,
+    )
 })
 
 test("a missing around anchor falls back to the bounded tail with an explanation", async ({
@@ -728,6 +824,9 @@ test("a missing around anchor falls back to the bounded tail with an explanation
       "Selected hit is no longer available. Showing latest messages.",
     ),
   ).toBeVisible()
+  await expect(
+    page.getByRole("button", { name: "Refresh transcript" }),
+  ).toHaveCount(0)
   await expect(page.getByText("needle missing message 988")).toBeVisible()
   expect(api.sessionCalls("missing")).toHaveLength(2)
   expect(api.sessionCalls("missing")[0].searchParams.get("around")).toBe(
@@ -743,31 +842,26 @@ test("a missing around anchor falls back to the bounded tail with an explanation
   await expect(page.getByText(/921–1000 of 1000 messages/)).toBeVisible()
 })
 
-test("a failed refresh keeps the cached transcript visible", async ({
-  page,
-}) => {
+test("transcript recovery appears only after an error", async ({ page }) => {
   let attempts = 0
-  let failRefresh: (() => void) | undefined
-  const api = await mockApi(page, (url) => {
+  await mockApi(page, (url) => {
     if (url.pathname === "/api/search") return searchReply([result("refresh")])
     if (url.pathname !== "/api/session") return
     attempts += 1
-    if (attempts === 1) return { body: sessionPage("refresh", 0, 4) }
-    return new Promise<MockReply>((resolve) => {
-      failRefresh = () =>
-        resolve({ status: 500, body: { error: "Refresh failed" } })
-    })
+    if (attempts === 1)
+      return { status: 500, body: { error: "Transcript unavailable" } }
+    return { body: sessionPage("refresh", 0, 4) }
   })
   await page.goto(
     "/?session=refresh&session_source=codex&path=%2Fhistory%2Fcodex%2Frefresh.jsonl&mode=history",
   )
   const content = page.getByText("needle refresh message 0")
+  await expect(page.getByRole("alert")).toContainText("Transcript unavailable")
+  const refresh = page.getByRole("button", { name: "Refresh transcript" })
+  await expect(refresh).toBeVisible()
+  await refresh.click()
   await expect(content).toBeVisible()
-  await page.getByRole("button", { name: "Reload latest transcript" }).click()
-  await expect(content).toBeVisible()
-  failRefresh?.()
-  await expect(page.getByRole("alert")).toContainText("Refresh failed")
-  await expect(content).toBeVisible()
+  await expect(refresh).toHaveCount(0)
 })
 
 test("Back and Forward restore the home and transcript views", async ({
@@ -1089,15 +1183,11 @@ test("visibility availability updates while automatic paging traverses hidden ki
   await page.goto("/?session=availability&mode=history")
   const reasoning = page.getByRole("button", { name: "Show reasoning" })
   const tools = page.getByRole("button", { name: "Show tool calls" })
-  const explanation = page.getByText(
-    "This window has no reasoning or tool messages.",
-  )
   await expect.poll(() => api.sessionCalls("availability").length).toBe(2)
   await expect(reasoning).toBeEnabled()
   await expect(reasoning).toHaveText("1")
   await expect(tools).toBeEnabled()
   await expect(tools).toHaveText("2")
-  await expect(explanation).toHaveCount(0)
 })
 
 test("automatic history paging crosses an all-hidden page", async ({ page }) => {
@@ -1134,4 +1224,110 @@ test("automatic history paging crosses an all-hidden page", async ({ page }) => 
       .slice(1)
       .map((url) => url.searchParams.get("before")),
   ).toEqual(["80", "40"])
+})
+
+for (const mobile of [false, true]) {
+  test(`long messages scroll with the transcript on ${mobile ? "mobile" : "desktop"}`, async ({ page }) => {
+    if (mobile) await page.setViewportSize({ width: 390, height: 844 })
+    const payload = sessionPage("inline", 0, 1)
+    payload.messages[0].content = Array.from({ length: 100 }, (_, index) =>
+      `Paragraph ${index}: ${"Long message text should flow within the transcript. ".repeat(8)}`,
+    ).join("\n\n") + "\n\nEND INLINE MESSAGE"
+    await mockApi(page, (url) => {
+      if (url.pathname === "/api/search") return searchReply([])
+      if (url.pathname === "/api/session") return { body: payload }
+    })
+    await page.goto("/?session=inline&record=inline-r0&mode=history")
+    const scroller = page.locator(".transcript-scroll")
+    const message = page.locator('[data-record-id="inline-r0"]')
+    await expect(message.getByText("END INLINE MESSAGE")).toHaveCount(1)
+    await expect(page.getByRole("button", { name: /Expand message|Collapse message|Load more message content/ })).toHaveCount(0)
+    expect(await message.evaluate((element) => element.clientHeight)).toBeGreaterThan(
+      await scroller.evaluate((element) => element.clientHeight),
+    )
+    const before = await scroller.evaluate((element) => element.scrollTop)
+    await message.locator("p").first().hover()
+    await page.mouse.wheel(0, 500)
+    await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(before + 100)
+    expect(await message.evaluate((element) => Array.from(element.querySelectorAll("*")).filter((child) => {
+      const style = getComputedStyle(child)
+      return /auto|scroll/.test(style.overflowY) && child.scrollHeight > child.clientHeight + 1
+    }).length)).toBe(0)
+  })
+}
+
+test("message continuation loads at its inline boundary and pauses after failure", async ({ page }) => {
+  const payload = sessionPage("continued", 0, 1)
+  const initial = "Initial paragraph with unicode café.\n\n".repeat(80)
+  const rest = "Remaining message content loaded inline."
+  payload.messages[0] = {
+    ...payload.messages[0], content: initial, truncated: true,
+    content_bytes: new TextEncoder().encode(initial + rest).length,
+  }
+  let attempts = 0
+  const api = await mockApi(page, (url) => {
+    if (url.pathname === "/api/search") return searchReply([])
+    if (url.pathname === "/api/session") return { body: payload }
+    if (url.pathname === "/api/session/content") {
+      attempts += 1
+      if (attempts === 1) return { status: 503, body: { error: "Content temporarily unavailable" } }
+      return { body: {
+        record_id: "continued-r0", version: "v1",
+        offset: new TextEncoder().encode(initial).length,
+        content: rest, truncated: false,
+        content_bytes: new TextEncoder().encode(initial + rest).length,
+      } }
+    }
+  })
+  await page.goto("/?session=continued&record=continued-r0&mode=history")
+  const scroller = page.locator(".transcript-scroll")
+  await expect(page.locator('[data-record-id="continued-r0"]')).toBeVisible()
+  expect(attempts).toBe(0)
+  await scroller.evaluate((element) => { element.scrollTop = element.scrollHeight })
+  await expect(page.getByRole("alert")).toContainText("Content temporarily unavailable")
+  await expect(
+    page.getByRole("button", { name: "Refresh transcript" }),
+  ).toHaveCount(0)
+  await page.waitForTimeout(200)
+  expect(attempts).toBe(1)
+  await page.getByRole("button", { name: "Retry loading message" }).click()
+  await expect(page.getByText(rest)).toHaveCount(1)
+  const contentCalls = api.calls.filter((url) => url.pathname === "/api/session/content")
+  expect(contentCalls).toHaveLength(2)
+  expect(contentCalls[1].searchParams.get("offset")).toBe(String(new TextEncoder().encode(initial).length))
+  await expect(page.getByRole("button", { name: "Retry loading message" })).toHaveCount(0)
+})
+
+test("search filters the chart and clearing restores the baseline despite stale responses", async ({ page }) => {
+  let releaseSlow: (() => void) | undefined
+  const api = await mockApi(page, (url) => {
+    if (url.pathname === "/api/search") return searchReply([])
+    if (url.pathname !== "/api/activity") return
+    const query = url.searchParams.get("q") || ""
+    const reply = {
+      body: {
+        metric: "sessions", range: "30d", bucket_keys: ["2026-09-05"],
+        token_usage_enabled: true, partial: false,
+        points: [{ date: "2026-09-05", source: "codex", value: query ? 3 : 200 }],
+      },
+    }
+    if (query === "slow") return new Promise<MockReply>((resolve) => {
+      releaseSlow = () => resolve(reply)
+    })
+    return reply
+  })
+  await page.goto("/")
+  await expect(page.getByText("200 sessions", { exact: true })).toBeVisible()
+  const search = page.getByRole("combobox", { name: "Search conversations" })
+  await search.fill("trino")
+  await expect(page.getByText("3 sessions", { exact: true })).toBeVisible()
+  expect(api.activityCalls().at(-1)?.searchParams.get("q")).toBe("trino")
+  await search.fill("slow")
+  await expect.poll(() => Boolean(releaseSlow)).toBe(true)
+  await search.fill("")
+  await expect(page.getByText("200 sessions", { exact: true })).toBeVisible()
+  releaseSlow?.()
+  await page.waitForTimeout(200)
+  await expect(page.getByText("200 sessions", { exact: true })).toBeVisible()
+  expect(api.activityCalls().at(-1)?.searchParams.has("q")).toBe(false)
 })

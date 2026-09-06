@@ -2,7 +2,7 @@ use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analy
 use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::types::SourceFilter;
-use crate::usage::{CostMode, UsageQuery, scan_usage_activity};
+use crate::usage::{CostMode, UsageQuery, scan_usage, scan_usage_activity};
 use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -411,6 +411,7 @@ impl TimeRange {
 #[derive(Debug)]
 struct ActivityRequest {
     metric: ActivityMetric,
+    query: String,
     source: Option<SourceFilter>,
     project: Option<String>,
     days: i64,
@@ -421,6 +422,7 @@ struct ActivityRequest {
 impl ActivityRequest {
     fn from_url(url: &RequestUrl) -> Result<Self> {
         let mut metric = ActivityMetric::Sessions;
+        let mut query = String::new();
         let mut source = None;
         let mut project = None;
         let mut days = 30;
@@ -431,6 +433,7 @@ impl ActivityRequest {
                 "metric" if value == "tokens" => metric = ActivityMetric::Tokens,
                 "metric" if value == "sessions" || value.is_empty() => {}
                 "metric" => return Err(anyhow!("unknown activity metric: {value}")),
+                "q" => query = value.trim().to_string(),
                 "source" if !value.is_empty() && value != "all" => {
                     source = Some(parse_source(value)?);
                 }
@@ -450,6 +453,7 @@ impl ActivityRequest {
         }
         Ok(Self {
             metric,
+            query,
             source,
             project,
             days,
@@ -457,6 +461,37 @@ impl ActivityRequest {
             origin,
         })
     }
+}
+
+fn activity_matching_session_scopes(
+    paths: &Paths,
+    params: &ActivityRequest,
+    since_ms: Option<u64>,
+) -> Result<Option<HashSet<(String, String, String)>>> {
+    if params.query.is_empty() {
+        return Ok(None);
+    }
+
+    let index = open_index(paths)?;
+    let scopes = index
+        .session_scopes_matching_query(&QueryOptions {
+            query: params.query.clone(),
+            project: params.project.clone(),
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: params.source,
+            since: since_ms,
+            until: None,
+            limit: 1,
+        })?
+        .into_iter()
+        .map(|(source, session_id, source_path)| {
+            (source.storage_label().to_string(), session_id, source_path)
+        })
+        .collect();
+    Ok(Some(scopes))
 }
 
 #[derive(Serialize)]
@@ -492,9 +527,10 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
         86_400_000
     };
     let mut buckets: BTreeMap<(u64, String), u64> = BTreeMap::new();
+    let matching_scopes = activity_matching_session_scopes(paths, params, since_ms)?;
 
-    let partial = match params.metric {
-        ActivityMetric::Sessions => {
+    let partial = match (params.metric, matching_scopes.as_ref()) {
+        (ActivityMetric::Sessions, matching_scopes) => {
             let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
             for session in store.query_sessions_filtered(
                 params.source,
@@ -504,6 +540,15 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 Some(params.origin),
                 None,
             )? {
+                if matching_scopes.is_some_and(|scopes| {
+                    !scopes.contains(&(
+                        session.source.storage_label().to_string(),
+                        session.session_id.clone(),
+                        session.source_path.clone(),
+                    ))
+                }) {
+                    continue;
+                }
                 add_activity_value(
                     &mut buckets,
                     session.last_at,
@@ -514,8 +559,68 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
             }
             false
         }
-        ActivityMetric::Tokens if !token_usage_enabled => false,
-        ActivityMetric::Tokens => {
+        (ActivityMetric::Tokens, _) if !token_usage_enabled => false,
+        (ActivityMetric::Tokens, Some(matching_scopes)) => {
+            let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+            let allowed_scopes = store
+                .query_sessions_filtered(
+                    params.source,
+                    since_ms,
+                    params.project.as_deref(),
+                    ProjectGrouping::Flat,
+                    Some(params.origin),
+                    None,
+                )?
+                .into_iter()
+                .map(|session| {
+                    (
+                        session.source.storage_label().to_string(),
+                        session.session_id,
+                        session.source_path,
+                    )
+                })
+                .filter(|scope| matching_scopes.contains(scope))
+                .collect::<HashSet<_>>();
+            if allowed_scopes.is_empty() {
+                false
+            } else {
+                let query = UsageQuery {
+                    source: params.source,
+                    project: params.project.clone(),
+                    project_grouping: ProjectGrouping::Flat,
+                    session_keys: None,
+                    since_ms,
+                    until_ms: None,
+                    cost_mode: CostMode::Source,
+                    include_events: true,
+                    cache_path: Some(paths.state.join("usage-cache.sqlite3")),
+                    memo_ttl_ms: 60_000,
+                };
+                let report = scan_usage(&query)?;
+                let partial = !report.warnings.is_empty();
+                for event in report.details {
+                    let Some(session_id) = event.session_id else {
+                        continue;
+                    };
+                    if !allowed_scopes.contains(&(
+                        event.source.to_string(),
+                        session_id,
+                        event.source_path.to_string(),
+                    )) {
+                        continue;
+                    }
+                    add_activity_value(
+                        &mut buckets,
+                        event.timestamp_ms,
+                        event.source,
+                        event.tokens.total(),
+                        bucket_ms,
+                    );
+                }
+                partial
+            }
+        }
+        (ActivityMetric::Tokens, None) => {
             // Restrict token activity to the selected origin via the sessions
             // that survive the same filter: usage events carry no kind of
             // their own, so the session roster is the source of truth.
@@ -1065,10 +1170,18 @@ struct SessionSummary {
     ts: u64,
     score: Option<f32>,
     snippet: String,
+    snippet_matches: Vec<SnippetMatch>,
+}
+
+#[derive(Serialize)]
+struct SnippetMatch {
+    start: usize,
+    end: usize,
 }
 
 fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload> {
     let index = open_index(paths)?;
+    let matchers = crate::cli::build_matchers(&params.query)?;
     let since = params
         .range
         .since_ms(Utc::now().timestamp_millis().max(0) as u64);
@@ -1145,6 +1258,12 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
             ) {
                 continue;
             }
+            let snippet = if params.query.is_empty() {
+                summarize(&record.text, 360)
+            } else {
+                crate::cli::match_preview(&record.text, &matchers, 160)
+            };
+            let snippet_matches = snippet_match_spans(&snippet, &matchers);
             summaries.push(SessionSummary {
                 record_id: crate::retrieval::canonical_record_id(&record),
                 session_id: record.session_id,
@@ -1154,7 +1273,8 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 role: record.role,
                 ts: record.ts,
                 score,
-                snippet: summarize(&record.text, 360),
+                snippet,
+                snippet_matches,
             });
             if summaries.len() == target {
                 break;
@@ -1577,6 +1697,33 @@ fn summarize(text: &str, max_chars: usize) -> String {
     let mut summary: String = compact.chars().take(max_chars.saturating_sub(1)).collect();
     summary.push('…');
     summary
+}
+
+fn snippet_match_spans(text: &str, matchers: &[regex::Regex]) -> Vec<SnippetMatch> {
+    let mut byte_spans = matchers
+        .iter()
+        .flat_map(|matcher| matcher.find_iter(text).map(|hit| (hit.start(), hit.end())))
+        .collect::<Vec<_>>();
+    byte_spans.sort_unstable();
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in byte_spans {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start < *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+
+    merged
+        .into_iter()
+        .map(|(start, end)| SnippetMatch {
+            start: text[..start].chars().count(),
+            end: text[..end].chars().count(),
+        })
+        .collect()
 }
 
 fn respond_json<T: Serialize>(request: Request, status: StatusCode, value: &T) -> Result<()> {
@@ -2045,14 +2192,176 @@ mod tests {
 
     #[test]
     fn activity_request_parses_metric_filters_and_range() {
-        let url =
-            parse_url("/api/activity?metric=tokens&source=codex&project=memex&days=1000").unwrap();
+        let url = parse_url(
+            "/api/activity?metric=tokens&q=%20searchtrino%20&source=codex&project=memex&days=1000",
+        )
+        .unwrap();
         let request = ActivityRequest::from_url(&url).unwrap();
 
         assert_eq!(request.metric, ActivityMetric::Tokens);
+        assert_eq!(request.query, "searchtrino");
         assert_eq!(request.source, Some(SourceFilter::Codex));
         assert_eq!(request.project.as_deref(), Some("memex"));
         assert_eq!(request.days, 365);
+    }
+
+    #[test]
+    fn activity_query_uses_every_exact_matching_scope_and_clear_restores_filters() {
+        use crate::analytics::AnalyticsWriter;
+
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let now = Utc::now().timestamp_millis().max(0) as u64;
+        let mut records = Vec::new();
+
+        for index in 0..61 {
+            let mut value = record(
+                index + 1,
+                &format!("matching-{index}"),
+                &format!("/tmp/matching-{index}.jsonl"),
+                "searchtrino".to_string(),
+            );
+            value.ts = now - index;
+            records.push(value);
+        }
+        for index in 0..4 {
+            let mut value = record(
+                index + 100,
+                &format!("unmatched-{index}"),
+                &format!("/tmp/unmatched-{index}.jsonl"),
+                "unrelated".to_string(),
+            );
+            value.ts = now - index;
+            records.push(value);
+        }
+
+        let mut other_project = record(
+            200,
+            "other-project",
+            "/tmp/other-project.jsonl",
+            "searchtrino".to_string(),
+        );
+        other_project.project = "elsewhere".to_string();
+        other_project.ts = now;
+        records.push(other_project);
+
+        let mut other_source = record(
+            201,
+            "other-source",
+            "/tmp/other-source.jsonl",
+            "searchtrino".to_string(),
+        );
+        other_source.source = SourceKind::Codex;
+        other_source.ts = now;
+        records.push(other_source);
+
+        for (doc_id, source_path, text) in [
+            (202, "/tmp/shared-match.jsonl", "searchtrino"),
+            (203, "/tmp/shared-miss.jsonl", "unrelated"),
+        ] {
+            let mut value = record(doc_id, "shared-id", source_path, text.to_string());
+            value.ts = now;
+            records.push(value);
+        }
+
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for value in &records {
+            analytics.record(value).unwrap();
+        }
+        analytics.flush().unwrap();
+        drop(analytics);
+        publish_records(&paths, records);
+
+        let total = |query: &str| {
+            let request = ActivityRequest::from_url(
+                &parse_url(&format!(
+                    "/api/activity?range=all&source=claude&project=memex&q={query}"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            activity_payload(&paths, &request)
+                .unwrap()
+                .points
+                .iter()
+                .map(|point| point.value)
+                .sum::<u64>()
+        };
+
+        assert_eq!(total("searchtrino"), 62);
+        assert_eq!(total(""), 67);
+        assert_eq!(total("%20%20"), 67);
+    }
+
+    #[test]
+    fn token_activity_query_filters_same_session_id_by_exact_source_path() {
+        use crate::analytics::AnalyticsWriter;
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.root.join("config.toml"), "token_usage = true\n").unwrap();
+
+        let claude_root = temp.path().join("claude");
+        let project_dir = claude_root.join("projects/memex");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let matching_path = project_dir.join("matching.jsonl");
+        let other_path = project_dir.join("other.jsonl");
+        let usage_line = |input_tokens| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"shared-id","requestId":"request-{input_tokens}","timestamp":"2026-09-05T12:00:00Z","cwd":"/repo/memex","message":{{"id":"message-{input_tokens}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input_tokens}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&matching_path, usage_line(10)).unwrap();
+        std::fs::write(&other_path, usage_line(90)).unwrap();
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(claude_root.as_os_str()))]);
+
+        let now = Utc::now().timestamp_millis().max(0) as u64;
+        let mut matching = record(
+            1,
+            "shared-id",
+            matching_path.to_string_lossy().as_ref(),
+            "searchtrino".to_string(),
+        );
+        matching.ts = now;
+        let mut other = record(
+            2,
+            "shared-id",
+            other_path.to_string_lossy().as_ref(),
+            "unrelated".to_string(),
+        );
+        other.ts = now;
+        let records = vec![matching, other];
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for value in &records {
+            analytics.record(value).unwrap();
+        }
+        analytics.flush().unwrap();
+        drop(analytics);
+        publish_records(&paths, records);
+
+        let total = |query: &str| {
+            let request = ActivityRequest::from_url(
+                &parse_url(&format!(
+                    "/api/activity?metric=tokens&range=all&origin=all&source=claude&project=memex&q={query}"
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            activity_payload(&paths, &request)
+                .unwrap()
+                .points
+                .iter()
+                .map(|point| point.value)
+                .sum::<u64>()
+        };
+
+        assert_eq!(total("searchtrino"), 10);
+        assert_eq!(total("missing-query"), 0);
+        assert_eq!(total(""), 100);
     }
 
     #[test]
@@ -2213,6 +2522,70 @@ mod tests {
         )
         .unwrap();
         assert!(filtered.results.is_empty());
+    }
+
+    #[test]
+    fn search_payload_centers_and_marks_late_unicode_matches() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let text = format!(
+            "Readable message prefix {}needle evidence",
+            "界 ".repeat(240)
+        );
+        publish_records(
+            &paths,
+            [record(1, "late-match", "/tmp/late-match.jsonl", text)],
+        );
+
+        let searched = search_payload(
+            &paths,
+            &SearchRequest {
+                query: "text:needle".to_string(),
+                source: None,
+                project: None,
+                offset: 0,
+                limit: 30,
+                origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
+            },
+        )
+        .unwrap();
+        let result = &searched.results[0];
+        assert!(result.snippet.starts_with('…'));
+        assert!(result.snippet.contains("needle evidence"));
+        assert!(result.snippet.chars().count() <= 160);
+        assert_eq!(result.snippet_matches.len(), 1);
+        let hit = &result.snippet_matches[0];
+        assert_eq!(
+            result
+                .snippet
+                .chars()
+                .skip(hit.start)
+                .take(hit.end - hit.start)
+                .collect::<String>(),
+            "needle"
+        );
+
+        let recent = search_payload(
+            &paths,
+            &SearchRequest {
+                query: String::new(),
+                source: None,
+                project: None,
+                offset: 0,
+                limit: 30,
+                origin: SessionKindFilter::Primary,
+                range: TimeRange::All,
+            },
+        )
+        .unwrap();
+        assert!(
+            recent.results[0]
+                .snippet
+                .starts_with("Readable message prefix")
+        );
+        assert!(recent.results[0].snippet_matches.is_empty());
     }
 
     #[test]
@@ -2632,6 +3005,7 @@ mod tests {
                 &paths,
                 &ActivityRequest {
                     metric: ActivityMetric::Sessions,
+                    query: String::new(),
                     source: None,
                     project: None,
                     days: 30,
