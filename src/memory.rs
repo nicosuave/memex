@@ -418,12 +418,19 @@ pub fn parse_memory_document(candidate: &MemoryCandidate) -> Result<MemoryDocume
 
 /// Re-read a snapshot-known source without mutating either the source or memory snapshot.
 pub(crate) fn reparse_memory_document(previous: &MemoryDocument) -> Result<MemoryDocument> {
-    parse_memory_document(&MemoryCandidate {
+    if fs::canonicalize(&previous.source_path)? != previous.source_path {
+        bail!("memory source path identity changed before reading");
+    }
+    let current = parse_memory_document(&MemoryCandidate {
         provider: previous.provider,
         source_path: previous.source_path.clone(),
         scope: previous.scope.clone(),
         kind: previous.kind,
-    })
+    })?;
+    if fs::canonicalize(&previous.source_path)? != previous.source_path {
+        bail!("memory source path identity changed while reading");
+    }
+    Ok(current)
 }
 
 fn parse_memory_content(

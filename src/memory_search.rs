@@ -413,6 +413,11 @@ pub fn read_memory(paths: &Paths, request: &MemoryReadRequest) -> Result<MemoryR
         }
         _ => {}
     }
+    if let Ok(canonical) = fs::canonicalize(&snapshot_document.source_path)
+        && canonical != snapshot_document.source_path
+    {
+        bail!("memory source path identity changed; refresh the index");
+    }
     let (snapshot_freshness, source_changed) = source_freshness(&snapshot_document);
     let (document, freshness, reparsed_current) = if source_changed {
         match reparse_memory_document(&snapshot_document) {
@@ -1364,6 +1369,50 @@ mod tests {
         assert!(value.changed_since_search);
         assert_eq!(value.section_ref, None);
         assert_eq!(value.text, "current full content");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_rejects_replaced_parent_directory_symlink() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let parent = temp.path().join("indexed");
+        fs::create_dir(&parent).unwrap();
+        let doc = document(
+            parent.join("MEMORY.md"),
+            "one",
+            "alpha",
+            100,
+            &[("old", "original")],
+        );
+        write_snapshot(&paths, vec![doc.clone()]);
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("MEMORY.md"), "outside replacement").unwrap();
+        fs::rename(&parent, temp.path().join("original-directory")).unwrap();
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+
+        let error = read_memory(
+            &paths,
+            &MemoryReadRequest {
+                memory_id: "one".to_string(),
+                section_ref: None,
+                content_version: None,
+                offset_chars: 0,
+                max_chars: 64,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("path identity changed"),
+            "{error:#}"
+        );
+        assert!(
+            reparse_memory_document(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("path identity changed")
+        );
     }
 
     #[test]
