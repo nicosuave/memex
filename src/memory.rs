@@ -416,16 +416,6 @@ pub fn parse_memory_document(candidate: &MemoryCandidate) -> Result<MemoryDocume
     parse_memory_content(candidate, content, &metadata)
 }
 
-/// Re-read a snapshot-known source without mutating either the source or memory snapshot.
-pub(crate) fn reparse_memory_document(previous: &MemoryDocument) -> Result<MemoryDocument> {
-    parse_memory_document(&MemoryCandidate {
-        provider: previous.provider,
-        source_path: previous.source_path.clone(),
-        scope: previous.scope.clone(),
-        kind: previous.kind,
-    })
-}
-
 fn parse_memory_content(
     candidate: &MemoryCandidate,
     content: String,
