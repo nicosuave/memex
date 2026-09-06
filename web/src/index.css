@@ -769,6 +769,25 @@ body {
   border-radius: 10px;
 }
 
+.context-section {
+  min-width: 0;
+  margin: 12px 0;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+}
+
+.context-title {
+  margin-bottom: 10px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.context-title code {
+  font-weight: normal;
+}
+
 .xml-title {
   padding: 9px 12px;
   font-size: 12px;

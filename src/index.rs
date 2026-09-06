@@ -12,7 +12,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use tantivy::collector::{Count, DocSetCollector, TopDocs};
+use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
+use tantivy::columnar::StrColumn;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
@@ -24,7 +25,11 @@ use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
     TextFieldIndexing, TextOptions,
 };
-use tantivy::{Index, IndexReader, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term};
+use tantivy::store::StoreReader;
+use tantivy::{
+    DocId, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, SegmentReader,
+    TantivyDocument, Term,
+};
 
 #[derive(Clone)]
 pub struct IndexFields {
@@ -169,6 +174,180 @@ pub struct SessionScopeKey {
     pub source: crate::types::SourceKind,
     pub session_id: String,
     pub source_path: String,
+}
+
+type SessionScopeIdentity = (crate::types::SourceKind, String, String);
+
+struct SessionScopeCollector {
+    fields: IndexFields,
+    fast_session_identity: bool,
+}
+
+enum SessionScopeSegmentCollector {
+    Fast {
+        source: StrColumn,
+        session_id: StrColumn,
+        source_path: StrColumn,
+        scope_ords: HashSet<(Option<u64>, Option<u64>, Option<u64>)>,
+    },
+    Stored {
+        store: StoreReader,
+        fields: IndexFields,
+        scopes: HashSet<SessionScopeIdentity>,
+        error: Option<tantivy::TantivyError>,
+    },
+}
+
+impl Collector for SessionScopeCollector {
+    type Fruit = std::result::Result<HashSet<SessionScopeIdentity>, tantivy::TantivyError>;
+    type Child = SessionScopeSegmentCollector;
+
+    fn for_segment(
+        &self,
+        _segment_local_id: u32,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        if !self.fast_session_identity {
+            return Ok(SessionScopeSegmentCollector::Stored {
+                store: segment.get_store_reader(1)?,
+                fields: self.fields.clone(),
+                scopes: HashSet::new(),
+                error: None,
+            });
+        }
+        let fast_fields = segment.fast_fields();
+        let source = self
+            .fields
+            .source
+            .map(|_| fast_fields.str("source"))
+            .transpose()?
+            .flatten();
+        let session_id = fast_fields.str("session_id")?;
+        let source_path = fast_fields.str("source_path")?;
+        if let (Some(source), Some(session_id), Some(source_path)) =
+            (source, session_id, source_path)
+        {
+            Ok(SessionScopeSegmentCollector::Fast {
+                source,
+                session_id,
+                source_path,
+                scope_ords: HashSet::new(),
+            })
+        } else {
+            Ok(SessionScopeSegmentCollector::Stored {
+                store: segment.get_store_reader(1)?,
+                fields: self.fields.clone(),
+                scopes: HashSet::new(),
+                error: None,
+            })
+        }
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let mut scopes = HashSet::new();
+        for fruit in segment_fruits {
+            scopes.extend(fruit?);
+        }
+        Ok(Ok(scopes))
+    }
+}
+
+impl SegmentCollector for SessionScopeSegmentCollector {
+    type Fruit = std::result::Result<HashSet<SessionScopeIdentity>, tantivy::TantivyError>;
+
+    fn collect(&mut self, doc: DocId, _score: Score) {
+        match self {
+            Self::Fast {
+                source,
+                session_id,
+                source_path,
+                scope_ords,
+            } => {
+                scope_ords.insert((
+                    source.ords().first(doc),
+                    session_id.ords().first(doc),
+                    source_path.ords().first(doc),
+                ));
+            }
+            Self::Stored {
+                store,
+                fields,
+                scopes,
+                error,
+            } if error.is_none() => {
+                if let Err(found) = collect_stored_scope(store, fields, scopes, doc) {
+                    *error = Some(found);
+                }
+            }
+            Self::Stored { .. } => {}
+        }
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        match self {
+            Self::Fast {
+                source,
+                session_id,
+                source_path,
+                scope_ords,
+            } => {
+                let mut scopes = HashSet::with_capacity(scope_ords.len());
+                for (source_ord, session_id_ord, source_path_ord) in scope_ords {
+                    let source_path = fast_string(&source_path, source_path_ord)?;
+                    let session_id = fast_string(&session_id, session_id_ord)?;
+                    let source_label = fast_string(&source, source_ord)?;
+                    let source = crate::types::SourceKind::from_label(&source_label)
+                        .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
+                    scopes.insert((source, session_id, source_path));
+                }
+                Ok(scopes)
+            }
+            Self::Stored { scopes, error, .. } => error.map_or(Ok(scopes), Err),
+        }
+    }
+}
+
+fn collect_stored_scope(
+    store: &StoreReader,
+    fields: &IndexFields,
+    scopes: &mut HashSet<SessionScopeIdentity>,
+    doc_id: DocId,
+) -> tantivy::Result<()> {
+    let doc = store.get::<TantivyDocument>(doc_id)?;
+    let source_path = doc
+        .get_first(fields.source_path)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let session_id = doc
+        .get_first(fields.session_id)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let source = fields
+        .source
+        .and_then(|field| doc.get_first(field))
+        .and_then(|value| value.as_str())
+        .and_then(crate::types::SourceKind::from_label)
+        .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
+    scopes.insert((source, session_id, source_path));
+    Ok(())
+}
+
+fn fast_string(column: &StrColumn, ord: Option<u64>) -> tantivy::Result<String> {
+    let Some(ord) = ord else {
+        return Ok(String::new());
+    };
+    let mut value = String::new();
+    column.ord_to_str(ord, &mut value)?;
+    Ok(value)
 }
 
 impl SearchIndex {
@@ -770,8 +949,9 @@ impl SearchIndex {
         Ok(results)
     }
 
-    /// Collect every exact session identity matching a lexical query without retaining scores or
-    /// full records. Stored documents are hydrated one at a time only to read identity fields.
+    /// Collect every exact session identity matching a lexical query without retaining scores,
+    /// document addresses, or full records. Current indexes read identity fast fields while
+    /// older compatible indexes fall back to hydrating one stored document at a time.
     pub fn session_scopes_matching_query(
         &self,
         options: &QueryOptions,
@@ -779,34 +959,19 @@ impl SearchIndex {
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let query = build_query(&self.fields, options, &self.index)?;
-        let mut addresses = searcher
-            .search(&query, &DocSetCollector)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        addresses.sort_unstable();
-        let mut scopes = HashSet::new();
-        for address in addresses {
-            let doc = searcher.doc::<TantivyDocument>(address)?;
-            let source_path = doc
-                .get_first(self.fields.source_path)
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let session_id = doc
-                .get_first(self.fields.session_id)
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let source = self
-                .fields
-                .source
-                .and_then(|field| doc.get_first(field))
-                .and_then(|value| value.as_str())
-                .and_then(crate::types::SourceKind::from_label)
-                .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
-            scopes.insert((source, session_id, source_path));
-        }
-        Ok(scopes)
+        let schema = self.index.schema();
+        let fast_session_identity = self.fields.source.is_some_and(|source| {
+            [source, self.fields.session_id, self.fields.source_path]
+                .into_iter()
+                .all(|field| schema.get_field_entry(field).is_fast())
+        });
+        Ok(searcher.search(
+            &query,
+            &SessionScopeCollector {
+                fields: self.fields.clone(),
+                fast_session_identity,
+            },
+        )??)
     }
 
     pub(crate) fn doc_ids_matching_filters(&self, options: &QueryOptions) -> Result<HashSet<u64>> {
@@ -1894,7 +2059,19 @@ fn build_schema() -> Result<Schema> {
 pub(crate) fn build_schema_with_canonical_record_id(
     include_canonical_record_id: bool,
 ) -> Result<Schema> {
+    build_schema_with_options(include_canonical_record_id, true)
+}
+
+fn build_schema_with_options(
+    include_canonical_record_id: bool,
+    fast_session_identity: bool,
+) -> Result<Schema> {
     let mut builder = SchemaBuilder::default();
+    let session_identity_options = if fast_session_identity {
+        STRING | STORED | FAST
+    } else {
+        STRING | STORED
+    };
 
     if include_canonical_record_id {
         builder.add_text_field("canonical_record_id", STRING | STORED);
@@ -1902,10 +2079,10 @@ pub(crate) fn build_schema_with_canonical_record_id(
     builder.add_u64_field("doc_id", INDEXED | STORED | FAST);
     builder.add_u64_field("ts", INDEXED | STORED | FAST);
     builder.add_text_field("project", STRING | STORED);
-    builder.add_text_field("session_id", STRING | STORED);
+    builder.add_text_field("session_id", session_identity_options.clone());
     builder.add_u64_field("turn_id", INDEXED | STORED | FAST);
     builder.add_text_field("role", STRING | STORED);
-    builder.add_text_field("source", STRING | STORED);
+    builder.add_text_field("source", session_identity_options.clone());
 
     let text_indexing = TextFieldIndexing::default()
         .set_tokenizer("default")
@@ -1927,7 +2104,7 @@ pub(crate) fn build_schema_with_canonical_record_id(
     builder.add_text_field("parent_tool_use_id", STRING | STORED);
     builder.add_text_field("source_tool_use_id", STRING | STORED);
     builder.add_text_field("source_tool_assistant_uuid", STRING | STORED);
-    builder.add_text_field("source_path", STRING | STORED);
+    builder.add_text_field("source_path", session_identity_options);
 
     Ok(builder.build())
 }
@@ -2557,6 +2734,101 @@ mod tests {
             })
             .expect("empty scope");
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn session_scope_collector_deduplicates_all_matches_with_fast_and_legacy_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for fast_session_identity in [true, false] {
+            let dir = tmp.path().join(if fast_session_identity {
+                "fast"
+            } else {
+                "legacy"
+            });
+            std::fs::create_dir(&dir).expect("create index dir");
+            let schema = build_schema_with_options(true, fast_session_identity).expect("schema");
+            drop(Index::create_in_dir(&dir, schema).expect("create index"));
+            let index = SearchIndex::open_or_create(&dir).expect("open index");
+            let mut writer = index.writer().expect("writer");
+            for doc_id in 1..=257 {
+                index
+                    .add_record(&mut writer, &test_record(doc_id, "shared needle"))
+                    .expect("add repeated session record");
+            }
+            let mut other = test_record(258, "shared needle");
+            other.source = crate::types::SourceKind::Claude;
+            other.session_id = "other-session".to_string();
+            other.source_path = "other.jsonl".to_string();
+            index
+                .add_record(&mut writer, &other)
+                .expect("add other session record");
+            let mut deleted = test_record(259, "shared needle");
+            deleted.session_id = "deleted-session".to_string();
+            deleted.source_path = "deleted.jsonl".to_string();
+            index
+                .add_record(&mut writer, &deleted)
+                .expect("add deleted session record");
+            if !fast_session_identity {
+                let mut inferred = TantivyDocument::default();
+                inferred.add_text(index.fields.text, "shared needle");
+                inferred.add_text(index.fields.session_id, "inferred-session");
+                inferred.add_text(
+                    index.fields.source_path,
+                    "/tmp/.claude/projects/inferred.jsonl",
+                );
+                writer
+                    .add_document(inferred)
+                    .expect("add legacy record without source field");
+            }
+            writer.commit().expect("commit");
+            writer.delete_term(Term::from_field_u64(index.fields.doc_id, deleted.doc_id));
+            writer.commit().expect("commit deletion");
+
+            let options = QueryOptions {
+                query: "shared needle".to_string(),
+                project: None,
+                role: None,
+                tool: None,
+                session_id: None,
+                session_scope: None,
+                source: None,
+                since: None,
+                until: None,
+                limit: 1,
+            };
+            let scopes = index
+                .session_scopes_matching_query(&options)
+                .expect("collect session scopes");
+
+            assert_eq!(scopes.len(), if fast_session_identity { 2 } else { 3 });
+            assert!(scopes.contains(&(
+                crate::types::SourceKind::Codex,
+                "session".to_string(),
+                "session.jsonl".to_string(),
+            )));
+            assert!(scopes.contains(&(
+                crate::types::SourceKind::Claude,
+                "other-session".to_string(),
+                "other.jsonl".to_string(),
+            )));
+            assert!(!scopes.iter().any(|scope| scope.1 == "deleted-session"));
+            if !fast_session_identity {
+                assert!(scopes.contains(&(
+                    crate::types::SourceKind::Claude,
+                    "inferred-session".to_string(),
+                    "/tmp/.claude/projects/inferred.jsonl".to_string(),
+                )));
+            }
+            assert!(
+                index
+                    .session_scopes_matching_query(&QueryOptions {
+                        query: "missing phrase".to_string(),
+                        ..options
+                    })
+                    .expect("collect empty result")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

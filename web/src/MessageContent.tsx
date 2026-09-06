@@ -1,10 +1,102 @@
-import { memo, useMemo } from "react"
+import { memo, useMemo, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import type { Message } from "./session"
 
 type XmlField = { label: string; value: string; path: string }
 type ToolPayload = Record<string, unknown>
+type MarkdownPart =
+  | { kind: "text"; content: string }
+  | { kind: "section"; tag: string; attributes: string; children: MarkdownPart[] }
+
+const contextTag = /(?:^|[-_])(?:context|instructions|reminder|environment|permissions|skills|memory|collaboration)(?:$|[-_])/i
+
+// Context envelopes are not XML documents: their bodies can contain Markdown,
+// unescaped ampersands, examples, and content whose closing tag has not loaded yet.
+function contextParts(content: string): MarkdownPart[] {
+  const parts: MarkdownPart[] = []
+  const stack: Extract<MarkdownPart, { kind: "section" }>[] = []
+  let fence: { character: string; length: number } | null = null
+  let inlineTicks = 0
+  const append = (text: string) => {
+    const children = stack.at(-1)?.children ?? parts
+    const previous = children.at(-1)
+    if (previous?.kind === "text") previous.content += text
+    else children.push({ kind: "text", content: text })
+  }
+  for (const line of content.split(/(?<=\n)/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line.trimEnd())
+    if (fence) {
+      append(line)
+      if (
+        marker && marker[1][0] === fence.character &&
+        marker[1].length >= fence.length && !marker[2].trim()
+      ) fence = null
+      continue
+    }
+    if (!inlineTicks && marker &&
+        (marker[1][0] !== "`" || !marker[2].includes("`"))) {
+      fence = { character: marker[1][0], length: marker[1].length }
+      append(line)
+      continue
+    }
+    const tag = !inlineTicks && /^ {0,3}<(\/?)([\w.-]+)([^>\n]*)>[ \t]*(?:\r?\n)?$/.exec(line)
+    if (tag && contextTag.test(tag[2]) && !tag[3].trimEnd().endsWith("/")) {
+      if (!tag[1]) {
+        const section: Extract<MarkdownPart, { kind: "section" }> = {
+          kind: "section", tag: tag[2], attributes: tag[3].trim(), children: [],
+        }
+        const children = stack.at(-1)?.children ?? parts
+        children.push(section)
+        stack.push(section)
+        continue
+      }
+      if (stack.at(-1)?.tag === tag[2] && !tag[3].trim()) {
+        stack.pop()
+        continue
+      }
+    }
+    append(line)
+    // Multiline code spans may contain something that looks like a wrapper.
+    for (const ticks of line.matchAll(/`+/g)) {
+      if (!inlineTicks) inlineTicks = ticks[0].length
+      else if (inlineTicks === ticks[0].length) inlineTicks = 0
+    }
+  }
+  return parts
+}
+
+function MarkdownImage({ src, alt, title, literal }: {
+  src?: string; alt?: string; title?: string; literal: string
+}) {
+  const [failedSource, setFailedSource] = useState<string>()
+  if (!src || failedSource === src) return <code>{literal}</code>
+  return <img src={src} alt={alt ?? ""} title={title} loading="lazy" onError={() => setFailedSource(src)} />
+}
+
+function MarkdownContent({ content }: { content: string }) {
+  return (
+    <div className="markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+        img: ({ src, alt, title, node }) => <MarkdownImage src={typeof src === "string" ? src : undefined} alt={alt} title={title}
+          literal={content.slice(node?.position?.start.offset, node?.position?.end.offset)} />,
+      }}>
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+function ContextContent({ parts }: { parts: MarkdownPart[] }) {
+  return parts.map((part, index) => part.kind === "text"
+    ? <MarkdownContent key={index} content={part.content} />
+    : <section className="context-section" key={index}>
+        <div className="context-title">{formatToolLabel(part.tag)}
+          {part.attributes && <code> {part.attributes}</code>}
+        </div>
+        <ContextContent parts={part.children} />
+      </section>)
+}
 
 const rustDebugString = /\bString\(("(?:\\.|[^"\\])*")\)/g
 const rustDebugStaticBoolean = /\bStatic\(Bool\((true|false)\)\)/g
@@ -115,6 +207,11 @@ function parseXml(
   }
 
   const fields: XmlField[] = []
+  // Flattening mixed XML content would silently discard text around children.
+  if (Array.from(documentNode.querySelectorAll("*")).some((node) =>
+    node.children.length && Array.from(node.childNodes).some((child) =>
+      (child.nodeType === Node.TEXT_NODE || child.nodeType === Node.CDATA_SECTION_NODE) &&
+      child.textContent?.trim()))) return null
   const walk = (node: Element, parentPath = "") => {
     const path = parentPath ? `${parentPath}/${node.tagName}` : node.tagName
     if (!node.children.length) {
@@ -168,11 +265,13 @@ export const MessageContent = memo(function MessageContent({
 }: {
   message: Message
 }) {
-  const parsed = useMemo(
-    () =>
-      ["tool_use", "tool_result"].includes(message.role)
-        ? null
-        : parseXml(message.content),
+  const rendered = useMemo(
+    () => {
+      if (["tool_use", "tool_result"].includes(message.role)) return null
+      const parts = contextParts(message.content)
+      if (parts.some((part) => part.kind === "section")) return { parts }
+      return { xml: parseXml(message.content) }
+    },
     [message.content, message.role],
   )
   if (message.role === "tool_use")
@@ -181,13 +280,7 @@ export const MessageContent = memo(function MessageContent({
   if (message.role === "tool_result")
     return <pre className="tool-content">{message.content}</pre>
 
-  if (parsed) return <XmlMessage parsed={parsed} />
-
-  return (
-    <div className="markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-        {message.content}
-      </ReactMarkdown>
-    </div>
-  )
+  if (rendered?.parts) return <ContextContent parts={rendered.parts} />
+  if (rendered?.xml) return <XmlMessage parsed={rendered.xml} />
+  return <MarkdownContent content={message.content} />
 })

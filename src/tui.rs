@@ -532,6 +532,8 @@ struct App {
     index: SearchIndex,
     focus: Focus,
     query: String,
+    render_matcher_query: Option<String>,
+    render_matchers: Vec<regex::Regex>,
     project: String,
     machine: String,
     home_machines: Vec<String>,
@@ -950,6 +952,8 @@ impl App {
             index,
             focus: Focus::Query,
             query: String::new(),
+            render_matcher_query: None,
+            render_matchers: Vec::new(),
             project: String::new(),
             machine: String::new(),
             home_machines,
@@ -1050,6 +1054,13 @@ impl App {
 
     fn refresh_results(&mut self) {
         self.kickoff_search();
+    }
+
+    fn refresh_render_matchers(&mut self) {
+        if self.render_matcher_query.as_deref() != Some(self.query.as_str()) {
+            self.render_matchers = crate::cli::build_matchers(&self.query).unwrap_or_default();
+            self.render_matcher_query = Some(self.query.clone());
+        }
     }
 
     fn home_chart_is_filtered(&self) -> bool {
@@ -3577,14 +3588,15 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     }
 
     let (project_width, detail_width) = session_row_layout(&app.results, col_width as usize);
-    let terms = query_terms(&app.query);
+    app.refresh_render_matchers();
+    let matchers = &app.render_matchers;
     let items: Vec<ListItem> = app
         .results
         .iter()
         .map(|session| {
             ListItem::new(session_result_line(
                 session,
-                &terms,
+                matchers,
                 project_width,
                 detail_width,
                 theme,
@@ -3975,40 +3987,12 @@ fn timeline_chart_row_line(cells: &[(char, Color)], selected: bool) -> Line<'sta
     line
 }
 
-fn query_terms(query: &str) -> Vec<Vec<char>> {
-    let mut seen = HashSet::new();
-    let mut terms = Vec::new();
-    for part in query.split_whitespace() {
-        let cleaned = part.trim_matches(|c: char| !c.is_alphanumeric());
-        if cleaned.chars().count() < 2 {
-            continue;
-        }
-        let key = cleaned.to_lowercase();
-        if seen.insert(key.clone()) {
-            terms.push(key.chars().collect());
-        }
-    }
-    terms
-}
-
-fn find_term(hay: &[char], term: &[char], from: usize) -> Option<usize> {
-    if term.is_empty() || hay.len() < term.len() || from > hay.len() - term.len() {
-        return None;
-    }
-    (from..=hay.len() - term.len()).find(|&i| {
-        hay[i..i + term.len()]
-            .iter()
-            .zip(term)
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
-    })
-}
-
 /// Renders a window of `text` around the first query-term hit, with every
 /// term occurrence inside the window emphasized. Falls back to a plain
 /// truncated snippet when no term matches literally (e.g. embedding hits).
 fn match_context_spans(
     text: &str,
-    terms: &[Vec<char>],
+    matchers: &[regex::Regex],
     width: usize,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
@@ -4016,10 +4000,19 @@ fn match_context_spans(
         return Vec::new();
     }
     let chars: Vec<char> = text.chars().collect();
-    let first = terms
+    let mut matches: Vec<(usize, usize, usize)> = matchers
         .iter()
-        .filter_map(|term| find_term(&chars, term, 0))
-        .min();
+        .enumerate()
+        .flat_map(|(matcher_index, matcher)| {
+            matcher.find_iter(text).map(move |found| {
+                let start = text[..found.start()].chars().count();
+                let len = text[found.start()..found.end()].chars().count();
+                (start, start + len, matcher_index)
+            })
+        })
+        .collect();
+    matches.sort_unstable_by_key(|(start, _, matcher_index)| (*start, *matcher_index));
+    let first = matches.first().map(|(start, _, _)| *start);
     let Some(first) = first else {
         return vec![Span::styled(truncate_end(text, width), theme.muted)];
     };
@@ -4032,24 +4025,18 @@ fn match_context_spans(
     }
     let mut i = start;
     while i < end {
-        let mut best: Option<(usize, usize)> = None;
-        for term in terms {
-            if let Some(pos) = find_term(&chars, term, i)
-                && pos < end
-                && best.is_none_or(|(bp, _)| pos < bp)
-            {
-                best = Some((pos, term.len()));
-            }
-        }
-        match best {
-            Some((pos, len)) => {
+        let next = matches
+            .iter()
+            .find(|(match_start, _, _)| *match_start >= i && *match_start < end);
+        match next {
+            Some(&(pos, match_end, _)) => {
                 if pos > i {
                     spans.push(Span::styled(
                         chars[i..pos].iter().collect::<String>(),
                         theme.muted,
                     ));
                 }
-                let match_end = (pos + len).min(end);
+                let match_end = match_end.min(end);
                 spans.push(Span::styled(
                     chars[pos..match_end].iter().collect::<String>(),
                     theme.text_bold,
@@ -4141,7 +4128,7 @@ fn session_row_layout(results: &[SessionSummary], total_width: usize) -> (usize,
 /// (or the session id when there's no snippet to show).
 fn session_result_line(
     session: &SessionSummary,
-    terms: &[Vec<char>],
+    matchers: &[regex::Regex],
     project_width: usize,
     detail_width: usize,
     theme: &Theme,
@@ -4205,7 +4192,7 @@ fn session_result_line(
                 Style::default().fg(Color::Rgb(160, 120, 80)),
             ));
         }
-        spans.extend(match_context_spans(&snippet, terms, detail_width, theme));
+        spans.extend(match_context_spans(&snippet, matchers, detail_width, theme));
     }
     Line::from(spans)
 }
@@ -4451,13 +4438,14 @@ fn draw_sessions_panel(
         // Same mini-search-result rows as the home screen list.
         let (project_width, detail_width) =
             session_row_layout(&app.results, content.width as usize);
-        let terms = query_terms(&app.query);
+        app.refresh_render_matchers();
+        let matchers = &app.render_matchers;
         app.results
             .iter()
             .map(|session| {
                 ListItem::new(session_result_line(
                     session,
-                    &terms,
+                    matchers,
                     project_width,
                     detail_width,
                     theme,
@@ -7149,7 +7137,6 @@ mod tests {
     #[test]
     fn grouped_search_previews_keep_late_matches_visible() {
         let theme = Theme::new();
-        let terms = query_terms("fireduck");
         let matchers = crate::cli::build_matchers("fireduck").unwrap();
         for federated in [false, true] {
             let mut sessions = HashMap::new();
@@ -7176,11 +7163,53 @@ mod tests {
                 let summary = sessions.values().next().unwrap();
                 assert!(summary.snippet.contains(word));
                 assert!(summary.snippet.chars().count() <= 160);
-                let spans = match_context_spans(&summary.snippet, &terms, 50, &theme);
+                let spans = match_context_spans(&summary.snippet, &matchers, 50, &theme);
                 assert!(spans.iter().any(|span| {
                     span.content == word && span.style.add_modifier.contains(Modifier::BOLD)
                 }));
             }
+        }
+    }
+
+    #[test]
+    fn fielded_query_session_row_keeps_late_match_visible_at_minimum_width() {
+        let theme = Theme::new();
+        let matchers = crate::cli::build_matchers("text:fireduck").unwrap();
+        let text = format!(
+            "{}fireduck matching output",
+            "far away context ".repeat(100)
+        );
+        let mut sessions = HashMap::new();
+        add_record_to_session(&mut sessions, 1.0, record("assistant", &text), &matchers);
+
+        let line = session_result_line(&sessions["session"], &matchers, 8, 16, &theme);
+        let rendered: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(rendered.contains("fireduck"));
+        assert!(line.spans.iter().any(|span| {
+            span.content == "fireduck" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn plain_quoted_query_keeps_component_matches_highlighted() {
+        let theme = Theme::new();
+        let matchers = crate::cli::build_matchers("\"fireduck engine\"").unwrap();
+        let spans = match_context_spans(
+            "context before fireduck engine context after",
+            &matchers,
+            40,
+            &theme,
+        );
+
+        for expected in ["fireduck", "engine"] {
+            assert!(spans.iter().any(|span| {
+                span.content == expected && span.style.add_modifier.contains(Modifier::BOLD)
+            }));
         }
     }
 
@@ -7386,6 +7415,33 @@ mod tests {
         let (_tmp, app) = test_app();
         assert_eq!(app.layout_mode, LayoutMode::Home);
         assert!(matches!(app.focus, Focus::Query));
+    }
+
+    #[test]
+    fn render_matcher_cache_refreshes_for_exact_query_changes() {
+        let (_tmp, mut app) = test_app();
+        app.query = "text:fireduck".to_string();
+        app.refresh_render_matchers();
+        assert_eq!(app.render_matcher_query.as_deref(), Some("text:fireduck"));
+        assert!(
+            app.render_matchers
+                .iter()
+                .any(|matcher| matcher.is_match("FIREDUCK"))
+        );
+
+        app.query = "text:needlé".to_string();
+        app.refresh_render_matchers();
+        assert_eq!(app.render_matcher_query.as_deref(), Some("text:needlé"));
+        assert!(
+            app.render_matchers
+                .iter()
+                .any(|matcher| matcher.is_match("NEEDLÉ"))
+        );
+        assert!(
+            !app.render_matchers
+                .iter()
+                .any(|matcher| matcher.is_match("fireduck"))
+        );
     }
 
     #[test]
@@ -7861,8 +7917,8 @@ mod tests {
     #[test]
     fn match_context_spans_bolds_the_hit() {
         let theme = Theme::new();
-        let terms = query_terms("sqlite");
-        let spans = match_context_spans("we fixed the sqlite reads today", &terms, 40, &theme);
+        let matchers = crate::cli::build_matchers("sqlite").unwrap();
+        let spans = match_context_spans("we fixed the sqlite reads today", &matchers, 40, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "we fixed the sqlite reads today");
         assert!(
@@ -7875,9 +7931,9 @@ mod tests {
     #[test]
     fn match_context_spans_windows_long_text() {
         let theme = Theme::new();
-        let terms = query_terms("needle");
+        let matchers = crate::cli::build_matchers("needle").unwrap();
         let text = format!("{} needle {}", "x".repeat(100), "y".repeat(100));
-        let spans = match_context_spans(&text, &terms, 30, &theme);
+        let spans = match_context_spans(&text, &matchers, 30, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(joined.starts_with('…'));
         assert!(joined.ends_with('…'));
@@ -7887,8 +7943,8 @@ mod tests {
     #[test]
     fn match_context_spans_fall_back_without_literal_hit() {
         let theme = Theme::new();
-        let terms = query_terms("zzz");
-        let spans = match_context_spans("completely unrelated text", &terms, 12, &theme);
+        let matchers = crate::cli::build_matchers("zzz").unwrap();
+        let spans = match_context_spans("completely unrelated text", &matchers, 12, &theme);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "completely …");
     }

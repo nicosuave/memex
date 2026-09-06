@@ -513,6 +513,37 @@ struct ActivityPoint {
     value: u64,
 }
 
+#[derive(Default)]
+struct AllowedUsageScopes {
+    exact: HashSet<(String, String, String)>,
+    copilot_session_ids: HashSet<String>,
+}
+
+impl AllowedUsageScopes {
+    fn insert(&mut self, scope: (String, String, String)) {
+        if scope.0 == "copilot" {
+            self.copilot_session_ids.insert(scope.1.clone());
+        }
+        self.exact.insert(scope);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    fn contains(&self, source: &str, session_id: &str, source_path: &str) -> bool {
+        if source == "copilot" {
+            self.copilot_session_ids.contains(session_id)
+        } else {
+            self.exact.contains(&(
+                source.to_string(),
+                session_id.to_string(),
+                source_path.to_string(),
+            ))
+        }
+    }
+}
+
 fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityPayload> {
     let config = UserConfig::load(paths)?;
     let token_usage_enabled = config.token_usage_enabled();
@@ -580,7 +611,10 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                     )
                 })
                 .filter(|scope| matching_scopes.contains(scope))
-                .collect::<HashSet<_>>();
+                .fold(AllowedUsageScopes::default(), |mut scopes, scope| {
+                    scopes.insert(scope);
+                    scopes
+                });
             if allowed_scopes.is_empty() {
                 false
             } else {
@@ -602,11 +636,11 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                     let Some(session_id) = event.session_id else {
                         continue;
                     };
-                    if !allowed_scopes.contains(&(
-                        event.source.to_string(),
-                        session_id,
-                        event.source_path.to_string(),
-                    )) {
+                    if !allowed_scopes.contains(
+                        event.source,
+                        &session_id,
+                        event.source_path.as_ref(),
+                    ) {
                         continue;
                     }
                     add_activity_value(
@@ -2362,6 +2396,91 @@ mod tests {
         assert_eq!(total("searchtrino"), 10);
         assert_eq!(total("missing-query"), 0);
         assert_eq!(total(""), 100);
+    }
+
+    #[test]
+    fn token_activity_query_correlates_copilot_session_state_with_otel_usage() {
+        use crate::analytics::AnalyticsWriter;
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.root.join("config.toml"), "token_usage = true\n").unwrap();
+
+        let copilot_root = temp.path().join("copilot");
+        let session_path = |session_id: &str| {
+            copilot_root
+                .join("session-state")
+                .join(session_id)
+                .join("events.jsonl")
+        };
+        let matching_path = session_path("matching-session");
+        let other_path = session_path("other-session");
+        std::fs::create_dir_all(matching_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        std::fs::write(&matching_path, "").unwrap();
+        std::fs::write(&other_path, "").unwrap();
+        let otel_dir = copilot_root.join("otel");
+        std::fs::create_dir_all(&otel_dir).unwrap();
+        let span = |trace: &str, session: &str, input: u64| {
+            format!(
+                r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"name":"chat","traceId":"{trace}","spanId":"span","startTimeUnixNano":"1750000000000000000","attributes":[{{"key":"gen_ai.usage.input_tokens","value":{{"intValue":"{input}"}}}},{{"key":"gen_ai.conversation.id","value":{{"stringValue":"{session}"}}}}]}}]}}]}}]}}"#
+            )
+        };
+        std::fs::write(
+            otel_dir.join("usage.jsonl"),
+            format!(
+                "{}\n{}\n",
+                span("matching-trace", "matching-session", 10),
+                span("other-trace", "other-session", 90)
+            ),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set_os(&[("COPILOT_HOME", Some(copilot_root.as_os_str()))]);
+
+        let now = Utc::now().timestamp_millis().max(0) as u64;
+        let mut matching = record(
+            1,
+            "matching-session",
+            matching_path.to_string_lossy().as_ref(),
+            "searchtrino".to_string(),
+        );
+        matching.source = SourceKind::Copilot;
+        matching.ts = now;
+        let mut other = record(
+            2,
+            "other-session",
+            other_path.to_string_lossy().as_ref(),
+            "unrelated".to_string(),
+        );
+        other.source = SourceKind::Copilot;
+        other.ts = now;
+        let records = vec![matching, other];
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for value in &records {
+            analytics.record(value).unwrap();
+        }
+        analytics.flush().unwrap();
+        drop(analytics);
+        publish_records(&paths, records);
+
+        let request = ActivityRequest::from_url(
+            &parse_url(
+                "/api/activity?metric=tokens&range=all&origin=all&source=copilot&q=searchtrino",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let total = activity_payload(&paths, &request)
+            .unwrap()
+            .points
+            .iter()
+            .map(|point| point.value)
+            .sum::<u64>();
+
+        assert_eq!(total, 10);
     }
 
     #[test]
