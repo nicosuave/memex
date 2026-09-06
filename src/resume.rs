@@ -48,7 +48,7 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
             Some("codex resume {session_id}".to_string())
         }
         "opencode" if remote || find_in_path("opencode").is_some() => {
-            Some("opencode resume {session_id}".to_string())
+            Some("opencode --session {session_id}".to_string())
         }
         "cursor" => (remote || find_in_path("cursor-agent").is_some())
             .then(|| "cursor-agent --resume {session_id}".to_string()),
@@ -156,6 +156,14 @@ mod tests {
         assert_eq!(
             default_resume_template("omp", true).as_deref(),
             Some("omp --resume {source_path_shell}")
+        );
+    }
+
+    #[test]
+    fn remote_opencode_default_uses_session_flag() {
+        assert_eq!(
+            default_resume_template("opencode", true).as_deref(),
+            Some("opencode --session {session_id}")
         );
     }
 }
