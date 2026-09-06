@@ -43,13 +43,14 @@ Stop after two reformulation rounds unless the user requests exhaustive research
 
 ## Search and refine
 
-### Memory notes and supporting history
+### Prior decisions and work
 
-Search defaults to conversations. When the question concerns saved agent memories,
-use `memex search "topic" --content memories`; use `--content all` when both notes
-and their supporting conversations matter. MCP `search` accepts the same `content`
-values. Keep provider selection separate (`--source claude` or `--source codex`).
-Session-only filters and commands retain their conversation meaning.
+For questions about prior decisions, established preferences, project conventions,
+or previous work, use `memex search "topic" --content all` to search memories and
+conversations together. Use `--content memories` when specifically inspecting saved
+notes. Search without `--content` remains conversation-only. MCP `search` accepts
+the same `content` values. Keep provider selection separate (`--source claude` or
+`--source codex`). Session-only filters and commands retain their conversation meaning.
 
 Memory hits have a `memory_id`, `content_version`, `section_ref`, and source
 metadata; mixed results also have `kind: "memory"`. Pass the returned memory
@@ -73,7 +74,7 @@ summary is authoritative merely because it is concise.
 
 ```bash
 memex search "exact anchor" --cwd . --unique-session --limit 20 --format toon
-memex search "remembered concept" --mode hybrid --project <project> --unique-session --format toon
+memex search "remembered concept" --content all --mode hybrid --project <project> --unique-session --format toon
 memex search "anchor" --query "another view" --unique-session --format toon
 ```
 
