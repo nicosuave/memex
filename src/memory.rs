@@ -1031,6 +1031,17 @@ fn parse_sections(content: &str) -> (Vec<MemorySection>, Option<String>) {
             &base_id,
         );
     }
+    // Heading slugs and generated occurrence/chunk suffixes share one namespace.
+    // Reserve final emitted IDs so a literal heading cannot alias another section.
+    let mut emitted_ids = HashSet::new();
+    for section in &mut sections {
+        let base = section.id.clone();
+        let mut suffix = 2;
+        while !emitted_ids.insert(section.id.clone()) {
+            section.id = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+    }
     (sections, title)
 }
 
@@ -1692,6 +1703,33 @@ mod tests {
             0
         );
         assert!(document.sections.len() >= 3);
+    }
+
+    #[test]
+    fn section_ids_remain_unique_across_heading_and_chunk_suffixes() {
+        for content in [
+            "# Topic\nfirst\n# Topic\nsecond\n# Topic-2\nthird\n# Topic-2-2\nfourth\n".to_string(),
+            format!(
+                "# Topic\n{}\n# Topic-part-1\nlast\n",
+                "x".repeat(MAX_MEMORY_SECTION_CHARS)
+            ),
+            format!(
+                "# Topic-part-1\nfirst\n# Topic\n{}\n",
+                "x".repeat(MAX_MEMORY_SECTION_CHARS)
+            ),
+        ] {
+            let (sections, _) = parse_sections(&content);
+            let ids: HashSet<_> = sections.iter().map(|section| &section.id).collect();
+            assert_eq!(ids.len(), sections.len(), "duplicate IDs: {sections:?}");
+            assert_eq!(
+                sections
+                    .iter()
+                    .map(|section| section.content.as_str())
+                    .collect::<String>(),
+                content
+            );
+            assert_eq!(sections, parse_sections(&content).0);
+        }
     }
 
     #[test]
