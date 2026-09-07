@@ -1,5 +1,5 @@
 use memex::{
-    analytics::{AnalyticsStore, analytics_path, backfill_from_index},
+    analytics::{AnalyticsStore, UNFILED_PROJECT, analytics_path, backfill_from_index},
     config::Paths,
     index::SearchIndex,
     memory::{MemoryDiscoveryOptions, MemoryStore},
@@ -435,7 +435,10 @@ fn sessions_match_cli_and_do_not_auto_index() {
     let mut client = Client::command(root.path(), |command| {
         command.env("HOME", root.path());
     });
-    let result = client.call("sessions", json!({"project":"mcp-test","source":"codex"}));
+    let result = client.call(
+        "sessions",
+        json!({"project":UNFILED_PROJECT,"source":"codex"}),
+    );
     assert_eq!(result["results"].as_array().unwrap().len(), 1);
     assert_eq!(result["results"][0]["machine"], "local");
     assert_eq!(result["results"][0]["session_id"], "session");
@@ -450,7 +453,7 @@ fn sessions_match_cli_and_do_not_auto_index() {
             "--no-update-check",
             "sessions",
             "--project",
-            "mcp-test",
+            UNFILED_PROJECT,
             "--source",
             "codex",
             "--json-array",
