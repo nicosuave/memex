@@ -627,6 +627,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                     until_ms: None,
                     cost_mode: CostMode::Source,
                     include_events: true,
+                    include_reviews: params.origin == SessionKindFilter::All,
                     cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                     memo_ttl_ms: 60_000,
                 };
@@ -655,10 +656,13 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
             }
         }
         (ActivityMetric::Tokens, None) => {
-            // Restrict token activity to the selected origin via the sessions
-            // that survive the same filter: usage events carry no kind of
-            // their own, so the session roster is the source of truth.
-            let session_keys = if params.origin == SessionKindFilter::All {
+            // Interactive/subagent subsets need the indexed session roster.
+            // Regular/all can include unindexed usage; the event review marker
+            // provides permission-review filtering independently.
+            let session_keys = if matches!(
+                params.origin,
+                SessionKindFilter::All | SessionKindFilter::Regular
+            ) {
                 None
             } else {
                 let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
@@ -690,6 +694,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 until_ms: None,
                 cost_mode: CostMode::Source,
                 include_events: false,
+                include_reviews: params.origin == SessionKindFilter::All,
                 cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                 memo_ttl_ms: 60_000,
             };
@@ -1180,9 +1185,10 @@ fn parse_origin(value: &str) -> Result<SessionKindFilter> {
     match value {
         "" | "interactive" => Ok(SessionKindFilter::Primary),
         "subagent" => Ok(SessionKindFilter::Subagent),
+        "regular" => Ok(SessionKindFilter::Regular),
         "all" => Ok(SessionKindFilter::All),
         _ => Err(anyhow!(
-            "unknown origin: {value} (expected interactive, subagent, or all)"
+            "unknown origin: {value} (expected interactive, subagent, regular, or all)"
         )),
     }
 }
@@ -2605,6 +2611,7 @@ mod tests {
         for (query, expected) in [
             ("subagent", SessionKindFilter::Subagent),
             ("all", SessionKindFilter::All),
+            ("regular", SessionKindFilter::Regular),
             ("interactive", SessionKindFilter::Primary),
             ("", SessionKindFilter::Primary),
         ] {
@@ -3239,9 +3246,11 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
         let mut writer = index.writer().unwrap();
-        for (doc_id, session_id, kind) in
-            [(1, "session-main", "main"), (2, "session-sub", "subagent")]
-        {
+        for (doc_id, session_id, kind) in [
+            (1, "session-main", "main"),
+            (2, "session-sub", "subagent"),
+            (3, "session-review", "guardian_review"),
+        ] {
             index
                 .add_record(
                     &mut writer,
@@ -3305,7 +3314,10 @@ mod tests {
         );
         let mut all = ids(payload_for(SessionKindFilter::All));
         all.sort();
-        assert_eq!(all, vec!["session-main", "session-sub"]);
+        assert_eq!(all, vec!["session-main", "session-review", "session-sub"]);
+        let mut regular = ids(payload_for(SessionKindFilter::Regular));
+        regular.sort();
+        assert_eq!(regular, vec!["session-main", "session-sub"]);
     }
 
     #[test]
@@ -3319,7 +3331,11 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let mut writer =
             AnalyticsWriter::open(analytics_path(&paths.state)).expect("open analytics");
-        for (session_id, kind, ts) in [("s-main", "main", now_ms), ("s-sub", "subagent", now_ms)] {
+        for (session_id, kind, ts) in [
+            ("s-main", "main", now_ms),
+            ("s-sub", "subagent", now_ms),
+            ("s-review", "guardian_review", now_ms),
+        ] {
             writer
                 .record(&Record {
                     source: SourceKind::Claude,
@@ -3364,7 +3380,8 @@ mod tests {
         };
         assert_eq!(total(SessionKindFilter::Primary), 1);
         assert_eq!(total(SessionKindFilter::Subagent), 1);
-        assert_eq!(total(SessionKindFilter::All), 2);
+        assert_eq!(total(SessionKindFilter::Regular), 2);
+        assert_eq!(total(SessionKindFilter::All), 3);
     }
 
     #[test]

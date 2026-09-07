@@ -840,6 +840,7 @@ pub(crate) fn parse_usage_file_for(
                 conservative_undercount: false,
                 cache_chain_excluded: false,
                 sidechain: false,
+                permission_review: false,
                 source_order: index,
             });
         }

@@ -1082,7 +1082,8 @@ function App() {
                 <SelectGroup>
                   <SelectItem value="interactive">interactive</SelectItem>
                   <SelectItem value="subagent">subagent</SelectItem>
-                  <SelectItem value="all">all origins</SelectItem>
+                  <SelectItem value="regular">regular (no permission reviews)</SelectItem>
+                  <SelectItem value="all">all (includes permission reviews)</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1412,7 +1413,8 @@ function App() {
                             Interactive
                           </SelectItem>
                           <SelectItem value="subagent">Subagent</SelectItem>
-                          <SelectItem value="all">All origins</SelectItem>
+                          <SelectItem value="regular">Regular (no permission reviews)</SelectItem>
+                          <SelectItem value="all">All (includes permission reviews)</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>

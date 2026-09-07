@@ -79,3 +79,26 @@ test("sidebar replaces counts with a shared sort control without reopening the t
   expect(api.calls.filter((url) => url.pathname === "/api/session").length).toBe(count)
   expect(api.calls.some((url) => url.pathname === "/api/stats")).toBe(false)
 })
+
+for (const mobile of [false, true]) {
+  test(`permission reviews require origin opt-in on ${mobile ? "mobile" : "desktop"}`, async ({ page }) => {
+    await page.setViewportSize({ width: mobile ? 390 : 1280, height: 900 })
+    const api = await mockSortedResults(page)
+    await page.goto("/?q=needle")
+    const origin = page.locator(".home-result-filters").getByRole("combobox", { name: "Origin", exact: true })
+    await expect(origin).toHaveText("interactive")
+    await expect.poll(() => api.calls.some((url) => url.pathname === "/api/search")).toBe(true)
+    expect(api.calls.filter((url) => url.pathname === "/api/search").every((url) => !url.searchParams.has("origin"))).toBe(true)
+    await origin.click()
+    await page.getByRole("option", { name: "all (includes permission reviews)", exact: true }).click()
+    await expect(page).toHaveURL(/origin=all/)
+    await expect.poll(() => api.calls.some((url) => url.pathname === "/api/search" && url.searchParams.get("origin") === "all")).toBe(true)
+    await expect.poll(() => api.calls.some((url) => url.pathname === "/api/activity" && url.searchParams.get("origin") === "all")).toBe(true)
+    await origin.click()
+    await page.getByRole("option", { name: "regular (no permission reviews)", exact: true }).click()
+    await expect(page).toHaveURL(/origin=regular/)
+    await expect.poll(() => api.calls.some((url) => url.pathname === "/api/search" && url.searchParams.get("origin") === "regular")).toBe(true)
+    await page.reload()
+    await expect(origin).toHaveText("regular (no permission reviews)")
+  })
+}

@@ -592,6 +592,13 @@ Search accepts `query`, `additional_queries` (up to eight queries total), `mode`
 `top_n_per_session: 2` for two hits per session or `unique_session: false` for
 individual matches. Search and sessions accept at most 500 results.
 
+Permission-review sessions are hidden by default. CLI search, session listing, usage,
+and MCP search/listing use `origin=regular`, which keeps ordinary subagents visible.
+Use `--origin all` (MCP: `"origin": "all"`) to include permission reviews. The TUI
+and web retain their interactive default; select **all** in the origin filter to
+include reviews. Explicit reads by session or record ID remain available.
+Existing Codex sessions are reclassified on the next index run.
+
 Read tools share a default 16,000 Unicode-character content budget, adjustable
 with `max_chars` from 1 to 64,000. Metadata is outside that budget. Inspect
 `content.truncated` and `content.continuations`: `next_offset` advances records,

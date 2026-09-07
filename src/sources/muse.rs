@@ -626,6 +626,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 conservative_undercount: false,
                 cache_chain_excluded: false,
                 sidechain: false,
+                permission_review: false,
                 source_order: 0,
             });
         }

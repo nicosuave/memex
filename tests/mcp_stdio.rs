@@ -421,6 +421,79 @@ fn search_reuses_cli_fusion_projection_and_observes_new_generations() {
 }
 
 #[test]
+fn permission_reviews_are_opt_in_in_cli_and_mcp_discovery() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("config.toml"),
+        "auto_index_on_search = false\n",
+    )
+    .unwrap();
+    let records: Vec<_> = [
+        ("main", "main"),
+        ("worker", "subagent"),
+        ("review", "guardian_review"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (id, kind))| {
+        let mut rec = record(i as u64 + 1, "needle permission fixture");
+        rec.session_id = id.into();
+        rec.links.conversation_kind = Some(kind.into());
+        rec
+    })
+    .collect();
+    seed_index(root.path(), &records);
+    let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    backfill_from_index(analytics_path(&paths.state), &index).unwrap();
+    let mut client = Client::start(root.path());
+    for tool in ["search", "sessions"] {
+        for all in [false, true] {
+            let mut args = if tool == "search" {
+                json!({"query":"needle","machines":["local"]})
+            } else {
+                json!({})
+            };
+            if all {
+                args["origin"] = json!("all");
+            }
+            let result = client.call(tool, args);
+            let rows = result["results"].as_array().unwrap();
+            assert_eq!(rows.len(), if all { 3 } else { 2 }, "{result}");
+            assert_eq!(rows.iter().any(|row| row["session_id"] == "review"), all);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
+            command.arg(tool);
+            if tool == "search" {
+                command.args(["needle", "--machine", "local"]);
+            }
+            if all {
+                command.args(["--origin", "all"]);
+            }
+            let output = command
+                .args(["--format", "json", "--root"])
+                .arg(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(cli.as_array().unwrap().len(), rows.len(), "{cli}");
+            assert_eq!(
+                cli.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["session_id"] == "review"),
+                all
+            );
+        }
+    }
+    client.stop();
+}
+
+#[test]
 fn sessions_match_cli_and_do_not_auto_index() {
     let (root, _) = fixture();
     let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();

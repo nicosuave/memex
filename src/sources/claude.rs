@@ -667,6 +667,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                     dedupe_confidence: if exact_dedupe { "exact" } else { "heuristic" },
                     conservative_undercount: false,
                     cache_chain_excluded: false,
+                    permission_review: false,
                     sidechain: value
                         .get("isSidechain")
                         .and_then(|value| value.as_bool())

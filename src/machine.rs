@@ -233,9 +233,9 @@ pub struct UsageSpec {
     pub cost_mode: CostMode,
     pub include_events: bool,
     pub memo_ttl_ms: u64,
-    /// Origin filter (`interactive` / `subagent` / `all`). `None` and `All`
-    /// both mean no restriction; kept `Option` for RPC compatibility with
-    /// peers that predate the field.
+    /// Origin filter. None/Regular exclude permission reviews without requiring
+    /// indexed sessions; All explicitly includes reviews. Optional for RPC
+    /// requests from peers that predate the field.
     #[serde(default)]
     pub kind: Option<SessionKindFilter>,
 }
@@ -2034,7 +2034,7 @@ fn session_activity_local(
         spec.until_ms,
         spec.project.as_deref(),
         spec.project_grouping,
-        spec.kind,
+        Some(spec.kind.unwrap_or_default()),
     )?;
     Ok(rows
         .into_iter()
@@ -2074,8 +2074,8 @@ fn apply_kind_to_session_keys(
     kind: Option<SessionKindFilter>,
     allowed: Option<HashSet<(String, String)>>,
 ) -> Option<HashSet<(String, String)>> {
-    let kind = kind.unwrap_or(SessionKindFilter::All);
-    if kind == SessionKindFilter::All {
+    let kind = kind.unwrap_or(SessionKindFilter::Regular);
+    if matches!(kind, SessionKindFilter::All | SessionKindFilter::Regular) {
         return session_keys;
     }
     let allowed = allowed?;
@@ -2090,8 +2090,8 @@ fn usage_query(paths: &Paths, spec: &UsageSpec) -> Result<UsageQuery> {
         .session_keys
         .as_ref()
         .map(|keys| keys.iter().cloned().collect());
-    let allowed = match spec.kind.unwrap_or(SessionKindFilter::All) {
-        SessionKindFilter::All => None,
+    let allowed = match spec.kind.unwrap_or(SessionKindFilter::Regular) {
+        SessionKindFilter::All | SessionKindFilter::Regular => None,
         kind => Some(usage_session_keys_for_kind(paths, kind)?),
     };
     Ok(UsageQuery {
@@ -2103,6 +2103,7 @@ fn usage_query(paths: &Paths, spec: &UsageSpec) -> Result<UsageQuery> {
         until_ms: spec.until_ms,
         cost_mode: spec.cost_mode,
         include_events: spec.include_events,
+        include_reviews: spec.kind == Some(SessionKindFilter::All),
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: spec.memo_ttl_ms,
     })
@@ -3288,6 +3289,41 @@ mod tests {
     }
 
     #[test]
+    fn default_usage_review_filter_does_not_require_indexed_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        let mut spec = UsageSpec {
+            source: None,
+            project: None,
+            project_grouping: ProjectGrouping::Flat,
+            session_keys: None,
+            machine_session_keys: None,
+            since_ms: None,
+            until_ms: None,
+            cost_mode: CostMode::Source,
+            include_events: false,
+            memo_ttl_ms: 0,
+            kind: None,
+        };
+        for kind in [
+            None,
+            Some(SessionKindFilter::Regular),
+            Some(SessionKindFilter::All),
+        ] {
+            spec.kind = kind;
+            let query = usage_query(&paths, &spec).expect("query without analytics database");
+            assert!(query.session_keys.is_none());
+            assert_eq!(query.include_reviews, kind == Some(SessionKindFilter::All));
+        }
+        spec.session_keys = Some(vec![("codex".into(), "unindexed".into())]);
+        spec.kind = Some(SessionKindFilter::Regular);
+        assert_eq!(
+            usage_query(&paths, &spec).unwrap().session_keys,
+            Some(HashSet::from([("codex".into(), "unindexed".into())]))
+        );
+    }
+
+    #[test]
     fn usage_query_resolves_origin_filter_against_analytics() {
         let tmp = TempDir::new().unwrap();
         let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
@@ -3385,7 +3421,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let mut analytics =
             AnalyticsWriter::open(analytics_path(&paths.state)).expect("analytics writer");
-        for (session_id, ts) in [("old", 10), ("new", 20)] {
+        for (session_id, ts) in [("old", 10), ("new", 20), ("review", 30)] {
             analytics
                 .record(&Record {
                     source: SourceKind::Codex,
@@ -3399,7 +3435,11 @@ mod tests {
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
-                    links: RecordLinks::default(),
+                    links: RecordLinks {
+                        conversation_kind: (session_id == "review")
+                            .then(|| "guardian_review".into()),
+                        ..RecordLinks::default()
+                    },
                     source_path: format!("{session_id}.jsonl"),
                 })
                 .expect("record session");
@@ -3422,6 +3462,19 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].timestamp_ms, 10);
         assert_eq!(points[1].timestamp_ms, 20);
+        let all = session_activity_local(
+            &paths,
+            &SessionActivitySpec {
+                source: Some(SourceFilter::Codex),
+                project: None,
+                project_grouping: ProjectGrouping::Flat,
+                since_ms: None,
+                until_ms: None,
+                kind: Some(SessionKindFilter::All),
+            },
+        )
+        .unwrap();
+        assert_eq!(all.len(), 3);
     }
 
     #[test]

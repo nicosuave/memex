@@ -45,28 +45,21 @@ pub enum SessionKindFilter {
     Primary,
     Subagent,
     #[default]
+    Regular,
     All,
 }
 
 impl SessionKindFilter {
-    /// Row-level predicate shared by SQL filters, the TUI, and CLI search:
-    /// interactive is (missing or 'main'); every other stored kind buckets
-    /// as subagent.
-    ///
-    /// The bucketing is intentionally lossy: the store keeps six session
-    /// kinds (`main`, `subagent`, `fork`, `sidechain`, `compaction`,
-    /// `branch`) but the query surface only switches on interactive or
-    /// not — forked, compacted, branched, and sidechain sessions are all
-    /// "not the user's own turn". Per-kind fidelity is not destroyed: it
-    /// stays on the `conversation_kind` column and on per-record links
-    /// for graph/search grouping. If this predicate ever gains a third
-    /// bucket, the `every_stored_kind_has_a_defined_filter_bucket` test
-    /// names every kind that must be reconsidered.
+    /// Shared origin predicate. Regular includes ordinary sessions of every
+    /// kind; permission reviews require the explicit All filter.
     pub fn matches_kind(self, kind: Option<&str>) -> bool {
         match self {
             SessionKindFilter::All => true,
+            SessionKindFilter::Regular => kind != Some("guardian_review"),
             SessionKindFilter::Primary => kind.is_none() || kind == Some("main"),
-            SessionKindFilter::Subagent => kind.is_some() && kind != Some("main"),
+            SessionKindFilter::Subagent => {
+                kind.is_some() && kind != Some("main") && kind != Some("guardian_review")
+            }
         }
     }
 }
@@ -371,7 +364,13 @@ impl AnalyticsStore {
                 }
                 SessionKindFilter::Subagent => {
                     clauses.push(
-                        "conversation_kind IS NOT NULL AND conversation_kind != 'main'".to_string(),
+                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
+                    );
+                }
+                SessionKindFilter::Regular => {
+                    clauses.push(
+                        "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
+                            .to_string(),
                     );
                 }
                 SessionKindFilter::All => {}
@@ -492,7 +491,13 @@ impl AnalyticsStore {
                 }
                 SessionKindFilter::Subagent => {
                     clauses.push(
-                        "conversation_kind IS NOT NULL AND conversation_kind != 'main'".to_string(),
+                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
+                    );
+                }
+                SessionKindFilter::Regular => {
+                    clauses.push(
+                        "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
+                            .to_string(),
                     );
                 }
                 SessionKindFilter::All => {}
@@ -667,7 +672,13 @@ impl AnalyticsStore {
                 }
                 SessionKindFilter::Subagent => {
                     clauses.push(
-                        "conversation_kind IS NOT NULL AND conversation_kind != 'main'".to_string(),
+                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
+                    );
+                }
+                SessionKindFilter::Regular => {
+                    clauses.push(
+                        "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
+                            .to_string(),
                     );
                 }
                 SessionKindFilter::All => {}
@@ -2578,9 +2589,7 @@ mod tests {
 
     #[test]
     fn every_stored_kind_has_a_defined_filter_bucket() {
-        // Contract: Primary is (NULL or 'main'); every other stored kind
-        // filters as subagent. If the predicate ever changes, this test
-        // names every kind that must be reconsidered.
+        // Exercise every stored kind through SQL and the in-memory predicate.
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("analytics.sqlite");
         let mut writer = AnalyticsWriter::open(&db).expect("open");
@@ -2591,6 +2600,7 @@ mod tests {
             ("s-side", "sidechain", 40),
             ("s-compact", "compaction", 50),
             ("s-branch", "branch", 60),
+            ("s-review", "guardian_review", 70),
         ] {
             let path = tmp.path().join(format!("{id}.jsonl"));
             fs::write(&path, "").expect("write");
@@ -2617,12 +2627,39 @@ mod tests {
             sub,
             vec!["s-branch", "s-compact", "s-fork", "s-side", "s-sub"]
         );
+        assert_eq!(filtered(SessionKindFilter::Regular).len(), 6);
+        assert_eq!(filtered(SessionKindFilter::All).len(), 7);
+        for filter in [
+            SessionKindFilter::Primary,
+            SessionKindFilter::Subagent,
+            SessionKindFilter::Regular,
+            SessionKindFilter::All,
+        ] {
+            let rows = store
+                .query_sessions_filtered(
+                    None,
+                    None,
+                    None,
+                    ProjectGrouping::Flat,
+                    Some(filter),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(rows.len(), filtered(filter).len());
+            for row in rows {
+                assert!(filter.matches_kind(row.conversation_kind.as_deref()));
+            }
+            assert_eq!(
+                filter.matches_kind(Some("guardian_review")),
+                filter == SessionKindFilter::All
+            );
+        }
         assert_eq!(
             store
                 .query_sessions_detailed(None, None, None, None, None)
                 .expect("all")
                 .len(),
-            6
+            7
         );
     }
 

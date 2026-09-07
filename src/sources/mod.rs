@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 pub enum ConversationKind {
     Main,
     Subagent,
+    GuardianReview,
     Sidechain,
     Fork,
     Branch,
@@ -46,6 +47,7 @@ impl ConversationKind {
         match self {
             Self::Main => "main",
             Self::Subagent => "subagent",
+            Self::GuardianReview => "guardian_review",
             Self::Sidechain => "sidechain",
             Self::Fork => "fork",
             Self::Branch => "branch",

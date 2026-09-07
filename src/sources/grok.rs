@@ -605,6 +605,7 @@ fn grok_usage_event(
         conservative_undercount: false,
         cache_chain_excluded: true,
         sidechain: false,
+        permission_review: false,
         source_order,
     }
 }

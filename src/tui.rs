@@ -73,6 +73,7 @@ enum SearchUpdate {
         range: TimelineRange,
         grouping: ProjectDisplayMode,
         query: String,
+        kind: crate::analytics::SessionKindFilter,
     },
     SearchError {
         request_id: u64,
@@ -559,8 +560,20 @@ struct App {
     timeline_rows: Vec<ProjectTimelineRow>,
     timeline_scroll: usize,
     timeline_selected: usize,
-    timeline_loaded: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
-    timeline_displayed: Option<(SourceChoice, TimelineRange, ProjectDisplayMode, String)>,
+    timeline_loaded: Option<(
+        SourceChoice,
+        TimelineRange,
+        ProjectDisplayMode,
+        String,
+        crate::analytics::SessionKindFilter,
+    )>,
+    timeline_displayed: Option<(
+        SourceChoice,
+        TimelineRange,
+        ProjectDisplayMode,
+        String,
+        crate::analytics::SessionKindFilter,
+    )>,
     timeline_state: LoadState,
     active_timeline_request: u64,
     home_activity: Vec<HomeChartPoint>,
@@ -1361,11 +1374,12 @@ impl App {
         let query = self.query.trim().to_string();
         let paths = self.paths.clone();
         let tx = self.search_tx.clone();
-        self.timeline_loaded = Some((source, range, grouping, query.clone()));
+        let kind = self.session_kind;
+        self.timeline_loaded = Some((source, range, grouping, query.clone(), kind));
         self.set_status("loading timeline...");
         std::thread::spawn(move || {
             let result =
-                build_project_timeline(&paths, source.as_filter(), range, grouping, &query);
+                build_project_timeline(&paths, source.as_filter(), range, grouping, &query, kind);
             match result {
                 Ok(rows) => {
                     let _ = tx.send(SearchUpdate::Timeline {
@@ -1375,6 +1389,7 @@ impl App {
                         range,
                         grouping,
                         query,
+                        kind,
                     });
                 }
                 Err(err) => {
@@ -1511,6 +1526,7 @@ impl App {
             now_ms(),
             self.paths.state.join("usage-cache.sqlite3"),
         );
+        query.include_reviews = session_kind == crate::analytics::SessionKindFilter::All;
         std::thread::spawn(move || {
             if !config.machines.is_empty() {
                 let result = federated_usage_activity(
@@ -1564,7 +1580,11 @@ impl App {
             // origin-filtered results; with an empty query the usage scan
             // is otherwise unfiltered, so resolve the origin here.
             if query.session_keys.is_none()
-                && session_kind != crate::analytics::SessionKindFilter::All
+                && !matches!(
+                    session_kind,
+                    crate::analytics::SessionKindFilter::All
+                        | crate::analytics::SessionKindFilter::Regular
+                )
             {
                 match crate::machine::usage_session_keys_for_kind(&paths, session_kind) {
                     Ok(keys) => query.session_keys = Some(keys),
@@ -1670,6 +1690,7 @@ impl App {
                 "all".to_string(),
                 "interactive".to_string(),
                 "subagent".to_string(),
+                "regular".to_string(),
             ],
             HomeDropdown::Project => {
                 let mut options = vec!["all projects".to_string()];
@@ -1703,6 +1724,7 @@ impl App {
                 .unwrap_or(0),
             HomeDropdown::Kind => match self.session_kind {
                 crate::analytics::SessionKindFilter::All => 0,
+                crate::analytics::SessionKindFilter::Regular => 3,
                 crate::analytics::SessionKindFilter::Primary => 1,
                 crate::analytics::SessionKindFilter::Subagent => 2,
             },
@@ -1783,6 +1805,7 @@ impl App {
                     0 => crate::analytics::SessionKindFilter::All,
                     1 => crate::analytics::SessionKindFilter::Primary,
                     2 => crate::analytics::SessionKindFilter::Subagent,
+                    3 => crate::analytics::SessionKindFilter::Regular,
                     _ => crate::analytics::SessionKindFilter::Primary,
                 };
                 true
@@ -2036,13 +2059,15 @@ impl App {
                 range,
                 grouping,
                 query,
+                kind,
             } if request_id == self.active_timeline_request
                 && self.timeline_loaded.as_ref().is_some_and(
-                    |(loaded_source, loaded_range, loaded_grouping, loaded_query)| {
+                    |(loaded_source, loaded_range, loaded_grouping, loaded_query, loaded_kind)| {
                         *loaded_source == source
                             && *loaded_range == range
                             && *loaded_grouping == grouping
                             && loaded_query == &query
+                            && *loaded_kind == kind
                     },
                 ) =>
             {
@@ -2054,7 +2079,7 @@ impl App {
                 };
                 self.timeline_scroll = 0;
                 self.timeline_selected = 0;
-                self.timeline_displayed = Some((source, range, grouping, query));
+                self.timeline_displayed = Some((source, range, grouping, query, kind));
                 self.set_status(format!("{} projects", self.timeline_rows.len()));
             }
             SearchUpdate::SearchError {
@@ -2348,16 +2373,23 @@ impl App {
             crate::analytics::SessionKindFilter::All => {
                 crate::analytics::SessionKindFilter::Subagent
             }
-            crate::analytics::SessionKindFilter::Subagent => {
+            crate::analytics::SessionKindFilter::Regular => {
                 crate::analytics::SessionKindFilter::Primary
+            }
+            crate::analytics::SessionKindFilter::Subagent => {
+                crate::analytics::SessionKindFilter::Regular
             }
         };
         let label = match self.session_kind {
             crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Regular => "regular",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
         };
         self.set_status(format!("sessions: {label}"));
+        if self.layout_mode == LayoutMode::Timeline {
+            self.kickoff_timeline_load();
+        }
         self.kickoff_search();
         self.kickoff_home_activity();
     }
@@ -2410,12 +2442,13 @@ impl App {
             return;
         };
         let project = row.project.clone();
-        let Some((source, range, display, query)) = self.timeline_displayed.clone() else {
+        let Some((source, range, display, query, kind)) = self.timeline_displayed.clone() else {
             self.set_status("timeline context unavailable");
             return;
         };
         self.source = source;
         self.project_display = display;
+        self.session_kind = kind;
         self.query = query;
         self.project = project;
         self.sessions_since = range.since_ms(now_ms());
@@ -3485,6 +3518,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         match app.session_kind {
             crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Regular => "regular",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
         }
     );
@@ -3714,6 +3748,7 @@ fn home_token_usage_query(
         // The chart consumes `scan_usage_activity`, which projects points straight from
         // the memoized assembly; full event details are never materialized.
         include_events: false,
+        include_reviews: false,
         cache_path: Some(cache_path),
         // Keystrokes and result updates re-run this query with different post-assembly
         // filters; reuse the assembled scan between them instead of re-reading logs. On a
@@ -4906,6 +4941,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
             crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
             crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Regular => "regular",
         };
         right_spans.push(Span::styled("origin ", theme.muted));
         right_spans.push(Span::styled("(c) ", theme.accent));
@@ -5403,19 +5439,27 @@ fn build_project_timeline(
     range: TimelineRange,
     display: ProjectDisplayMode,
     query: &str,
+    kind: crate::analytics::SessionKindFilter,
 ) -> Result<Vec<ProjectTimelineRow>> {
     let now = now_ms();
     let since = range.since_ms(now);
     let rows: Vec<SessionSummary> = if query.trim().is_empty() {
         let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
         store
-            .query_sessions(source, since, None, display.grouping(), None)?
+            .query_sessions_filtered(source, since, None, display.grouping(), Some(kind), None)?
             .into_iter()
             .map(session_summary_from_row)
             .collect()
     } else {
         let index = SearchIndex::open_or_create(&paths.index)?;
-        let mut sessions = sessions_from_query(&index, query, source, None, since, RESULT_LIMIT)?;
+        let record_limit = if kind == crate::analytics::SessionKindFilter::All {
+            RESULT_LIMIT
+        } else {
+            RESULT_LIMIT * 5
+        };
+        let mut sessions = sessions_from_query(&index, query, source, None, since, record_limit)?;
+        sessions.retain(|session| kind.matches_kind(session.conversation_kind.as_deref()));
+        sessions.truncate(RESULT_LIMIT);
         enrich_session_projects(paths, &mut sessions, display.grouping());
         sessions
     };
@@ -8000,7 +8044,7 @@ mod tests {
         app.open_home_dropdown(HomeDropdown::Kind);
         assert_eq!(
             app.home_dropdown_options(),
-            vec!["all", "interactive", "subagent"]
+            vec!["all", "interactive", "subagent", "regular"]
         );
     }
 
@@ -8134,6 +8178,67 @@ mod tests {
     }
 
     #[test]
+    fn timeline_origin_filters_analytics_and_search_counts() {
+        use crate::analytics::{AnalyticsWriter, SessionKindFilter};
+
+        let (_tmp, app) = test_app();
+        let mut writer = app.index.writer().unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&app.paths.state)).unwrap();
+        for (id, kind) in [(1, "main"), (2, "subagent"), (3, "guardian_review")] {
+            let mut event = record("user", "needle");
+            event.doc_id = id;
+            event.ts = id;
+            event.session_id = format!("session-{id}");
+            event.source_path = format!("session-{id}.jsonl");
+            event.links.conversation_kind = Some(kind.into());
+            app.index.add_record(&mut writer, &event).unwrap();
+            analytics.record(&event).unwrap();
+        }
+        writer.commit().unwrap();
+        app.index.publish_generation().unwrap();
+        analytics.flush().unwrap();
+        for query in ["", "needle"] {
+            for (kind, expected) in [
+                (SessionKindFilter::Regular, 2),
+                (SessionKindFilter::All, 3),
+                (SessionKindFilter::Primary, 1),
+                (SessionKindFilter::Subagent, 1),
+            ] {
+                let rows = build_project_timeline(
+                    &app.paths,
+                    None,
+                    TimelineRange::All,
+                    ProjectDisplayMode::Flat,
+                    query,
+                    kind,
+                )
+                .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].session_count, expected,
+                    "query={query:?} kind={kind:?}"
+                );
+                assert_eq!(rows[0].session_events.len(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn changing_origin_refreshes_visible_timeline() {
+        let (_tmp, mut app) = test_app();
+        app.layout_mode = LayoutMode::Timeline;
+        app.session_kind = crate::analytics::SessionKindFilter::Primary;
+        let previous_request = app.active_timeline_request;
+        app.cycle_session_kind();
+        assert!(app.active_timeline_request > previous_request);
+        assert_eq!(app.timeline_state, LoadState::Loading);
+        assert_eq!(
+            app.timeline_loaded.as_ref().unwrap().4,
+            crate::analytics::SessionKindFilter::All
+        );
+    }
+
+    #[test]
     fn timeline_result_uses_captured_query_while_search_buffer_is_edited() {
         let (_tmp, mut app) = test_app();
         app.active_timeline_request = 7;
@@ -8143,6 +8248,7 @@ mod tests {
             TimelineRange::All,
             ProjectDisplayMode::NestedWorktrees,
             String::new(),
+            app.session_kind,
         ));
         app.query = "draft search".to_string();
 
@@ -8153,6 +8259,7 @@ mod tests {
             range: TimelineRange::All,
             grouping: ProjectDisplayMode::NestedWorktrees,
             query: String::new(),
+            kind: app.session_kind,
         });
 
         assert_eq!(app.timeline_state, LoadState::Empty);
@@ -8385,12 +8492,14 @@ mod tests {
             TimelineRange::Week,
             ProjectDisplayMode::Flat,
             "needle".to_string(),
+            crate::analytics::SessionKindFilter::All,
         ));
         app.timeline_loaded = Some((
             SourceChoice::All,
             TimelineRange::All,
             ProjectDisplayMode::NestedWorktrees,
             "pending query".to_string(),
+            app.session_kind,
         ));
         app.query = "draft query".to_string();
         app.list_area = Rect::new(0, 0, 80, 3); // legend plus two rows
@@ -8407,6 +8516,7 @@ mod tests {
         assert!(matches!(app.focus, Focus::List));
         assert_eq!(app.project, "project-3");
         assert_eq!(app.query, "needle");
+        assert_eq!(app.session_kind, crate::analytics::SessionKindFilter::All);
         assert_eq!(app.source, SourceChoice::Claude);
         assert_eq!(app.project_display, ProjectDisplayMode::Flat);
         assert!(app.sessions_since.is_some());

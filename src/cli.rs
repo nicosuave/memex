@@ -299,8 +299,8 @@ OUTPUT FIELDS (--fields):
         /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
-        /// Filter by session origin: interactive, subagent, or all
-        #[arg(long, value_enum, default_value_t = SessionOrigin::All, help_heading = "Filters")]
+        /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular, help_heading = "Filters")]
         origin: SessionOrigin,
         /// Retrieval mode (default: lexical)
         #[arg(long, value_enum, conflicts_with_all = ["semantic", "hybrid"], help_heading = "Search")]
@@ -579,8 +579,8 @@ EXAMPLES:
         /// Maximum number of sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Filter by session origin: interactive, subagent, or all
-        #[arg(long, value_enum, default_value_t = SessionOrigin::All)]
+        /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
         origin: SessionOrigin,
         /// Only show interactive sessions (alias for --origin interactive)
         #[arg(long, conflicts_with = "origin", hide = true)]
@@ -617,6 +617,9 @@ EXAMPLES:
         /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Session origin; all includes permission-review usage
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+        origin: SessionOrigin,
         /// Only include events on or after this date/timestamp
         #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
         since: Option<String>,
@@ -876,9 +879,12 @@ impl From<TransferMode> for CoreTransferMode {
 #[value(rename_all = "kebab-case")]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SessionOrigin {
+    /// Ordinary sessions, including subagents, without permission reviews.
+    #[default]
+    Regular,
     Interactive,
     Subagent,
-    #[default]
+    /// Every session, including permission reviews.
     All,
 }
 
@@ -970,7 +976,7 @@ pub(crate) struct SearchRequest {
     pub(crate) session: Option<String>,
     /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
     pub(crate) source: Option<String>,
-    /// Include interactive sessions, subagent sessions, or all sessions.
+    /// Session origin: regular (default) excludes permission reviews; all includes them. Interactive and subagent select ordinary session subsets.
     #[serde(default)]
     pub(crate) origin: SessionOrigin,
     /// Lexical, semantic, or hybrid retrieval.
@@ -1016,7 +1022,7 @@ pub(crate) struct SessionsRequest {
     pub(crate) source: Option<String>,
     /// Earliest activity timestamp (RFC3339, date, unix seconds, or unix milliseconds).
     pub(crate) since: Option<String>,
-    /// Include interactive sessions, subagent sessions, or all sessions.
+    /// Session origin: regular (default) excludes permission reviews; all includes them. Interactive and subagent select ordinary session subsets.
     #[serde(default)]
     pub(crate) origin: SessionOrigin,
     /// Maximum returned sessions (1-500).
@@ -1029,6 +1035,7 @@ impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
         match value {
             SessionOrigin::Interactive => crate::analytics::SessionKindFilter::Primary,
             SessionOrigin::Subagent => crate::analytics::SessionKindFilter::Subagent,
+            SessionOrigin::Regular => crate::analytics::SessionKindFilter::Regular,
             SessionOrigin::All => crate::analytics::SessionKindFilter::All,
         }
     }
@@ -1644,6 +1651,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Usage {
             source,
+            origin,
             since,
             until,
             json,
@@ -1655,6 +1663,7 @@ pub fn run() -> Result<()> {
         } => {
             run_usage(UsageCommandOptions {
                 source,
+                origin,
                 since,
                 until,
                 output: output.resolve(
@@ -2363,8 +2372,10 @@ fn collect_search_with_memories(
     if limit == 0 || limit > 500 {
         return Err(anyhow!("limit must be between 1 and 500"));
     }
-    let conversation_only_filters =
-        role.is_some() || tool.is_some() || session.is_some() || origin != SessionOrigin::All;
+    let conversation_only_filters = role.is_some()
+        || tool.is_some()
+        || session.is_some()
+        || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All);
     if content == SearchContent::Memories && conversation_only_filters {
         return Err(anyhow!(
             "--role, --tool, --session, and --origin filter conversations; use --content conversations or all"
@@ -3857,6 +3868,7 @@ fn run_stats(root: Option<PathBuf>) -> Result<()> {
 
 struct UsageCommandOptions {
     source: Option<SourceFilter>,
+    origin: SessionOrigin,
     since: Option<String>,
     until: Option<String>,
     output: OutputOptions,
@@ -3869,6 +3881,7 @@ struct UsageCommandOptions {
 fn run_usage(options: UsageCommandOptions) -> Result<()> {
     let UsageCommandOptions {
         source,
+        origin,
         since,
         until,
         output,
@@ -3900,7 +3913,7 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
                 cost_mode,
                 include_events,
                 memo_ttl_ms: 0,
-                kind: None,
+                kind: Some(origin.into()),
             },
         )?;
         if output.format != OutputFormat::Text {
@@ -3939,11 +3952,18 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
         source,
         project: None,
         project_grouping: crate::analytics::ProjectGrouping::Flat,
-        session_keys: None,
+        session_keys: match origin {
+            SessionOrigin::All | SessionOrigin::Regular => None,
+            other => Some(crate::machine::usage_session_keys_for_kind(
+                &paths,
+                other.into(),
+            )?),
+        },
         since_ms,
         until_ms,
         cost_mode,
         include_events,
+        include_reviews: origin == SessionOrigin::All,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: 0,
     };
@@ -7109,7 +7129,7 @@ mod tests {
         assert_eq!(request.recency_half_life_days, 30.0);
         assert!(request.additional_queries.is_empty());
         assert!(request.machines.is_empty());
-        assert_eq!(request.origin, SessionOrigin::All);
+        assert_eq!(request.origin, SessionOrigin::Regular);
     }
 
     #[test]
@@ -7318,6 +7338,38 @@ mod tests {
             assert!(!fields.contains("text"));
         }
         assert!(search_fields(None, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn discovery_defaults_exclude_reviews_with_explicit_all_opt_in() {
+        for command in ["search", "sessions", "usage"] {
+            for explicit_all in [false, true] {
+                let mut args = vec!["memex", command];
+                if command == "search" {
+                    args.push("needle");
+                }
+                if explicit_all {
+                    args.extend(["--origin", "all"]);
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let origin = match cli.command.unwrap() {
+                    Commands::Search { origin, .. }
+                    | Commands::Sessions { origin, .. }
+                    | Commands::Usage { origin, .. } => origin,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    origin,
+                    if explicit_all {
+                        SessionOrigin::All
+                    } else {
+                        SessionOrigin::Regular
+                    }
+                );
+            }
+        }
+        let request: SessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(request.origin, SessionOrigin::Regular);
     }
 
     #[test]

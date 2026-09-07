@@ -26,6 +26,8 @@ pub struct UsageQuery {
     pub until_ms: Option<u64>,
     pub cost_mode: CostMode,
     pub include_events: bool,
+    /// Include internal AI permission-review sessions in reconstructed usage.
+    pub include_reviews: bool,
     pub cache_path: Option<PathBuf>,
     /// Reuse the previous in-process scan result when it is at most this old. Filters
     /// (`since_ms`, `project`, `session_keys`, ...) apply after assembly, so repeated
@@ -122,6 +124,8 @@ pub struct UsageEvent {
     pub(crate) cache_chain_excluded: bool,
     #[serde(skip)]
     pub(crate) sidechain: bool,
+    #[serde(skip)]
+    pub(crate) permission_review: bool,
     #[serde(skip)]
     pub(crate) source_order: u64,
 }
@@ -221,9 +225,10 @@ fn filtered_events<'a>(
 ) -> impl Iterator<Item = &'a UsageEvent> + 'a {
     let mut project_cache = HashMap::new();
     assembled.iter().filter(move |event| {
-        query
-            .since_ms
-            .is_none_or(|since| event.timestamp_ms >= since)
+        (query.include_reviews || !event.permission_review)
+            && query
+                .since_ms
+                .is_none_or(|since| event.timestamp_ms >= since)
             && query
                 .until_ms
                 .is_none_or(|until| event.timestamp_ms < until)
@@ -672,6 +677,7 @@ struct CachedUsageEvent {
     conservative_undercount: bool,
     cache_chain_excluded: bool,
     sidechain: bool,
+    permission_review: bool,
     source_order: u64,
 }
 
@@ -693,6 +699,7 @@ impl CachedUsageEvent {
             conservative_undercount: event.conservative_undercount,
             cache_chain_excluded: event.cache_chain_excluded,
             sidechain: event.sidechain,
+            permission_review: event.permission_review,
             source_order: event.source_order,
         }
     }
@@ -720,6 +727,7 @@ impl CachedUsageEvent {
             conservative_undercount: self.conservative_undercount,
             cache_chain_excluded: self.cache_chain_excluded,
             sidechain: self.sidechain,
+            permission_review: self.permission_review,
             source_order: self.source_order,
         }
     }
@@ -778,6 +786,14 @@ impl UsageCache {
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(2))?;
+        // Postcard encodes event fields positionally. Rebuild the disposable cache
+        // when its event layout changes so old rows cannot decode with shifted fields.
+        let event_format: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if event_format != 1 {
+            connection
+                .execute_batch("DROP TABLE IF EXISTS usage_file_cache; PRAGMA user_version = 1;")?;
+        }
         // Drop pre-postcard cache tables and any schema missing a required column: the
         // JSON-era claude table, the pre-rename blob column, and the deps_blob column that
         // records cross-file dependencies. A missing column means an older layout, so the
@@ -1621,6 +1637,38 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn usage_event_layout_change_rebuilds_cached_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let cache = UsageCache::open(&path).expect("open cache");
+        cache
+            .connection
+            .execute_batch(
+                "INSERT INTO usage_file_cache(source, path, parser_version, size, mtime_ns,
+                 scanned_at_ms, events_blob, deps_blob)
+             VALUES ('codex', '/tmp/review.jsonl', 1, 10, 20, 30, X'00', X'00');
+             PRAGMA user_version = 0;",
+            )
+            .expect("seed older event layout");
+        drop(cache);
+        let rebuilt = UsageCache::open(&path).expect("rebuild cache");
+        let rows: u64 = rebuilt
+            .connection
+            .query_row("SELECT count(*) FROM usage_file_cache", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(
+            rebuilt
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn usage_parser_version_change_invalidates_cached_rows() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("usage-cache.sqlite3");
@@ -2136,6 +2184,7 @@ mod tests {
             conservative_undercount: false,
             cache_chain_excluded: false,
             sidechain: false,
+            permission_review: false,
             source_order: 0,
         }
     }
@@ -2475,6 +2524,71 @@ mod tests {
         assert_eq!(parsed[0].events.len(), 1);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(vanished.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn permission_reviews_are_opt_in_for_cold_cached_memoized_usage_and_activity() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions/2026/07/03");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        for (id, origin) in [
+            ("primary", serde_json::json!({"source": "cli"})),
+            (
+                "agent",
+                serde_json::json!({"source": {"subagent": "worker"}}),
+            ),
+            (
+                "review",
+                serde_json::json!({"thread_source": "guardian_review"}),
+            ),
+            (
+                "legacy-review",
+                serde_json::json!({"source": {"subagent": {"other": "guardian"}}}),
+            ),
+        ] {
+            let mut payload = origin;
+            payload["id"] = id.into();
+            payload["cwd"] = "/repo/memex".into();
+            let metadata = serde_json::json!({"type": "session_meta", "payload": payload});
+            let usage = serde_json::json!({
+                "type": "event_msg", "timestamp": "2026-07-03T01:02:05Z",
+                "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": 100, "output_tokens": 25},
+                    "total_token_usage": {"input_tokens": 100, "output_tokens": 25}
+                }}
+            });
+            std::fs::write(
+                sessions.join(format!("rollout-{id}.jsonl")),
+                format!("{metadata}\n{usage}\n"),
+            )
+            .expect("write session");
+        }
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(tmp.path().as_os_str()))]);
+        let mut query = UsageQuery {
+            source: Some(SourceFilter::Codex),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            ..UsageQuery::default()
+        };
+        let cold = scan_usage(&query).expect("cold scan");
+        assert_eq!(cold.events, 2);
+        assert_eq!(cold.total_tokens, 250);
+        assert!(cold.details.iter().all(|event| !event.permission_review));
+        let warm = scan_usage(&query).expect("cached scan");
+        assert_eq!(warm.events, 2);
+        query.memo_ttl_ms = 60_000;
+        assert_eq!(scan_usage(&query).unwrap().events, 2);
+        query.include_reviews = true;
+        assert_eq!(scan_usage(&query).unwrap().events, 4);
+        assert_eq!(scan_usage_activity(&query).unwrap().0.len(), 4);
+        query.include_reviews = false;
+        assert_eq!(scan_usage_activity(&query).unwrap().0.len(), 2);
+        query.memo_ttl_ms = 0;
+        query.include_reviews = true;
+        assert_eq!(scan_usage(&query).unwrap().total_tokens, 500);
     }
 
     #[test]
@@ -3335,6 +3449,7 @@ mod tests {
             conservative_undercount: false,
             cache_chain_excluded: false,
             sidechain: false,
+            permission_review: false,
             source_order: 0,
         };
         // 100*3 + 40*.3 + 20*3.75 + 10*6 + 20*15 = $0.000747
@@ -3361,6 +3476,7 @@ mod tests {
             conservative_undercount: false,
             cache_chain_excluded: false,
             sidechain: false,
+            permission_review: false,
             source_order: 0,
         };
         assert_eq!(event_cost_nanos(&event, CostMode::Auto), Some(0));
@@ -3373,6 +3489,7 @@ mod tests {
         event.cost_authoritative = true;
         event.cache_chain_excluded = true;
         event.sidechain = true;
+        event.permission_review = true;
         event.source_order = 42;
 
         let json = serde_json::to_value(&event).unwrap();
@@ -3382,6 +3499,7 @@ mod tests {
         assert!(!object.contains_key("cost_authoritative"));
         assert!(!object.contains_key("cache_chain_excluded"));
         assert!(!object.contains_key("sidechain"));
+        assert!(!object.contains_key("permission_review"));
         assert!(!object.contains_key("source_order"));
 
         let bytes = postcard::to_stdvec(&CachedUsageEvent::from_event(&event)).unwrap();
@@ -3391,5 +3509,6 @@ mod tests {
         let restored = cached.into_event("claude", Arc::from("cached"));
         assert!(restored.cost_authoritative);
         assert!(restored.cache_chain_excluded);
+        assert!(restored.permission_review);
     }
 }

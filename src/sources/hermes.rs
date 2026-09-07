@@ -531,6 +531,7 @@ fn event(
         conservative_undercount: conservative,
         cache_chain_excluded: true,
         sidechain: false,
+        permission_review: false,
         source_order: order,
     }
 }
