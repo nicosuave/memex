@@ -359,7 +359,9 @@ separate from the control transport so an immutable S3 split backend can replace
 In the TUI, use the `machines` dropdown (or press `m` while the session list is focused)
 to select the configured default set, `local`, or one remote machine. The machine, source,
 project, and query filters are shared by the session results and token chart; the range
-dropdown bounds the chart.
+dropdown bounds the chart. Repository project mode groups linked checkouts and worktrees
+under their repository name. Sessions without repository metadata appear under `Unfiled`
+instead of turning arbitrary working-directory or standalone-task names into projects.
 
 ### Opening federated results
 

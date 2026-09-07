@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
+pub const UNFILED_PROJECT: &str = "Unfiled";
+const REPOSITORY_PROJECT_SQL: &str = "COALESCE(NULLIF(repo_project, ''), 'Unfiled')";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,8 +186,9 @@ impl AnalyticsStore {
             CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
             CREATE INDEX IF NOT EXISTS sessions_project_last_at_idx ON sessions(project, last_at);
             CREATE INDEX IF NOT EXISTS sessions_repo_project_last_at_idx ON sessions(repo_project, last_at);
-            CREATE INDEX IF NOT EXISTS sessions_display_project_last_at_idx
-                ON sessions(COALESCE(NULLIF(repo_project, ''), project), last_at);
+            DROP INDEX IF EXISTS sessions_display_project_last_at_idx;
+            CREATE INDEX IF NOT EXISTS sessions_repository_project_last_at_idx
+                ON sessions(COALESCE(NULLIF(repo_project, ''), 'Unfiled'), last_at);
             CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
             "#,
         )?;
@@ -325,11 +328,11 @@ impl AnalyticsStore {
         kind: Option<SessionKindFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<SessionRow>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT source, session_id, source_path, project,
-                    COALESCE(NULLIF(repo_project, ''), project) AS display_project,
+                    {REPOSITORY_PROJECT_SQL} AS display_project,
                     cwd, last_at, message_count, label, conversation_kind
-             FROM sessions",
+             FROM sessions"
         );
         let mut clauses = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -354,7 +357,7 @@ impl AnalyticsStore {
             match grouping {
                 ProjectGrouping::Flat => clauses.push("project = ?".to_string()),
                 ProjectGrouping::Repository => {
-                    clauses.push("COALESCE(NULLIF(repo_project, ''), project) = ?".to_string())
+                    clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"))
                 }
             }
             values.push(rusqlite::types::Value::Text(project.to_string()));
@@ -460,7 +463,7 @@ impl AnalyticsStore {
             );
         }
         if let Some(project) = project {
-            clauses.push("COALESCE(NULLIF(repo_project, ''), project) = ?".to_string());
+            clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"));
             values.push(rusqlite::types::Value::Text(project.to_string()));
         }
         if let Some(cwd) = cwd {
@@ -565,7 +568,7 @@ impl AnalyticsStore {
     ) -> Result<Vec<String>> {
         let project_expr = match grouping {
             ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
         };
         let mut sql = format!("SELECT DISTINCT {project_expr} FROM sessions");
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -590,7 +593,16 @@ impl AnalyticsStore {
                 projects.push(project);
             }
         }
-        projects.sort();
+        projects.sort_by(|left, right| {
+            match (
+                left.as_str() == UNFILED_PROJECT,
+                right.as_str() == UNFILED_PROJECT,
+            ) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => left.cmp(right),
+            }
+        });
         projects.dedup();
         Ok(projects)
     }
@@ -641,7 +653,7 @@ impl AnalyticsStore {
         if let Some(project) = project {
             let project_expr = match grouping {
                 ProjectGrouping::Flat => "project",
-                ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+                ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
             };
             clauses.push(format!("{project_expr} = ?"));
             values.push(rusqlite::types::Value::Text(project.to_string()));
@@ -701,7 +713,7 @@ impl AnalyticsStore {
     ) -> Result<Vec<(String, u64)>> {
         let project_expr = match grouping {
             ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
         };
         let mut sql = format!("SELECT {project_expr}, last_at FROM sessions");
         let mut clauses = Vec::new();
@@ -750,7 +762,7 @@ impl AnalyticsStore {
     ) -> Result<Option<String>> {
         let display_expr = match grouping {
             ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
         };
         let project: Option<String> = self
             .conn
@@ -776,7 +788,7 @@ impl AnalyticsStore {
         }
         let display_expr = match grouping {
             ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => "COALESCE(NULLIF(repo_project, ''), project)",
+            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
         };
         let conditions = std::iter::repeat_n(
             "(source = ? AND session_id = ? AND source_path = ?)",
@@ -1043,7 +1055,8 @@ fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         deadline,
     );
-    let path_repo_project = claude_worktree_repo_project(cwd);
+    let path_repo_project =
+        claude_worktree_repo_project(cwd).or_else(|| codex_worktree_repo_project(cwd));
     let repo_project = common_dir
         .as_deref()
         .and_then(common_dir_project_name)
@@ -1084,6 +1097,27 @@ fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
         }
         let repo_dir = claude_dir.parent()?;
         return path_file_name(repo_dir.to_string_lossy().as_ref());
+    }
+    None
+}
+
+fn codex_worktree_repo_project(cwd: &str) -> Option<String> {
+    let cwd = Path::new(cwd);
+    for ancestor in cwd.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
+            continue;
+        }
+        let codex_dir = ancestor.parent()?;
+        if codex_dir.file_name().and_then(|name| name.to_str()) != Some(".codex") {
+            continue;
+        }
+        let mut relative = cwd.strip_prefix(ancestor).ok()?.components();
+        relative.next()?;
+        return relative
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
     }
     None
 }
@@ -2194,7 +2228,7 @@ mod tests {
             .conn
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT source FROM sessions
-                 WHERE COALESCE(NULLIF(repo_project, ''), project) = ?1
+                 WHERE COALESCE(NULLIF(repo_project, ''), 'Unfiled') = ?1
                  ORDER BY last_at DESC LIMIT 200",
                 params!["memex"],
                 |row| row.get(3),
@@ -2202,9 +2236,108 @@ mod tests {
             .expect("query plan");
 
         assert!(
-            plan.contains("sessions_display_project_last_at_idx"),
+            plan.contains("sessions_repository_project_last_at_idx"),
             "{plan}"
         );
+    }
+
+    #[test]
+    fn repository_grouping_buckets_non_git_sessions_as_unfiled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let standalone = tmp.path().join("generated-task-name");
+        fs::create_dir(&standalone).expect("standalone dir");
+        let standalone_transcript = tmp.path().join("standalone.jsonl");
+        fs::write(
+            &standalone_transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"standalone\",\"cwd\":\"{}\"}}}}\n",
+                standalone.display()
+            ),
+        )
+        .expect("write standalone transcript");
+        let repo_transcript = tmp.path().join("repo.jsonl");
+        fs::write(&repo_transcript, "").expect("write repo transcript");
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(
+            &db,
+            [
+                record(
+                    "generated-task-name",
+                    "standalone",
+                    &standalone_transcript,
+                    10,
+                ),
+                record("raw-repo-slug", "repo", &repo_transcript, 20),
+            ],
+        )
+        .expect("rebuild");
+
+        let store = AnalyticsStore::open(&db).expect("open store");
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET repo_project = 'alpha' WHERE session_id = 'repo'",
+                [],
+            )
+            .expect("seed repository project");
+
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Repository, None)
+            .expect("repository sessions");
+        assert_eq!(rows[0].display_project, "alpha");
+        assert_eq!(rows[1].project, "generated-task-name");
+        assert_eq!(rows[1].display_project, UNFILED_PROJECT);
+        assert_eq!(
+            store
+                .query_projects(None, ProjectGrouping::Repository)
+                .expect("repository projects"),
+            vec![UNFILED_PROJECT, "alpha"]
+        );
+
+        let unfiled = store
+            .query_sessions(
+                None,
+                None,
+                Some(UNFILED_PROJECT),
+                ProjectGrouping::Repository,
+                None,
+            )
+            .expect("unfiled sessions");
+        assert_eq!(unfiled.len(), 1);
+        assert_eq!(unfiled[0].session_id, "standalone");
+        assert_eq!(
+            store
+                .query_sessions_detailed(None, Some(UNFILED_PROJECT), None, None, None)
+                .expect("detailed unfiled sessions")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .query_project_timestamps(None, None, ProjectGrouping::Repository)
+                .expect("repository timestamps"),
+            vec![(UNFILED_PROJECT.to_string(), 10), ("alpha".to_string(), 20)]
+        );
+
+        let session_projects = store
+            .query_session_projects(
+                &[(
+                    SourceKind::Codex,
+                    "standalone".to_string(),
+                    standalone_transcript.to_string_lossy().to_string(),
+                )],
+                ProjectGrouping::Repository,
+            )
+            .expect("session projects");
+        assert_eq!(
+            session_projects.values().next().map(String::as_str),
+            Some(UNFILED_PROJECT)
+        );
+
+        let flat = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("flat sessions");
+        assert_eq!(flat[1].display_project, "generated-task-name");
     }
 
     #[test]
@@ -2285,6 +2418,23 @@ mod tests {
         );
         assert_eq!(
             claude_worktree_repo_project("/Users/nico/Code/atm-backend"),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_worktree_path_falls_back_to_repo_directory() {
+        let cwd = "/missing/home/.codex/worktrees/8952/memex/crates/core";
+        assert_eq!(codex_worktree_repo_project(cwd).as_deref(), Some("memex"));
+        let metadata = git_metadata_for_cwd(cwd);
+        assert_eq!(metadata.repo_project.as_deref(), Some("memex"));
+        assert_eq!(metadata.status, "path-fallback");
+        assert_eq!(
+            codex_worktree_repo_project("/missing/home/.codex/worktrees/8952"),
+            None
+        );
+        assert_eq!(
+            codex_worktree_repo_project("/missing/home/Documents/Codex/2026-09-07/hel"),
             None
         );
     }

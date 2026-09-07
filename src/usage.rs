@@ -585,9 +585,9 @@ fn usage_project_matches(
         ProjectGrouping::Repository => cache
             .entry(candidate.to_string())
             .or_insert_with(|| {
-                if Path::new(candidate).is_dir() {
+                if Path::new(candidate).is_absolute() {
                     crate::analytics::repository_project_for_cwd(candidate)
-                        .unwrap_or_else(|| usage_project_key(candidate))
+                        .unwrap_or_else(|| crate::analytics::UNFILED_PROJECT.to_string())
                 } else {
                     usage_project_key(candidate)
                 }
@@ -3166,6 +3166,33 @@ mod tests {
             "/Users/nico/Code/other",
             "memex",
             ProjectGrouping::Flat,
+            &mut cache,
+        ));
+    }
+
+    #[test]
+    fn repository_usage_groups_absolute_non_git_paths_as_unfiled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let standalone = tmp.path().join("generated-task-name");
+        fs::create_dir(&standalone).expect("standalone dir");
+        let mut cache = HashMap::new();
+
+        assert!(usage_project_matches(
+            standalone.to_string_lossy().as_ref(),
+            crate::analytics::UNFILED_PROJECT,
+            ProjectGrouping::Repository,
+            &mut cache,
+        ));
+        assert!(usage_project_matches(
+            "/missing/home/.codex/worktrees/8952/memex",
+            "memex",
+            ProjectGrouping::Repository,
+            &mut cache,
+        ));
+        assert!(usage_project_matches(
+            "memex",
+            "memex",
+            ProjectGrouping::Repository,
             &mut cache,
         ));
     }
