@@ -158,6 +158,10 @@ struct PtyOutput {
 }
 
 fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
+    run_pty_with_tui_input(command, input, b"")
+}
+
+fn run_pty_with_tui_input(command: &mut Command, input: &[u8], tui_input: &[u8]) -> PtyOutput {
     let mut master_fd = -1;
     let mut slave_fd = -1;
     let mut size = libc::winsize {
@@ -199,12 +203,39 @@ fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
         });
     }
     let mut child = command.spawn().unwrap();
+    // Command retains its configured Stdio handles after spawn. Close the parent's
+    // slave copies so the master reader can finish when the child exits on Linux.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     drop(slave);
     let mut reader = master.try_clone().unwrap();
-    let output = std::thread::spawn(move || {
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
+    let tui_input = tui_input.to_vec();
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = reader.read_to_end(&mut bytes);
-        String::from_utf8_lossy(&bytes).into_owned()
+        let mut buffer = [0; 4096];
+        let mut cursor_replied = false;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(len) => {
+                    bytes.extend_from_slice(&buffer[..len]);
+                    // Ratatui queries the cursor when entering the TUI. Emulate
+                    // that terminal response before sending interactive keys.
+                    if !cursor_replied && bytes.windows(4).any(|part| part == b"\x1b[6n") {
+                        cursor_replied = true;
+                        let _ = reader.write_all(b"\x1b[1;1R");
+                        let _ = reader.write_all(&tui_input);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Linux reports EIO when the PTY slave closes.
+                Err(_) => break,
+            }
+        }
+        let _ = output_tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
     master.write_all(input).unwrap();
     master.flush().unwrap();
@@ -223,8 +254,21 @@ fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
     drop(master);
     PtyOutput {
         status,
-        output: output.join().unwrap(),
+        output: output_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("PTY output did not close within 10 seconds"),
     }
+}
+
+#[test]
+fn pty_output_closes_after_child_exit_while_command_is_alive() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf pty-finished"]);
+    let output = run_pty(&mut command, b"");
+    assert!(output.status.success());
+    assert_eq!(output.output, "pty-finished");
+    // Keep Command alive through collection, as the interactive fixtures do.
+    assert_eq!(command.get_program(), "sh");
 }
 
 #[test]
@@ -254,7 +298,8 @@ fn bare_human_startup_accepts_cached_update_before_tui() {
 fn declining_startup_update_enters_tui_without_mutation() {
     let fixture = Fixture::new();
     fixture.cache_update();
-    let output = run_pty(&mut fixture.command(), b"n\rq");
+    // Ctrl-C is the global quit binding; plain 'q' is home-screen search input.
+    let output = run_pty_with_tui_input(&mut fixture.command(), b"n\r", b"\x03");
     assert!(output.status.success(), "{}", output.output);
     assert!(
         output
