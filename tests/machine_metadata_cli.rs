@@ -35,6 +35,12 @@ impl Fixture {
         let peer = directory.path().join("peer");
         seed(&local, "local-project", 1);
         seed(&peer, "peer-project", 225);
+        // Resume metadata must not depend on provider binaries installed on the host.
+        std::fs::write(
+            peer.join("config.toml"),
+            "codex_resume_cmd = \"fixture-codex resume {session_id}\"\n",
+        )
+        .unwrap();
         std::fs::write(
             local.join("config.toml"),
             r#"
@@ -159,7 +165,13 @@ fn metadata_keeps_local_defaults_and_round_trips_complete_peer_results() {
         assert_eq!(session["repo_project"], "peer-project");
         assert_eq!(session["cwd"], "/peer/work");
         assert_eq!(session["label"], "Fixture title");
-        assert!(session["resume_cmd"].as_str().unwrap().contains("codex"));
+        assert_eq!(
+            session["resume_cmd"],
+            format!(
+                "fixture-codex resume {}",
+                session["session_id"].as_str().unwrap()
+            )
+        );
     }
     assert_eq!(
         fixture.json(&[
