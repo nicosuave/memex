@@ -136,7 +136,7 @@ struct BrowserView: View {
                             .font(.caption).monospacedDigit().foregroundStyle(.secondary)
                     }
                     .tag(Store.Scope.project(project.project))
-                    .help("\(project.project): \(project.sessionCount) conversations across all time and origins")
+                    .help("\(project.project): \(project.sessionCount) conversations across all time, excluding permission reviews")
                 }
             } header: {
                 HStack {

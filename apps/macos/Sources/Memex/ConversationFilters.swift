@@ -37,12 +37,20 @@ enum ConversationTimeframe: String, CaseIterable, Codable, Sendable {
 }
 
 enum ConversationOrigin: String, CaseIterable, Codable, Sendable {
-    case all, interactive, subagent
+    case all, interactive, subagent, includingReviews
+    var argument: String {
+        switch self {
+        case .all: "regular"
+        case .includingReviews: "all"
+        case .interactive, .subagent: rawValue
+        }
+    }
     var title: String {
         switch self {
         case .all: "All conversations"
         case .interactive: "Interactive"
         case .subagent: "Subagents"
+        case .includingReviews: "Including permission reviews"
         }
     }
 }

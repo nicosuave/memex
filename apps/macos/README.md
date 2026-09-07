@@ -3,10 +3,11 @@
 A native macOS companion to the Memex CLI: a project sidebar, a compact session
 list, and a paged conversation reader. It supports sessions and lexical search
 across configured machines, project and provider filters, and local resume-command copying.
-The conversation list has one Filters button: its popover combines timeframe
+The toolbar has one Filters button: its popover combines timeframe
 (all time, last24 hours,7 days, or30 days), provider, and conversation origin.
+Permission reviews are hidden by default; choose Including permission reviews to show them.
 Filters combine with the selected project and machine, persist across launches,
-and can be reset together. Project counts remain full-index, all-history totals.
+and can be reset together. Project counts remain full-index, all-history totals excluding permission reviews.
 Press Command-F in the reader for literal find across the complete conversation,
 including earlier pages and tool contents. Command-G and Shift-Command-G navigate
 matches; Escape closes find. Results appear incrementally while scanning.

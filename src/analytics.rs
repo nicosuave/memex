@@ -576,15 +576,17 @@ impl AnalyticsStore {
 
     /// Aggregate in SQLite rather than materializing every session in the client.
     /// One stored row is one (source, session_id, source_path) session identity.
+    /// Match repository grouping and the default regular-session filter.
     pub fn query_project_summaries(
         &self,
         source: Option<SourceFilter>,
     ) -> Result<Vec<ProjectSummary>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "with project_sessions as (
-                select coalesce(nullif(repo_project, ''), project) as project,
+                select {REPOSITORY_PROJECT_SQL} as project,
                        last_at
-                from sessions",
+                from sessions
+                where (conversation_kind is null or conversation_kind != 'guardian_review')",
         );
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(source) = source {
@@ -592,7 +594,7 @@ impl AnalyticsStore {
             let placeholders = std::iter::repeat_n("?", labels.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            sql.push_str(&format!(" where source in ({placeholders})"));
+            sql.push_str(&format!(" and source in ({placeholders})"));
             values.extend(
                 labels
                     .iter()
@@ -604,7 +606,6 @@ impl AnalyticsStore {
              select project, count(*) as session_count,
                     max(case when last_at > 0 then last_at end) as last_at
              from project_sessions
-             where trim(project, char(9) || char(10) || char(13) || ' ') != ''
              group by project
              order by last_at desc, project asc",
         );
@@ -2085,6 +2086,11 @@ mod tests {
              ('codex', 'session-0', '/other-path', 'raw', 'repo', 0, 998),
              ('codex', 'older', '/older', 'older', '', 0, 12),
              ('codex', 'blank', '/blank', '   ', null, 0, 5000);
+             insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at, conversation_kind) values
+             ('codex', 'review', '/review', 'raw', 'repo', 0, 9000, 'guardian_review'),
+             ('codex', 'review-only', '/review-only', 'raw', 'review-only', 0, 9001, 'guardian_review'),
+             ('codex', 'unfiled-review', '/unfiled-review', 'raw', null, 0, 9002, 'guardian_review'),
+             ('codex', 'agent', '/agent', 'raw', 'repo', 0, 900, 'subagent');
              commit;",
         ).unwrap();
         let summaries = store.query_project_summaries(None).unwrap();
@@ -2092,26 +2098,35 @@ mod tests {
             summaries,
             vec![
                 ProjectSummary {
-                    project: "repo".into(),
-                    session_count: 252,
-                    last_at: Some(999)
+                    project: UNFILED_PROJECT.into(),
+                    session_count: 2,
+                    last_at: Some(5000)
                 },
                 ProjectSummary {
-                    project: "older".into(),
-                    session_count: 1,
-                    last_at: Some(12)
+                    project: "repo".into(),
+                    session_count: 253,
+                    last_at: Some(999)
                 },
             ]
         );
-        let matching = store
-            .query_sessions_detailed(None, Some("repo"), None, None, None)
-            .unwrap();
-        assert_eq!(matching.len() as u64, summaries[0].session_count);
+        for summary in &summaries {
+            let matching = store
+                .query_sessions_detailed_filtered(
+                    None,
+                    Some(&summary.project),
+                    None,
+                    None,
+                    Some(SessionKindFilter::Regular),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(matching.len() as u64, summary.session_count);
+        }
         let codex = store
             .query_project_summaries(Some(SourceFilter::Codex))
             .unwrap();
-        assert_eq!(codex[0].session_count, 251);
-        assert_eq!(codex[0].last_at, Some(998));
+        assert_eq!(codex[1].session_count, 252);
+        assert_eq!(codex[1].last_at, Some(998));
     }
 
     #[test]
@@ -2119,13 +2134,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
         store.conn.execute_batch(
-            "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
-             ('codex', 'b', '/b', 'b', 0, 10),
-             ('codex', 'a', '/a', 'a', 0, 10),
-             ('codex', 'zero', '/zero', 'unknown', 0, 0),
-             ('codex', 'negative', '/negative', 'unknown', 0, -1),
-             ('codex', 'encoded', '/encoded', '-Users-nico-Code-project', 0, 0),
-             ('codex', 'blank', '/blank', '', 0, 50);",
+            "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at) values
+             ('codex', 'b', '/b', 'raw', 'b', 0, 10),
+             ('codex', 'a', '/a', 'raw', 'a', 0, 10),
+             ('codex', 'zero', '/zero', 'raw', 'unknown', 0, 0),
+             ('codex', 'negative', '/negative', 'raw', 'unknown', 0, -1),
+             ('codex', 'encoded', '/encoded', 'raw', '-Users-nico-Code-project', 0, 0);",
         ).unwrap();
         let rows = store.query_project_summaries(None).unwrap();
         assert_eq!(

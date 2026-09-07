@@ -128,7 +128,7 @@ struct MemexClient: Sendable {
         if let project { args += ["--project", project] }
         if let source { args += ["--source", source] }
         if let since { args += ["--since", since] }
-        args += ["--origin", origin.rawValue]
+        args += ["--origin", origin.argument]
         return try JSONDecoder().decode([Session].self, from: await run(args))
     }
 
@@ -144,7 +144,7 @@ struct MemexClient: Sendable {
         if let project { args += ["--project", project] }
         if let source { args += ["--source", source] }
         if let since { args += ["--since", since] }
-        args += ["--origin", origin.rawValue]
+        args += ["--origin", origin.argument]
         return try JSONDecoder().decode([SearchHit].self, from: await run(args + ["--", query]))
     }
 

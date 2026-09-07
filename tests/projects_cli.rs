@@ -31,11 +31,15 @@ fn projects_json_aggregates_all_sessions_and_matches_project_filter() {
         ).unwrap();
     }
     transaction.execute_batch(
-        "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
-         ('codex-session', 'alias-1', '/alias1', 'repo', 0, 2000),
-         ('codex-history', 'alias-2', '/alias2', 'repo', 0, 3000),
-         ('claude', 'claude-1', '/claude', 'repo', 0, 4000),
-         ('codex', 'no-date', '/no-date', 'undated', 0, 0);",
+        "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at, conversation_kind) values
+         ('codex-session', 'alias-1', '/alias1', 'worktree', 'repo', 0, 2000, 'main'),
+         ('codex-history', 'alias-2', '/alias2', 'worktree', 'repo', 0, 3000, 'subagent'),
+         ('claude', 'claude-1', '/claude', 'worktree', 'repo', 0, 4000, null),
+         ('codex', 'no-date', '/no-date', 'undated', null, 0, 0, null),
+         ('codex', 'empty-repo', '/empty-repo', 'other', '', 0, 0, 'main'),
+         ('codex', 'review', '/review', 'worktree', 'repo', 0, 9000, 'guardian_review'),
+         ('codex', 'review-only', '/review-only', 'worktree', 'review-only', 0, 9001, 'guardian_review'),
+         ('codex', 'unfiled-review', '/unfiled-review', 'other', null, 0, 9002, 'guardian_review');",
     ).unwrap();
     transaction.commit().unwrap();
     let output = run(root.path(), &["projects", "--format", "json"]);
@@ -49,7 +53,7 @@ fn projects_json_aggregates_all_sessions_and_matches_project_filter() {
         values,
         json!([
             {"project":"repo", "session_count":228, "last_at":"1970-01-01T00:00:04Z"},
-            {"project":"undated", "session_count":1, "last_at":null},
+            {"project":"Unfiled", "session_count":2, "last_at":null},
         ])
     );
     let filtered = run(
@@ -60,24 +64,26 @@ fn projects_json_aggregates_all_sessions_and_matches_project_filter() {
     let filtered: Value = serde_json::from_slice(&filtered.stdout).unwrap();
     assert_eq!(filtered[0]["session_count"], 227);
     assert_eq!(filtered[0]["last_at"], "1970-01-01T00:00:03Z");
-    let sessions = run(
-        root.path(),
-        &[
-            "sessions",
-            "--project",
-            "repo",
-            "--limit",
-            "1000",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(sessions.status.success());
-    let sessions: Vec<Value> = serde_json::from_slice(&sessions.stdout).unwrap();
-    assert_eq!(
-        sessions.len(),
-        values[0]["session_count"].as_u64().unwrap() as usize
-    );
+    for project in values.as_array().unwrap() {
+        let sessions = run(
+            root.path(),
+            &[
+                "sessions",
+                "--project",
+                project["project"].as_str().unwrap(),
+                "--limit",
+                "1000",
+                "--format",
+                "json",
+            ],
+        );
+        assert!(sessions.status.success());
+        let sessions: Vec<Value> = serde_json::from_slice(&sessions.stdout).unwrap();
+        assert_eq!(
+            sessions.len(),
+            project["session_count"].as_u64().unwrap() as usize
+        );
+    }
     let jsonl = run(root.path(), &["projects"]);
     assert!(jsonl.status.success());
     let lines: Vec<Value> = String::from_utf8(jsonl.stdout)

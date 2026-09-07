@@ -43,15 +43,16 @@ private struct FilterFixture {
           while [ -e "$(dirname "$0")/hold" ]; do sleep 0.01; done
         fi
         awk -v project="$project" -v source="$source" -v origin="$origin" -v since="$since" -v machine="$machine" -v recent='RECENT_DATE' -v old='OLD_DATE' 'BEGIN {
-          sources[1]="codex"; sources[2]="claude"; sources[3]="codex"; sources[4]="codex"; sources[5]="codex";
-          projects[1]="memex"; projects[2]="memex"; projects[3]="other"; projects[4]="memex"; projects[5]="memex";
-          kinds[1]="subagent"; kinds[2]="interactive"; kinds[3]="subagent"; kinds[4]="subagent"; kinds[5]="interactive";
+          sources[1]="codex"; sources[2]="claude"; sources[3]="codex"; sources[4]="codex"; sources[5]="codex"; sources[6]="codex";
+          projects[1]="memex"; projects[2]="memex"; projects[3]="other"; projects[4]="memex"; projects[5]="memex"; projects[6]="memex";
+          kinds[1]="subagent"; kinds[2]="interactive"; kinds[3]="subagent"; kinds[4]="subagent"; kinds[5]="interactive"; kinds[6]="guardian_review";
           printf "["; count=0;
-          for(i=1;i<=5;i++) {
+          for(i=1;i<=6;i++) {
             ts=(i==4 ? old : recent);
             if(project!="" && projects[i]!=project)continue;
             if(source!="" && sources[i]!=source)continue;
-            if(origin!="all" && kinds[i]!=origin)continue;
+            if(origin=="regular" && kinds[i]=="guardian_review")continue;
+            if(origin!="all" && origin!="regular" && kinds[i]!=origin)continue;
             if(since!="" && ts<since)continue;
             if(count++)printf ",";
             printf "{\"source\":\"%s\",\"session_id\":\"r%d\",\"source_path\":\"/%s/r%d\",\"project\":\"%s\",\"last_at\":\"%s\",\"label\":\"Fixture %d\",\"snippet\":\"needle\",\"record_id\":\"match%d\",\"machine\":\"%s\"}",sources[i],i,machine,i,projects[i],ts,i,i,machine;
@@ -142,4 +143,24 @@ private struct FilterFixture {
     host.layoutSubtreeIfNeeded()
     #expect(host.fittingSize.height <= 44)
     #expect(store.filters.summary == "Last 30 days · OpenClaw · Interactive")
+}
+
+@MainActor @Test func permissionReviewsAreHiddenByDefaultForBrowsingAndSearch() async throws {
+    let fixture = try FilterFixture()
+    defer { fixture.cleanUp() }
+    let store = Store(client: fixture.client)
+    store.machines = [.local, MachineChoice(id: "fixture-remote", label: "Remote")]
+    for query in ["", "needle"] {
+        store.query = query
+        store.filters = .defaults
+        await store.loadSessions()
+        #expect(store.sessions.count == 10)
+        #expect(!store.sessions.contains { $0.sessionID == "r6" })
+        store.filters.origin = .includingReviews
+        await store.loadSessions()
+        #expect(store.sessions.count == 12)
+        #expect(store.sessions.filter { $0.sessionID == "r6" }.count == 2)
+    }
+    let prior = try JSONDecoder().decode(ConversationOrigin.self, from: Data("\"all\"".utf8))
+    #expect(prior.argument == "regular")
 }
