@@ -22,6 +22,7 @@ struct MemexApp: App {
 
 struct BrowserView: View {
     @Bindable var store: Store
+    @State private var sessionColumnWidth: CGFloat = 330
 
     var body: some View {
         NavigationSplitView {
@@ -29,11 +30,15 @@ struct BrowserView: View {
                 .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 290)
         } content: {
             sessionList
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: SessionColumnWidth.self, value: geometry.size.width)
+                })
                 .navigationSplitViewColumnWidth(min: 260, ideal: 330, max: 450)
         } detail: {
             ReaderView(store: store)
         }
         .navigationSplitViewStyle(.balanced)
+        .onPreferenceChange(SessionColumnWidth.self) { sessionColumnWidth = $0 }
         .toolbar(removing: defaultTitleItem)
         .searchable(text: $store.query, placement: .toolbar, prompt: "Search conversations")
         .task(id: store.requestID) { await store.loadSessions() }
@@ -57,10 +62,7 @@ struct BrowserView: View {
             } else {
                 resumeToolbarItem
             }
-            ToolbarItem(placement: .primaryAction) {
-                ConversationFilterButton(store: store)
-            }
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .navigation) {
                 Button { Task { await store.refresh() } } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
@@ -76,7 +78,7 @@ struct BrowserView: View {
         }
     }
 
-    // Retain the native center slot so trailing actions stay beside search.
+    // Reserve the native center slot between leading reader tools and Resume.
     private var toolbarCenter: some ToolbarContent {
         ToolbarItem(placement: .principal) {
             Color.clear.frame(width: 1, height: 1).accessibilityHidden(true)
@@ -89,19 +91,32 @@ struct BrowserView: View {
     }
 
     private var titleToolbarItem: some ToolbarContent {
-            ToolbarItem(placement: .navigation) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
+        ToolbarItem(placement: .navigation) {
+            HStack(spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(store.scope.title)
                         .font(.headline)
                         .lineLimit(1)
-                    Text(store.loadingSessions ? "Loading…" : "\(store.sessions.count) conversations")
+                    Text(store.loadingSessions ? "Loading…" : "\(store.sessions.count)")
                         .font(.subheadline.weight(.regular))
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                         .lineLimit(1)
                         .help("Conversations currently loaded")
                 }
+                Spacer(minLength: 4)
+                if #available(macOS 26.0, *) {
+                    ConversationFilterButton(store: store)
+                        .buttonStyle(.glass)
+                        .buttonBorderShape(.circle)
+                } else {
+                    ConversationFilterButton(store: store)
+                }
             }
+            // Navigation items begin at the sidebar separator. Keep this header
+            // tied to the real list width as the user drags either divider.
+            .frame(width: max(180, sessionColumnWidth - 48))
+        }
     }
 
     private var sidebar: some View {
@@ -256,4 +271,9 @@ struct ErrorBanner: View {
         .padding().frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.5))
     }
+}
+
+private struct SessionColumnWidth: PreferenceKey {
+    static var defaultValue: CGFloat { 330 }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

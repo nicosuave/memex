@@ -37,7 +37,7 @@ struct ReaderView: View {
 
                 }
                 .toolbar {
-                    ToolbarItemGroup(placement: .primaryAction) {
+                    ToolbarItemGroup(placement: .navigation) {
                         Button {
                             find?.isOpen = true
                             findFocused = true
