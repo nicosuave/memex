@@ -322,6 +322,8 @@ fn agent_and_non_interactive_ptys_show_help_without_prompting() {
         let fixture = Fixture::new();
         fixture.cache_update();
         let mut command = fixture.command();
+        // Assert help text independently of the host's terminal color settings.
+        command.env("NO_COLOR", "1");
         if agent {
             command.env("CODEX_THREAD_ID", "fixture-thread");
         } else {
@@ -329,8 +331,12 @@ fn agent_and_non_interactive_ptys_show_help_without_prompting() {
         }
         let output = run_pty(&mut command, b"");
         assert!(output.status.success(), "{}", output.output);
-        assert!(output.output.contains("Usage: memex"));
-        assert!(output.output.contains("Find and read:"));
+        assert!(output.output.contains("Usage: memex"), "{}", output.output);
+        assert!(
+            output.output.contains("Find and read:"),
+            "{}",
+            output.output
+        );
         assert!(output.output.contains("update: memex v99.0.0 is available"));
         assert!(
             !output
