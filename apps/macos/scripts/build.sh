@@ -62,6 +62,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSAppleEventsUsageDescription</key><string>Memex opens your selected terminal to resume the conversation you choose.</string>
 </dict></plist>
 PLIST
 plutil -lint "$APP/Contents/Info.plist"

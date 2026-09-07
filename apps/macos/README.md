@@ -2,10 +2,11 @@
 
 A native macOS companion to the Memex CLI: a project sidebar, a compact session
 list, and a paged conversation reader. It supports sessions and lexical search
-across configured machines, project and provider filters, and local resume-command copying.
+across configured machines, project and provider filters, and local conversation resuming.
 The toolbar has one Filters button: its popover combines timeframe
-(all time, last24 hours,7 days, or30 days), provider, and conversation origin.
-Permission reviews are hidden by default; choose Including permission reviews to show them.
+(all time, last 24 hours, 7 days, or 30 days), provider, and type
+(Chats and subagents, Chats only, or Subagents only).
+Permission reviews are hidden by default; enable Show permission reviews with Chats and subagents to include them.
 Filters combine with the selected project and machine, persist across launches,
 and can be reset together. Project counts remain full-index, all-history totals excluding permission reviews.
 Press Command-F in the reader for literal find across the complete conversation,
@@ -31,7 +32,11 @@ from each machine, so a slow peer does not hold back local results. Project coun
 combine the selected machines; failed peers retain their last cached totals and
 show a retry warning. Remote sessions carry their machine identity through search
 and transcript reads.
-Resume commands are copied for you to inspect and run; the app does not execute them.
+The toolbar Resume split button opens a fresh window in Ghostree, Ghostty, or Terminal
+using the CLI's configured resume command and the conversation's working directory.
+Its menu remembers your chosen installed terminal. Older Ghostty versions without
+the scripting API are omitted. macOS may request Automation permission on first use.
+Remote conversations must be resumed on their own machine; their Resume control is disabled.
 
 ## Build and launch
 

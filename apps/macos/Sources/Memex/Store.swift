@@ -45,6 +45,9 @@ final class Store {
     var loadingRecords = false
     var listError: String?
     var readerError: String?
+    var loadingSessionMetadata = false
+    var sessionMetadataError: String?
+    private var sessionMetadataGeneration = UUID()
     var hasMoreRecords = false
     private(set) var recordsOffset = 0
     private(set) var hasEarlierRecords = false
@@ -170,6 +173,7 @@ final class Store {
         async let projects: Void = loadProjects()
         async let machines: Void = loadMachines()
         _ = await (sessions, projects, machines)
+        await loadSelectedSessionMetadata()
     }
 
     func loadMoreSessionsIfNeeded(visibleID: String) {
@@ -223,11 +227,39 @@ final class Store {
                 else { batches[batch.machine] = batch.rows }
                 let rows = await mergeMachineSessions(batches: ids.compactMap { batches[$0] }, limit: limit, ranked: query != nil)
                 guard listGeneration == generation, sessionCriteriaID == criteria, !Task.isCancelled else { group.cancelAll(); return }
-                sessions = rows
+                if query != nil {
+                    let metadata = Dictionary(catalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                    sessions = rows.map { row in metadata[row.id].map { row.applyingMetadata($0) } ?? row }
+                } else { sessions = rows }
                 if scope == .all && query == nil && !filters.isActive { catalog = rows }
                 hasMoreSessions = rows.count >= limit
                 if !rows.contains(where: { $0.id == selectedID }) { selectedID = rows.first?.id }
                 listError = errors.keys.sorted().compactMap { errors[$0] }.joined(separator: "\n").nilIfBlank
+            }
+        }
+    }
+
+    func loadSelectedSessionMetadata() async {
+        let generation = UUID()
+        sessionMetadataGeneration = generation
+        loadingSessionMetadata = false
+        sessionMetadataError = nil
+        guard let session = selected, session.machineID == "local",
+              session.searchRecordID != nil, session.resumeCommand == nil else { return }
+        let request = readerRequestID
+        loadingSessionMetadata = true
+        defer { if sessionMetadataGeneration == generation { loadingSessionMetadata = false } }
+        do {
+            let detail = try await client.sessionDetails(for: session)
+            try Task.checkCancellation()
+            guard sessionMetadataGeneration == generation, readerRequestID == request,
+                  let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }
+            sessions[index] = sessions[index].applyingMetadata(detail)
+            catalog.removeAll { $0.id == detail.id }
+            catalog.append(detail)
+        } catch is CancellationError {} catch {
+            if sessionMetadataGeneration == generation, readerRequestID == request {
+                sessionMetadataError = error.localizedDescription
             }
         }
     }

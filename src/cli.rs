@@ -589,6 +589,12 @@ EXAMPLES:
         /// Read one machine (defaults to local; ignores configured search defaults)
         #[arg(long)]
         machine: Option<String>,
+        /// Match this exact session ID
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Match this exact indexed source path
+        #[arg(long)]
+        source_path: Option<String>,
         /// Only sessions whose cwd is this path, lives under it, or whose git root is it
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -1041,6 +1047,12 @@ pub(crate) struct SearchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionsRequest {
+    /// Match this exact session ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    /// Match this exact indexed source path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_path: Option<String>,
     /// Restrict sessions to this directory or repository.
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to list.
@@ -1658,6 +1670,8 @@ pub fn run() -> Result<()> {
         }
         Commands::Sessions {
             machine,
+            session_id,
+            source_path,
             cwd,
             project,
             source,
@@ -1675,6 +1689,8 @@ pub fn run() -> Result<()> {
                 origin
             };
             run_sessions(
+                session_id,
+                source_path,
                 cwd,
                 project,
                 source,
@@ -4394,6 +4410,8 @@ fn session_resume_command(
 
 #[allow(clippy::too_many_arguments)]
 fn run_sessions(
+    session_id: Option<String>,
+    source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
@@ -4414,6 +4432,8 @@ fn run_sessions(
             &config,
             id,
             SessionsRequest {
+                session_id,
+                source_path,
                 cwd: cwd.map(|value| value.to_string_lossy().to_string()),
                 project,
                 source: source.map(|value| value.as_str().to_string()),
@@ -4423,7 +4443,17 @@ fn run_sessions(
             },
         )?
     } else {
-        collect_sessions(cwd, project, source, since, limit, origin, root)?
+        collect_sessions(
+            session_id,
+            source_path,
+            cwd,
+            project,
+            source,
+            since,
+            limit,
+            origin,
+            root,
+        )?
     };
     if let Some(machine) = machine {
         for item in &mut items {
@@ -4444,7 +4474,10 @@ pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> R
     }).collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_sessions(
+    session_id: Option<String>,
+    source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
@@ -4462,12 +4495,14 @@ pub(crate) fn collect_sessions(
         SessionOrigin::All => None,
         other => Some(other.into()),
     };
-    let rows = store.query_sessions_detailed_filtered(
+    let rows = store.query_sessions_detailed_selected(
         source,
         project.as_deref(),
         cwd_filter.as_deref(),
         since_ms,
         kind_filter,
+        session_id.as_deref(),
+        source_path.as_deref(),
         Some(limit),
     )?;
 
@@ -4495,6 +4530,8 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
     validate_mcp_limit(request.limit)?;
     let source = parse_source_filter(request.source)?;
     let mut results = collect_sessions(
+        request.session_id,
+        request.source_path,
         request.cwd.map(PathBuf::from),
         request.project,
         source,
@@ -7436,6 +7473,47 @@ mod tests {
             assert!(!fields.contains("text"));
         }
         assert!(search_fields(None, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn sessions_cli_accepts_exact_identity_selectors() {
+        let cli = Cli::try_parse_from([
+            "memex",
+            "sessions",
+            "--source",
+            "codex",
+            "--session-id",
+            "shared",
+            "--source-path",
+            "/old session.jsonl",
+            "--origin",
+            "all",
+            "--limit",
+            "1",
+        ])
+        .unwrap();
+        let Commands::Sessions {
+            session_id,
+            source_path,
+            source,
+            origin,
+            limit,
+            ..
+        } = cli.command.unwrap()
+        else {
+            panic!("expected sessions command");
+        };
+        assert_eq!(session_id.as_deref(), Some("shared"));
+        assert_eq!(source_path.as_deref(), Some("/old session.jsonl"));
+        assert_eq!(source, Some(SourceFilter::Codex));
+        assert_eq!(origin, SessionOrigin::All);
+        assert_eq!(limit, 1);
+        let defaults: SessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(defaults.session_id.is_none());
+        assert!(defaults.source_path.is_none());
+        let serialized = serde_json::to_value(defaults).unwrap();
+        assert!(serialized.get("session_id").is_none());
+        assert!(serialized.get("source_path").is_none());
     }
 
     #[test]

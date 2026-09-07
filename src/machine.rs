@@ -1916,6 +1916,8 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }),
         RpcOperation::Sessions { request } => Ok(RpcPayload::Sessions {
             sessions: crate::cli::collect_sessions(
+                request.session_id,
+                request.source_path,
                 request.cwd.map(std::path::PathBuf::from),
                 request.project,
                 crate::cli::parse_source_filter(request.source)?,
@@ -3506,6 +3508,61 @@ mod tests {
                 "sub-ses".to_string()
             )]))
         );
+    }
+
+    #[test]
+    fn sessions_rpc_preserves_exact_identity_and_canonical_resume_command() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (id, path, ts, source) in [
+            ("shared", "/old session.jsonl", 1, SourceKind::Codex),
+            ("shared", "/new.jsonl", 2, SourceKind::Codex),
+            ("other", "/old session.jsonl", 3, SourceKind::Codex),
+            ("shared", "/old session.jsonl", 4, SourceKind::Claude),
+        ] {
+            let mut record = test_record(ts, id, path, 1);
+            record.source = source;
+            record.ts = ts;
+            analytics.record(&record).unwrap();
+        }
+        analytics.flush().unwrap();
+        for (path, count) in [("/old session.jsonl", 1), ("/absent.jsonl", 0)] {
+            let request: crate::cli::SessionsRequest = serde_json::from_value(serde_json::json!({
+                "source": "codex", "session_id": "shared", "source_path": path,
+                "origin": "all", "limit": 1,
+            }))
+            .unwrap();
+            let encoded = serde_json::to_vec(&RpcOperation::Sessions {
+                request: request.clone(),
+            })
+            .unwrap();
+            let decoded: RpcOperation = serde_json::from_slice(&encoded).unwrap();
+            let RpcPayload::Sessions { sessions } = handle_rpc(&paths, &config, decoded).unwrap()
+            else {
+                panic!("expected sessions metadata");
+            };
+            assert_eq!(sessions.len(), count);
+            let mcp = crate::cli::mcp_sessions(Some(paths.root.clone()), request).unwrap();
+            assert_eq!(mcp["results"].as_array().unwrap().len(), count);
+            if count == 1 {
+                assert_eq!(sessions[0]["source"], "codex");
+                assert_eq!(sessions[0]["session_id"], "shared");
+                assert_eq!(sessions[0]["source_path"], path);
+                assert_eq!(
+                    sessions[0]["resume_cmd"],
+                    "configured-resume shared '/old session.jsonl'"
+                );
+                assert_eq!(mcp["results"][0]["resume_cmd"], sessions[0]["resume_cmd"]);
+            }
+        }
     }
 
     #[test]

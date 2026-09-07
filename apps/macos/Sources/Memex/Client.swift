@@ -132,6 +132,17 @@ struct MemexClient: Sendable {
         return try JSONDecoder().decode([Session].self, from: await run(args))
     }
 
+    func sessionDetails(for session: Session) async throws -> Session {
+        let args = ["sessions", "--format", "json", "--machine", session.machineID,
+                    "--source", session.source, "--session-id=\(session.sessionID)",
+                    "--source-path=\(session.sourcePath)", "--origin", "all", "--limit", "1"]
+        let rows = try JSONDecoder().decode([Session].self, from: await run(args))
+        guard rows.count == 1, let detail = rows.first, detail.id == session.id else {
+            throw ClientError(message: "This conversation's resume details are unavailable. Refresh conversations and try again.")
+        }
+        return detail
+    }
+
     func projects(machine: String = "local") async throws -> [ProjectSummary] {
         try JSONDecoder().decode([ProjectSummary].self, from: await run(["projects", "--format", "json", "--machine", machine]))
     }

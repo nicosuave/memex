@@ -38,6 +38,7 @@ struct BrowserView: View {
         .searchable(text: $store.query, placement: .toolbar, prompt: "Search conversations")
         .task(id: store.requestID) { await store.loadSessions() }
         .task(id: store.readerRequestID) { await store.loadRecords() }
+        .task(id: store.readerRequestID) { await store.loadSelectedSessionMetadata() }
         .task { await store.loadMachines() }
         .task(id: store.machineRequestID) { await store.loadProjects() }
         .onChange(of: store.scope) { _, _ in store.sessionLimit = 200 }
@@ -50,6 +51,12 @@ struct BrowserView: View {
                 titleToolbarItem
                 toolbarCenter
             }
+            if #available(macOS 26.0, *) {
+                resumeToolbarItem.sharedBackgroundVisibility(.hidden)
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+            } else {
+                resumeToolbarItem
+            }
             ToolbarItem(placement: .primaryAction) {
                 ConversationFilterButton(store: store)
             }
@@ -60,6 +67,12 @@ struct BrowserView: View {
                 .help("Refresh conversations (⌘R)")
                 .disabled(store.loadingSessions)
             }
+        }
+    }
+
+    private var resumeToolbarItem: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            if store.selected != nil { ResumeToolbarButton(store: store) }
         }
     }
 
@@ -192,7 +205,7 @@ struct BrowserView: View {
                         Label(store.filters.isActive ? "No matching conversations" : (store.query.isEmpty ? "No conversations yet" : "No matches"),
                               systemImage: "bubble.left.and.bubble.right")
                     } description: {
-                        Text(store.filters.isActive ? "Try another timeframe, provider, or origin." :
+                        Text(store.filters.isActive ? "Try another timeframe, provider, or conversation type." :
                              (store.query.isEmpty ? "Run memex index to index your local history, then refresh." : "Try different words or another project."))
                     } actions: {
                         if store.filters.isActive { Button("Reset Filters") { store.filters = .defaults } }

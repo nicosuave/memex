@@ -21,6 +21,16 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
     var projectName: String { repoProject?.nilIfBlank ?? project.nilIfBlank ?? "No project" }
     var date: Date? { lastAt.flatMap { try? Date.ISO8601FormatStyle().parse($0) } }
 
+    func applyingMetadata(_ metadata: Session) -> Session {
+        guard metadata.id == id else { return self }
+        var value = metadata
+        value.snippet = snippet
+        value.searchRecordID = searchRecordID
+        if value.label == nil { value.label = label }
+        if value.lastAt == nil { value.lastAt = lastAt }
+        return value
+    }
+
     enum CodingKeys: String, CodingKey {
         case source, project, label, cwd, snippet, machine
         case sessionID = "session_id", sourcePath = "source_path"

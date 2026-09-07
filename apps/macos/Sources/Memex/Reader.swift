@@ -3,7 +3,6 @@ import SwiftUI
 
 struct ReaderView: View {
     @Bindable var store: Store
-    @State private var copiedResume = false
     @State private var navigation = TranscriptNavigationState()
     @State private var find: ConversationFindState?
     @FocusState private var findFocused: Bool
@@ -53,15 +52,6 @@ struct ReaderView: View {
                                 Label("Reveal source", systemImage: "doc")
                             }.help("Reveal transcript in Finder")
                         }
-                        if session.machineID == "local", let command = session.resumeCommand {
-                            Button {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(command, forType: .string)
-                                copiedResume = true
-                            } label: {
-                                Label(copiedResume ? "Copied" : "Copy resume command", systemImage: copiedResume ? "checkmark" : "terminal")
-                            }.help("Copy resume command")
-                        }
                     }
                 }
             } else {
@@ -71,7 +61,6 @@ struct ReaderView: View {
         }
         .onAppear { if find == nil { find = ConversationFindState(client: store.client) } }
         .onChange(of: store.selectedID) { _, _ in
-            copiedResume = false
             find?.search(in: store.selected)
         }
         .onChange(of: find?.query) { _, _ in find?.search(in: store.selected) }

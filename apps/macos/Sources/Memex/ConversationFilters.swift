@@ -6,6 +6,17 @@ struct ConversationFilters: Codable, Equatable, Sendable {
     var origin = ConversationOrigin.all
 
     static let defaults = ConversationFilters()
+    var conversationType: ConversationOrigin {
+        get { origin == .includingReviews ? .all : origin }
+        set { origin = newValue }
+    }
+    var showsPermissionReviews: Bool {
+        get { origin == .includingReviews }
+        set {
+            guard conversationType == .all else { return }
+            origin = newValue ? .includingReviews : .all
+        }
+    }
     var isActive: Bool { self != .defaults }
     var summary: String {
         [timeframe == .all ? nil : timeframe.title,
@@ -38,6 +49,7 @@ enum ConversationTimeframe: String, CaseIterable, Codable, Sendable {
 
 enum ConversationOrigin: String, CaseIterable, Codable, Sendable {
     case all, interactive, subagent, includingReviews
+    static let conversationTypes: [Self] = [.all, .interactive, .subagent]
     var argument: String {
         switch self {
         case .all: "regular"
@@ -47,10 +59,10 @@ enum ConversationOrigin: String, CaseIterable, Codable, Sendable {
     }
     var title: String {
         switch self {
-        case .all: "All conversations"
-        case .interactive: "Interactive"
-        case .subagent: "Subagents"
-        case .includingReviews: "Including permission reviews"
+        case .all: "Chats and subagents"
+        case .interactive: "Chats only"
+        case .subagent: "Subagents only"
+        case .includingReviews: "Permission reviews shown"
         }
     }
 }

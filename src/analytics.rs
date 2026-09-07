@@ -449,6 +449,24 @@ impl AnalyticsStore {
         kind: Option<SessionKindFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
+        self.query_sessions_detailed_selected(
+            source, project, cwd, since_ms, kind, None, None, limit,
+        )
+    }
+
+    /// Apply exact identity selectors together with all listing filters before limiting rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_sessions_detailed_selected(
+        &self,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        since_ms: Option<u64>,
+        kind: Option<SessionKindFilter>,
+        session_id: Option<&str>,
+        source_path: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionDetailRow>> {
         let mut sql = String::from(
             "SELECT source, session_id, source_path, project, repo_project,
                     cwd, git_root, started_at, last_at, message_count, label, conversation_kind
@@ -456,6 +474,15 @@ impl AnalyticsStore {
         );
         let mut clauses = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(session_id) = session_id {
+            clauses.push("session_id = ?".to_string());
+            values.push(rusqlite::types::Value::Text(session_id.to_string()));
+        }
+        if let Some(source_path) = source_path {
+            clauses.push("source_path = ?".to_string());
+            values.push(rusqlite::types::Value::Text(source_path.to_string()));
+        }
 
         if let Some(source) = source {
             let labels = source.storage_labels();
@@ -2066,6 +2093,56 @@ mod tests {
             links: RecordLinks::default(),
             source_path: source_path.to_string_lossy().to_string(),
         }
+    }
+
+    #[test]
+    fn detailed_sessions_exact_selectors_apply_before_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
+             ('codex', 'shared', '/old', 'target', 1, 1),
+             ('codex', 'shared', '/new', 'target', 2, 2),
+             ('codex', 'other', '/old', 'target', 3, 3),
+             ('claude', 'shared', '/old', 'target', 4, 4);",
+        ).unwrap();
+        let query = |session_id, source_path| {
+            store
+                .query_sessions_detailed_selected(
+                    Some(SourceFilter::Codex),
+                    None,
+                    None,
+                    None,
+                    None,
+                    session_id,
+                    source_path,
+                    Some(1),
+                )
+                .unwrap()
+        };
+        let exact = query(Some("shared"), Some("/old"));
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].last_at, 1);
+        assert_eq!(exact[0].source, SourceKind::Codex);
+        assert_eq!(query(Some("shared"), None)[0].source_path, "/new");
+        assert_eq!(query(None, Some("/old"))[0].session_id, "other");
+        assert!(query(Some("missing"), Some("/old")).is_empty());
+        assert!(query(Some("shared"), Some("/old%")).is_empty());
+        assert!(
+            store
+                .query_sessions_detailed_selected(
+                    Some(SourceFilter::Codex),
+                    Some("different"),
+                    None,
+                    None,
+                    None,
+                    Some("shared"),
+                    Some("/old"),
+                    Some(1),
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -142,7 +142,7 @@ private struct FilterFixture {
     host.frame = NSRect(x: 0, y: 0, width: 260, height: 40)
     host.layoutSubtreeIfNeeded()
     #expect(host.fittingSize.height <= 44)
-    #expect(store.filters.summary == "Last 30 days · OpenClaw · Interactive")
+    #expect(store.filters.summary == "Last 30 days · OpenClaw · Chats only")
 }
 
 @MainActor @Test func permissionReviewsAreHiddenByDefaultForBrowsingAndSearch() async throws {
@@ -163,4 +163,29 @@ private struct FilterFixture {
     }
     let prior = try JSONDecoder().decode(ConversationOrigin.self, from: Data("\"all\"".utf8))
     #expect(prior.argument == "regular")
+}
+
+@Test func conversationTypeAndPermissionReviewToggleKeepDistinctMeanings() throws {
+    var filters = ConversationFilters.defaults
+    #expect(filters.conversationType == .all)
+    #expect(!filters.showsPermissionReviews)
+    filters.showsPermissionReviews = true
+    #expect(filters.origin.argument == "all")
+    #expect(filters.conversationType == .all)
+    filters.showsPermissionReviews = false
+    #expect(filters.origin.argument == "regular")
+    for type in [ConversationOrigin.interactive, .subagent] {
+        filters.conversationType = .all
+        filters.showsPermissionReviews = true
+        filters.conversationType = type
+        #expect(!filters.showsPermissionReviews)
+        filters.showsPermissionReviews = true
+        #expect(filters.origin == type)
+    }
+    filters.conversationType = .all
+    #expect(filters == .defaults)
+    let saved = try JSONDecoder().decode(ConversationFilters.self,
+        from: Data(#"{"timeframe":"all","provider":"all","origin":"includingReviews"}"#.utf8))
+    #expect(saved.conversationType == .all)
+    #expect(saved.showsPermissionReviews)
 }
