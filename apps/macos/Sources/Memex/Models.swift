@@ -93,7 +93,12 @@ struct Message: Decodable, Equatable, Sendable {
     }
 
     var isActivity: Bool { ["tool_use", "tool_result", "tool", "reasoning"].contains(role) }
-    var isInstruction: Bool { ["system", "developer"].contains(role) }
+    var isEnvironmentContext: Bool {
+        guard role == "user" else { return false }
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.hasPrefix("<environment_context>") && value.hasSuffix("</environment_context>")
+    }
+    var isInstruction: Bool { ["system", "developer"].contains(role) || isEnvironmentContext }
     var activityTitle: String {
         if role == "reasoning" { return "Reasoning" }
         guard let toolName = toolName?.nilIfBlank else {
@@ -109,6 +114,7 @@ struct TranscriptActivity: Identifiable, Sendable {
     var id: String { records.first(where: { $0.record.role == "tool_use" })?.id ?? records[0].id }
     var title: String {
         let message = records.first(where: { $0.record.role == "tool_use" })?.record ?? records[0].record
+        if message.isEnvironmentContext { return "Environment context" }
         if message.isInstruction { return message.role.capitalized + " instructions" }
         return message.activityTitle
     }

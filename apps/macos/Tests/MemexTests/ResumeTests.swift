@@ -13,7 +13,7 @@ private func resumableSession(machine: String = "local", command: String? = "cod
     let cwd = "/tmp/a'b $(touch nope)\nline"
     let session = resumableSession(command: command, cwd: cwd)
     let launch = "/bin/zsh -lic " + ResumeLaunchPlan.shellQuote("cd -- " + ResumeLaunchPlan.shellQuote(cwd) + " || exit\n" + command)
-    for destination in ResumeDestination.allCases {
+    for destination in [ResumeDestination.ghostree, .ghostty, .terminal] {
         let plan = try ResumeLaunchPlan(session: session, destination: destination)
         #expect(plan.destination == destination)
         #expect(plan.script.contains(ResumeLaunchPlan.appleScriptString(launch)))
@@ -83,4 +83,19 @@ private func resumableSession(machine: String = "local", command: String? = "cod
     process.waitUntilExit()
     #expect(process.terminationStatus == 0)
     #expect(String(decoding: data, as: UTF8.self) == value)
+}
+
+@MainActor @Test func chatGPTMenuCanOpenWhileTerminalMetadataIsUnavailable() {
+    let coordinator = ResumeSplitControl.Coordinator()
+    coordinator.enabled = false
+    coordinator.menuEnabled = true
+    coordinator.canOpen = { $0 == .chatgpt }
+    var opened: [ResumeDestination] = []
+    coordinator.onOpen = { opened.append($0) }
+    let item = NSMenuItem()
+    item.representedObject = "terminal"
+    coordinator.openSpecific(item)
+    item.representedObject = "chatgpt"
+    coordinator.openSpecific(item)
+    #expect(opened == [.chatgpt])
 }

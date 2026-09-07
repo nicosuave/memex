@@ -56,6 +56,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     private var records: [TranscriptRecord] = []
     private var provider = ""
     private var expanded = Set<String>()
+    private var rawTools = Set<String>()
     private var measurements: [String: Measurement] = [:]
     private var measuredWidth: CGFloat = 0
     private var notifiedWidth: CGFloat = 0
@@ -111,6 +112,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let isUser: Bool
         let isDisclosure: Bool
         let isExpanded: Bool
+        let showsRawControl: Bool
+        let showsRaw: Bool
+        let finding: Bool
     }
 
     override func loadView() {
@@ -158,7 +162,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             selectedFindCell?.clearFindSelection()
             selectedFindCell = nil
         }
-        if changedQuery { measurements.removeAll(keepingCapacity: true) }
+        if changedQuery {
+            measurements.removeAll(keepingCapacity: true)
+            textLayouts.removeAll(keepingCapacity: true)
+        }
         defer { applyFindPosition() }
         if changedSession { savePosition() }
         if let navigation { self.navigation = navigation }
@@ -192,6 +199,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         self.provider = provider
         if changedSession {
             needsInitialPosition = true
+            rawTools.removeAll()
             expanded = self.navigation.positions[sessionID]?.expanded ?? []
         }
         if needsInitialPosition, self.navigation.positions[sessionID] == nil, let anchorID,
@@ -254,7 +262,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             } else if let cached = findRecordBodies[record.id] {
                 body = cached
             } else {
-                body = TranscriptTextLayout(text: ConversationMatcher.body(record), font: value.font).attributedText.string
+                body = record.record.isActivity && !record.record.isInstruction && record.record.role != "reasoning"
+                    ? ToolContentRenderer.render([record], raw: true).string
+                    : TranscriptTextLayout(text: ConversationMatcher.body(record), font: value.font).attributedText.string
                 findRecordBodies[record.id] = body
             }
             let section = rendered.range(of: body, options: .literal,
@@ -381,6 +391,13 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         rebuildRows()
     }
 
+    func toggleRaw(_ id: String) {
+        if rawTools.contains(id) { rawTools.remove(id) } else { rawTools.insert(id) }
+        measurements.removeValue(forKey: id)
+        textLayouts.removeValue(forKey: id)
+        rebuildRows()
+    }
+
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { measurement(at: row).height }
@@ -439,7 +456,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
 
     private func configure(_ cell: TranscriptCell, row: Int) {
         let id = rows[row].id
-        cell.configure(measurement(at: row), toggle: { [weak self] in self?.toggle(id) })
+        cell.configure(measurement(at: row), toggle: { [weak self] in self?.toggle(id) },
+                       toggleRaw: { [weak self] in self?.toggleRaw(id) })
     }
 
     func measurement(at index: Int) -> Measurement {
@@ -464,7 +482,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         case .activity(let entry, let nested):
             title = entry.title
             isUser = false; isDisclosure = true
-            isTool = !entry.records[0].record.isInstruction
+            isTool = !entry.records[0].record.isInstruction && entry.records[0].record.role != "reasoning"
             indent = nested ? 20 : 0
             if isExpanded { fullText = entry.body }
         case .message(let entry):
@@ -480,11 +498,17 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let contentWidth = isUser ? min(620, available) : available
         let contentX = isUser ? width - 30 - contentWidth : 30 + indent
         let bodyWidth = contentWidth - (isUser ? 30 : 0)
-        let textLayout = textLayouts[row.id] ?? TranscriptTextLayout(text: body, font: font)
+        let showsRaw = rawTools.contains(row.id) || !findQuery.isEmpty
+        let textLayout: TranscriptTextLayout
+        if let cached = textLayouts[row.id] { textLayout = cached }
+        else if isTool && isExpanded && !body.isEmpty {
+            textLayout = TranscriptTextLayout(rendered: ToolContentRenderer.render(row.records, raw: showsRaw), trimEdges: false)
+        } else { textLayout = TranscriptTextLayout(text: body, font: font) }
         textLayouts[row.id] = textLayout
         let textHeight = textLayout.height(for: bodyWidth)
         let bodyHeight = textHeight + (isUser && !body.isEmpty ? 30 : 0)
-        let height = 38 + bodyHeight + (body.isEmpty ? 0 : 20)
+        let showsRawControl = isTool && isExpanded && !body.isEmpty
+        let height = 38 + bodyHeight + (body.isEmpty ? 0 : 20) + (showsRawControl ? 28 : 0)
         let highlighted: NSAttributedString
         if findQuery.isEmpty {
             highlighted = textLayout.attributedText
@@ -497,7 +521,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         }
         let result = Measurement(title: title, body: body, attributedBody: highlighted, font: font, textHeight: textHeight, height: height,
             contentX: contentX, contentWidth: contentWidth, isUser: isUser, isDisclosure: isDisclosure,
-            isExpanded: isExpanded)
+            isExpanded: isExpanded, showsRawControl: showsRawControl, showsRaw: showsRaw, finding: !findQuery.isEmpty)
         measurements[row.id] = result
         return result
     }
@@ -507,10 +531,12 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
 private final class TranscriptCell: NSTableCellView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let disclosure = NSButton()
+    private let rawDisclosure = NSButton()
     private let message = NSTextView()
     private let bubble = NSView()
     private var measurement: TranscriptController.Measurement?
     private var onToggle: (() -> Void)?
+    private var onToggleRaw: (() -> Void)?
     private var displayedText: NSAttributedString?
     override var isFlipped: Bool { true }
 
@@ -525,6 +551,12 @@ private final class TranscriptCell: NSTableCellView {
         disclosure.contentTintColor = .secondaryLabelColor
         disclosure.target = self
         disclosure.action = #selector(toggle)
+        rawDisclosure.isBordered = false
+        rawDisclosure.alignment = .left
+        rawDisclosure.font = .systemFont(ofSize: 12)
+        rawDisclosure.contentTintColor = .secondaryLabelColor
+        rawDisclosure.target = self
+        rawDisclosure.action = #selector(toggleRaw)
         message.isEditable = false
         message.isSelectable = true
         message.drawsBackground = false
@@ -538,13 +570,18 @@ private final class TranscriptCell: NSTableCellView {
         addSubview(bubble)
         addSubview(titleLabel)
         addSubview(disclosure)
+        addSubview(rawDisclosure)
         addSubview(message)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func configure(_ value: TranscriptController.Measurement, toggle: @escaping () -> Void) {
+    func configure(_ value: TranscriptController.Measurement, toggle: @escaping () -> Void, toggleRaw: @escaping () -> Void) {
         measurement = value
         onToggle = toggle
+        onToggleRaw = toggleRaw
+        rawDisclosure.isHidden = !value.showsRawControl
+        rawDisclosure.title = value.finding ? "Raw content shown for Find" : (value.showsRaw ? "Show formatted content" : "Show raw content")
+        rawDisclosure.isEnabled = !value.finding
         titleLabel.stringValue = value.title
         titleLabel.alignment = value.isUser ? .right : .left
         titleLabel.isHidden = value.isDisclosure
@@ -570,8 +607,10 @@ private final class TranscriptCell: NSTableCellView {
         let width = value.contentWidth
         titleLabel.frame = NSRect(x: x, y: 10, width: width, height: 18)
         disclosure.frame = NSRect(x: x, y: 8, width: width, height: 22)
+        rawDisclosure.frame = NSRect(x: x, y: 32, width: width, height: 22)
+        let bodyY: CGFloat = value.showsRawControl ? 62 : 34
         let inset: CGFloat = value.isUser ? 15 : 0
-        message.frame = NSRect(x: x + inset, y: 34 + inset, width: width - 2 * inset, height: value.textHeight)
+        message.frame = NSRect(x: x + inset, y: bodyY + inset, width: width - 2 * inset, height: value.textHeight)
         bubble.frame = NSRect(x: x, y: 34, width: width, height: value.textHeight + 2 * inset)
     }
 
@@ -588,6 +627,7 @@ private final class TranscriptCell: NSTableCellView {
     }
 
     @objc private func toggle() { onToggle?() }
+    @objc private func toggleRaw() { onToggleRaw?() }
 }
 
 /// Retain glyph shaping across width changes and use the same TextKit settings
@@ -598,15 +638,20 @@ private final class TranscriptCell: NSTableCellView {
     private let manager = NSLayoutManager()
     private let container = NSTextContainer(size: .zero)
 
-    init(text: String, font: NSFont) {
-        let rendered = RichTextRenderer.render(text, font: font)
+    convenience init(text: String, font: NSFont) {
+        self.init(rendered: RichTextRenderer.render(text, font: font))
+    }
+
+    init(rendered: NSAttributedString, trimEdges: Bool = true) {
         // Markdown block separators belong between paragraphs, not at the
         // bubble edges where TextKit would measure an extra empty line.
         let value = rendered.string as NSString
         let content = CharacterSet.newlines.inverted
         let first = value.rangeOfCharacter(from: content)
         let last = value.rangeOfCharacter(from: content, options: .backwards)
-        if first.location != NSNotFound {
+        if !trimEdges {
+            attributedText = rendered
+        } else if first.location != NSNotFound {
             attributedText = rendered.attributedSubstring(from: NSRange(
                 location: first.location, length: NSMaxRange(last) - first.location))
         } else {

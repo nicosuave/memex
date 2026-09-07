@@ -13,7 +13,10 @@ Press Command-F in the reader for literal find across the complete conversation,
 including earlier pages and tool contents. Command-G and Shift-Command-G navigate
 matches; Escape closes find. Results appear incrementally while scanning.
 Source-only matches hidden by Markdown still reveal the containing message.
-Tool activity and session instructions start collapsed. Each tool call and its result share
+Tool activity and session instructions, including generated environment context, start collapsed.
+Expanded tools show labeled JSON fields, literal code, and decoded output lines.
+Long encoded payloads stay compact; Show raw content reveals the complete source.
+Find automatically uses raw tool content to retain exact matches. Each tool call and its result share
 one expandable row; single operations and instructions have no extra outer disclosure. Both the session list and
 transcript load additional pages as you scroll, without load buttons. Browsing
 opens at the newest messages; scrolling up loads earlier context. Search opens at
@@ -32,11 +35,14 @@ from each machine, so a slow peer does not hold back local results. Project coun
 combine the selected machines; failed peers retain their last cached totals and
 show a retry warning. Remote sessions carry their machine identity through search
 and transcript reads.
-The toolbar Resume split button opens a fresh window in Ghostree, Ghostty, or Terminal
+The toolbar Resume split button opens a fresh window in an installed Ghostree, Ghostty,
+Terminal, Alacritty, kitty, WezTerm, or cmux
 using the CLI's configured resume command and the conversation's working directory.
-Its menu remembers your chosen installed terminal. Older Ghostty versions without
+For local Codex conversations, ChatGPT is also available through its conversation deep link.
+Its menu remembers your chosen app. Older Ghostty versions without
 the scripting API are omitted. macOS may request Automation permission on first use.
-Remote conversations must be resumed on their own machine; their Resume control is disabled.
+Remote conversations must be resumed on their own machine; their Resume action is disabled.
+cmux requires socket access and opens the resumed session in a fresh workspace.
 
 ## Build and launch
 

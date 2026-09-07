@@ -4,18 +4,25 @@ import SwiftUI
 // Launch adapters follow the applications' shipped scripting dictionaries:
 // Ghostty/Ghostree: new window with a surface configuration; Terminal: do script.
 enum ResumeDestination: String, CaseIterable, Sendable {
-    case ghostree, ghostty, terminal
+    case ghostree, ghostty, terminal, alacritty, kitty, wezterm, cmux, chatgpt
 
     var title: String {
-        switch self { case .ghostree: "Ghostree"; case .ghostty: "Ghostty"; case .terminal: "Terminal" }
+        switch self {
+        case .ghostree: "Ghostree"; case .ghostty: "Ghostty"; case .terminal: "Terminal"
+        case .chatgpt: "ChatGPT"
+        default: terminalAdapter!.title
+        }
     }
     var bundleID: String {
         switch self {
         case .ghostree: "dev.sidequery.Ghostree"
         case .ghostty: "com.mitchellh.ghostty"
         case .terminal: "com.apple.Terminal"
+        case .chatgpt: "com.openai.codex"
+        default: terminalAdapter!.bundleID
         }
     }
+    var terminalAdapter: TerminalLaunchAdapter? { TerminalLaunchAdapter(rawValue: rawValue) }
     @MainActor var appURL: URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) }
     @MainActor var icon: NSImage? {
         guard let appURL else { return NSImage(systemSymbolName: "terminal", accessibilityDescription: title) }
@@ -26,13 +33,17 @@ enum ResumeDestination: String, CaseIterable, Sendable {
     @MainActor static var installed: [Self] {
         allCases.filter { destination in
             guard let url = destination.appURL else { return false }
-            if destination == .terminal { return true }
+            if destination == .terminal || destination == .chatgpt { return true }
+            if let adapter = destination.terminalAdapter { return adapter.isAvailable(at: url) }
             // Older Ghostty versions do not expose the surface-configuration API.
             let dictionary = url.appendingPathComponent("Contents/Resources/Ghostty.sdef")
             guard let source = try? String(contentsOf: dictionary, encoding: .utf8) else { return false }
             return source.contains("name=\"new window\"") && source.contains("name=\"with configuration\"")
                 && source.contains("name=\"command\"")
         }
+    }
+    @MainActor static func available(for session: Session) -> [Self] {
+        installed.filter { $0 != .chatgpt || ChatGPTResume.url(for: session) != nil }
     }
     static func preferred(in installed: [Self], saved: String?) -> Self? {
         if let saved, let destination = Self(rawValue: saved), installed.contains(destination) { return destination }
@@ -76,6 +87,8 @@ struct ResumeLaunchPlan: Equatable, Sendable {
                 activate
             end tell
             """
+        default:
+            throw ResumeError(message: "This destination uses a direct launch adapter.")
         }
     }
 
@@ -135,22 +148,35 @@ struct ResumeButton: View {
     @State private var error: String?
 
     var body: some View {
-        let destinations = ResumeDestination.installed
+        let destinations = ResumeDestination.available(for: session)
         let preferred = ResumeDestination.preferred(in: destinations, saved: savedDestination)
-        let reason = metadataHelp ?? ResumeLaunchPlan.unavailableReason(for: session)
+        let reason = (preferred == .chatgpt ? nil : metadataHelp ?? ResumeLaunchPlan.unavailableReason(for: session))
             ?? (preferred == nil ? "Install a supported terminal to resume this conversation." : nil)
         ResumeSplitControl(destinations: destinations, preferred: preferred,
                            enabled: reason == nil && !isLaunching,
+                           menuEnabled: !isLaunching,
+                           canOpen: { $0 == .chatgpt || (metadataHelp == nil && ResumeLaunchPlan.unavailableReason(for: session) == nil) },
                            help: reason ?? "Resume in \(preferred?.title ?? "terminal")") { destination in
             savedDestination = destination.rawValue
             isLaunching = true
             Task {
                 defer { isLaunching = false }
-                do { try await ResumeLaunchPlan(session: session, destination: destination).run() }
+                do {
+                    if destination == .chatgpt {
+                        try await ChatGPTResume.open(session)
+                    } else if let adapter = destination.terminalAdapter, let url = destination.appURL {
+                        if let reason = ResumeLaunchPlan.unavailableReason(for: session) { throw ResumeError(message: reason) }
+                        let payload = (session.cwd?.nilIfBlank.map { "cd -- \(ResumeLaunchPlan.shellQuote($0)) || exit\n" } ?? "") + session.resumeCommand!
+                        try await adapter.launch(payload: payload, appURL: url).run()
+                    } else {
+                        try await ResumeLaunchPlan(session: session, destination: destination).run()
+                    }
+                }
                 catch { self.error = error.localizedDescription }
             }
         }
         .fixedSize()
+        .modifier(ResumeCapsule())
         .alert("Could not resume conversation", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK") { error = nil }
         } message: { Text(error ?? "") }
@@ -161,6 +187,8 @@ struct ResumeSplitControl: NSViewRepresentable {
     let destinations: [ResumeDestination]
     let preferred: ResumeDestination?
     let enabled: Bool
+    var menuEnabled: Bool? = nil
+    var canOpen: (ResumeDestination) -> Bool = { _ in true }
     let help: String
     let onOpen: (ResumeDestination) -> Void
 
@@ -184,14 +212,21 @@ struct ResumeSplitControl: NSViewRepresentable {
         context.coordinator.preferred = preferred
         context.coordinator.onOpen = onOpen
         context.coordinator.enabled = enabled
-        control.isEnabled = enabled
+        context.coordinator.menuEnabled = menuEnabled ?? enabled
+        context.coordinator.canOpen = canOpen
+        control.isEnabled = enabled || (menuEnabled ?? enabled)
+        control.setEnabled(enabled, forSegment: 0)
+        control.setEnabled(menuEnabled ?? enabled, forSegment: 1)
         control.setImage(preferred?.icon ?? NSImage(systemSymbolName: "terminal", accessibilityDescription: nil), forSegment: 0)
         control.setToolTip(help, forSegment: 0)
-        control.setToolTip(enabled ? "Choose terminal" : help, forSegment: 1)
+        control.setToolTip((menuEnabled ?? enabled) ? "Choose app" : help, forSegment: 1)
         control.toolTip = help
         let menu = NSMenu()
+        menu.autoenablesItems = false
         for destination in destinations {
+            if destination == .chatgpt && !menu.items.isEmpty { menu.addItem(.separator()) }
             let item = NSMenuItem(title: destination.title, action: #selector(Coordinator.openSpecific(_:)), keyEquivalent: "")
+            item.isEnabled = canOpen(destination)
             item.target = context.coordinator
             item.representedObject = destination.rawValue
             item.image = destination.icon
@@ -204,17 +239,32 @@ struct ResumeSplitControl: NSViewRepresentable {
     @MainActor final class Coordinator: NSObject {
         var preferred: ResumeDestination?
         var enabled = false
+        var menuEnabled: Bool? = nil
+        var canOpen: (ResumeDestination) -> Bool = { _ in true }
         var onOpen: ((ResumeDestination) -> Void)?
         @objc func openPreferred(_ sender: NSSegmentedControl) {
-            guard enabled else { return }
             if sender.selectedSegment == 1 {
+                guard menuEnabled ?? enabled else { return }
                 sender.menu(forSegment: 1)?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
-            } else if let preferred { onOpen?(preferred) }
+            } else if enabled, let preferred { onOpen?(preferred) }
         }
         @objc func openSpecific(_ sender: NSMenuItem) {
-            guard enabled, let raw = sender.representedObject as? String,
-                  let destination = ResumeDestination(rawValue: raw) else { return }
+            guard menuEnabled ?? enabled, let raw = sender.representedObject as? String,
+                  let destination = ResumeDestination(rawValue: raw), canOpen(destination) else { return }
             onOpen?(destination)
+        }
+    }
+}
+
+private struct ResumeCapsule: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content
+                .padding(.horizontal, 8)
+                .frame(height: 32)
+                .glassEffect(.regular, in: .capsule)
+        } else {
+            content
         }
     }
 }
