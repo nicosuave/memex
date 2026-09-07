@@ -297,6 +297,12 @@ pub struct Federated<T> {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum RpcOperation {
     Ping,
+    Projects {
+        source: Option<SourceFilter>,
+    },
+    Sessions {
+        request: crate::cli::SessionsRequest,
+    },
     MemorySearch {
         options: MemorySearchOptions,
     },
@@ -367,6 +373,12 @@ struct RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RpcPayload {
+    Projects {
+        projects: Vec<serde_json::Value>,
+    },
+    Sessions {
+        sessions: Vec<serde_json::Value>,
+    },
     Pong {
         version: String,
     },
@@ -1781,6 +1793,74 @@ pub fn federated_session_activity(
     Ok((points, !errors.is_empty()))
 }
 
+/// Discovery deliberately ignores the configured default search subset and never
+/// exposes transport commands, hosts, credentials, or index configuration.
+pub fn configured_machine_summaries(config: &UserConfig) -> Result<Vec<serde_json::Value>> {
+    let mut items = vec![serde_json::json!({"id": LOCAL_MACHINE_ID, "label": "This Mac"})];
+    let mut seen = HashSet::from([LOCAL_MACHINE_ID.to_string()]);
+    for machine in config.machines.iter().filter(|machine| machine.enabled()) {
+        validate_machine(machine)?;
+        if !seen.insert(machine.id.clone()) {
+            bail!("duplicate machine id '{}'", machine.id);
+        }
+        items.push(serde_json::json!({
+            "id": machine.id,
+            "label": machine.label.as_deref().filter(|label| !label.trim().is_empty()).unwrap_or(&machine.id),
+        }));
+    }
+    Ok(items)
+}
+
+pub(crate) fn remote_project_summaries(
+    config: &UserConfig,
+    id: &str,
+    source: Option<SourceFilter>,
+) -> Result<Vec<serde_json::Value>> {
+    match metadata_rpc(config, id, RpcOperation::Projects { source }, "projects")? {
+        RpcPayload::Projects { projects } => Ok(projects),
+        _ => bail!("machine '{id}' returned an unexpected projects metadata response"),
+    }
+}
+
+pub(crate) fn remote_sessions(
+    config: &UserConfig,
+    id: &str,
+    request: crate::cli::SessionsRequest,
+) -> Result<Vec<serde_json::Value>> {
+    match metadata_rpc(config, id, RpcOperation::Sessions { request }, "sessions")? {
+        RpcPayload::Sessions { sessions } => Ok(sessions),
+        _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
+    }
+}
+
+fn metadata_rpc(
+    config: &UserConfig,
+    id: &str,
+    operation: RpcOperation,
+    name: &str,
+) -> Result<RpcPayload> {
+    let machine = config
+        .machines
+        .iter()
+        .find(|machine| machine.id == id)
+        .ok_or_else(|| anyhow!("unknown machine '{id}'"))?;
+    let response = rpc(
+        machine,
+        operation,
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    );
+    let response = match response {
+        Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
+        value => value,
+    };
+    response.map_err(|error| {
+        let message = error.to_string();
+        if message.contains("unknown variant") || message.contains("unsupported RPC protocol") {
+            anyhow!("machine '{id}' does not support {name} metadata; update Memex on that peer to use this view. {message}")
+        } else { error }
+    })
+}
+
 pub fn remote_shell_command(machine: &MachineConfig, command: &str) -> Result<String> {
     validate_machine(machine)?;
     let target = machine
@@ -1831,6 +1911,20 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
 
 fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Result<RpcPayload> {
     match request {
+        RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
+            projects: crate::cli::collect_projects(paths, source)?,
+        }),
+        RpcOperation::Sessions { request } => Ok(RpcPayload::Sessions {
+            sessions: crate::cli::collect_sessions(
+                request.cwd.map(std::path::PathBuf::from),
+                request.project,
+                crate::cli::parse_source_filter(request.source)?,
+                request.since,
+                request.limit,
+                request.origin,
+                Some(paths.root.clone()),
+            )?,
+        }),
         RpcOperation::Ping => Ok(RpcPayload::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
         }),

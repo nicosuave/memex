@@ -39,6 +39,14 @@ pub struct SessionRow {
     pub conversation_kind: Option<String>,
 }
 
+/// Full-index repository totals, keyed exactly like the sessions project filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project: String,
+    pub session_count: u64,
+    pub last_at: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKindFilter {
@@ -564,6 +572,51 @@ impl AnalyticsStore {
             .flatten()
             .flatten()
             .filter(|kind| !kind.is_empty())
+    }
+
+    /// Aggregate in SQLite rather than materializing every session in the client.
+    /// One stored row is one (source, session_id, source_path) session identity.
+    pub fn query_project_summaries(
+        &self,
+        source: Option<SourceFilter>,
+    ) -> Result<Vec<ProjectSummary>> {
+        let mut sql = String::from(
+            "with project_sessions as (
+                select coalesce(nullif(repo_project, ''), project) as project,
+                       last_at
+                from sessions",
+        );
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(source) = source {
+            let labels = source.storage_labels();
+            let placeholders = std::iter::repeat_n("?", labels.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" where source in ({placeholders})"));
+            values.extend(
+                labels
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+        }
+        sql.push_str(
+            ")
+             select project, count(*) as session_count,
+                    max(case when last_at > 0 then last_at end) as last_at
+             from project_sessions
+             where trim(project, char(9) || char(10) || char(13) || ' ') != ''
+             group by project
+             order by last_at desc, project asc",
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok(ProjectSummary {
+                project: row.get(0)?,
+                session_count: row.get(1)?,
+                last_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn query_projects(
@@ -2012,6 +2065,78 @@ mod tests {
             links: RecordLinks::default(),
             source_path: source_path.to_string_lossy().to_string(),
         }
+    }
+
+    #[test]
+    fn project_summaries_count_the_full_index_and_group_repositories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch("begin").unwrap();
+        for index in 0..250 {
+            store.conn.execute(
+                "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at)
+                 values ('codex', ?1, ?2, ?3, 'repo', 0, ?4)",
+                params![format!("session-{index}"), format!("/path/{index}"), format!("worktree-{index}"), index + 1],
+            ).unwrap();
+        }
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at) values
+             ('claude', 'session-0', '/path/0', 'raw', 'repo', 0, 999),
+             ('codex', 'session-0', '/other-path', 'raw', 'repo', 0, 998),
+             ('codex', 'older', '/older', 'older', '', 0, 12),
+             ('codex', 'blank', '/blank', '   ', null, 0, 5000);
+             commit;",
+        ).unwrap();
+        let summaries = store.query_project_summaries(None).unwrap();
+        assert_eq!(
+            summaries,
+            vec![
+                ProjectSummary {
+                    project: "repo".into(),
+                    session_count: 252,
+                    last_at: Some(999)
+                },
+                ProjectSummary {
+                    project: "older".into(),
+                    session_count: 1,
+                    last_at: Some(12)
+                },
+            ]
+        );
+        let matching = store
+            .query_sessions_detailed(None, Some("repo"), None, None, None)
+            .unwrap();
+        assert_eq!(matching.len() as u64, summaries[0].session_count);
+        let codex = store
+            .query_project_summaries(Some(SourceFilter::Codex))
+            .unwrap();
+        assert_eq!(codex[0].session_count, 251);
+        assert_eq!(codex[0].last_at, Some(998));
+    }
+
+    #[test]
+    fn project_summaries_sort_ties_and_preserve_filter_keys_and_unknown_dates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
+             ('codex', 'b', '/b', 'b', 0, 10),
+             ('codex', 'a', '/a', 'a', 0, 10),
+             ('codex', 'zero', '/zero', 'unknown', 0, 0),
+             ('codex', 'negative', '/negative', 'unknown', 0, -1),
+             ('codex', 'encoded', '/encoded', '-Users-nico-Code-project', 0, 0),
+             ('codex', 'blank', '/blank', '', 0, 50);",
+        ).unwrap();
+        let rows = store.query_project_summaries(None).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "-Users-nico-Code-project", "unknown"]
+        );
+        assert_eq!(rows[2].last_at, None);
+        assert_eq!(rows[3].last_at, None);
+        assert_eq!(rows[3].session_count, 2);
     }
 
     #[test]

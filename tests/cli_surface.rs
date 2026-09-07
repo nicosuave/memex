@@ -82,7 +82,9 @@ fn assert_directory_empty(path: &Path) {
 #[test]
 fn top_level_help_shows_only_the_canonical_command_surface() {
     let rows = command_rows(&successful_stdout(&["--help"]));
-    for command in ["index", "daemon", "web", "session", "debug"] {
+    for command in [
+        "index", "daemon", "web", "session", "projects", "machines", "debug",
+    ] {
         assert!(
             rows.contains(command),
             "missing command row {command:?}: {rows:?}"
@@ -197,6 +199,8 @@ fn format_help_is_consistent_and_deprecated_output_flags_are_hidden() {
         vec!["show", "--help"],
         vec!["context", "--help"],
         vec!["sessions", "--help"],
+        vec!["projects", "--help"],
+        vec!["machines", "--help"],
         vec!["session", "batch", "--help"],
         vec!["usage", "--help"],
     ] {

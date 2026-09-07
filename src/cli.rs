@@ -60,7 +60,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -556,6 +556,28 @@ The input contains at most 32 requests; each page is limited to 500 records."
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// List this machine and enabled configured peers (without connecting)
+    Machines {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// List every indexed project with session count and latest activity
+    Projects {
+        /// Filter by source
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Read one machine (defaults to local; ignores configured search defaults)
+        #[arg(long)]
+        machine: Option<String>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
     /// List indexed sessions with cwd and git metadata (newest first)
     #[command(after_help = "\
 EXAMPLES:
@@ -564,6 +586,9 @@ EXAMPLES:
     memex sessions --source claude --limit 5
     memex sessions --format json")]
     Sessions {
+        /// Read one machine (defaults to local; ignores configured search defaults)
+        #[arg(long)]
+        machine: Option<String>,
         /// Only sessions whose cwd is this path, lives under it, or whose git root is it
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -875,7 +900,9 @@ impl From<TransferMode> for CoreTransferMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize, JsonSchema,
+)]
 #[value(rename_all = "kebab-case")]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SessionOrigin {
@@ -1011,7 +1038,7 @@ pub(crate) struct SearchRequest {
 }
 
 /// Parameters for the MCP session-listing tool.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionsRequest {
     /// Restrict sessions to this directory or repository.
@@ -1597,7 +1624,40 @@ pub fn run() -> Result<()> {
         | Commands::EvalRetrieval { dataset, k, root } => {
             run_eval_retrieval(dataset, k, root)?;
         }
+        Commands::Machines { root, output } => {
+            let paths = Paths::new(root)?;
+            let config = UserConfig::load(&paths)?;
+            output
+                .resolve(OutputFormat::Jsonl, None, false)?
+                .print_values(crate::machine::configured_machine_summaries(&config)?)?;
+        }
+        Commands::Projects {
+            source,
+            machine,
+            root,
+            output,
+        } => {
+            let paths = Paths::new(root)?;
+            let mut items = if let Some(id) = machine
+                .as_deref()
+                .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
+            {
+                let config = UserConfig::load(&paths)?;
+                crate::machine::remote_project_summaries(&config, id, source)?
+            } else {
+                collect_projects(&paths, source)?
+            };
+            if let Some(machine) = machine {
+                for item in &mut items {
+                    item["machine"] = Value::String(machine.clone());
+                }
+            }
+            output
+                .resolve(OutputFormat::Jsonl, None, false)?
+                .print_values(items)?;
+        }
         Commands::Sessions {
+            machine,
             cwd,
             project,
             source,
@@ -1627,6 +1687,7 @@ pub fn run() -> Result<()> {
                     false,
                 )?,
                 root,
+                machine,
             )?;
         }
         Commands::Herdr { action } => match action {
@@ -3157,7 +3218,7 @@ fn validate_mcp_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn parse_source_filter(source: Option<String>) -> Result<Option<SourceFilter>> {
+pub(crate) fn parse_source_filter(source: Option<String>) -> Result<Option<SourceFilter>> {
     source
         .map(|source| {
             SourceFilter::from_str(&source, true).map_err(|_| anyhow!("unknown source '{source}'"))
@@ -4341,12 +4402,49 @@ fn run_sessions(
     origin: SessionOrigin,
     output: OutputOptions,
     root: Option<PathBuf>,
+    machine: Option<String>,
 ) -> Result<()> {
-    let items = collect_sessions(cwd, project, source, since, limit, origin, root)?;
+    let mut items = if let Some(id) = machine
+        .as_deref()
+        .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
+    {
+        let paths = Paths::new(root)?;
+        let config = UserConfig::load(&paths)?;
+        crate::machine::remote_sessions(
+            &config,
+            id,
+            SessionsRequest {
+                cwd: cwd.map(|value| value.to_string_lossy().to_string()),
+                project,
+                source: source.map(|value| value.as_str().to_string()),
+                since,
+                limit,
+                origin,
+            },
+        )?
+    } else {
+        collect_sessions(cwd, project, source, since, limit, origin, root)?
+    };
+    if let Some(machine) = machine {
+        for item in &mut items {
+            item["machine"] = Value::String(machine.clone());
+        }
+    }
     output.print_values(items)
 }
 
-fn collect_sessions(
+pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> Result<Vec<Value>> {
+    let store = open_analytics_read_only(paths)?;
+    Ok(store.query_project_summaries(source)?.into_iter().map(|row| {
+        let last_at = row.last_at.and_then(|timestamp| {
+            let formatted = format_ts(timestamp);
+            (formatted != "-").then_some(formatted)
+        });
+        serde_json::json!({"project": row.project, "session_count": row.session_count, "last_at": last_at})
+    }).collect())
+}
+
+pub(crate) fn collect_sessions(
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
