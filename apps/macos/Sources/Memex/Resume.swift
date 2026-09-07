@@ -260,7 +260,7 @@ private struct ResumeCapsule: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
             content
-                .padding(.horizontal, 8)
+                .padding(.leading, 8)
                 .frame(height: 32)
                 .glassEffect(.regular, in: .capsule)
         } else {
