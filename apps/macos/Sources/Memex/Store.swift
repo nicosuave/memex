@@ -64,6 +64,11 @@ final class Store {
     private var readerWindowOrder: [String] = []
     var hasMoreSessions = false
     var sessionLimit = 200
+    private var countGeneration = UUID()
+    private var countRequestKey: String?
+    private var countResultKey: String?
+    private var countValue: Int?
+    private var countRefresh = 0
     private var listGeneration = UUID()
     private var readerGeneration = UUID()
     let client: MemexClient
@@ -94,6 +99,21 @@ final class Store {
     var machineRequestID: String { "\(machineSelection)|\(selectedMachineIDs.joined(separator: "|"))" }
     private var sessionCriteriaID: String { "\(machineRequestID)|\(scope)|\(filters)|\(query)" }
     var requestID: String { "\(sessionCriteriaID)|\(sessionLimit)" }
+    var sessionCountRequestID: String { "\(sessionCriteriaID)|\(countRefresh)" }
+    var sessionTotal: Int? {
+        guard countResultKey == sessionCountRequestID, let countValue,
+              countValue >= sessions.count else { return nil }
+        return countValue
+    }
+    var sessionCountLabel: String {
+        if let total = sessionTotal { return total.formatted() }
+        if loadingSessions && sessions.isEmpty { return "Loading…" }
+        return "\(sessions.count.formatted())+"
+    }
+    var sessionCountHelp: String {
+        sessionTotal == nil ? "Conversations currently loaded; total unavailable or still loading" :
+            "Total matching conversations across the selected machines"
+    }
 
     var readerAnchorID: String? { query.nilIfBlank == nil ? nil : selected?.searchRecordID }
     var readerStartsAtEnd: Bool { readerAnchorID == nil }
@@ -170,10 +190,12 @@ final class Store {
 
     func refresh() async {
         filterReferenceDate = Date()
+        countRefresh += 1
         async let sessions: Void = loadSessions()
         async let projects: Void = loadProjects()
         async let machines: Void = loadMachines()
-        _ = await (sessions, projects, machines)
+        async let count: Void = loadSessionCount()
+        _ = await (sessions, projects, machines, count)
         await loadSelectedSessionMetadata()
     }
 
@@ -186,12 +208,60 @@ final class Store {
         sessionLimit += 200
     }
 
-    func loadSessions() async {
+    private func prepareSessionCriteria() {
         let criteria = sessionCriteriaID
         if activeSessionCriteria != criteria {
             activeSessionCriteria = criteria
             filterReferenceDate = Date()
         }
+    }
+
+    func loadSessionCount() async {
+        prepareSessionCriteria()
+        let request = sessionCountRequestID
+        guard countRequestKey != request else { return }
+        let generation = UUID()
+        countGeneration = generation
+        countRequestKey = request
+        countValue = nil
+        countResultKey = nil
+        defer {
+            if Task.isCancelled, countGeneration == generation { countRequestKey = nil }
+        }
+        let ids = selectedMachineIDs
+        let query = query.nilIfBlank
+        let project = scope.project
+        let source = filters.provider.argument
+        let since = filters.timeframe.since(relativeTo: filterReferenceDate)
+        let origin = filters.origin
+        let client = client
+        if query != nil {
+            do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+        }
+        let total = await withTaskGroup(of: Int?.self) { group -> Int? in
+            for machine in ids {
+                group.addTask {
+                    try? await client.sessionCount(query: query, project: project, source: source,
+                        machine: machine, since: since, origin: origin)
+                }
+            }
+            var sum = 0
+            for await count in group {
+                guard let count else { group.cancelAll(); return nil }
+                let addition = sum.addingReportingOverflow(count)
+                guard !addition.overflow else { group.cancelAll(); return nil }
+                sum = addition.partialValue
+            }
+            return ids.isEmpty ? nil : sum
+        }
+        guard countGeneration == generation, sessionCountRequestID == request, !Task.isCancelled else { return }
+        countValue = total
+        countResultKey = request
+    }
+
+    func loadSessions() async {
+        prepareSessionCriteria()
+        let criteria = sessionCriteriaID
         let generation = UUID()
         listGeneration = generation
         loadingSessions = true

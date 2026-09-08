@@ -132,6 +132,34 @@ struct MemexClient: Sendable {
         return try JSONDecoder().decode([Session].self, from: await run(args))
     }
 
+    func sessionCount(query: String? = nil, project: String? = nil, source: String? = nil,
+                      machine: String = "local", since: String? = nil,
+                      origin: ConversationOrigin = .all) async throws -> Int? {
+        var args = ["sessions", "--count", "--format", "json", "--machine", machine,
+                    "--origin", origin.argument]
+        if let query = query?.nilIfBlank { args += ["--query=\(query)"] }
+        if let project { args += ["--project", project] }
+        if let source { args += ["--source", source] }
+        if let since { args += ["--since", since] }
+        struct Count: Decodable { let total: Int? }
+        if let data = try? await run(args, timeout: 10),
+           let response = try? JSONDecoder().decode(Count.self, from: data),
+           let total = response.total, total >= 0 { return total }
+        try Task.checkCancellation()
+        // Older peers already expose full regular-session project totals. They
+        // are an exact fallback only for the same unfiltered browsing scope.
+        guard query?.nilIfBlank == nil, source == nil, since == nil,
+              origin.argument == "regular" else { return nil }
+        let summaries = try await projects(machine: machine, timeout: 10)
+        var total = 0
+        for row in summaries where project == nil || row.project == project {
+            let addition = total.addingReportingOverflow(row.sessionCount)
+            guard row.sessionCount >= 0, !addition.overflow else { return nil }
+            total = addition.partialValue
+        }
+        return total
+    }
+
     func sessionDetails(for session: Session) async throws -> Session {
         let args = ["sessions", "--format", "json", "--machine", session.machineID,
                     "--source", session.source, "--session-id=\(session.sessionID)",
@@ -143,8 +171,8 @@ struct MemexClient: Sendable {
         return detail
     }
 
-    func projects(machine: String = "local") async throws -> [ProjectSummary] {
-        try JSONDecoder().decode([ProjectSummary].self, from: await run(["projects", "--format", "json", "--machine", machine]))
+    func projects(machine: String = "local", timeout: TimeInterval = 60) async throws -> [ProjectSummary] {
+        try JSONDecoder().decode([ProjectSummary].self, from: await run(["projects", "--format", "json", "--machine", machine], timeout: timeout))
     }
 
     func search(_ query: String, project: String?, source: String?, limit: Int, machine: String = "local",

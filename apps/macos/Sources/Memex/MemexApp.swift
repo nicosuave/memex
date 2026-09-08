@@ -70,6 +70,7 @@ private struct BrowserReader: View {
     var body: some View {
         ReaderView(store: store)
         .task(id: store.requestID) { await store.loadSessions() }
+        .task(id: store.sessionCountRequestID) { await store.loadSessionCount() }
         .task(id: store.readerRequestID) { await store.loadRecords() }
         .task(id: store.readerRequestID) { await store.loadSelectedSessionMetadata() }
         .task { await store.loadMachines() }

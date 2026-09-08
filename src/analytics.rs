@@ -6,7 +6,7 @@ use crate::types::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -472,76 +472,16 @@ impl AnalyticsStore {
                     cwd, git_root, started_at, last_at, message_count, label, conversation_kind
              FROM sessions",
         );
-        let mut clauses = Vec::new();
-        let mut values: Vec<rusqlite::types::Value> = Vec::new();
-
-        if let Some(session_id) = session_id {
-            clauses.push("session_id = ?".to_string());
-            values.push(rusqlite::types::Value::Text(session_id.to_string()));
-        }
-        if let Some(source_path) = source_path {
-            clauses.push("source_path = ?".to_string());
-            values.push(rusqlite::types::Value::Text(source_path.to_string()));
-        }
-
-        if let Some(source) = source {
-            let labels = source.storage_labels();
-            let placeholders = std::iter::repeat_n("?", labels.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            clauses.push(format!("source IN ({placeholders})"));
-            values.extend(
-                labels
-                    .iter()
-                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
-            );
-        }
-        if let Some(project) = project {
-            clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"));
-            values.push(rusqlite::types::Value::Text(project.to_string()));
-        }
-        if let Some(cwd) = cwd {
-            let root = cwd.trim_end_matches('/').to_string();
-            // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
-            // match sessions under /tmp/fooXbar.
-            let escaped = root
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
-            values.push(rusqlite::types::Value::Text(root.clone()));
-            values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
-            values.push(rusqlite::types::Value::Text(root));
-        }
-        if let Some(since_ms) = since_ms {
-            clauses.push("last_at >= ?".to_string());
-            values.push(rusqlite::types::Value::Integer(since_ms as i64));
-        }
-        if let Some(kind) = kind {
-            match kind {
-                SessionKindFilter::Primary => {
-                    clauses.push(
-                        "(conversation_kind IS NULL OR conversation_kind = 'main')".to_string(),
-                    );
-                }
-                SessionKindFilter::Subagent => {
-                    clauses.push(
-                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
-                    );
-                }
-                SessionKindFilter::Regular => {
-                    clauses.push(
-                        "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
-                            .to_string(),
-                    );
-                }
-                SessionKindFilter::All => {}
-            }
-        }
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
+        let (predicate, mut values) = session_selection_sql(
+            source,
+            project,
+            cwd,
+            since_ms,
+            kind,
+            session_id,
+            source_path,
+        );
+        sql.push_str(&predicate);
         sql.push_str(" ORDER BY last_at DESC");
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
@@ -574,6 +514,63 @@ impl AnalyticsStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Count exactly the same identities and predicates as session listing, without detail rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_sessions_selected(
+        &self,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        since_ms: Option<u64>,
+        kind: Option<SessionKindFilter>,
+        session_id: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<u64> {
+        let (predicate, values) = session_selection_sql(
+            source,
+            project,
+            cwd,
+            since_ms,
+            kind,
+            session_id,
+            source_path,
+        );
+        Ok(self.conn.query_row(
+            &format!("SELECT count(*) FROM sessions{predicate}"),
+            params_from_iter(values),
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Count indexed identities using canonical whole-session origin metadata.
+    /// A missing row is distinct from a known primary session with a NULL kind.
+    pub fn count_session_scopes(
+        &self,
+        scopes: &HashSet<(SourceKind, String, String)>,
+        kind: SessionKindFilter,
+    ) -> Result<Option<u64>> {
+        if kind == SessionKindFilter::All {
+            return Ok(Some(scopes.len() as u64));
+        }
+        let mut stmt = self.conn.prepare("SELECT conversation_kind FROM sessions WHERE source = ?1 AND session_id = ?2 AND source_path = ?3")?;
+        let mut count = 0;
+        for (source, session_id, source_path) in scopes {
+            let metadata = stmt
+                .query_row(
+                    params![source.storage_label(), session_id, source_path],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            let Some(metadata) = metadata else {
+                return Ok(None);
+            };
+            if kind.matches_kind(metadata.as_deref().filter(|value| !value.is_empty())) {
+                count += 1;
+            }
+        }
+        Ok(Some(count))
     }
 
     /// Stored conversation kind for one exact session identity, if the
@@ -2028,6 +2025,89 @@ pub fn backfill_from_index(
     writer.store.mark_complete()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn session_selection_sql(
+    source: Option<SourceFilter>,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    since_ms: Option<u64>,
+    kind: Option<SessionKindFilter>,
+    session_id: Option<&str>,
+    source_path: Option<&str>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut clauses = Vec::new();
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(session_id) = session_id {
+        clauses.push("session_id = ?".to_string());
+        values.push(rusqlite::types::Value::Text(session_id.to_string()));
+    }
+    if let Some(source_path) = source_path {
+        clauses.push("source_path = ?".to_string());
+        values.push(rusqlite::types::Value::Text(source_path.to_string()));
+    }
+
+    if let Some(source) = source {
+        let labels = source.storage_labels();
+        let placeholders = std::iter::repeat_n("?", labels.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("source IN ({placeholders})"));
+        values.extend(
+            labels
+                .iter()
+                .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+        );
+    }
+    if let Some(project) = project {
+        clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"));
+        values.push(rusqlite::types::Value::Text(project.to_string()));
+    }
+    if let Some(cwd) = cwd {
+        let root = cwd.trim_end_matches('/').to_string();
+        // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
+        // match sessions under /tmp/fooXbar.
+        let escaped = root
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
+        values.push(rusqlite::types::Value::Text(root.clone()));
+        values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
+        values.push(rusqlite::types::Value::Text(root));
+    }
+    if let Some(since_ms) = since_ms {
+        clauses.push("last_at >= ?".to_string());
+        values.push(rusqlite::types::Value::Integer(since_ms as i64));
+    }
+    if let Some(kind) = kind {
+        match kind {
+            SessionKindFilter::Primary => {
+                clauses
+                    .push("(conversation_kind IS NULL OR conversation_kind = 'main')".to_string());
+            }
+            SessionKindFilter::Subagent => {
+                clauses.push(
+                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
+                    );
+            }
+            SessionKindFilter::Regular => {
+                clauses.push(
+                    "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
+                        .to_string(),
+                );
+            }
+            SessionKindFilter::All => {}
+        }
+    }
+    let predicate = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    (predicate, values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2367,6 +2447,20 @@ mod tests {
                 None,
             )
             .expect("scoped sessions");
+        assert_eq!(
+            store
+                .count_sessions_selected(
+                    None,
+                    None,
+                    Some(target.to_string_lossy().as_ref()),
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .unwrap(),
+            1
+        );
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].session_id, "s-target");
     }

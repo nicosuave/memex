@@ -586,6 +586,12 @@ EXAMPLES:
     memex sessions --source claude --limit 5
     memex sessions --format json")]
     Sessions {
+        /// Return one exact count object instead of session rows (unavailable totals are null)
+        #[arg(long)]
+        count: bool,
+        /// Count conversations matching this lexical query; requires --count
+        #[arg(long, requires = "count", conflicts_with = "cwd")]
+        query: Option<String>,
         /// Read one machine (defaults to local; ignores configured search defaults)
         #[arg(long)]
         machine: Option<String>,
@@ -1669,6 +1675,8 @@ pub fn run() -> Result<()> {
                 .print_values(items)?;
         }
         Commands::Sessions {
+            count,
+            query,
             machine,
             session_id,
             source_path,
@@ -1688,6 +1696,34 @@ pub fn run() -> Result<()> {
             } else {
                 origin
             };
+            if count {
+                let paths = Paths::new(root)?;
+                let request = SessionsRequest {
+                    session_id,
+                    source_path,
+                    cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+                    project,
+                    source: source.map(|value| value.as_str().to_string()),
+                    since,
+                    limit,
+                    origin,
+                };
+                let result = if let Some(id) = machine
+                    .as_deref()
+                    .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
+                {
+                    crate::machine::remote_session_count(
+                        &UserConfig::load(&paths)?,
+                        id,
+                        request,
+                        query,
+                    )?
+                } else {
+                    collect_session_count(&paths, request, query)?
+                };
+                println!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
             run_sessions(
                 session_id,
                 source_path,
@@ -4526,6 +4562,95 @@ pub(crate) fn collect_sessions(
     Ok(items)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SessionCount {
+    pub(crate) total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+pub(crate) fn collect_session_count(
+    paths: &Paths,
+    request: SessionsRequest,
+    query: Option<String>,
+) -> Result<SessionCount> {
+    let source = parse_source_filter(request.source)?;
+    let since = parse_ts_millis(request.since)?;
+    let kind = request.origin.into();
+    let query = query.filter(|query| !query.trim().is_empty());
+    if let Some(query) = query {
+        if request.cwd.is_some() {
+            return Err(anyhow!("--query count does not support --cwd"));
+        }
+        if !SearchIndex::exists(&paths.index) {
+            return Ok(SessionCount {
+                total: None,
+                reason: Some("search index unavailable".into()),
+            });
+        }
+        let index = SearchIndex::open_or_create(&paths.index)?;
+        let scopes = index.fast_session_scopes_matching_query(&QueryOptions {
+            query,
+            project: request.project,
+            role: None,
+            tool: None,
+            session_id: request.session_id,
+            session_scope: None,
+            source,
+            since,
+            until: None,
+            limit: 1,
+        })?;
+        let Some(mut scopes) = scopes else {
+            return Ok(SessionCount {
+                total: None,
+                reason: Some("index lacks fast session identity fields".into()),
+            });
+        };
+        if let Some(path) = request.source_path {
+            scopes.retain(|scope| scope.2 == path);
+        }
+        if scopes.is_empty() || kind == crate::analytics::SessionKindFilter::All {
+            return Ok(SessionCount {
+                total: Some(scopes.len() as u64),
+                reason: None,
+            });
+        }
+        let store = match open_analytics_read_only(paths) {
+            Ok(store) => store,
+            Err(_) => {
+                return Ok(SessionCount {
+                    total: None,
+                    reason: Some("canonical session metadata unavailable".into()),
+                });
+            }
+        };
+        let total = store.count_session_scopes(&scopes, kind)?;
+        Ok(SessionCount {
+            total,
+            reason: total
+                .is_none()
+                .then(|| "canonical session metadata incomplete".into()),
+        })
+    } else {
+        let store = open_analytics_read_only(paths)?;
+        let cwd = canonical_cwd_filter(request.cwd.map(PathBuf::from));
+        let total = store.count_sessions_selected(
+            source,
+            request.project.as_deref(),
+            cwd.as_deref(),
+            since,
+            Some(kind),
+            request.session_id.as_deref(),
+            request.source_path.as_deref(),
+        )?;
+        Ok(SessionCount {
+            total: Some(total),
+            reason: None,
+        })
+    }
+}
+
 pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> Result<Value> {
     validate_mcp_limit(request.limit)?;
     let source = parse_source_filter(request.source)?;
@@ -7247,6 +7372,28 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn session_count_query_requires_count_and_rejects_cwd() {
+        assert!(Cli::try_parse_from(["memex", "sessions", "--query", "needle"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "memex", "sessions", "--count", "--query", "needle", "--cwd", "."
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "memex",
+                "sessions",
+                "--count",
+                "--query=--needle",
+                "--format",
+                "json"
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn mcp_search_request_uses_bounded_compact_defaults() {

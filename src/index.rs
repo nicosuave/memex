@@ -1019,6 +1019,39 @@ impl SearchIndex {
         )??)
     }
 
+    /// Interactive exact counts must never hydrate legacy stored records.
+    pub fn fast_session_scopes_matching_query(
+        &self,
+        options: &QueryOptions,
+    ) -> Result<Option<HashSet<SessionScopeIdentity>>> {
+        let schema = self.index.schema();
+        if !self.fields.source.is_some_and(|source| {
+            [source, self.fields.session_id, self.fields.source_path]
+                .into_iter()
+                .all(|field| schema.get_field_entry(field).is_fast())
+        }) {
+            return Ok(None);
+        }
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        // A compatible schema alone is insufficient for mixed/older segments.
+        for segment in searcher.segment_readers() {
+            for field in ["source", "session_id", "source_path"] {
+                if segment.fast_fields().str(field)?.is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+        let query = build_query(&self.fields, options, &self.index)?;
+        Ok(Some(searcher.search(
+            &query,
+            &SessionScopeCollector {
+                fields: self.fields.clone(),
+                fast_session_identity: true,
+            },
+        )??))
+    }
+
     pub fn session_scope_has_matching_conversation_kind(
         &self,
         options: &QueryOptions,
@@ -2968,6 +3001,12 @@ mod tests {
                 .session_scopes_matching_query(&options)
                 .expect("collect session scopes");
 
+            let fast_scopes = index.fast_session_scopes_matching_query(&options).unwrap();
+            if fast_session_identity {
+                assert_eq!(fast_scopes.as_ref(), Some(&scopes));
+            } else {
+                assert!(fast_scopes.is_none());
+            }
             assert_eq!(scopes.len(), if fast_session_identity { 2 } else { 3 });
             assert!(scopes.contains(&(
                 crate::types::SourceKind::Codex,
