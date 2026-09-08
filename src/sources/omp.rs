@@ -91,7 +91,7 @@ fn profile_session_roots(profiles_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn session_roots() -> Vec<PathBuf> {
+pub(crate) fn session_roots() -> Vec<PathBuf> {
     if std::env::var_os("PI_CODING_AGENT_DIR").is_some_and(|value| !value.is_empty()) {
         return vec![agent_root().join("sessions")];
     }

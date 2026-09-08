@@ -22,6 +22,7 @@ pub mod tui;
 pub mod types;
 pub mod usage;
 pub mod vector;
+pub mod watch;
 pub mod web;
 pub mod web_auth;
 

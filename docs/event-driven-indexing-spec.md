@@ -1,5 +1,23 @@
 # Event-driven indexing: FSEvents / inotify spec
 
+> **Implementation status (shipped):** `src/watch.rs` + daemon wiring
+> implements this spec with `--watch-mode events|poll` (`daemon run`,
+> `daemon enable/restart`, hidden on legacy `index --watch`).
+> Two findings from implementation are now part of the design:
+> (1) FSEvents defers content-modification events for files held open for
+> writing (0 events in 8s with the fd open, immediate delivery on close;
+> regression test `fsevents_defers_modify_until_close`) while agents stream
+> transcripts through a single held-open fd (confirmed via `lsof` on live
+> Codex sessions) — so macOS runs a 5s hot sweep re-statting recently
+> active files (`hot_sweep_dirty`, `HOT_SWEEP_INTERVAL`, `HOT_WINDOW`).
+> inotify reports every write, so Linux skips the sweep.
+> (2) Watch roots are canonicalized before arming: backends silently
+> mis-deliver for paths containing symlinks.
+> Tier-1/2 dirty-path ingest (spec §7) is intentionally deferred: fires run
+> the full incremental ingest behind a stat-based no-op skip
+> (`dirty_needs_ingest`), which keeps converge-equality trivially exact
+> while delivering the latency and idle-cost wins.
+
 Started from latest `main` (`04adaca`). This spec replaces the daemon's
 polling loop with OS filesystem events, with periodic reconciliation as the
 correctness backstop. Events are **hints only** — `ingest.json` file-state

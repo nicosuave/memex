@@ -30,6 +30,8 @@ use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
 use crate::usage::{CostMode, UsageQuery, scan_usage};
 use crate::vector::VectorIndex;
+use crate::watch::WatchMode;
+use crate::watch::{WatchService, watch_roots};
 use anyhow::{Context, Result, anyhow};
 use chrono::SecondsFormat;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -212,6 +214,9 @@ EXAMPLES:
             hide = true
         )]
         watch_interval: u64,
+        /// Refresh strategy for watch mode: filesystem events (default) or legacy polling
+        #[arg(long, value_enum, hide = true)]
+        watch_mode: Option<WatchMode>,
         #[arg(long, hide = true)]
         web_ui: bool,
         #[arg(long, hide = true, value_name = "ADDRESS")]
@@ -1049,6 +1054,9 @@ enum IndexServiceCommand {
         /// Seconds between index refreshes (default: config or 30)
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         poll_interval: Option<u64>,
+        /// Refresh strategy: filesystem events (default) or legacy polling
+        #[arg(long, value_enum)]
+        watch_mode: Option<WatchMode>,
         #[command(flatten)]
         mcp: DaemonMcpArgs,
     },
@@ -1065,6 +1073,9 @@ enum IndexServiceCommand {
         /// Seconds between index checks in continuous mode [default: 30]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         poll_interval: Option<u64>,
+        /// Refresh strategy for continuous mode: filesystem events (default) or legacy polling
+        #[arg(long, value_enum)]
+        watch_mode: Option<WatchMode>,
         /// Seconds between invocations in interval mode [default: 3600]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         interval: Option<u64>,
@@ -1102,6 +1113,9 @@ enum IndexServiceCommand {
         /// Seconds between index checks in continuous mode [default: 30]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         poll_interval: Option<u64>,
+        /// Refresh strategy for continuous mode: filesystem events (default) or legacy polling
+        #[arg(long, value_enum)]
+        watch_mode: Option<WatchMode>,
         /// Seconds between invocations in interval mode [default: 3600]
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..), value_name = "SECONDS")]
         interval: Option<u64>,
@@ -1232,13 +1246,14 @@ pub fn run() -> Result<()> {
             index,
             watch,
             watch_interval,
+            watch_mode,
             web_ui,
             web_listen,
             mcp,
             no_mcp,
             mcp_listen,
         } => {
-            if watch {
+            if watch || watch_mode.is_some() {
                 let listen = (web_ui || web_listen.is_some())
                     .then(|| web_listen.unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string()));
                 let config = UserConfig::load(&Paths::new(index.root.clone())?)?;
@@ -1248,7 +1263,8 @@ pub fn run() -> Result<()> {
                     mcp_listen,
                 }
                 .resolve(&config);
-                run_index_loop(&index, watch_interval, listen, mcp)?;
+                let mode = watch_mode.unwrap_or(WatchMode::Events);
+                run_index_loop(&index, mode, watch_interval, listen, mcp)?;
             } else if web_ui || web_listen.is_some() || mcp || no_mcp || mcp_listen.is_some() {
                 return Err(anyhow!("server options require `memex daemon run`"));
             } else {
@@ -1367,6 +1383,7 @@ pub fn run() -> Result<()> {
                 web_ui,
                 web_listen,
                 poll_interval,
+                watch_mode,
                 mcp,
             } => {
                 let config = UserConfig::load(&Paths::new(index.root.clone())?)?;
@@ -1376,9 +1393,13 @@ pub fn run() -> Result<()> {
                             .or_else(|| config.index_service_web_listen.clone())
                             .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string())
                     });
-                let interval = poll_interval.unwrap_or(config.index_service_poll_interval());
+                let mode = watch_mode.unwrap_or(config.index_service_watch_mode()?);
+                let interval = poll_interval.unwrap_or(match mode {
+                    WatchMode::Events => config.index_service_resync_interval(),
+                    WatchMode::Poll => config.index_service_poll_interval(),
+                });
                 anyhow::ensure!(interval > 0, "poll interval must be positive");
-                run_index_loop(&index, interval, web, mcp.resolve(&config))?;
+                run_index_loop(&index, mode, interval, web, mcp.resolve(&config))?;
             }
             IndexServiceCommand::Enable {
                 index,
@@ -1386,6 +1407,7 @@ pub fn run() -> Result<()> {
                 label,
                 continuous,
                 poll_interval,
+                watch_mode,
                 interval,
                 web_ui,
                 web_listen,
@@ -1400,6 +1422,7 @@ pub fn run() -> Result<()> {
                     label,
                     continuous,
                     poll_interval,
+                    watch_mode,
                     interval,
                     web_ui,
                     web_listen,
@@ -1415,6 +1438,7 @@ pub fn run() -> Result<()> {
                 label,
                 continuous,
                 poll_interval,
+                watch_mode,
                 interval,
                 web_ui,
                 web_listen,
@@ -1429,6 +1453,7 @@ pub fn run() -> Result<()> {
                     label,
                     continuous,
                     poll_interval,
+                    watch_mode,
                     interval,
                     web_ui,
                     web_listen,
@@ -1755,6 +1780,20 @@ pub fn run() -> Result<()> {
 
 fn run_index_loop(
     index: &IndexArgs,
+    mode: WatchMode,
+    interval_secs: u64,
+    web_listen: Option<String>,
+    mcp: Option<crate::mcp::HttpOptions>,
+) -> Result<()> {
+    if mode == WatchMode::Poll {
+        run_poll_loop(index, interval_secs, web_listen, mcp)
+    } else {
+        run_event_loop(index, Duration::from_secs(interval_secs), web_listen, mcp)
+    }
+}
+
+fn run_poll_loop(
+    index: &IndexArgs,
     interval_secs: u64,
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
@@ -1793,75 +1832,197 @@ fn initialize_index_loop<T>(
     Ok(web)
 }
 
-fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index(
-        index.source.clone(),
-        index.include_agents,
-        index.include_reasoning,
-        index.source_enabled(IndexSource::Claude),
-        index.source_enabled(IndexSource::Codex),
-        index.source_enabled(IndexSource::Opencode),
-        index.source_enabled(IndexSource::Cursor),
-        index.source_enabled(IndexSource::Pi),
-        index.source_enabled(IndexSource::Omp),
-        index.source_enabled(IndexSource::Openclaw),
-        index.source_enabled(IndexSource::Copilot),
-        index.source_enabled(IndexSource::Grok),
-        index.source_enabled(IndexSource::Jcode),
-        index.source_enabled(IndexSource::Muse),
-        index.embeddings,
-        index.no_embeddings,
-        index.model.clone(),
-        index.root.clone(),
-        index.exclude.clone(),
-        reindex,
-        continuous,
-        index.diagnostics,
-    )
+/// Event-driven daemon loop: the watcher is armed before the initial scan so
+/// nothing falls in the gap, then every debounced batch (or the periodic
+/// resync) runs the normal incremental ingest. On ingest failure the hints
+/// are kept and retried; the resync timer bounds staleness no matter what.
+fn run_event_loop(
+    index: &IndexArgs,
+    resync: Duration,
+    web_listen: Option<String>,
+    mcp: Option<crate::mcp::HttpOptions>,
+) -> Result<()> {
+    use crate::watch::{
+        FireCause, HOT_SWEEP_INTERVAL, HOT_WINDOW, WatchConfig, WatchService, dirty_needs_ingest,
+        watch_excluder, watch_roots,
+    };
+
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let options = build_ingest_options(index, &config)?;
+    let mut service = WatchService::new(
+        watch_roots(&options),
+        watch_excluder(&options)?,
+        WatchConfig {
+            resync_interval: resync,
+            ..WatchConfig::default()
+        },
+    )?;
+    eprintln!(
+        "watch: events mode ({} watched roots, {} pending, resync every {}s)",
+        service.watched_roots().len(),
+        service.pending_roots().len(),
+        resync.as_secs(),
+    );
+
+    let mcp_server = mcp
+        .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
+        .transpose()?;
+    let _web_thread = initialize_index_loop(
+        || run_index_args(index, false, true),
+        || {
+            web_listen
+                .as_deref()
+                .map(|listen| crate::web::spawn(index.root.clone(), listen))
+                .transpose()
+        },
+    )?;
+
+    let mut last_sweep = Instant::now();
+    loop {
+        match service.poll() {
+            Some(FireCause::Resync) => {
+                if let Err(error) = refresh_watch_roots(&mut service, index) {
+                    eprintln!("watch: root refresh failed: {error:#}");
+                }
+                match run_index_args(index, false, true) {
+                    Ok(()) => {
+                        service.mark_complete(FireCause::Resync);
+                        log_watch_stats(&service);
+                    }
+                    Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
+                }
+            }
+            Some(FireCause::Dirty) => {
+                let dirty = service.dirty_paths();
+                match dirty_needs_ingest(&paths, &dirty) {
+                    Ok(false) => service.mark_skipped(),
+                    Ok(true) => match run_index_args(index, false, true) {
+                        Ok(()) => {
+                            service.mark_complete(FireCause::Dirty);
+                            log_watch_stats(&service);
+                        }
+                        Err(error) => {
+                            eprintln!("watch: ingest failed, retrying: {error:#}");
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
+                        if run_index_args(index, false, true).is_ok() {
+                            service.mark_complete(FireCause::Dirty);
+                            log_watch_stats(&service);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        // FSEvents defers modify events for held-open files and agents stream
+        // transcripts through one open fd, so re-stat recently active files on
+        // macOS. inotify reports every write, making this unnecessary there.
+        if cfg!(target_os = "macos") && last_sweep.elapsed() >= HOT_SWEEP_INTERVAL {
+            last_sweep = Instant::now();
+            match service.hot_sweep_dirty(&paths, HOT_WINDOW) {
+                Ok(changed) if !changed.is_empty() => service.note_dirty(changed),
+                Ok(_) => {}
+                Err(error) => eprintln!("watch: hot sweep failed: {error:#}"),
+            }
+        }
+        if let Some(server) = &mcp_server
+            && !server.wait_timeout(Duration::from_millis(0))?
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        std::io::stdout().flush().ok();
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_index(
-    source: Option<PathBuf>,
-    include_agents: bool,
-    include_reasoning: bool,
-    claude: bool,
-    codex: bool,
-    opencode: bool,
-    cursor: bool,
-    pi: bool,
-    omp: bool,
-    openclaw: bool,
-    copilot: bool,
-    grok: bool,
-    jcode: bool,
-    muse: bool,
-    embeddings_flag: bool,
-    no_embeddings: bool,
-    model: Option<String>,
-    root: Option<PathBuf>,
-    mut excludes: Vec<String>,
-    reindex: bool,
-    continuous: bool,
-    print_diagnostics: bool,
-) -> Result<()> {
-    let paths = Paths::new(root)?;
+/// Re-resolve watch roots (cheap; call on resync) so newly installed agent
+/// backends are picked up without a daemon restart.
+fn refresh_watch_roots(service: &mut WatchService, index: &IndexArgs) -> Result<()> {
+    let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
+    let options = build_ingest_options(index, &config)?;
+    service.ensure_roots(watch_roots(&options));
+    Ok(())
+}
 
+fn log_watch_stats(service: &WatchService) {
+    let stats = service.stats();
+    eprintln!(
+        "watch: events={} filtered={} fires_dirty={} fires_resync={} noop_skips={} \
+         errors={} resync_req={} hot_sweeps={} hot_hits={}",
+        stats.events_total,
+        stats.events_filtered,
+        stats.fires_dirty,
+        stats.fires_resync,
+        stats.noop_skips,
+        stats.watcher_errors,
+        stats.resync_requests,
+        stats.hot_sweeps,
+        stats.hot_hits,
+    );
+}
+fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
+    run_index(index, reindex, continuous)
+}
+
+/// Resolve the ingest projection from CLI flags plus config. Shared by the
+/// one-shot indexer and the event-driven daemon (which needs the same source
+/// set to compute its watch roots).
+fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<IngestOptions> {
     // Config exclusions apply to every index run; CLI --exclude adds one-off patterns.
+    let mut excludes = index.exclude.clone();
     excludes.extend(config.exclude_path_patterns());
 
     // Model priority: CLI flag > config file > env var > default
-    let model_choice = config.resolve_model(model)?;
+    let model_choice = config.resolve_model(index.model.clone())?;
     let embed_runtime = config.resolve_embed_runtime()?;
     let tool_content_limits = config.indexed_tool_content_limits()?;
-    let include_reasoning = include_reasoning || config.include_reasoning_default();
+    let include_reasoning = index.include_reasoning || config.include_reasoning_default();
     let embeddings = resolve_flag(
         config.embeddings_default(),
-        embeddings_flag,
-        no_embeddings,
+        index.embeddings,
+        index.no_embeddings,
         "embeddings",
     )?;
+    Ok(IngestOptions {
+        claude_sources: if index.source_enabled(IndexSource::Claude) {
+            index
+                .source
+                .clone()
+                .map(|source| vec![source])
+                .unwrap_or_else(default_claude_sources)
+        } else {
+            Vec::new()
+        },
+        include_agents: index.include_agents,
+        include_reasoning,
+        include_codex: index.source_enabled(IndexSource::Codex),
+        include_opencode: index.source_enabled(IndexSource::Opencode),
+        include_cursor: index.source_enabled(IndexSource::Cursor),
+        include_pi: index.source_enabled(IndexSource::Pi),
+        include_omp: index.source_enabled(IndexSource::Omp),
+        include_openclaw: index.source_enabled(IndexSource::Openclaw),
+        include_copilot: index.source_enabled(IndexSource::Copilot),
+        include_grok: index.source_enabled(IndexSource::Grok),
+        include_jcode: index.source_enabled(IndexSource::Jcode),
+        include_muse: index.source_enabled(IndexSource::Muse),
+        exclude_patterns: excludes,
+        embeddings,
+        backfill_embeddings: false,
+        model: model_choice,
+        embed_runtime,
+        tool_content_limits,
+    })
+}
+
+fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
+    let paths = Paths::new(index.root.clone())?;
+    let config = UserConfig::load(&paths)?;
+    let opts = build_ingest_options(index, &config)?;
+    let print_diagnostics = index.diagnostics;
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex {
@@ -1872,34 +2033,6 @@ fn run_index(
         SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
     } else {
         SearchIndex::open_or_create_for_ingest(&paths.index)?
-    };
-
-    let opts = IngestOptions {
-        claude_sources: if claude {
-            source
-                .map(|source| vec![source])
-                .unwrap_or_else(default_claude_sources)
-        } else {
-            Vec::new()
-        },
-        include_agents,
-        include_reasoning,
-        include_codex: codex,
-        include_opencode: opencode,
-        include_cursor: cursor,
-        include_pi: pi,
-        include_omp: omp,
-        include_openclaw: openclaw,
-        include_copilot: copilot,
-        include_grok: grok,
-        include_jcode: jcode,
-        include_muse: muse,
-        exclude_patterns: excludes,
-        embeddings,
-        backfill_embeddings: false,
-        model: model_choice,
-        embed_runtime,
-        tool_content_limits,
     };
 
     let report = ingest_all(&paths, &index, &opts, &lease)?;
@@ -4934,6 +5067,7 @@ fn run_index_service_enable(
     label: Option<String>,
     continuous: bool,
     poll_interval: Option<u64>,
+    watch_mode: Option<WatchMode>,
     interval: Option<u64>,
     web_ui: bool,
     web_listen: Option<String>,
@@ -4959,6 +5093,7 @@ fn run_index_service_enable(
         stderr: config_path_setting(stderr.as_deref(), "--stderr")?,
         plist: config_path_setting(plist.as_deref(), "--plist")?,
         systemd_dir: config_path_setting(systemd_dir.as_deref(), "--systemd-dir")?,
+        watch_mode: watch_mode.map(|mode| mode.to_string()),
         ..IndexServiceConfigUpdates::from_cli(
             continuous,
             poll_interval,
@@ -4978,7 +5113,8 @@ fn run_index_service_enable(
     let web_listen = web_listen
         .or_else(|| config.index_service_web_listen.clone())
         .unwrap_or_else(|| crate::web::DEFAULT_LISTEN.to_string());
-    let cli_continuous = continuous || poll_interval.is_some() || cli_web_ui;
+    let cli_continuous =
+        continuous || poll_interval.is_some() || watch_mode.is_some() || cli_web_ui;
     let config_continuous = match config.index_service_mode() {
         Some("interval") => false,
         Some("continuous") => true,
@@ -4996,7 +5132,11 @@ fn run_index_service_enable(
     } else {
         config_continuous
     };
-    let poll_interval = poll_interval.unwrap_or(config.index_service_poll_interval());
+    let watch_mode = watch_mode.unwrap_or(config.index_service_watch_mode()?);
+    let poll_interval = poll_interval.unwrap_or(match watch_mode {
+        WatchMode::Events => config.index_service_resync_interval(),
+        WatchMode::Poll => config.index_service_poll_interval(),
+    });
     let interval = interval.unwrap_or(config.index_service_interval());
     if web_ui {
         crate::web::validate_listener(&web_listen)?;
@@ -5007,6 +5147,7 @@ fn run_index_service_enable(
         index,
         continuous,
         poll_interval,
+        watch_mode,
         web_ui,
         &web_listen,
         mcp_listen,
@@ -5067,6 +5208,7 @@ fn run_index_service_enable(
 struct IndexServiceConfigUpdates {
     mode: Option<&'static str>,
     poll_interval: Option<i64>,
+    watch_mode: Option<String>,
     interval: Option<i64>,
     web_ui: Option<bool>,
     web_listen: Option<String>,
@@ -5138,6 +5280,7 @@ impl IndexServiceConfigUpdates {
 fn persist_index_service_config(paths: &Paths, updates: &IndexServiceConfigUpdates) -> Result<()> {
     if updates.mode.is_none()
         && updates.poll_interval.is_none()
+        && updates.watch_mode.is_none()
         && updates.interval.is_none()
         && updates.web_ui.is_none()
         && updates.web_listen.is_none()
@@ -5175,6 +5318,12 @@ fn persist_index_service_config(paths: &Paths, updates: &IndexServiceConfigUpdat
             "index_service_poll_interval"
         };
         replace_toml_value(&mut document[key], value(interval));
+    }
+    if let Some(mode) = &updates.watch_mode {
+        replace_toml_value(
+            &mut document["index_service_watch_mode"],
+            value(mode.as_str()),
+        );
     }
     if let Some(interval) = updates.interval {
         replace_toml_value(&mut document["index_service_interval"], value(interval));
@@ -6042,6 +6191,7 @@ fn build_index_command_args(
     index: &IndexArgs,
     continuous: bool,
     poll_interval: u64,
+    watch_mode: WatchMode,
     web_ui: bool,
     web_listen: &str,
     mcp_listen: Option<std::net::SocketAddr>,
@@ -6124,7 +6274,12 @@ fn build_index_command_args(
     if index.diagnostics {
         args.push("--diagnostics".to_string());
     }
-    if continuous {
+    if continuous && watch_mode == WatchMode::Poll {
+        args.push("--watch-mode".to_string());
+        args.push("poll".to_string());
+        args.push("--watch-interval".to_string());
+        args.push(format!("{poll_interval}"));
+    } else if continuous {
         args.push("--watch".to_string());
         args.push("--watch-interval".to_string());
         args.push(format!("{poll_interval}"));
@@ -7372,8 +7527,15 @@ mod tests {
             diagnostics: false,
         };
 
-        let args =
-            build_index_command_args(&index, false, 30, false, crate::web::DEFAULT_LISTEN, None);
+        let args = build_index_command_args(
+            &index,
+            false,
+            30,
+            WatchMode::Events,
+            false,
+            crate::web::DEFAULT_LISTEN,
+            None,
+        );
 
         assert!(args.contains(&"--no-codex".to_string()));
         assert!(args.contains(&"--no-opencode".to_string()));
@@ -7422,7 +7584,15 @@ mod tests {
             diagnostics: false,
         };
 
-        let args = build_index_command_args(&index, false, 30, false, "127.0.0.1:7777", None);
+        let args = build_index_command_args(
+            &index,
+            false,
+            30,
+            WatchMode::Events,
+            false,
+            "127.0.0.1:7777",
+            None,
+        );
 
         let mut pairs = args.windows(2);
         assert!(pairs.any(|w| w == ["--exclude", "~/work/**"]));
@@ -7465,7 +7635,15 @@ mod tests {
             diagnostics: false,
         };
 
-        let args = build_index_command_args(&index, true, 30, true, "127.0.0.1:6363", None);
+        let args = build_index_command_args(
+            &index,
+            true,
+            30,
+            WatchMode::Events,
+            true,
+            "127.0.0.1:6363",
+            None,
+        );
 
         assert!(
             args.windows(2)
@@ -7473,6 +7651,81 @@ mod tests {
         );
         assert!(args.contains(&"--web-ui".to_string()));
         assert!(args.contains(&"--watch".to_string()));
+    }
+
+    #[test]
+    fn build_index_command_args_emits_poll_mode_without_watch() {
+        let index = IndexArgs {
+            only_source: Vec::new(),
+            exclude_source: Vec::new(),
+            source: None,
+            include_agents: false,
+            include_reasoning: false,
+            exclude: Vec::new(),
+            codex: true,
+            opencode: true,
+            cursor: true,
+            pi: true,
+            omp: true,
+            openclaw: true,
+            copilot: true,
+            grok: true,
+            jcode: true,
+            muse: true,
+            no_codex: false,
+            no_opencode: false,
+            no_pi: false,
+            no_omp: false,
+            no_openclaw: false,
+            no_copilot: false,
+            no_grok: false,
+            no_jcode: false,
+            no_muse: false,
+            embeddings: false,
+            no_embeddings: false,
+            model: None,
+            root: None,
+            diagnostics: false,
+        };
+
+        let args = build_index_command_args(
+            &index,
+            true,
+            30,
+            WatchMode::Poll,
+            false,
+            crate::web::DEFAULT_LISTEN,
+            None,
+        );
+
+        assert!(!args.contains(&"--watch".to_string()));
+        assert!(args.windows(2).any(|pair| pair == ["--watch-mode", "poll"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--watch-interval", "30"])
+        );
+    }
+
+    #[test]
+    fn daemon_run_accepts_watch_mode_flag() {
+        let cli = Cli::try_parse_from(["memex", "daemon", "run", "--watch-mode", "poll"])
+            .expect("parse daemon run");
+        let Some(Commands::IndexService {
+            action: IndexServiceCommand::Run { watch_mode, .. },
+        }) = cli.command
+        else {
+            panic!("expected daemon run command");
+        };
+        assert_eq!(watch_mode, Some(WatchMode::Poll));
+    }
+
+    #[test]
+    fn legacy_index_watch_defaults_to_events() {
+        let cli = Cli::try_parse_from(["memex", "index", "--watch"]).expect("parse index watch");
+        let Some(Commands::Index { watch_mode, .. }) = cli.command else {
+            panic!("expected index command");
+        };
+        assert_eq!(watch_mode, None);
     }
 
     #[test]

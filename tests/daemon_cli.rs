@@ -405,3 +405,71 @@ fn malformed_mcp_public_url_fails_startup_without_a_live_listener() {
     );
     assert_listener_closes(mcp);
 }
+
+fn wait_for_log(child: &mut ChildGuard, needle: &str, timeout_secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if child.diagnostics().contains(needle) {
+            return;
+        }
+        child.assert_running();
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {needle:?}: {}", child.diagnostics());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn spawn_index_daemon(dirs: &TestDirs, extra: &[&str]) -> ChildGuard {
+    let root = dirs.root.path().to_str().unwrap();
+    let claude = dirs.claude.path().to_str().unwrap();
+    let mut args = vec![
+        "daemon",
+        "run",
+        "--root",
+        root,
+        "--only-source",
+        "claude",
+        "--claude-path",
+        claude,
+        "--no-embeddings",
+    ];
+    args.extend_from_slice(extra);
+    ChildGuard::spawn(&dirs, &args)
+}
+
+const MINIMAL_CLAUDE_LINE: &str = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"uuid\":\"u1\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n";
+
+#[test]
+fn daemon_event_mode_indexes_new_transcripts_without_resync() {
+    let dirs = TestDirs::new();
+    // Resync an hour out: if the transcript gets indexed, events did it.
+    let mut daemon = spawn_index_daemon(
+        &dirs,
+        &["--watch-mode", "events", "--poll-interval", "3600"],
+    );
+    wait_for_log(&mut daemon, "indexed 0 records", 60);
+
+    std::fs::write(
+        dirs.claude.path().join("session.jsonl"),
+        MINIMAL_CLAUDE_LINE,
+    )
+    .expect("write transcript");
+    wait_for_log(&mut daemon, "indexed 1 records", 90);
+    daemon.stop();
+}
+
+#[test]
+fn daemon_poll_mode_still_indexes_on_interval() {
+    let dirs = TestDirs::new();
+    let mut daemon = spawn_index_daemon(&dirs, &["--watch-mode", "poll", "--poll-interval", "1"]);
+    wait_for_log(&mut daemon, "indexed 0 records", 60);
+
+    std::fs::write(
+        dirs.claude.path().join("session.jsonl"),
+        MINIMAL_CLAUDE_LINE,
+    )
+    .expect("write transcript");
+    wait_for_log(&mut daemon, "indexed 1 records", 60);
+    daemon.stop();
+}

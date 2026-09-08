@@ -565,12 +565,12 @@ pub fn ingest_if_stale(
 /// Glob-based path exclusion applied at discovery time so matched
 /// transcripts never enter the index. Empty pattern sets disable matching.
 #[derive(Debug, Clone)]
-struct PathExcluder {
+pub(crate) struct PathExcluder {
     set: Option<globset::GlobSet>,
 }
 
 impl PathExcluder {
-    fn build(patterns: &[String]) -> Result<Self> {
+    pub(crate) fn build(patterns: &[String]) -> Result<Self> {
         if patterns.is_empty() {
             return Ok(Self { set: None });
         }
@@ -589,7 +589,7 @@ impl PathExcluder {
         Ok(Self { set: Some(set) })
     }
 
-    fn is_excluded(&self, path: &Path) -> bool {
+    pub(crate) fn is_excluded(&self, path: &Path) -> bool {
         let Some(set) = &self.set else {
             return false;
         };
@@ -600,7 +600,7 @@ impl PathExcluder {
     }
 }
 
-fn build_path_excluder(options: &IngestOptions) -> Result<PathExcluder> {
+pub(crate) fn build_path_excluder(options: &IngestOptions) -> Result<PathExcluder> {
     let expanded = crate::config::expand_exclude_patterns(options.exclude_patterns.clone());
     PathExcluder::build(&expanded)
 }

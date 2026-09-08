@@ -140,6 +140,11 @@ pub struct UserConfig {
     /// Background index service poll interval in seconds.
     #[serde(alias = "index_service_watch_interval")]
     pub index_service_poll_interval: Option<u64>,
+    /// Refresh strategy for the continuous background service: "events" or "poll".
+    pub index_service_watch_mode: Option<String>,
+    /// Full-resync interval in seconds for events mode (the missed-event backstop).
+    /// Falls back to `index_service_poll_interval` when unset.
+    pub index_service_resync_interval: Option<u64>,
     /// Serve the local Web UI from the continuous background index service.
     pub index_service_web_ui: Option<bool>,
     /// Serve MCP from the continuous background index service.
@@ -425,6 +430,19 @@ impl UserConfig {
         self.index_service_poll_interval.unwrap_or(30)
     }
 
+    pub(crate) fn index_service_watch_mode(&self) -> Result<crate::watch::WatchMode> {
+        match self.index_service_watch_mode.as_deref() {
+            None => Ok(crate::watch::WatchMode::Events),
+            Some(mode) => mode.parse(),
+        }
+    }
+
+    pub fn index_service_resync_interval(&self) -> u64 {
+        self.index_service_resync_interval
+            .or(self.index_service_poll_interval)
+            .unwrap_or(600)
+    }
+
     pub fn index_service_web_ui_default(&self) -> bool {
         self.index_service_web_ui.unwrap_or(false)
     }
@@ -516,6 +534,37 @@ mod tests {
     #[test]
     fn token_usage_is_disabled_by_default() {
         assert!(!UserConfig::default().token_usage_enabled());
+    }
+
+    #[test]
+    fn watch_mode_defaults_to_events_and_rejects_unknown() {
+        assert_eq!(
+            UserConfig::default()
+                .index_service_watch_mode()
+                .expect("default watch mode"),
+            crate::watch::WatchMode::Events
+        );
+        let config: UserConfig =
+            toml::from_str(r#"index_service_watch_mode = "poll""#).expect("parse config");
+        assert_eq!(
+            config.index_service_watch_mode().expect("poll watch mode"),
+            crate::watch::WatchMode::Poll
+        );
+        let config: UserConfig =
+            toml::from_str(r#"index_service_watch_mode = "fsevents""#).expect("parse config");
+        assert!(config.index_service_watch_mode().is_err());
+    }
+
+    #[test]
+    fn resync_interval_falls_back_to_poll_interval_then_default() {
+        assert_eq!(UserConfig::default().index_service_resync_interval(), 600);
+        let config: UserConfig =
+            toml::from_str("index_service_poll_interval = 30").expect("parse config");
+        assert_eq!(config.index_service_resync_interval(), 30);
+        let config: UserConfig =
+            toml::from_str("index_service_poll_interval = 30\nindex_service_resync_interval = 120")
+                .expect("parse config");
+        assert_eq!(config.index_service_resync_interval(), 120);
     }
 
     #[test]

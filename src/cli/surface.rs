@@ -397,6 +397,7 @@ mod tests {
             &selected,
             true,
             17,
+            crate::watch::WatchMode::Events,
             true,
             "127.0.0.1:4567",
             None,
