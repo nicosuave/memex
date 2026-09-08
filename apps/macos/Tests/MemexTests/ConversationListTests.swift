@@ -23,7 +23,7 @@ import Testing
         controller.table.layoutSubtreeIfNeeded()
         let y = controller.scrollView.contentView.bounds.minY
         let visible = controller.table.rows(in: controller.table.visibleRect)
-        #expect(visible.length > 0 && visible.length < 10)
+        #expect(visible.length > 0 && visible.length < 16)
         let row = visible.location
         let cell = try #require(controller.table.view(atColumn: 0, row: row, makeIfNecessary: true))
         controller.update(sessions: sessions(2000), selectedID: initial[5].id, select: { _ in }, loadMore: { _ in })

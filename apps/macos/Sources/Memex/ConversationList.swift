@@ -109,7 +109,7 @@ struct NativeConversationList: NSViewControllerRepresentable {
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { rows[row].machine == nil ? 112 : 130 }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { rows[row].machine == nil ? 68 : 84 }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let identifier = NSUserInterfaceItemIdentifier("conversation-cell")
         let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? ConversationCell ?? ConversationCell()
@@ -145,16 +145,18 @@ struct NativeConversationList: NSViewControllerRepresentable {
             field.lineBreakMode = .byTruncatingTail
             addSubview(field)
         }
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        project.font = .systemFont(ofSize: 12, weight: .semibold)
+        project.textColor = .labelColor
+        title.font = .systemFont(ofSize: 13)
         title.textColor = .labelColor
         preview.font = .systemFont(ofSize: 12)
         for field in [title, preview] {
-            field.lineBreakMode = .byWordWrapping
-            field.cell?.wraps = true
+            field.lineBreakMode = .byTruncatingTail
+            field.cell?.wraps = false
             field.cell?.isScrollable = false
         }
-        title.maximumNumberOfLines = 2
-        preview.maximumNumberOfLines = 2
+        title.maximumNumberOfLines = 1
+        preview.maximumNumberOfLines = 1
         date.alignment = .right
         setAccessibilityElement(true)
     }
@@ -174,10 +176,10 @@ struct NativeConversationList: NSViewControllerRepresentable {
         super.layout()
         let width = max(0, bounds.width - 16)
         let dateWidth = min(width, ceil(date.intrinsicContentSize.width) + 4)
-        project.frame = NSRect(x: 8, y: 10, width: max(0, width - dateWidth - 6), height: 15)
-        date.frame = NSRect(x: 8 + width - dateWidth, y: 10, width: dateWidth, height: 15)
-        title.frame = NSRect(x: 8, y: 30, width: width, height: 34)
-        preview.frame = NSRect(x: 8, y: 69, width: width, height: 30)
-        machine.frame = NSRect(x: 8, y: 108, width: width, height: 15)
+        project.frame = NSRect(x: 8, y: 8, width: max(0, width - dateWidth - 6), height: 15)
+        date.frame = NSRect(x: 8 + width - dateWidth, y: 8, width: dateWidth, height: 15)
+        title.frame = NSRect(x: 8, y: 25, width: width, height: 17)
+        preview.frame = NSRect(x: 8, y: 43, width: width, height: 16)
+        machine.frame = NSRect(x: 8, y: 88, width: width, height: 15)
     }
 }
