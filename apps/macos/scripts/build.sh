@@ -4,7 +4,25 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CONFIGURATION=${1:-release}
-source "$ROOT/version.env"
+REPO=$(cd "$ROOT/../.." && pwd)
+# The Rust package owns the release version. Keep local and release bundles aligned.
+MARKETING_VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$REPO/Cargo.toml")
+BUILD_NUMBER=$(git -C "$REPO" rev-list --count HEAD)
+SIGNING_MODE=${SIGNING_MODE:-adhoc}
+case "$SIGNING_MODE" in
+  adhoc) SIGN_ARGS=(--force --sign -) ;;
+  developer-id)
+    : "${CODESIGN_IDENTITY:?Set CODESIGN_IDENTITY to a local Developer ID Application identity}"
+    SIGN_ARGS=(--force --options runtime --timestamp --sign "$CODESIGN_IDENTITY")
+    ;;
+  *) echo "Unknown SIGNING_MODE: $SIGNING_MODE" >&2; exit 1 ;;
+esac
+read -r -a ARCH_LIST <<< "${ARCHES:-$(uname -m)}"
+SWIFT_ARGS=()
+for arch in "${ARCH_LIST[@]}"; do
+  case "$arch" in arm64|x86_64) ;; *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; esac
+  SWIFT_ARGS+=(--arch "$arch")
+done
 APP="$ROOT/build/Memex.app"
 CLI=${MEMEX_CLI:-$(command -v memex || true)}
 if [[ ! -f "$CLI" || ! -x "$CLI" ]]; then
@@ -17,8 +35,8 @@ if ! "$CLI" projects --help >/dev/null 2>&1 || ! "$CLI" machines --help >/dev/nu
   echo "This app requires a Memex CLI with projects and machines commands. Build this checkout's CLI and set MEMEX_CLI to it." >&2
   exit 1
 fi
-swift build --package-path "$ROOT" -c "$CONFIGURATION" --product Memex
-BIN_DIR=$(swift build --package-path "$ROOT" -c "$CONFIGURATION" --show-bin-path)
+swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --product Memex --force-resolved-versions
+BIN_DIR=$(swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --show-bin-path)
 
 # This directory contains only generated bundle output.
 rm -rf "$APP"
@@ -45,10 +63,13 @@ verify_dependencies() {
         exit 1
         ;;
     esac
-  done < <(otool -L "$binary" | awk 'NR>1 {sub(/^[[:space:]]+/, ""); sub(/ \(compatibility.*$/, ""); print}')
+  done < <(otool -L "$binary" | awk '/^\t/ {sub(/^[[:space:]]+/, ""); sub(/ \(compatibility.*$/, ""); print}')
 }
 verify_dependencies "$CLI"
 verify_dependencies "$BIN_DIR/Memex"
+for binary in "$APP/Contents/MacOS/Memex" "$APP/Contents/Helpers/memex"; do
+  lipo "$binary" -verify_arch "${ARCH_LIST[@]}"
+done
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -69,8 +90,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$APP/Contents/Info.plist"
 xattr -cr "$APP"
-codesign --force --sign - "$APP/Contents/Helpers/memex"
-codesign --force --sign - "$APP"
+codesign "${SIGN_ARGS[@]}" "$APP/Contents/Helpers/memex"
+codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/bundle/Release.entitlements" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 "$APP/Contents/Helpers/memex" --version
 echo "Built $APP"

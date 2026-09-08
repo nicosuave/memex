@@ -94,6 +94,86 @@ MEMEX_DAEMON_TEST_CLI="$PWD/target/debug/memex" swift test --package-path apps/m
 This test starts and stops its own foreground daemon with a temporary data root
 and one synthetic transcript; it does not use your sources or service settings.
 
+## App releases
+
+The app is distributed separately from the CLI archives. GitHub Actions continues
+to publish the CLI; app builds, Developer ID signing, and notarization run on a
+maintainer's Mac. Apple credentials stay in the local Keychain.
+
+Once the first app release is published, install or upgrade it with:
+
+```sh
+brew install --cask nicosuave/tap/memex-app
+brew upgrade --cask nicosuave/tap/memex-app
+```
+
+Alternatively, download `memex-app-VERSION-macos-universal.zip` from the matching
+GitHub release, unzip it, and move `Memex.app` to Applications. The app includes
+its CLI and supports Apple Silicon and Intel on macOS 14+. The separate `memex`
+formula remains available for terminal use. There is no in-app updater.
+
+The release Mac needs Xcode developer tools, Rust with both macOS targets, `gh`,
+and `jq`, plus a Developer ID Application certificate with its private key in
+Keychain. Authenticate `gh` with write access to `nicosuave/memex` and
+`nicosuave/homebrew-tap`. Set up Rust targets once:
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
+
+Use the existing `sidequery-notarization` notarytool Keychain profile, or create a
+profile interactively with `xcrun notarytool store-credentials PROFILE` and set
+`NOTARY_PROFILE`. Do not put passwords or certificate exports in the repository
+or GitHub secrets. Select the local signing identity explicitly:
+
+```sh
+export CODESIGN_IDENTITY='Developer ID Application: YOUR NAME (TEAMID)'
+```
+
+After the normal CLI release has created and published `vVERSION`, use a clean
+checkout at that exact tag and run:
+
+```sh
+scripts/release_macos_local.sh VERSION
+```
+
+The command checks the package version, clean checkout, local/published tag, and
+GitHub release. It builds both the Swift app and Rust helper from that checkout,
+verifies both architectures and system-library dependencies, signs with hardened
+runtime, submits to Apple, requires an Accepted result, staples the ticket, and
+checks Gatekeeper. It then verifies the extracted ZIP, uploads it and its SHA256,
+and creates or updates `Casks/memex-app.rb` in the tap using your local GitHub
+authentication. It never overwrites published assets or downgrades the cask.
+
+Outputs and notarization results remain under
+`apps/macos/build/releases/vVERSION/`. If uploading is interrupted, retry the
+saved, verified artifacts without rebuilding or notarizing again:
+
+```sh
+scripts/release_macos_local.sh --publish-only VERSION
+```
+
+If only the cask update failed, it can be retried independently; the command
+downloads the published app and verifies its checksum before updating the tap:
+
+```sh
+apps/macos/scripts/publish-cask.sh VERSION
+```
+
+To validate universal packaging without Apple credentials or publishing anything:
+
+```sh
+apps/macos/scripts/build-release.sh
+```
+
+This defaults to ad hoc signing. Both normal and release app builds derive their
+marketing version from `Cargo.toml` and build number from the commit count.
+`SIGNING_MODE=developer-id` enables distribution signing; it requires
+`CODESIGN_IDENTITY` and does not fall back to ad hoc signing on failure.
+
+Run the release contract tests with `bash apps/macos/Tests/release-scripts.sh`.
+These use temporary fixtures for external services and need no Apple credentials.
+
 ## Local data and packaging
 
 The app uses your existing Memex configuration and index. When a compatible
@@ -125,8 +205,8 @@ is packaged; updating your installed CLI alone does not change an existing bundl
 The packaging script checks that both executables depend only on Apple's system
 libraries. Custom CLI builds with external libraries fail with the dependency name
 rather than producing a bundle that depends on your Homebrew installation.
-The bundle is built for the local machine and signed ad hoc for development;
-distribution signing and notarization are not configured.
+The normal build targets the local machine and signs ad hoc for development;
+the app release commands above build universal bundles for distribution.
 
 The SwiftUI shell embeds an AppKit NSTableView transcript with native text selection.
 The transcript has no LazyVStack; row measurements retain TextKit glyph layout across resizes. Messages display their full text; tool bodies are only
