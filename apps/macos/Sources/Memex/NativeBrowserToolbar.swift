@@ -229,7 +229,7 @@ private struct ConversationToolbarTitle: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(store.scope.title).font(.headline).lineLimit(1)
-            Text(store.loadingSessions ? "Loading…" : "\(store.sessions.count)")
+            Text(store.loadingSessions ? "Loading…" : "\(store.sessions.count)\(store.hasMoreSessions ? "+" : "")")
                 .font(.subheadline).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
                 .help("Conversations currently loaded")
         }
