@@ -3,44 +3,72 @@ import SwiftUI
 
 @main
 struct MemexApp: App {
-    @State private var store = Store(filterPreferences: .standard)
+    @NSApplicationDelegateAdaptor(MemexApplicationDelegate.self) private var delegate
 
     var body: some Scene {
-        WindowGroup {
-            BrowserView(store: store)
-                .frame(minWidth: 900, minHeight: 560)
-        }
-        .defaultSize(width: 1380, height: 900)
-        .commands {
-            CommandGroup(after: .newItem) {
-                Button("Refresh Conversations") { Task { await store.refresh() } }
-                    .keyboardShortcut("r")
+        Settings { EmptyView() }
+            .commands {
+                CommandGroup(replacing: .newItem) {
+                    Button("Open Memex") { delegate.showBrowser() }
+                        .keyboardShortcut("n")
+                }
+                CommandGroup(after: .newItem) {
+                    Button("Refresh Conversations") { Task { await delegate.store.refresh() } }
+                        .keyboardShortcut("r")
+                    Button("Find in Conversation") { delegate.store.findConversationRequest += 1 }
+                        .keyboardShortcut("f")
+                        .disabled(delegate.store.selected == nil)
+                }
             }
-        }
     }
 }
 
-struct BrowserView: View {
+@MainActor final class MemexApplicationDelegate: NSObject, NSApplicationDelegate {
+    let store = Store(filterPreferences: .standard)
+    private var browser: NSWindowController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) { showBrowser() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showBrowser()
+        return false
+    }
+    func showBrowser() {
+        if browser == nil {
+            // Own the window and toolbar together. Replacing a SwiftUI WindowGroup's
+            // toolbar leaves its private toolbar observations attached to old items.
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1380, height: 900),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                  backing: .buffered, defer: false)
+            window.title = "Memex"
+            window.minSize = NSSize(width: 900, height: 560)
+            window.isReleasedWhenClosed = false
+            let content = BrowserContent(store: store)
+            window.contentViewController = BrowserColumnsController(store: store, sidebar: content.sidebar,
+                conversations: content.conversations, reader: content.reader)
+            // Installing a native content controller adopts its fitting size.
+            // Restore the intended initial browser size before frame autosave.
+            window.setContentSize(NSSize(width: 1380, height: 900))
+            window.center()
+            window.setFrameAutosaveName("MemexBrowser")
+            browser = NSWindowController(window: window)
+        }
+        browser?.showWindow(nil)
+        browser?.window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+@MainActor struct BrowserContent {
+    let store: Store
+    var sidebar: some View { BrowserSidebar(store: store) }
+    var conversations: some View { BrowserConversationList(store: store) }
+    var reader: some View { BrowserReader(store: store) }
+}
+
+private struct BrowserReader: View {
     @Bindable var store: Store
-    @State private var sessionColumnWidth: CGFloat = 330
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 290)
-        } content: {
-            sessionList
-                .background(GeometryReader { geometry in
-                    Color.clear.preference(key: SessionColumnWidth.self, value: geometry.size.width)
-                })
-                .navigationSplitViewColumnWidth(min: 260, ideal: 330, max: 450)
-        } detail: {
-            ReaderView(store: store)
-        }
-        .navigationSplitViewStyle(.balanced)
-        .onPreferenceChange(SessionColumnWidth.self) { sessionColumnWidth = $0 }
-        .toolbar(removing: defaultTitleItem)
-        .searchable(text: $store.query, placement: .toolbar, prompt: "Search conversations")
+        ReaderView(store: store)
         .task(id: store.requestID) { await store.loadSessions() }
         .task(id: store.readerRequestID) { await store.loadRecords() }
         .task(id: store.readerRequestID) { await store.loadSelectedSessionMetadata() }
@@ -48,76 +76,13 @@ struct BrowserView: View {
         .task(id: store.machineRequestID) { await store.loadProjects() }
         .onChange(of: store.scope) { _, _ in store.sessionLimit = 200 }
         .onChange(of: store.machineSelection) { _, _ in store.sessionLimit = 200 }
-        .toolbar {
-            if #available(macOS 26.0, *) {
-                titleToolbarItem.sharedBackgroundVisibility(.hidden)
-                toolbarCenter.sharedBackgroundVisibility(.hidden)
-            } else {
-                titleToolbarItem
-                toolbarCenter
-            }
-            if #available(macOS 26.0, *) {
-                resumeToolbarItem.sharedBackgroundVisibility(.hidden)
-                ToolbarSpacer(.fixed, placement: .primaryAction)
-            } else {
-                resumeToolbarItem
-            }
-            ToolbarItem(placement: .navigation) {
-                Button { Task { await store.refresh() } } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                .help("Refresh conversations (⌘R)")
-                .disabled(store.loadingSessions)
-            }
-        }
     }
+}
 
-    private var resumeToolbarItem: some ToolbarContent {
-        ToolbarItem(placement: .primaryAction) {
-            if store.selected != nil { ResumeToolbarButton(store: store) }
-        }
-    }
+private struct BrowserSidebar: View {
+    @Bindable var store: Store
 
-    // Reserve the native center slot between leading reader tools and Resume.
-    private var toolbarCenter: some ToolbarContent {
-        ToolbarItem(placement: .principal) {
-            Color.clear.frame(width: 1, height: 1).accessibilityHidden(true)
-        }
-    }
-
-    private var defaultTitleItem: ToolbarDefaultItemKind? {
-        if #available(macOS 15.0, *) { return .title }
-        return nil
-    }
-
-    private var titleToolbarItem: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            HStack(spacing: 10) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(store.scope.title)
-                        .font(.headline)
-                        .lineLimit(1)
-                    Text(store.loadingSessions ? "Loading…" : "\(store.sessions.count)")
-                        .font(.subheadline.weight(.regular))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .help("Conversations currently loaded")
-                }
-                Spacer(minLength: 4)
-                if #available(macOS 26.0, *) {
-                    ConversationFilterButton(store: store)
-                        .buttonStyle(.glass)
-                        .buttonBorderShape(.circle)
-                } else {
-                    ConversationFilterButton(store: store)
-                }
-            }
-            // Navigation items begin at the sidebar separator. Keep this header
-            // tied to the real list width as the user drags either divider.
-            .frame(width: max(180, sessionColumnWidth - 48))
-        }
-    }
+    var body: some View { sidebar }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
@@ -146,7 +111,6 @@ struct BrowserView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .background(Color(nsColor: .windowBackgroundColor))
         }
-        .navigationTitle("Memex")
     }
 
     private var sidebarList: some View {
@@ -192,6 +156,7 @@ struct BrowserView: View {
                         Image(systemName: "ellipsis")
                     }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .padding(.trailing, 8)
                     .help("Sort projects").accessibilityLabel("Sort projects")
                 }
             }
@@ -200,7 +165,12 @@ struct BrowserView: View {
         .listStyle(.sidebar)
     }
 
-    private var sessionList: some View {
+}
+
+private struct BrowserConversationList: View {
+    @Bindable var store: Store
+
+    var body: some View {
         VStack(spacing: 0) {
             if let error = store.listError {
                 ErrorBanner(message: error) { Task { await store.loadSessions() } }
@@ -229,7 +199,6 @@ struct BrowserView: View {
             }
 
         }
-        .navigationTitle(store.scope.title)
     }
 }
 
@@ -271,9 +240,4 @@ struct ErrorBanner: View {
         .padding().frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.5))
     }
-}
-
-private struct SessionColumnWidth: PreferenceKey {
-    static var defaultValue: CGFloat { 330 }
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

@@ -1,20 +1,10 @@
 import SwiftUI
 
-struct ConversationFilterButton: View {
+struct ConversationFilterControls: View {
     @Bindable var store: Store
-    @State private var showingFilters = false
+    let done: () -> Void
 
     var body: some View {
-        Button { showingFilters.toggle() } label: {
-            Label("Filters", systemImage: store.filters.isActive
-                  ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-        }
-        .accessibilityLabel("Conversation filters")
-        .help(store.filters.isActive ? "Filters: \(store.filters.summary)" : "Filter conversations")
-        .popover(isPresented: $showingFilters, arrowEdge: .bottom) { controls }
-    }
-
-    private var controls: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Filters").font(.headline)
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
@@ -49,7 +39,7 @@ struct ConversationFilterButton: View {
                 Button("Reset Filters") { store.filters = .defaults }
                     .disabled(!store.filters.isActive)
                 Spacer()
-                Button("Done") { showingFilters = false }
+                Button("Done", action: done)
                     .keyboardShortcut(.defaultAction)
             }
         }

@@ -143,7 +143,7 @@ private func isMainThread() -> Bool { Thread.isMainThread }
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 700),
         styleMask: [.titled, .resizable], backing: .buffered, defer: false)
     window.isReleasedWhenClosed = false
-    let host = NSHostingView(rootView: BrowserView(store: store))
+    let host = NSHostingView(rootView: BrowserContent(store: store).sidebar)
     window.contentView = host
     defer { window.close() }
     let heartbeat = ProjectHeartbeat()

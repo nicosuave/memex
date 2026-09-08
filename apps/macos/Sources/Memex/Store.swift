@@ -21,6 +21,7 @@ final class Store {
     var machineSelection: MachineSelection = .all
     var machineError: String?
     var loadingMachines = false
+    var findConversationRequest = 0
     var selectedID: String?
     var records: [TranscriptRecord] = []
     var query = ""

@@ -36,30 +36,16 @@ struct ReaderView: View {
                     }
 
                 }
-                .toolbar {
-                    ToolbarItemGroup(placement: .navigation) {
-                        Button {
-                            find?.isOpen = true
-                            findFocused = true
-                        } label: { Label("Find in conversation", systemImage: "magnifyingglass") }
-                        .keyboardShortcut("f", modifiers: .command)
-                        .help("Find in conversation (⌘F)")
-                        Button { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(session.sessionID, forType: .string) } label: {
-                            Label("Copy session ID", systemImage: "link")
-                        }.help("Copy session ID")
-                        if session.machineID == "local" {
-                            Button { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: session.sourcePath)]) } label: {
-                                Label("Reveal source", systemImage: "doc")
-                            }.help("Reveal transcript in Finder")
-                        }
-                    }
-                }
             } else {
                 ContentUnavailableView("Your conversations, together", systemImage: "bubble.left.and.bubble.right",
                     description: Text("Select a conversation or search your history."))
             }
         }
         .onAppear { if find == nil { find = ConversationFindState(client: store.client) } }
+        .onChange(of: store.findConversationRequest) { _, _ in
+            find?.isOpen = true
+            findFocused = true
+        }
         .onChange(of: store.selectedID) { _, _ in
             find?.search(in: store.selected)
         }

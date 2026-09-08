@@ -134,17 +134,6 @@ private struct FilterFixture {
     #expect(Store(filterPreferences: preferences).filters == .defaults)
 }
 
-@MainActor @Test func filterButtonRemainsCompactWithActiveFilters() {
-    _ = NSApplication.shared
-    let store = Store()
-    store.filters = ConversationFilters(timeframe: .month, provider: .openclaw, origin: .interactive)
-    let host = NSHostingView(rootView: ConversationFilterButton(store: store))
-    host.frame = NSRect(x: 0, y: 0, width: 260, height: 40)
-    host.layoutSubtreeIfNeeded()
-    #expect(host.fittingSize.height <= 44)
-    #expect(store.filters.summary == "Last 30 days · OpenClaw · Chats only")
-}
-
 @MainActor @Test func permissionReviewsAreHiddenByDefaultForBrowsingAndSearch() async throws {
     let fixture = try FilterFixture()
     defer { fixture.cleanUp() }

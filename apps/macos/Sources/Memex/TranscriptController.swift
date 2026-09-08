@@ -49,7 +49,7 @@ struct NativeTranscript: NSViewControllerRepresentable {
 
 @MainActor
 final class TranscriptController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
-    let table = NSTableView()
+    let table = TranscriptTableView()
     let scrollView = TranscriptScrollView()
     private(set) var rows: [Row] = []
     private var sessionID = ""
@@ -198,6 +198,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         self.records = records
         self.provider = provider
         if changedSession {
+            table.minimumDocumentHeight = 0
             needsInitialPosition = true
             rawTools.removeAll()
             expanded = self.navigation.positions[sessionID]?.expanded ?? []
@@ -385,17 +386,41 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     func toggle(_ id: String) {
-        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
-        measurements.removeValue(forKey: id)
-        textLayouts.removeValue(forKey: id)
-        rebuildRows()
+        updateDisclosure(id) {
+            if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+        }
     }
 
     func toggleRaw(_ id: String) {
-        if rawTools.contains(id) { rawTools.remove(id) } else { rawTools.insert(id) }
+        updateDisclosure(id) {
+            if rawTools.contains(id) { rawTools.remove(id) } else { rawTools.insert(id) }
+        }
+    }
+
+    private func updateDisclosure(_ id: String, change: () -> Void) {
+        guard let row = rows.firstIndex(where: { $0.id == id }) else { return }
+        view.layoutSubtreeIfNeeded()
+        // Anchor the clicked header, not the first record in the viewport: a
+        // group and its first expanded operation can share that record ID.
+        let offset = table.rect(ofRow: row).minY - scrollView.contentView.bounds.minY
+        let wasUpdating = updatingRows
+        updatingRows = true
+        defer {
+            updatingRows = wasUpdating
+            savePosition()
+        }
+        change()
+        // Collapsing the final row must not clamp the clip view upward. Keep
+        // only enough trailing space to retain this viewport; scrolling upward
+        // releases it again without moving the reader's content.
+        table.minimumDocumentHeight = scrollView.contentView.bounds.maxY
         measurements.removeValue(forKey: id)
         textLayouts.removeValue(forKey: id)
         rebuildRows()
+        view.layoutSubtreeIfNeeded()
+        guard let updatedRow = rows.firstIndex(where: { $0.id == id }) else { return }
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, table.rect(ofRow: updatedRow).minY - offset)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -403,7 +428,14 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { measurement(at: row).height }
 
     @objc private func scrolled(_ notification: Notification) {
-        if !updatingRows { savePosition() }
+        if !updatingRows {
+            if table.minimumDocumentHeight > scrollView.contentView.bounds.maxY {
+                table.minimumDocumentHeight = scrollView.contentView.bounds.maxY
+                let contentHeight = rows.isEmpty ? 0 : table.rect(ofRow: rows.count - 1).maxY
+                table.setFrameSize(NSSize(width: table.frame.width, height: contentHeight))
+            }
+            savePosition()
+        }
         loadNextPageIfNeeded()
     }
 
@@ -527,6 +559,16 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     }
 }
 
+/// NSTableView normally shrinks its document to the last row during reload.
+/// A disclosure can temporarily retain the current viewport's trailing space.
+@MainActor final class TranscriptTableView: NSTableView {
+    var minimumDocumentHeight: CGFloat = 0
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(NSSize(width: newSize.width, height: max(newSize.height, minimumDocumentHeight)))
+    }
+}
+
 @MainActor
 private final class TranscriptCell: NSTableCellView {
     private let titleLabel = NSTextField(labelWithString: "")
@@ -545,9 +587,11 @@ private final class TranscriptCell: NSTableCellView {
         titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.lineBreakMode = .byTruncatingTail
+        disclosure.cell = TranscriptDisclosureCell()
         disclosure.isBordered = false
         disclosure.alignment = .left
         disclosure.font = .systemFont(ofSize: 13)
+        disclosure.imagePosition = .imageRight
         disclosure.contentTintColor = .secondaryLabelColor
         disclosure.target = self
         disclosure.action = #selector(toggle)
@@ -586,7 +630,10 @@ private final class TranscriptCell: NSTableCellView {
         titleLabel.alignment = value.isUser ? .right : .left
         titleLabel.isHidden = value.isDisclosure
         disclosure.isHidden = !value.isDisclosure
-        disclosure.title = "\(value.isExpanded ? "⌄" : "›")  \(value.title)"
+        disclosure.title = value.title
+        disclosure.image = NSImage(systemSymbolName: value.isExpanded ? "chevron.down" : "chevron.right",
+                                   accessibilityDescription: nil)?.withSymbolConfiguration(
+                                    NSImage.SymbolConfiguration(pointSize: 10, weight: .light))
         disclosure.setAccessibilityLabel(value.title)
         disclosure.setAccessibilityValue(value.isExpanded ? "Expanded" : "Collapsed")
         if displayedText !== value.attributedBody {
@@ -628,6 +675,19 @@ private final class TranscriptCell: NSTableCellView {
 
     @objc private func toggle() { onToggle?() }
     @objc private func toggleRaw() { onToggleRaw?() }
+}
+
+/// Reserve identical text and symbol geometry in both disclosure states. The
+/// chevron follows the label rather than aligning with the far edge of the row.
+@MainActor private final class TranscriptDisclosureCell: NSButtonCell {
+    override func titleRect(forBounds rect: NSRect) -> NSRect {
+        let width = min(attributedTitle.size().width.rounded(.up), max(0, rect.width - 18))
+        return NSRect(x: rect.minX, y: rect.midY - 9, width: width, height: 18)
+    }
+
+    override func imageRect(forBounds rect: NSRect) -> NSRect {
+        NSRect(x: titleRect(forBounds: rect).maxX + 6, y: rect.midY - 5, width: 10, height: 10)
+    }
 }
 
 /// Retain glyph shaping across width changes and use the same TextKit settings
