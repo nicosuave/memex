@@ -85,9 +85,36 @@ Run the native tests with:
 swift test --package-path apps/macos
 ```
 
+To also test the Swift client against a real Rust daemon, build the CLI and run:
+
+```sh
+MEMEX_DAEMON_TEST_CLI="$PWD/target/debug/memex" swift test --package-path apps/macos --filter isolatedRustDaemonServesSwiftClientAndReconnects
+```
+
+This test starts and stops its own foreground daemon with a temporary data root
+and one synthetic transcript; it does not use your sources or service settings.
+
 ## Local data and packaging
 
-The app uses the bundled CLI and your existing Memex configuration and index.
+The app uses your existing Memex configuration and index. When a compatible
+continuous daemon is running, it connects through the private Unix socket at
+`<data-root>/state/native/app.sock`. A small pool of persistent connections lets
+lists, counts, search, and transcript reads proceed independently. This avoids
+launching a CLI process for each request; query collectors still open their
+readers per operation so published index generations remain visible.
+
+If the daemon is absent, older, or unavailable, requests use the bundled CLI.
+The app does not enable or restart the daemon or change service settings. An older running daemon needs an updated binary and a normal restart
+before it provides the socket. Local socket reads do not trigger auto-indexing;
+remote machines and CLI fallback retain their existing indexing policies.
+A runtime `MEMEX_CLI` override selects CLI-only operation for development.
+
+The socket is private to the current user and data root. Its versioned protocol
+exposes only native-app reads, without an HTTP port or browser authentication.
+Cancellation closes the request's connection; completed requests return their
+connections to the pool. An operation error is shown normally rather than being
+silently retried through the CLI.
+
 Project summaries are cached under `~/Library/Caches/dev.memex.app`, separately
 for each data root and machine. Reading, decoding, sorting, and saving this cache happen away
 from the main actor. Failed refreshes retain cached projects and expose a retry.

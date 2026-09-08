@@ -88,9 +88,10 @@ final class CommandRun: @unchecked Sendable {
 struct MemexClient: Sendable {
     let executable: URL
     let root: String?
+    private let daemon: DaemonClient?
     static let pageSize = 60
 
-    init(executable: URL? = nil, root: String? = nil) {
+    init(executable: URL? = nil, root: String? = nil, daemonSocket: URL? = nil) {
         let environment = ProcessInfo.processInfo.environment
         let bundled = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/memex")
         let candidates: [String?] = [environment["MEMEX_CLI"], bundled.path, "/opt/homebrew/bin/memex", "/usr/local/bin/memex"]
@@ -98,9 +99,19 @@ struct MemexClient: Sendable {
             FileManager.default.isExecutableFile(atPath: $0)
         } ?? bundled.path)
         self.root = root ?? environment["MEMEX_ROOT"]
+        // Explicit CLI overrides remain useful for development and fixtures.
+        // An explicit socket can opt those clients into the daemon transport.
+        if daemonSocket != nil || (executable == nil && environment["MEMEX_CLI"] == nil) {
+            let dataRoot = self.root.map { URL(fileURLWithPath: $0) } ??
+                FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".memex")
+            daemon = DaemonClient(root: dataRoot, socket: daemonSocket)
+        } else { daemon = nil }
     }
 
-    func run(_ arguments: [String], timeout: TimeInterval = 60) async throws -> Data {
+    func run(_ arguments: [String], timeout: TimeInterval = 60, daemonRequest: DaemonRequest? = nil) async throws -> Data {
+        if let daemon, let daemonRequest,
+           let response = try await daemon.request(daemonRequest, timeout: timeout) { return response }
+        try Task.checkCancellation()
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw ClientError(message: "Memex CLI is missing. Build the app with scripts/build.sh or set MEMEX_CLI to your memex executable.")
         }
@@ -118,7 +129,7 @@ struct MemexClient: Sendable {
     }
 
     func machines() async throws -> [MachineChoice] {
-        try JSONDecoder().decode([MachineChoice].self, from: await run(["machines", "--format", "json"]))
+        try JSONDecoder().decode([MachineChoice].self, from: await run(["machines", "--format", "json"], daemonRequest: DaemonRequest(op: "machines")))
     }
 
     func sessions(limit: Int, project: String? = nil, source: String? = nil, machine: String = "local",
@@ -129,7 +140,10 @@ struct MemexClient: Sendable {
         if let source { args += ["--source", source] }
         if let since { args += ["--since", since] }
         args += ["--origin", origin.argument]
-        return try JSONDecoder().decode([Session].self, from: await run(args))
+        var request = DaemonRequest(op: "sessions")
+        request.machine = machine
+        request.filters = DaemonSessionFilters(project: project, source: source, since: since, limit: limit, origin: origin.argument)
+        return try JSONDecoder().decode([Session].self, from: await run(args, daemonRequest: request))
     }
 
     func sessionCount(query: String? = nil, project: String? = nil, source: String? = nil,
@@ -141,8 +155,12 @@ struct MemexClient: Sendable {
         if let project { args += ["--project", project] }
         if let source { args += ["--source", source] }
         if let since { args += ["--since", since] }
+        var request = DaemonRequest(op: "count")
+        request.machine = machine
+        request.query = query?.nilIfBlank
+        request.filters = DaemonSessionFilters(project: project, source: source, since: since, limit: 200, origin: origin.argument)
         struct Count: Decodable { let total: Int? }
-        if let data = try? await run(args, timeout: 10),
+        if let data = try? await run(args, timeout: 10, daemonRequest: request),
            let response = try? JSONDecoder().decode(Count.self, from: data),
            let total = response.total, total >= 0 { return total }
         try Task.checkCancellation()
@@ -164,7 +182,11 @@ struct MemexClient: Sendable {
         let args = ["sessions", "--format", "json", "--machine", session.machineID,
                     "--source", session.source, "--session-id=\(session.sessionID)",
                     "--source-path=\(session.sourcePath)", "--origin", "all", "--limit", "1"]
-        let rows = try JSONDecoder().decode([Session].self, from: await run(args))
+        var request = DaemonRequest(op: "sessions")
+        request.machine = session.machineID
+        request.filters = DaemonSessionFilters(sessionID: session.sessionID, sourcePath: session.sourcePath,
+            source: session.source, limit: 1, origin: "all")
+        let rows = try JSONDecoder().decode([Session].self, from: await run(args, daemonRequest: request))
         guard rows.count == 1, let detail = rows.first, detail.id == session.id else {
             throw ClientError(message: "This conversation's resume details are unavailable. Refresh conversations and try again.")
         }
@@ -172,7 +194,9 @@ struct MemexClient: Sendable {
     }
 
     func projects(machine: String = "local", timeout: TimeInterval = 60) async throws -> [ProjectSummary] {
-        try JSONDecoder().decode([ProjectSummary].self, from: await run(["projects", "--format", "json", "--machine", machine], timeout: timeout))
+        var request = DaemonRequest(op: "projects")
+        request.machine = machine
+        return try JSONDecoder().decode([ProjectSummary].self, from: await run(["projects", "--format", "json", "--machine", machine], timeout: timeout, daemonRequest: request))
     }
 
     func search(_ query: String, project: String?, source: String?, limit: Int, machine: String = "local",
@@ -184,7 +208,15 @@ struct MemexClient: Sendable {
         if let source { args += ["--source", source] }
         if let since { args += ["--since", since] }
         args += ["--origin", origin.argument]
-        return try JSONDecoder().decode([SearchHit].self, from: await run(args + ["--", query]))
+        var request = DaemonRequest(op: "search")
+        request.machine = machine
+        request.query = query
+        request.project = project
+        request.source = source
+        request.since = since
+        request.origin = origin.argument
+        request.limit = limit
+        return try JSONDecoder().decode([SearchHit].self, from: await run(args + ["--", query], daemonRequest: request))
     }
 
     func records(for session: Session, offset: Int, limit: Int = Self.pageSize) async throws -> [TranscriptRecord] {
@@ -192,7 +224,8 @@ struct MemexClient: Sendable {
         let args = ["session", "--machine", session.machineID, "--source-path", session.sourcePath,
                     "--offset", String(offset), "--limit", String(limit), "--full", "--format", "json",
                     "--", session.sessionID]
-        return try JSONDecoder().decode([TranscriptRecord].self, from: await run(args))
+        return try JSONDecoder().decode([TranscriptRecord].self, from: await run(args,
+            daemonRequest: sessionRequest(session, offset: offset, limit: limit)))
     }
 
     /// The CLI has no ID-only session mode. Bound search scans to 256K characters
@@ -201,11 +234,23 @@ struct MemexClient: Sendable {
         let args = ["session", "--machine", session.machineID, "--source-path", session.sourcePath,
                     "--offset", String(offset), "--limit", String(limit), "--max-chars", limit == 1 ? "1" : "262144",
                     "--format", "json", "--", session.sessionID]
-        let entries = try JSONDecoder().decode([RecordMetadataEntry].self, from: await run(args))
+        var request = sessionRequest(session, offset: offset, limit: limit)
+        request.maxChars = limit == 1 ? 1 : 262144
+        let entries = try JSONDecoder().decode([RecordMetadataEntry].self, from: await run(args, daemonRequest: request))
         guard let page = entries.last(where: { $0.type == "page" }), let total = page.total else {
             throw ClientError(message: "Memex did not return transcript pagination metadata.")
         }
         return RecordMetadataPage(ids: entries.compactMap(\.recordID), total: total, nextOffset: page.nextOffset)
+    }
+
+    private func sessionRequest(_ session: Session, offset: Int, limit: Int) -> DaemonRequest {
+        var request = DaemonRequest(op: "session")
+        request.machine = session.machineID
+        request.sessionID = session.sessionID
+        request.sourcePath = session.sourcePath
+        request.offset = offset
+        request.limit = limit
+        return request
     }
 
     func initialRecordOffset(for session: Session, anchor: String?) async throws -> (offset: Int, total: Int) {

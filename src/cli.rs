@@ -1881,6 +1881,14 @@ fn run_index_loop(
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
 ) -> Result<()> {
+    #[cfg(unix)]
+    let _native_server = match crate::native::spawn(index.root.clone()) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!("native app socket unavailable: {error:#}");
+            None
+        }
+    };
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
@@ -2753,7 +2761,181 @@ struct SearchCollection {
     failures: Vec<String>,
 }
 
+/// Native reads share CLI retrieval and projection, with local auto-index disabled.
+#[cfg(unix)]
+pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation) -> Result<Value> {
+    use crate::native::{Operation, Unavailable};
+    let config = UserConfig::load(paths)?;
+    let check_index = |machine: &str| -> Result<()> {
+        if machine == crate::machine::LOCAL_MACHINE_ID && !SearchIndex::exists(&paths.index) {
+            return Err(Unavailable("search index unavailable").into());
+        }
+        Ok(())
+    };
+    let check_analytics = |machine: &str| -> Result<()> {
+        if machine == crate::machine::LOCAL_MACHINE_ID && !analytics_path(&paths.state).exists() {
+            return Err(Unavailable("analytics cache unavailable").into());
+        }
+        Ok(())
+    };
+    let tag = |mut items: Vec<Value>, machine: String| {
+        for item in &mut items {
+            item["machine"] = Value::String(machine.clone());
+        }
+        Value::Array(items)
+    };
+    match operation {
+        Operation::Hello {} => unreachable!("hello is handled by the transport"),
+        Operation::Machines {} => Ok(Value::Array(crate::machine::configured_machine_summaries(
+            &config,
+        )?)),
+        Operation::Projects { machine } => {
+            check_analytics(&machine)?;
+            let items = if machine == crate::machine::LOCAL_MACHINE_ID {
+                collect_projects(paths, None)?
+            } else {
+                crate::machine::remote_project_summaries(&config, &machine, None)?
+            };
+            Ok(tag(items, machine))
+        }
+        Operation::Sessions { machine, filters } => {
+            anyhow::ensure!(filters.limit > 0, "session list limit must be positive");
+            if filters.limit > 100_000 {
+                return Err(Unavailable("session list exceeds native transport capacity").into());
+            }
+            check_analytics(&machine)?;
+            let items = if machine == crate::machine::LOCAL_MACHINE_ID {
+                collect_sessions(
+                    filters.session_id,
+                    filters.source_path,
+                    filters.cwd.map(PathBuf::from),
+                    filters.project,
+                    parse_source_filter(filters.source)?,
+                    filters.since,
+                    filters.limit,
+                    filters.origin,
+                    Some(paths.root.clone()),
+                )?
+            } else {
+                crate::machine::remote_sessions(&config, &machine, filters)?
+            };
+            Ok(tag(items, machine))
+        }
+        Operation::Count {
+            machine,
+            filters,
+            query,
+        } => {
+            if query.as_ref().is_some_and(|q| !q.trim().is_empty()) {
+                check_index(&machine)?;
+            } else {
+                check_analytics(&machine)?;
+            }
+            let count = if machine == crate::machine::LOCAL_MACHINE_ID {
+                collect_session_count(paths, filters, query)?
+            } else {
+                crate::machine::remote_session_count(&config, &machine, filters, query)?
+            };
+            Ok(serde_json::to_value(count)?)
+        }
+        Operation::Search {
+            machine,
+            query,
+            project,
+            source,
+            since,
+            origin,
+            limit,
+        } => {
+            anyhow::ensure!(limit > 0, "search limit must be positive");
+            if limit > 100_000 {
+                return Err(Unavailable("search exceeds native transport capacity").into());
+            }
+            check_index(&machine)?;
+            let collected = collect_search_with_auto_index(
+                SearchCollectRequest {
+                    query,
+                    additional_queries: Vec::new(),
+                    cwd: None,
+                    project,
+                    role: None,
+                    tool: None,
+                    session: None,
+                    source: parse_source_filter(source)?,
+                    origin,
+                    mode: SearchMode::Lexical,
+                    min_score: None,
+                    recency_weight: 1.0,
+                    recency_half_life_days: 30.0,
+                    since,
+                    until: None,
+                    limit,
+                    top_n_per_session: None,
+                    unique_session: true,
+                    fields: search_fields(
+                        Some(
+                            "source,session_id,source_path,project,snippet,ts,machine,record_id"
+                                .into(),
+                        ),
+                        false,
+                    )?,
+                    sort: SortBy::Score,
+                    verbose: false,
+                    format: SearchFormat::Json,
+                    root: Some(paths.root.clone()),
+                    machines: vec![machine],
+                },
+                false,
+            )?;
+            // Like the CLI, failures of every selected machine are errors; partial
+            // federation is not possible for the native app's single selection.
+            Ok(Value::Array(project_located_results(
+                collected.results,
+                &collected.render,
+            )?))
+        }
+        Operation::Session {
+            machine,
+            session_id,
+            source_path,
+            offset,
+            limit,
+            max_chars,
+        } => {
+            check_index(&machine)?;
+            let (records, page) = collect_session_page(
+                paths,
+                &config,
+                &machine,
+                &session_id,
+                &source_path,
+                offset,
+                Some(limit),
+                &ReadArgs {
+                    full: max_chars.is_none(),
+                    max_chars,
+                },
+            )?;
+            let mut items = records
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if let Some((total, next_offset)) = page {
+                items.push(serde_json::json!({"type":"page", "machine":machine, "session_id":session_id, "source_path":source_path, "offset":offset, "total":total, "next_offset":next_offset}));
+            }
+            Ok(tag(items, machine))
+        }
+    }
+}
+
 fn collect_search(request: SearchCollectRequest) -> Result<SearchCollection> {
+    collect_search_with_auto_index(request, true)
+}
+
+fn collect_search_with_auto_index(
+    request: SearchCollectRequest,
+    auto_index_local: bool,
+) -> Result<SearchCollection> {
     let SearchCollectRequest {
         query,
         additional_queries,
@@ -2877,8 +3059,13 @@ fn collect_search(request: SearchCollectRequest) -> Result<SearchCollection> {
                 min_score,
                 project_grouping: None,
             };
-            let federated =
-                federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
+            let federated = federated_search(
+                &paths,
+                &config,
+                &selected_machines,
+                &spec,
+                auto_index_local && query_index == 0,
+            )?;
             round_capped = round_capped || federated.candidate_count > federated.items.len();
             query_candidate_counts.push(federated.candidate_count);
             for (machine, error) in federated.failures {
@@ -3698,31 +3885,30 @@ struct SessionRunArgs {
     root: Option<PathBuf>,
 }
 
-fn run_session(args: SessionRunArgs) -> Result<()> {
-    let SessionRunArgs {
-        session_id,
-        machine,
-        source_path,
-        offset,
-        limit,
-        output,
-        read,
-        root,
-    } = args;
+type CollectedSessionPage = (Vec<BoundedRecord>, Option<(usize, Option<usize>)>);
+
+#[allow(clippy::too_many_arguments)]
+fn collect_session_page(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    session_id: &str,
+    source_path: &str,
+    offset: usize,
+    limit: Option<usize>,
+    read: &ReadArgs,
+) -> Result<CollectedSessionPage> {
     let mut budget = read.budget()?;
     if session_id.is_empty() {
         return Err(anyhow!("session_id must not be empty"));
     }
-    let paths = Paths::new(root)?;
-    let config = UserConfig::load(&paths)?;
-    let source_path = source_path.unwrap_or_default();
-    let (records, page) = if read.full {
+    if read.full {
         let records = hydrate_session_records(
-            &paths,
-            &config,
-            &machine,
-            &session_id,
-            &source_path,
+            paths,
+            config,
+            machine,
+            session_id,
+            source_path,
             offset,
             limit,
         )?
@@ -3737,21 +3923,46 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-        (records, None)
+        Ok((records, None))
     } else {
         let request = SessionPageRequest {
-            session_id: session_id.clone(),
-            source_path: source_path.clone(),
+            session_id: session_id.to_owned(),
+            source_path: source_path.to_owned(),
             offset,
             limit: limit.unwrap_or(50),
         };
-        let mut pages =
-            read_session_pages(&paths, &config, &machine, &[request], budget.remaining())?;
+        let mut pages = read_session_pages(paths, config, machine, &[request], budget.remaining())?;
         let page = pages
             .pop()
             .ok_or_else(|| anyhow!("session response missing page"))?;
-        (page.records, Some((page.total, page.next_offset)))
-    };
+        Ok((page.records, Some((page.total, page.next_offset))))
+    }
+}
+
+fn run_session(args: SessionRunArgs) -> Result<()> {
+    let SessionRunArgs {
+        session_id,
+        machine,
+        source_path,
+        offset,
+        limit,
+        output,
+        read,
+        root,
+    } = args;
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let source_path = source_path.unwrap_or_default();
+    let (records, page) = collect_session_page(
+        &paths,
+        &config,
+        &machine,
+        &session_id,
+        &source_path,
+        offset,
+        limit,
+        &read,
+    )?;
     let text = output.format == OutputFormat::Text;
     let mut writer = output.writer();
     for item in records {
