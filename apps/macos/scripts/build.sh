@@ -26,6 +26,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" \
   "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN_DIR/Memex" "$APP/Contents/MacOS/Memex"
 cp "$CLI" "$APP/Contents/Helpers/memex"
+cp "$ROOT/bundle/Memex.icns" "$APP/Contents/Resources/Memex.icns"
 chmod u+w "$APP/Contents/Helpers/memex"
 shopt -s nullglob
 for resource in "$BIN_DIR/"*.bundle; do
@@ -57,6 +58,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleDisplayName</key><string>Memex</string>
 <key>CFBundleIdentifier</key><string>dev.memex.app</string>
 <key>CFBundleExecutable</key><string>Memex</string>
+<key>CFBundleIconFile</key><string>Memex</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>${MARKETING_VERSION}</string>
 <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
