@@ -176,15 +176,9 @@ private struct BrowserConversationList: View {
             if let error = store.listError {
                 ErrorBanner(message: error) { Task { await store.loadSessions() } }
             }
-            List(selection: $store.selectedID) {
-                ForEach(store.sessions) { session in
-                    SessionRow(session: session)
-                        .tag(session.id)
-                        .padding(.vertical, 6)
-                        .onAppear { store.loadMoreSessionsIfNeeded(visibleID: session.id) }
-                }
-            }
-            .listStyle(.inset)
+            NativeConversationList(sessions: store.sessions, selectedID: store.selectedID,
+                select: { store.selectedID = $0 },
+                loadMore: { store.loadMoreSessionsIfNeeded(visibleID: $0) })
             .overlay {
                 if store.sessions.isEmpty && !store.loadingSessions && store.listError == nil {
                     ContentUnavailableView {
