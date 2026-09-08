@@ -2,7 +2,7 @@ use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::embed::EmbedderHandle;
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
-use crate::ingest::{IngestOptions, ingest_all};
+use crate::ingest::{IngestOptions, ingest_all, ingest_dirty};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
@@ -1878,6 +1878,7 @@ fn run_event_loop(
         },
     )?;
 
+    service.mark_complete(FireCause::Resync);
     let mut last_sweep = Instant::now();
     loop {
         match service.poll() {
@@ -1897,9 +1898,18 @@ fn run_event_loop(
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
                     Ok(false) => service.mark_skipped(),
-                    Ok(true) => match run_index_args(index, false, true) {
-                        Ok(()) => {
-                            service.mark_complete(FireCause::Dirty);
+                    Ok(true) => match run_index_selection(index, false, true, Some(&dirty)) {
+                        Ok(full_scan) => {
+                            if full_scan
+                                && let Err(error) = refresh_watch_roots(&mut service, index)
+                            {
+                                eprintln!("watch: root refresh failed: {error:#}");
+                            }
+                            service.mark_complete(if full_scan {
+                                FireCause::Resync
+                            } else {
+                                FireCause::Dirty
+                            });
                             log_watch_stats(&service);
                         }
                         Err(error) => {
@@ -1909,7 +1919,7 @@ fn run_event_loop(
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
                         if run_index_args(index, false, true).is_ok() {
-                            service.mark_complete(FireCause::Dirty);
+                            service.mark_complete(FireCause::Resync);
                             log_watch_stats(&service);
                         }
                     }
@@ -2019,6 +2029,17 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
 }
 
 fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
+    run_index_selection(index, reindex, continuous, None).map(|_| ())
+}
+
+/// Return whether discovery covered all sources, so only reconciliation
+/// resets the full-scan timer in the event-driven daemon.
+fn run_index_selection(
+    index: &IndexArgs,
+    reindex: bool,
+    continuous: bool,
+    dirty: Option<&HashSet<PathBuf>>,
+) -> Result<bool> {
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
     let opts = build_ingest_options(index, &config)?;
@@ -2035,7 +2056,12 @@ fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
         SearchIndex::open_or_create_for_ingest(&paths.index)?
     };
 
-    let report = ingest_all(&paths, &index, &opts, &lease)?;
+    let (report, full_scan) = if let Some(dirty) = dirty {
+        let result = ingest_dirty(&paths, &index, &opts, &lease, dirty)?;
+        (result.report, result.full_scan)
+    } else {
+        (ingest_all(&paths, &index, &opts, &lease)?, true)
+    };
     if report.records_embedded > 0 {
         println!(
             "indexed {} records, embedded {} across {} files (skipped {})",
@@ -2056,7 +2082,7 @@ fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
             serde_json::to_string_pretty(&report.diagnostics)?
         );
     }
-    Ok(())
+    Ok(full_scan)
 }
 
 fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {

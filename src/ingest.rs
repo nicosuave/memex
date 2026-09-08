@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod selection;
+
 const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_CHARS: usize = 8192;
 const RETAINED_HEAD_PERCENT: usize = 75;
@@ -58,6 +60,13 @@ pub struct IngestReport {
     pub files_scanned: usize,
     pub files_skipped: usize,
     pub diagnostics: crate::sources::ParseDiagnostics,
+}
+
+/// Whether a dirty batch stayed targeted or required a complete reconciliation.
+/// Only a full scan may advance the daemon's reconciliation deadline.
+pub(crate) struct DirtyIngestReport {
+    pub report: IngestReport,
+    pub full_scan: bool,
 }
 
 #[derive(Debug)]
@@ -669,9 +678,31 @@ pub fn ingest_all(
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
-    _lease: &IngestLease,
+    lease: &IngestLease,
 ) -> Result<IngestReport> {
-    refresh_memories(paths, options)?;
+    ingest_selected(paths, index, options, lease, None).map(|result| result.report)
+}
+
+/// Ingest a filesystem-event batch through the normal publication pipeline.
+/// Missing/ambiguous inputs and interrupted publication fall back to full
+/// reconciliation; a partial inventory never establishes global absence.
+pub(crate) fn ingest_dirty(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    lease: &IngestLease,
+    dirty: &HashSet<PathBuf>,
+) -> Result<DirtyIngestReport> {
+    ingest_selected(paths, index, options, lease, Some(dirty))
+}
+
+fn ingest_selected(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    _lease: &IngestLease,
+    dirty: Option<&HashSet<PathBuf>>,
+) -> Result<DirtyIngestReport> {
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let state_path = paths.state.join("ingest.json");
@@ -695,18 +726,38 @@ pub fn ingest_all(
         }
     }
 
+    let selected = if let Some(dirty) = dirty
+        && !recovering_pending_ingest
+        && !empty_index_rebuild
+        && state_path.exists()
+    {
+        match selection::resolve_dirty(options, dirty, &state)? {
+            selection::DirtySelection::Paths { files, databases } => Some((files, databases)),
+            selection::DirtySelection::Resync => None,
+        }
+    } else {
+        None
+    };
+    let full_scan = selected.is_none();
+    if full_scan {
+        // Memory discovery is independent of transcript file events.
+        refresh_memories(paths, options)?;
+    }
+
     // Index-time exclusion: matched transcripts never enter the index, and
     // records previously indexed from now-excluded paths are removed.
     let excluder = build_path_excluder(options)?;
     let mut excluded_state_paths: Vec<String> = Vec::new();
-    state.files.retain(|key, _| {
-        if excluder.is_excluded(Path::new(key)) {
-            excluded_state_paths.push(key.clone());
-            false
-        } else {
-            true
-        }
-    });
+    if full_scan {
+        state.files.retain(|key, _| {
+            if excluder.is_excluded(Path::new(key)) {
+                excluded_state_paths.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
     let next_doc_id = Arc::new(AtomicU64::new(state.next_doc_id));
 
     let mut tasks = Vec::new();
@@ -724,7 +775,31 @@ pub fn ingest_all(
     let mut opencode_discovered_database_paths = HashSet::new();
     let mut opencode_legacy_paths_to_delete = Vec::new();
 
-    for claude_source in &options.claude_sources {
+    if let Some((files, _)) = &selected {
+        for file in files {
+            let Some(meta) = discovered_metadata(&file.path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = file.path.to_string_lossy();
+            let (task, skip) = prepare_file_task(
+                file.path.clone(),
+                file.source,
+                options.include_reasoning,
+                &meta,
+                state.files.get(key.as_ref()),
+            );
+            if skip {
+                files_skipped += 1;
+            } else {
+                tasks.push(task);
+            }
+        }
+    }
+
+    for claude_source in options.claude_sources.iter().filter(|_| full_scan) {
         if !claude_source.exists() {
             continue;
         }
@@ -757,8 +832,16 @@ pub fn ingest_all(
         }
     }
 
-    let mut session_ids = HashSet::new();
-    if options.include_codex {
+    let mut session_ids = selected.as_ref().map_or_else(HashSet::new, |(files, _)| {
+        if files.iter().any(|file| {
+            file.source == SourceKind::Codex && crate::sources::codex::is_history_path(&file.path)
+        }) {
+            selection::codex_session_ids(options, &state, files)
+        } else {
+            HashSet::new()
+        }
+    });
+    if options.include_codex && full_scan {
         let codex_files = crate::sources::codex::discover_rollouts();
         for source_file in codex_files {
             let path = source_file.path;
@@ -791,7 +874,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_codex {
+    if options.include_codex && full_scan {
         for history_path in crate::sources::codex::history_paths() {
             if excluder.is_excluded(&history_path) {
                 files_skipped += 1;
@@ -819,8 +902,17 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_opencode {
-        let database_files = crate::sources::opencode::discover_databases()?;
+    if options.include_opencode
+        && (full_scan
+            || selected
+                .as_ref()
+                .is_some_and(|(_, databases)| !databases.is_empty()))
+    {
+        let database_files = if let Some((_, databases)) = &selected {
+            databases.clone()
+        } else {
+            crate::sources::opencode::discover_databases()?
+        };
         let mut planned_databases = Vec::new();
         for source_file in database_files {
             let path = source_file.path;
@@ -832,12 +924,19 @@ pub fn ingest_all(
             opencode_discovered_database_paths.insert(key.clone());
             let Some(meta) = (match discovered_metadata(&path) {
                 Ok(meta) => meta,
-                Err(_) => {
+                Err(error) => {
+                    if !full_scan {
+                        return Err(error)
+                            .with_context(|| format!("stat changed database {}", path.display()));
+                    }
                     opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
                     files_skipped += 1;
                     continue;
                 }
             }) else {
+                if !full_scan {
+                    return ingest_selected(paths, index, options, _lease, None);
+                }
                 opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
                 files_skipped += 1;
                 continue;
@@ -847,10 +946,29 @@ pub fn ingest_all(
             let previous = state.opencode_databases.get(&key);
             match crate::sources::opencode::scan_database(&path, previous) {
                 Ok(scan) => {
+                    if !full_scan
+                        && previous.is_none_or(|previous| {
+                            let sessions = scan
+                                .sessions
+                                .iter()
+                                .map(|session| session.id.clone())
+                                .collect::<HashSet<_>>();
+                            sessions != previous.owned_session_ids
+                        })
+                    {
+                        // Adding/removing session ownership can affect other
+                        // databases or the legacy JSON store. Ordinary WAL
+                        // updates retain the inventory and stay targeted.
+                        return ingest_selected(paths, index, options, _lease, None);
+                    }
                     opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Planned);
                     planned_databases.push(PlannedOpencodeDatabase { path, scan });
                 }
-                Err(_) => {
+                Err(error) => {
+                    if !full_scan {
+                        return Err(error)
+                            .with_context(|| format!("scan changed database {}", path.display()));
+                    }
                     // A bad/locked modern database must not hide the compatible JSON store.
                     opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
                     files_skipped += 1;
@@ -885,7 +1003,12 @@ pub fn ingest_all(
                     opencode_diagnostics.merge(prepared.diagnostics.clone());
                     opencode_ready_databases.push(prepared);
                 }
-                Err(_) => {
+                Err(error) => {
+                    if !full_scan {
+                        return Err(error).with_context(|| {
+                            format!("parse changed database {}", database.path.display())
+                        });
+                    }
                     opencode_database_outcomes.insert(path, OpencodeDatabaseOutcome::Failed);
                     files_skipped += 1;
                 }
@@ -902,7 +1025,7 @@ pub fn ingest_all(
                     classify_opencode_database_outcome(
                         opencode_database_outcomes.get(*path).copied(),
                         opencode_discovered_database_paths.contains(*path),
-                        true,
+                        full_scan,
                     ),
                     OpencodeDatabaseOutcome::Failed
                 )
@@ -924,7 +1047,7 @@ pub fn ingest_all(
             let outcome = classify_opencode_database_outcome(
                 opencode_database_outcomes.get(path).copied(),
                 opencode_discovered_database_paths.contains(path),
-                true,
+                full_scan,
             );
             if outcome != OpencodeDatabaseOutcome::Ready {
                 if outcome == OpencodeDatabaseOutcome::ConfirmedAbsent {
@@ -990,7 +1113,7 @@ pub fn ingest_all(
                     classify_opencode_database_outcome(
                         opencode_database_outcomes.get(&scope.source_path).copied(),
                         opencode_discovered_database_paths.contains(&scope.source_path),
-                        true,
+                        full_scan,
                     ) == OpencodeDatabaseOutcome::Failed
                 })
                 .cloned()
@@ -1013,7 +1136,11 @@ pub fn ingest_all(
         opencode_database_paths_to_delete.sort();
         opencode_database_paths_to_delete.dedup();
 
-        let opencode_files = crate::sources::opencode::discover_sessions()?;
+        let opencode_files = if full_scan {
+            crate::sources::opencode::discover_sessions()?
+        } else {
+            Vec::new()
+        };
         for source_file in opencode_files {
             let path = source_file.path;
             if excluder.is_excluded(&path) {
@@ -1053,7 +1180,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_cursor {
+    if options.include_cursor && full_scan {
         let cursor_files = crate::sources::cursor::discover_transcripts();
         for source_file in cursor_files {
             let path = source_file.path;
@@ -1083,7 +1210,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_pi {
+    if options.include_pi && full_scan {
         let pi_files = crate::sources::pi::discover();
         for source_file in pi_files {
             let path = source_file.path;
@@ -1113,7 +1240,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_omp {
+    if options.include_omp && full_scan {
         let omp_files = crate::sources::omp::discover();
         for source_file in omp_files {
             let path = source_file.path;
@@ -1143,7 +1270,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_openclaw {
+    if options.include_openclaw && full_scan {
         for source_file in crate::sources::openclaw::discover() {
             let path = source_file.path;
             if excluder.is_excluded(&path) {
@@ -1172,7 +1299,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_copilot {
+    if options.include_copilot && full_scan {
         let copilot_files = crate::sources::copilot::discover_sessions();
         for source_file in copilot_files {
             let path = source_file.path;
@@ -1202,7 +1329,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_grok {
+    if options.include_grok && full_scan {
         for source_file in crate::sources::grok::discover_sessions() {
             let path = source_file.path;
             if excluder.is_excluded(&path) {
@@ -1231,7 +1358,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_jcode {
+    if options.include_jcode && full_scan {
         let jcode_files = crate::sources::jcode::discover();
         for source_file in jcode_files {
             let path = source_file.path;
@@ -1261,7 +1388,7 @@ pub fn ingest_all(
         }
     }
 
-    if options.include_muse {
+    if options.include_muse && full_scan {
         let muse_files = crate::sources::muse::discover();
         for source_file in muse_files {
             let path = source_file.path;
@@ -1294,7 +1421,7 @@ pub fn ingest_all(
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
     let mut excluded_index_paths: Vec<String> = Vec::new();
-    if excluder.set.is_some() {
+    if full_scan && excluder.set.is_some() {
         index.for_each_record(|record| {
             if excluder.is_excluded(Path::new(&record.source_path)) {
                 excluded_index_paths.push(record.source_path.clone());
@@ -1370,7 +1497,7 @@ pub fn ingest_all(
         && opencode_ready_databases
             .iter()
             .all(|database| database.scan.dirty_session_ids.is_empty())
-        && can_skip_noop_index(paths, index, options)?
+        && (!full_scan || can_skip_noop_index(paths, index, options)?)
     {
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
@@ -1383,7 +1510,9 @@ pub fn ingest_all(
         if opencode_database_state_changed {
             state.save(&state_path)?;
         }
-        update_scan_cache(paths, files_scanned, total_bytes)?;
+        if full_scan {
+            update_scan_cache(paths, files_scanned, total_bytes)?;
+        }
         if recovering_pending_ingest {
             finalize_pending_ingest(
                 &pending_ingest_path(paths),
@@ -1391,12 +1520,15 @@ pub fn ingest_all(
                 state.next_doc_id,
             )?;
         }
-        return Ok(IngestReport {
-            records_added: 0,
-            records_embedded: 0,
-            files_scanned,
-            files_skipped,
-            diagnostics: Default::default(),
+        return Ok(DirtyIngestReport {
+            full_scan,
+            report: IngestReport {
+                records_added: 0,
+                records_embedded: 0,
+                files_scanned,
+                files_skipped,
+                diagnostics: Default::default(),
+            },
         });
     }
 
@@ -1643,7 +1775,7 @@ pub fn ingest_all(
     })?;
     progress.finish();
     tail.set_message("updating analytics…");
-    let outcome = (|| -> Result<IngestReport> {
+    let outcome = (|| -> Result<DirtyIngestReport> {
         let writer_outcome =
             writer_result.context("index writer stopped before ingestion completed")?;
         parser_result?;
@@ -1683,15 +1815,20 @@ pub fn ingest_all(
         state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
         state.save(&state_path)?;
 
-        update_scan_cache(paths, files_scanned, total_bytes)?;
+        if full_scan {
+            update_scan_cache(paths, files_scanned, total_bytes)?;
+        }
         finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
 
-        Ok(IngestReport {
-            records_added,
-            records_embedded,
-            files_scanned,
-            files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
-            diagnostics,
+        Ok(DirtyIngestReport {
+            full_scan,
+            report: IngestReport {
+                records_added,
+                records_embedded,
+                files_scanned,
+                files_skipped: files_skipped + parse_skipped.load(Ordering::Relaxed),
+                diagnostics,
+            },
         })
     })();
     tail.finish_and_clear();
@@ -2824,6 +2961,341 @@ mod tests {
 
         assert_eq!(report.files_scanned, 2);
         assert_eq!(report.records_added, 2);
+    }
+
+    fn append_claude_message(path: &Path, text: &str) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "user", "uuid": text,
+                "message": {"role": "user", "content": text},
+            })
+        )
+        .unwrap();
+    }
+
+    fn indexed_texts(paths: &Paths) -> Vec<String> {
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut texts = Vec::new();
+        index
+            .for_each_record(|record| {
+                texts.push(record.text);
+                Ok(())
+            })
+            .unwrap();
+        texts.sort();
+        texts
+    }
+
+    #[test]
+    fn targeted_ingest_only_updates_selected_files_until_reconciliation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let first = source.join("first.jsonl");
+        let second = source.join("second.jsonl");
+        append_claude_message(&first, "first original");
+        append_claude_message(&second, "second original");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .files_scanned,
+            2
+        );
+        let cache_path = paths.state.join("scan_cache.json");
+        let original_cache = fs::read(&cache_path).unwrap();
+        let state_before = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        append_claude_message(&first, "first appended");
+        append_claude_message(&second, "second missed event");
+        // The watcher emits canonical paths; ingestion must retain lexical
+        // discovery keys rather than create duplicate state/index entries.
+        let dirty = HashSet::from([fs::canonicalize(&first).unwrap()]);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
+        assert!(!result.full_scan);
+        assert_eq!(result.report.files_scanned, 1);
+        assert_eq!(result.report.records_added, 1);
+        assert_eq!(
+            indexed_texts(&paths),
+            ["first appended", "first original", "second original"]
+        );
+        let state_after = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        let key = second.to_string_lossy();
+        assert_eq!(
+            state_after.files[key.as_ref()].offset,
+            state_before.files[key.as_ref()].offset
+        );
+        assert_eq!(state_after.files.len(), 2);
+        assert_eq!(fs::read(&cache_path).unwrap(), original_cache);
+
+        // A no-op batch must not mark a complete scan fresh either.
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
+        assert!(!result.full_scan);
+        assert_eq!(result.report.records_added, 0);
+        assert_eq!(fs::read(&cache_path).unwrap(), original_cache);
+
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.records_added, 1);
+        assert_eq!(
+            indexed_texts(&paths),
+            [
+                "first appended",
+                "first original",
+                "second missed event",
+                "second original"
+            ]
+        );
+    }
+
+    #[test]
+    fn targeted_ingest_creates_and_replaces_files_without_unrelated_discovery() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let first = source.join("first.jsonl");
+        append_claude_message(&first, "existing");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source.clone()];
+        let lease = ingest_lease(&paths);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        // A full discovery would fail on this unrelated configured source.
+        let bad_root = tmp.path().join("not-a-directory");
+        fs::write(&bad_root, "not a directory").unwrap();
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(bad_root.as_os_str()))]);
+        options.include_opencode = true;
+        let new_file = source.join("new.jsonl");
+        append_claude_message(&new_file, "created");
+        for expected in ["created", "rewritten"] {
+            if expected == "rewritten" {
+                fs::write(&new_file, []).unwrap();
+                append_claude_message(&new_file, expected);
+            }
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            let result = ingest_dirty(
+                &paths,
+                &index,
+                &options,
+                &lease,
+                &HashSet::from([new_file.clone()]),
+            )
+            .unwrap();
+            assert!(!result.full_scan);
+            assert_eq!(result.report.files_scanned, 1);
+            assert_eq!(result.report.records_added, 1);
+            let mut expected_texts = vec!["existing".to_string(), expected.to_string()];
+            expected_texts.sort();
+            assert_eq!(indexed_texts(&paths), expected_texts);
+        }
+    }
+
+    #[test]
+    fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let first = source.join("first.jsonl");
+        let second = source.join("second.jsonl");
+        append_claude_message(&first, "first original");
+        append_claude_message(&second, "second original");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        append_claude_message(&first, "first appended");
+        append_claude_message(&second, "second missed event");
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        PendingIngest {
+            next_doc_id: state.next_doc_id,
+            source_paths: vec![second.to_string_lossy().into_owned()],
+            session_scopes: Vec::new(),
+            vector_publication: false,
+        }
+        .save(&pending_ingest_path(&paths))
+        .unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result =
+            ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([first])).unwrap();
+        assert!(result.full_scan);
+        assert_eq!(result.report.files_scanned, 2);
+        assert_eq!(
+            indexed_texts(&paths),
+            [
+                "first appended",
+                "first original",
+                "second missed event",
+                "second original"
+            ]
+        );
+        assert!(!pending_ingest_path(&paths).exists());
+    }
+
+    #[test]
+    fn targeted_ingest_preserves_unselected_database_ownership_and_wal_updates() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("opencode");
+        fs::create_dir_all(&source).unwrap();
+        let first = source.join("opencode.db");
+        let second = source.join("opencode-work.db");
+        let create = |path: &Path, id: &str| {
+            let writer = rusqlite::Connection::open(path).unwrap();
+            writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+                CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+                CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT);
+                CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);").unwrap();
+            writer
+                .execute("INSERT INTO session VALUES (?1, NULL, '/tmp', 1, 2)", [id])
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO message VALUES ('message', ?1, 3, '{\"role\":\"assistant\"}')",
+                    [id],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO part VALUES ('part', 'message', ?1)",
+                    [
+                        serde_json::json!({"type": "text", "text": format!("{id} original")})
+                            .to_string(),
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute("INSERT INTO event VALUES ('event-1', ?1)", [id])
+                .unwrap();
+            writer
+        };
+        let first_writer = create(&first, "first");
+        let second_writer = create(&second, "second");
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(source.as_os_str()))]);
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_opencode = true;
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            2
+        );
+        let second_key = second.to_string_lossy().into_owned();
+        let prior = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        for (writer, id) in [(&first_writer, "first"), (&second_writer, "second")] {
+            writer
+                .execute(
+                    "UPDATE part SET data = ?1",
+                    [
+                        serde_json::json!({"type": "text", "text": format!("{id} updated")})
+                            .to_string(),
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute("INSERT INTO event VALUES ('event-2', ?1)", [id])
+                .unwrap();
+        }
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let dirty = HashSet::from([source.join("opencode.db-wal")]);
+        let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
+        assert!(!result.full_scan);
+        assert_eq!(result.report.files_scanned, 1);
+        assert_eq!(indexed_texts(&paths), ["first updated", "second original"]);
+        let updated = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(
+            updated.opencode_databases[&second_key],
+            prior.opencode_databases[&second_key]
+        );
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        assert_eq!(indexed_texts(&paths), ["first updated", "second updated"]);
+
+        // Ownership changes require a complete inventory, including the
+        // unaffected database and any compatible legacy session store.
+        first_writer
+            .execute("DELETE FROM session WHERE id = 'first'", [])
+            .unwrap();
+        first_writer
+            .execute("INSERT INTO event VALUES ('event-3', 'first')", [])
+            .unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
+        assert!(result.full_scan);
+        assert_eq!(indexed_texts(&paths), ["second updated"]);
+    }
+
+    #[test]
+    fn targeted_ingest_codex_history_uses_known_rollouts_without_discovery() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("custom-codex");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let id = "11111111-1111-1111-1111-111111111111";
+        let rollout = sessions.join(format!("rollout-{id}.jsonl"));
+        fs::write(&rollout, format!("{}\n{}\n",
+            serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp"}}),
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "rollout original"}]}}),
+        )).unwrap();
+        let history = home.join("history.jsonl");
+        fs::write(
+            &history,
+            format!(
+                "{}\n",
+                serde_json::json!({"session_id": id, "text": "duplicate history", "ts": 1})
+            ),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_codex = true;
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        assert_eq!(indexed_texts(&paths), ["rollout original"]);
+        let mut file = fs::OpenOptions::new().append(true).open(&history).unwrap();
+        for (session_id, text) in [(id, "duplicate append"), ("history-only", "history only")] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"session_id": session_id, "text": text, "ts": 2})
+            )
+            .unwrap();
+        }
+        drop(file);
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result =
+            ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([history])).unwrap();
+        assert!(!result.full_scan);
+        assert_eq!(result.report.files_scanned, 1);
+        assert_eq!(indexed_texts(&paths), ["history only", "rollout original"]);
     }
 
     #[test]

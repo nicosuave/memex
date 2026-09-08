@@ -481,6 +481,37 @@ fn daemon_poll_mode_still_indexes_on_interval() {
     daemon.stop();
 }
 
+#[test]
+fn daemon_event_mode_scans_only_the_changed_transcript() {
+    let dirs = TestDirs::new();
+    let first = dirs.claude.path().join("first.jsonl");
+    std::fs::write(&first, MINIMAL_CLAUDE_LINE).unwrap();
+    std::fs::write(dirs.claude.path().join("second.jsonl"), MINIMAL_CLAUDE_LINE).unwrap();
+    let mut daemon = spawn_index_daemon(
+        &dirs,
+        &["--watch-mode", "events", "--poll-interval", "3600"],
+    );
+    wait_for_log(&mut daemon, "indexed 2 records across 2 files", 60);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&first)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "uuid": "u2",
+                "message": {"role": "user", "content": "appended"},
+            })
+        )
+        .unwrap();
+    }
+    wait_for_log(&mut daemon, "indexed 1 records across 1 files", 90);
+    daemon.stop();
+}
+
 fn wait_for_session_text(daemon: &mut ChildGuard, root: &Path, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {

@@ -8,8 +8,8 @@
 //!
 //! Design rules (see `docs/event-driven-indexing-spec.md`):
 //!
-//! - Events are **hints only**. Every fire still runs the normal incremental
-//!   ingest, whose `IngestState` comparison (`size`/`mtime`/identity) stays
+//! - Events are **hints only**. Dirty fires select affected inputs for the
+//!   normal incremental ingest, whose `IngestState` comparison (`size`/`mtime`/identity) stays
 //!   the source of truth. A spurious event costs one cheap stat check.
 //! - Fires are debounced and settled: a transcript being actively appended to
 //!   must go quiet before it is parsed. This matters because the JSONL
@@ -440,16 +440,19 @@ impl WatchService {
         &self.pending
     }
 
-    /// Record a completed ingest: clear hints, restart all timers.
+    /// Record a completed ingest. Partial batches clear their hints without
+    /// postponing full reconciliation of sources that had no delivered events.
     pub(crate) fn mark_complete(&mut self, cause: FireCause) {
         self.dirty.clear();
         self.batch_start = None;
         self.last_fire = Some(Instant::now());
-        self.resync_due = self.last_fire.unwrap() + self.config.resync_interval;
-        self.resync_needed = false;
         match cause {
             FireCause::Dirty => self.stats.fires_dirty += 1,
-            FireCause::Resync => self.stats.fires_resync += 1,
+            FireCause::Resync => {
+                self.resync_due = self.last_fire.unwrap() + self.config.resync_interval;
+                self.resync_needed = false;
+                self.stats.fires_resync += 1;
+            }
         }
     }
 
@@ -1129,6 +1132,23 @@ mod tests {
         assert_eq!(service.poll(), None);
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(service.poll(), Some(FireCause::Resync));
+    }
+
+    #[test]
+    fn targeted_ingests_cannot_postpone_full_reconciliation() {
+        let _guard = env_lock();
+        let mut service = test_service();
+        service.config.min_spacing = Duration::ZERO;
+        let deadline = service.resync_due;
+        for _ in 0..3 {
+            service.mark_complete(FireCause::Dirty);
+            assert_eq!(service.fire_decision(deadline), Some(FireCause::Resync));
+        }
+        service.request_resync();
+        service.mark_complete(FireCause::Dirty);
+        assert_eq!(service.poll(), Some(FireCause::Resync));
+        service.mark_complete(FireCause::Resync);
+        assert_eq!(service.poll(), None);
     }
 
     /// FSEvents defers content-modification events for a file held open for

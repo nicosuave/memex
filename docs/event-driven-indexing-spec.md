@@ -17,10 +17,12 @@
 > inotify reports every write, so Linux skips the sweep.
 > (2) Watch roots are canonicalized before arming: backends silently
 > mis-deliver for paths containing symlinks.
-> Tier-1/2 dirty-path ingest (spec §7) is intentionally deferred: fires run
-> the full incremental ingest behind a stat-based no-op skip
-> (`dirty_needs_ingest`), which keeps converge-equality trivially exact
-> while delivering the latency and idle-cost wins.
+> Dirty batches now call `ingest_dirty`: `src/ingest/selection.rs` resolves
+> ordinary transcript paths without walking source trees, and publication
+> reuses the existing parsers, lease, writer, analytics, and ingest state.
+> OpenCode WAL updates with unchanged session ownership scan only their DB.
+> Structural changes and unresolved dependencies use full reconciliation
+> (see §7). Partial runs never advance the full-scan cache or resync timer.
 
 Started from latest `main` (`04adaca`). This spec replaces the daemon's
 polling loop with OS filesystem events, with periodic reconciliation as the
@@ -168,7 +170,7 @@ Resolver output derives from the enabled-source flags in `IngestOptions`:
 | Jcode | `JCODE_HOME` / `~/.jcode/sessions` | Single-JSON files: atomic reparse rule already exists; event just triggers it sooner. |
 | Muse | `MUSE_HOME` / `~/.local/share/muse/sessions` | |
 | Hermes | `HERMES_HOME` profiles | Currently discovery-only; include for free via `profile_roots()`. |
-| Memory docs | Whatever `refresh_memories` (`src/ingest.rs:1701`) reads: project `memory/` dirs are per-project (unbounded) — **do not** watch the world. Watch only `~/.memex/memory/` outputs? No: inputs live in user repos. Decision: memory refresh stays on the ingest path (it runs inside every ingest, including event-triggered ones) and is *not* independently watched in v1. Document this explicitly. |
+| Memory docs | Inputs live in project memory directories, not just Memex's outputs. Refresh during full ingestion/reconciliation and the existing search-time refresh path; targeted transcript batches do not rediscover memory inputs. Memory documents are not independently watched in v1. |
 | Config | `~/.memex/config.toml` | Change → re-resolve roots (add/drop watches), re-read debounce/resync settings. Debounce this harder (5s); never trigger an ingest by itself. |
 
 Nonexistent roots: watch the nearest existing ancestor so first-run creation is
@@ -228,18 +230,19 @@ one stat.
   Skip unchanged (same size+mtime fast path already inside). Parse tails in the
   existing rayon pool, publish through the existing `writer_loop`. No directory
   walk. This is the whole performance win.
-- **Tier 2 — scoped discovery** (on create/delete/rename/dir events, unknown
-  paths, or any event whose parent dir isn't in state): re-run discovery for
-  the affected source root only (e.g. one `discover_rollouts()` call), diff
-  against `state.files` keys under that root to find tombstones, then proceed
-  as Tier 1 for the delta. Never a full multi-source walk on the hot path.
+- **Dependency/structural fallback**: directory changes, missing indexed
+  paths, ambiguous source overlaps and nested symlinks request full
+  reconciliation. So do legacy OpenCode message/part/session dependencies,
+  Pi settings, Grok summaries and Copilot workspace metadata. New ordinary
+  transcript files use Tier 1. Unrelated regular files and agent-home cache
+  directories are ignored. Source-scoped structural discovery is future work.
 - **Tier 3 — full resync** (section 8): literally call the existing
   `ingest_all` discovery path. Correctness backstop, not the hot path.
 
-Tier 1/2 should be implemented as a `dirty_paths: HashSet<PathBuf>` parameter
-threaded into `ingest_all` (or a sibling `ingest_dirty`) that constrains
-discovery — not as a copy of the ingest body. One parse path, two discovery
-scopes.
+`ingest_all` and `ingest_dirty` share `ingest_selected` and its publication
+pipeline. Targeted Codex history uses known rollout paths plus the current
+batch for deduplication. Partial inventories preserve unselected file and
+database state and cannot establish absence of another database.
 
 ## 8. Reconciliation protocol (the correctness core)
 
@@ -251,11 +254,10 @@ covers it:
 1. **Startup**: always Tier 3 full scan before arming the watcher snapshot.
    Also runs `PendingIngest` recovery first (unchanged order). This bounds
    the offline window (daemon stopped, laptop asleep, `kill -9`).
-2. **Periodic resync**: Tier 3 on a jittered timer, default 5–15 min
-   (configurable; reuses `index_service_poll_interval` as the floor so existing
-   configs keep meaning "at most this stale"). Jitter ±20% avoids lockstep
-   with systemd/launchd neighbors. This is the backstop that makes every
-   missed-event bug self-healing within minutes.
+2. **Periodic resync**: Tier 3 after the configured interval since the last
+   complete scan (default 600s; legacy poll-interval settings remain honored).
+   Targeted ingestion never postpones this deadline or updates the full-scan
+   cache, so continuous activity cannot starve missed-event recovery.
 3. **Overflow/resync signals**: FSEvent `mustScanSubDirs` / history-drop, inotify
    `IN_Q_OVERFLOW`, `notify::EventKind::Other` resync markers, watcher `Error`
    of any kind → immediate Tier 3, then re-establish watches. Log at warn with
@@ -269,10 +271,10 @@ covers it:
    on both Tantivy and vector stores. Additionally, Tier 3's existing
    excluded/vanished handling stays as the final sweep. Never trust a delete
    event alone to name every affected session (directory renames move many).
-6. **Opencode ownership drift**: DB compaction can reassign session ownership
-   between DB files. The existing `owner_by_session` claim pass already
-   reconciles this from scan output — event mode must run that pass on *any*
-   opencode DB event (Tier 2 scoped to opencode roots), not just full scans.
+6. **Opencode ownership drift**: ordinary WAL updates retain the existing
+   owned-session set and update only that database. A new database or changed
+   session set escalates to full discovery before publication, so ownership
+   transfers and legacy-store migration use the complete claim pass.
 7. **State-vs-index audit**: keep the `empty_index_rebuild` guard
    (`src/ingest.rs:687`) and the `PendingIngest` source-path invalidation on
    all tiers. If the index is empty but state is non-empty (or vice versa),
