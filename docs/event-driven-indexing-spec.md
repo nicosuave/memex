@@ -10,6 +10,10 @@
 > transcripts through a single held-open fd (confirmed via `lsof` on live
 > Codex sessions) — so macOS runs a 5s hot sweep re-statting recently
 > active files (`hot_sweep_dirty`, `HOT_SWEEP_INTERVAL`, `HOT_WINDOW`).
+> Candidates are selected from stored ingest timestamps before statting;
+> cold sessions resume through events or the periodic resync. Tracked
+> OpenCode databases also have their main file and WAL statted, since an
+> open WAL can contain commits without any main-file modification.
 > inotify reports every write, so Linux skips the sweep.
 > (2) Watch roots are canonicalized before arming: backends silently
 > mis-deliver for paths containing symlinks.
@@ -154,7 +158,7 @@ Resolver output derives from the enabled-source flags in `IngestOptions`:
 | ------ | -------------- | ----- |
 | Claude | `default_claude_sources()` (`CLAUDE_CONFIG_DIR` or `~/.claude/projects`, `~/.config/claude/projects`) + explicit `--claude-path` | Watch the `projects` dirs, not `$HOME`. |
 | Codex | `CODEX_HOME` (`~/.codex`): `sessions/`, rollout roots, history file parents | History files are single files — watch parent dir. |
-| OpenCode | `OPENCODE_DATA_DIR` / `~/.local/share/opencode`: storage root, message/parts roots, `*.sqlite` parents | SQLite: trigger on main DB path only; ignore `-wal`/`-shm`/`-journal` sidecar events (they always accompany a DB write; coalesce, don't double-fire). Cursor logic (`event_rowid`/`event_id` in `scan_database`) stays authoritative. |
+| OpenCode | `OPENCODE_DATA_DIR` / `~/.local/share/opencode`: storage root, message/parts roots, `opencode*.db` parents | Route WAL events to their main DB path: committed writes may change only the WAL. Ignore `-shm`/`-journal` noise. Cursor logic (`event_rowid`/`event_id` in `scan_database`) stays authoritative. |
 | Cursor | `~/.cursor/projects` | |
 | Pi | `PI_CODING_AGENT_DIR` / `~/.pi/agent/sessions` (+ configured session root) | Env-driven; also watch `config.toml` (see below) and re-resolve roots when it changes. |
 | OMP | `~/.omp/agent/sessions`, profiles root, `XDG_DATA_HOME` variant | |
@@ -181,7 +185,8 @@ Drop in the watcher callback, in order:
 2. Sidecars and temp files: `*.tmp`, `*.swp`, `*~`, `.DS_Store`,
    `.memex-opencode-spool-*` (`OPENCODE_SPOOL_PREFIX`), Tantivy generation
    workdirs under `~/.memex/index` (never watch `~/.memex` itself), SQLite
-   `-wal`/`-shm`/`-journal` (coalesced into the main-DB event).
+   `-shm`/`-journal` and unrelated `-wal` files. OpenCode WAL events are
+   translated into main-DB hints before filtering the remaining sidecars.
 3. Paths matching the existing `PathExcluder` (config `exclude_paths` + CLI
    `--exclude`). Canonicalize before matching, exactly like discovery does.
 4. Events from our own state writes (`ingest.json`, `scan_cache.json`,

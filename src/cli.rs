@@ -5093,10 +5093,10 @@ fn run_index_service_enable(
         stderr: config_path_setting(stderr.as_deref(), "--stderr")?,
         plist: config_path_setting(plist.as_deref(), "--plist")?,
         systemd_dir: config_path_setting(systemd_dir.as_deref(), "--systemd-dir")?,
-        watch_mode: watch_mode.map(|mode| mode.to_string()),
         ..IndexServiceConfigUpdates::from_cli(
             continuous,
             poll_interval,
+            watch_mode,
             interval,
             web_ui,
             web_listen.as_deref(),
@@ -5234,6 +5234,7 @@ impl IndexServiceConfigUpdates {
     fn from_cli(
         continuous: bool,
         poll_interval: Option<u64>,
+        watch_mode: Option<WatchMode>,
         interval: Option<u64>,
         web_ui: bool,
         web_listen: Option<&str>,
@@ -5241,6 +5242,7 @@ impl IndexServiceConfigUpdates {
     ) -> Result<Self> {
         let mode = if continuous
             || poll_interval.is_some()
+            || watch_mode.is_some()
             || web_ui
             || web_listen.is_some()
             || mcp_args.mcp
@@ -5254,6 +5256,7 @@ impl IndexServiceConfigUpdates {
         };
         Ok(Self {
             mode,
+            watch_mode: watch_mode.map(|mode| mode.to_string()),
             poll_interval: poll_interval
                 .map(i64::try_from)
                 .transpose()
@@ -8099,6 +8102,7 @@ arguments = {
                 false,
                 Some(12),
                 None,
+                None,
                 false,
                 None,
                 &DaemonMcpArgs::default(),
@@ -8121,6 +8125,86 @@ arguments = {
                     .index_service_poll_interval(),
                 12
             );
+        }
+    }
+
+    #[test]
+    fn daemon_watch_mode_persists_continuous_across_plain_restart() {
+        for action in ["enable", "restart"] {
+            for watch_mode in ["events", "poll"] {
+                for initial_config in ["", "index_service_mode = \"interval\"\n"] {
+                    for interval in [None, Some("60")] {
+                        let tmp = TempDir::new().unwrap();
+                        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+                        let path = paths.root.join("config.toml");
+                        std::fs::write(&path, initial_config).unwrap();
+                        let mut args = vec!["memex", "daemon", action, "--watch-mode", watch_mode];
+                        if let Some(interval) = interval {
+                            args.extend(["--interval", interval]);
+                        }
+                        let cli = Cli::try_parse_from(args).unwrap();
+                        let Some(Commands::IndexService {
+                            action:
+                                IndexServiceCommand::Enable {
+                                    continuous,
+                                    poll_interval,
+                                    watch_mode: selected_mode,
+                                    interval,
+                                    web_ui,
+                                    web_listen,
+                                    mcp,
+                                    ..
+                                }
+                                | IndexServiceCommand::Restart {
+                                    continuous,
+                                    poll_interval,
+                                    watch_mode: selected_mode,
+                                    interval,
+                                    web_ui,
+                                    web_listen,
+                                    mcp,
+                                    ..
+                                },
+                        }) = cli.command
+                        else {
+                            panic!("expected daemon enable or restart");
+                        };
+                        let updates = IndexServiceConfigUpdates::from_cli(
+                            continuous,
+                            poll_interval,
+                            selected_mode,
+                            interval,
+                            web_ui,
+                            web_listen.as_deref(),
+                            &mcp,
+                        )
+                        .unwrap();
+                        persist_index_service_config(&paths, &updates).unwrap();
+                        let before_restart = std::fs::read_to_string(&path).unwrap();
+
+                        // A restart without flags must retain the continuous mode
+                        // implied by --watch-mode, even over interval configuration.
+                        let restart_updates = IndexServiceConfigUpdates::from_cli(
+                            false,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                            &DaemonMcpArgs::default(),
+                        )
+                        .unwrap();
+                        persist_index_service_config(&paths, &restart_updates).unwrap();
+                        let restarted = UserConfig::load(&paths).unwrap();
+                        assert_eq!(restarted.index_service_mode(), Some("continuous"));
+                        assert_eq!(
+                            restarted.index_service_watch_mode().unwrap().to_string(),
+                            watch_mode
+                        );
+                        assert_eq!(std::fs::read_to_string(&path).unwrap(), before_restart);
+                    }
+                }
+            }
         }
     }
 
@@ -8153,6 +8237,7 @@ arguments = {
         let updates = IndexServiceConfigUpdates::from_cli(
             continuous,
             poll_interval,
+            None,
             interval,
             web_ui,
             web_listen.as_deref(),
@@ -8210,6 +8295,7 @@ arguments = {
         let updates = IndexServiceConfigUpdates::from_cli(
             continuous,
             poll_interval,
+            None,
             interval,
             web_ui,
             web_listen.as_deref(),
@@ -8238,6 +8324,7 @@ arguments = {
         let restart_updates = IndexServiceConfigUpdates::from_cli(
             continuous,
             poll_interval,
+            None,
             interval,
             web_ui,
             web_listen.as_deref(),

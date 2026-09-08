@@ -27,10 +27,12 @@ use crate::ingest::{IngestOptions, PathExcluder, build_path_excluder};
 use crate::state::IngestState;
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Daemon refresh strategy.
@@ -201,6 +203,20 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
     }
     let mut paths = Vec::with_capacity(event.paths.len());
     for path in &event.paths {
+        // OpenCode commits can live entirely in the WAL until checkpoint.
+        // Route the hint to the database that ingestion knows how to read.
+        if let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix("-wal"))
+            .filter(|name| crate::sources::opencode::is_database_path(name))
+        {
+            let database = path.with_file_name(name);
+            if !excluder.is_excluded(path) && !excluder.is_excluded(&database) {
+                paths.push(database);
+            }
+            continue;
+        }
         let ignored = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -289,6 +305,7 @@ pub(crate) struct WatchService {
     watcher: RecommendedWatcher,
     receiver: Receiver<notify::Result<Event>>,
     _sender: Sender<notify::Result<Event>>,
+    queue_overflow: Arc<AtomicBool>,
     watched: Vec<PathBuf>,
     pending: Vec<PathBuf>,
     dirty: HashMap<PathBuf, Instant>,
@@ -301,22 +318,55 @@ pub(crate) struct WatchService {
     stats: WatchStats,
     hot_snapshot: Option<HashMap<String, StateSnapshot>>,
     hot_state_mtime: Option<SystemTime>,
+    hot_databases: HashMap<PathBuf, Option<DatabaseSnapshot>>,
 }
 
 /// Compact copy of the ingest state needed to spot changed files without
 /// re-reading `ingest.json` on every sweep.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StateSnapshot {
     size: u64,
     mtime: i64,
     modified_ns: Option<i64>,
 }
 
+impl StateSnapshot {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            size: metadata.len(),
+            mtime: modified.as_secs() as i64,
+            modified_ns: Some(modified.as_nanos().min(i64::MAX as u128) as i64),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatabaseSnapshot {
+    database: Option<StateSnapshot>,
+    wal: Option<StateSnapshot>,
+}
+
+const EVENT_QUEUE_CAPACITY: usize = 8192;
+
+fn enqueue_event(
+    sender: &Sender<notify::Result<Event>>,
+    overflow: &AtomicBool,
+    event: notify::Result<Event>,
+) {
+    // Never block the OS watcher during ingestion. One sticky bit preserves
+    // the need to reconcile when bounded buffering cannot retain all hints.
+    if let Err(TrySendError::Full(_)) = sender.try_send(event) {
+        overflow.store(true, Ordering::Release);
+    }
+}
+
 /// How often the macOS hot sweep re-stats recently active files (see
 /// [`WatchService::hot_sweep_dirty`]).
 pub(crate) const HOT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
-/// Files whose current mtime is older than this are never sweep candidates;
-/// structural changes to them still arrive as events.
+/// Files whose ingested mtime is older than this are not sweep candidates;
+/// events and periodic resync discover resumed cold sessions.
 pub(crate) const HOT_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 impl WatchService {
@@ -325,11 +375,13 @@ impl WatchService {
         excluder: PathExcluder,
         config: WatchConfig,
     ) -> Result<Self> {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(EVENT_QUEUE_CAPACITY);
         let callback_sender = sender.clone();
+        let queue_overflow = Arc::new(AtomicBool::new(false));
+        let callback_overflow = Arc::clone(&queue_overflow);
         let watcher = RecommendedWatcher::new(
             move |result| {
-                let _ = callback_sender.send(result);
+                enqueue_event(&callback_sender, &callback_overflow, result);
             },
             Config::default(),
         )
@@ -339,6 +391,7 @@ impl WatchService {
             watcher,
             receiver,
             _sender: sender,
+            queue_overflow,
             watched: Vec::new(),
             pending: roots,
             dirty: HashMap::new(),
@@ -351,6 +404,7 @@ impl WatchService {
             stats: WatchStats::default(),
             hot_snapshot: None,
             hot_state_mtime: None,
+            hot_databases: HashMap::new(),
         };
         service.sort_pending();
         service.activate_pending();
@@ -478,19 +532,16 @@ impl WatchService {
     }
 
     fn drain(&mut self) {
-        const DRAIN_CAP: usize = 8192;
+        if self.queue_overflow.swap(false, Ordering::AcqRel) {
+            self.request_resync();
+        }
         let now = Instant::now();
-        let mut seen = 0usize;
-        while let Ok(result) = self.receiver.try_recv() {
-            seen += 1;
-            if seen > DRAIN_CAP {
-                // Shedding detail, not correctness: the resync that follows
-                // re-converges everything the dropped events hinted at.
-                self.dirty.clear();
-                self.request_resync();
-                while self.receiver.try_recv().is_ok() {}
-                return;
-            }
+        // Bound work as well as memory: a producer that never goes quiet
+        // must not keep the scheduler draining forever.
+        for _ in 0..EVENT_QUEUE_CAPACITY {
+            let Ok(result) = self.receiver.try_recv() else {
+                break;
+            };
             let event = match result {
                 Ok(event) => event,
                 Err(error) => {
@@ -605,14 +656,20 @@ impl WatchService {
     /// macOS; everywhere else events plus the resync timer suffice.
     ///
     /// Cost is bounded: `ingest.json` is re-parsed only when it changed, and
-    /// only files modified within `window` are stat-compared — idle history
-    /// costs one stat of the state file per sweep.
+    /// only files ingested within `window` are stat-compared. Cold history
+    /// is rediscovered through events/resync. Each tracked OpenCode database
+    /// also needs two stats: its main file and its possibly held-open WAL.
     pub(crate) fn hot_sweep_dirty(
         &mut self,
         paths: &Paths,
         window: Duration,
     ) -> Result<Vec<PathBuf>> {
         self.stats.hot_sweeps += 1;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(window.as_secs()) as i64;
         let state_path = paths.state.join("ingest.json");
         let state_mtime = std::fs::metadata(&state_path)
             .ok()
@@ -623,6 +680,7 @@ impl WatchService {
                 state
                     .files
                     .iter()
+                    .filter(|(_, file)| file.mtime >= cutoff)
                     .map(|(key, file)| {
                         (
                             key.clone(),
@@ -635,11 +693,20 @@ impl WatchService {
                     })
                     .collect(),
             );
+            self.hot_databases.retain(|path, _| {
+                state
+                    .opencode_databases
+                    .contains_key(path.to_string_lossy().as_ref())
+            });
+            for key in state.opencode_databases.keys() {
+                self.hot_databases.entry(PathBuf::from(key)).or_insert(None);
+            }
             self.hot_state_mtime = state_mtime;
         }
-        let now = SystemTime::now();
         let mut changed = Vec::new();
-        if let Some(snapshot) = &self.hot_snapshot {
+        if let Some(snapshot) = &mut self.hot_snapshot {
+            // Expire candidates even when the ingest state has not changed.
+            snapshot.retain(|_, previous| previous.mtime >= cutoff);
             for (key, previous) in snapshot {
                 let path = Path::new(key);
                 let metadata = match std::fs::metadata(path) {
@@ -650,15 +717,6 @@ impl WatchService {
                     }
                     Err(_) => continue,
                 };
-                let modified = metadata.modified().ok();
-                let fresh = modified.is_some_and(|mtime| {
-                    now.duration_since(mtime)
-                        .map(|age| age <= window)
-                        .unwrap_or(true)
-                });
-                if !fresh {
-                    continue;
-                }
                 if stat_differs(
                     &metadata,
                     previous.size,
@@ -667,6 +725,18 @@ impl WatchService {
                 ) {
                     changed.push(PathBuf::from(key));
                 }
+            }
+        }
+        for (path, previous) in &mut self.hot_databases {
+            let mut wal = path.as_os_str().to_os_string();
+            wal.push("-wal");
+            let current = DatabaseSnapshot {
+                database: StateSnapshot::read(path),
+                wal: StateSnapshot::read(Path::new(&wal)),
+            };
+            if previous.as_ref() != Some(&current) {
+                changed.push(path.clone());
+                *previous = Some(current);
             }
         }
         self.stats.hot_hits += changed.len() as u64;
@@ -680,6 +750,7 @@ mod tests {
     use crate::config::UserConfig;
     use crate::state::{FileIdentity, FileState};
     use crate::test_support::{EnvVarGuard, env_lock};
+    use crossbeam_channel::unbounded;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::Path;
@@ -841,9 +912,9 @@ mod tests {
         );
         assert_eq!(paths.len(), 1);
 
-        // SQLite sidecars and editor debris do not.
+        // Unrelated SQLite sidecars and editor debris do not.
         for junk in [
-            "opencode.db-wal",
+            "other.db-wal",
             "opencode.db-shm",
             "opencode.db-journal",
             "session.jsonl.tmp",
@@ -867,6 +938,78 @@ mod tests {
             &excluder,
         );
         assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn wal_events_target_database_and_honor_database_exclusions() {
+        let _guard = env_lock();
+        let mut options = test_options();
+        for name in ["opencode.db", "opencode-work.db"] {
+            let database = PathBuf::from(format!("/tmp/sessions/{name}"));
+            let wal = PathBuf::from(format!("/tmp/sessions/{name}-wal"));
+            let event = Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![wal.clone()],
+                attrs: Default::default(),
+            };
+            options.exclude_patterns.clear();
+            let excluder = watch_excluder(&options).unwrap();
+            assert_eq!(
+                interesting_event_paths(&event, &excluder).0,
+                vec![database.clone()]
+            );
+            for excluded in [&database, &wal] {
+                options.exclude_patterns = vec![excluded.to_string_lossy().into_owned()];
+                let excluder = watch_excluder(&options).unwrap();
+                assert!(interesting_event_paths(&event, &excluder).0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn event_queue_overflow_is_nonblocking_and_survives_inflight_ingest() {
+        let _guard = env_lock();
+        let mut service = test_service();
+        service.config.min_spacing = Duration::ZERO;
+        let sender = service._sender.clone();
+        let overflow = Arc::clone(&service.queue_overflow);
+        let (finished_tx, finished_rx) = bounded(1);
+        let producer = std::thread::spawn(move || {
+            for _ in 0..EVENT_QUEUE_CAPACITY + 1 {
+                enqueue_event(
+                    &sender,
+                    &overflow,
+                    Ok(Event {
+                        kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                        paths: vec![PathBuf::from("/tmp/queue-session.jsonl")],
+                        attrs: Default::default(),
+                    }),
+                );
+            }
+            finished_tx.send(()).unwrap();
+        });
+        // No consumer runs until the producer finishes, just like a slow ingest.
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("callback blocked on full queue");
+        producer.join().unwrap();
+        assert_eq!(service.receiver.len(), EVENT_QUEUE_CAPACITY);
+        service.mark_complete(FireCause::Dirty);
+        assert_eq!(service.poll(), Some(FireCause::Resync));
+        service.mark_complete(FireCause::Resync);
+        assert_eq!(service.poll(), None);
+        // Recovery does not leave a permanent overflow condition.
+        enqueue_event(
+            &service._sender,
+            &service.queue_overflow,
+            Ok(Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![PathBuf::from("/tmp/after-overflow.jsonl")],
+                attrs: Default::default(),
+            }),
+        );
+        service.config.debounce = Duration::ZERO;
+        assert_eq!(service.poll(), Some(FireCause::Dirty));
     }
 
     #[test]
@@ -1223,5 +1366,100 @@ mod tests {
         std::fs::remove_file(&hot).expect("remove");
         let changed = service.hot_sweep_dirty(&paths, HOT_WINDOW).expect("sweep");
         assert!(changed.contains(&hot));
+    }
+
+    #[test]
+    fn hot_sweep_does_not_revisit_cold_history() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        let hot = temp.path().join("hot.jsonl");
+        std::fs::write(&hot, "{}\n").unwrap();
+        let mut files = HashMap::from([(hot.to_string_lossy().into_owned(), file_state_for(&hot))]);
+        // Missing historical files would be reported as deletions if the
+        // hot sweep tried to stat them. Resync owns those cold tombstones.
+        for index in 0..256 {
+            let mut cold = file_state_for(&hot);
+            cold.mtime = 1_000_000;
+            files.insert(
+                temp.path()
+                    .join(format!("cold-{index}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned(),
+                cold,
+            );
+        }
+        write_ingest_state(&paths.root, files);
+        let mut service = test_service();
+        for _ in 0..2 {
+            assert!(
+                service
+                    .hot_sweep_dirty(&paths, HOT_WINDOW)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        std::fs::write(&hot, "{}\n{}\n").unwrap();
+        assert_eq!(
+            service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+            vec![hot]
+        );
+    }
+
+    #[test]
+    fn hot_sweep_observes_held_open_database_wal_commits() {
+        let _guard = env_lock();
+        for name in ["opencode.db", "opencode-work.db"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+            let database = temp.path().join(name);
+            let writer = rusqlite::Connection::open(&database).unwrap();
+            writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE messages (body TEXT);").unwrap();
+            let mut state = IngestState::default();
+            state
+                .opencode_databases
+                .insert(database.to_string_lossy().into_owned(), Default::default());
+            state.save(&paths.state.join("ingest.json")).unwrap();
+            let mut service = test_service();
+            // A newly tracked database gets one conservative reconciliation.
+            assert_eq!(
+                service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+                vec![database.clone()]
+            );
+            assert!(
+                service
+                    .hot_sweep_dirty(&paths, HOT_WINDOW)
+                    .unwrap()
+                    .is_empty()
+            );
+            let main_before = StateSnapshot::read(&database);
+            writer
+                .execute("INSERT INTO messages VALUES ('committed while open')", [])
+                .unwrap();
+            assert_eq!(StateSnapshot::read(&database), main_before);
+            // Reloading ingest state must not reset the WAL observation baseline.
+            state.save(&paths.state.join("ingest.json")).unwrap();
+            let changed = service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap();
+            assert_eq!(changed, vec![database.clone()]);
+            assert!(dirty_needs_ingest(&paths, &changed.into_iter().collect()).unwrap());
+            assert!(
+                service
+                    .hot_sweep_dirty(&paths, HOT_WINDOW)
+                    .unwrap()
+                    .is_empty()
+            );
+            writer
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            assert_eq!(
+                service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+                vec![database.clone()]
+            );
+            drop(writer);
+            assert_eq!(
+                service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+                vec![database]
+            );
+        }
     }
 }
