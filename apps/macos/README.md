@@ -12,19 +12,46 @@ and can be reset together. Project counts remain full-index, all-history totals 
 Press Command-F in the reader for literal find across the complete conversation,
 including earlier pages and tool contents. Command-G and Shift-Command-G navigate
 matches; Escape closes find. Results appear incrementally while scanning.
-Source-only matches hidden by Markdown still reveal the containing message.
-Tool activity and session instructions, including generated environment context, start collapsed.
-Expanded tools show labeled JSON fields, literal code, and decoded output lines.
+Source-only matches hidden by Markdown reveal and select the original text.
+Tool activity and session context start collapsed. Recognized injected plugin,
+AGENTS.md, environment, permissions, and harness sections are separated from the
+actual request, including mixed records. Quoted examples and arbitrary HTML stay visible.
+Activity rows use tool icons and compact summaries derived from recognized arguments;
+groups count logical operations rather than counting calls and results separately.
+Explicitly failed, cancelled, or interrupted operations stay visible between compact
+routine groups. Missing results do not imply a running or successful operation.
+Completed work collapses around the final answer only when the same source turn
+has explicit completion and final-answer metadata. Older or incomplete records
+retain their visible assistant messages.
+Expanded tools show labeled JSON fields, native command/file/diff cards, literal code, and decoded output lines.
 Long encoded payloads stay compact; Show raw content reveals the complete source.
-Find automatically uses raw tool content to retain exact matches. Each tool call and its result share
+Find automatically uses raw tool content to retain exact matches. Hover or focus a
+message to reveal its copy icon. Source access stays in the toolbar; full raw
+transcript access stays in the header context menu.
+The header's context menu offers Raw transcript, exposing every normalized CLI record, including
+unrecognized fields, with normal bidirectional paging. Reveal source opens the original local log.
+Each tool call and its result share
 one expandable row; single operations and instructions have no extra outer disclosure. Both the session list and
 transcript load additional pages as you scroll, without load buttons. Browsing
 opens at the newest messages; scrolling up loads earlier context. Search opens at
 the matched message, with paging in both directions. Returning to a conversation
 restores its reading position during the current app session (up to 20 recent views).
 Messages render Markdown headings, emphasis, lists, links, quotes, and code blocks
-as native attributed text. XML-style prompt wrappers become labeled sections with
-subtle borders and formatted content; fenced code stays literal.
+as native content. Top-level fenced code gets syntax colors, a language label,
+copy control, and horizontal scrolling. Long messages and outputs start bounded;
+Show all reveals their full content, and copying preserves the full source.
+Typed provider images and documents, Markdown images, and local file cards retain
+their original references. Local images and embedded image data have thumbnails
+and enlargement; remote URLs open explicitly. Paths from another machine never
+resolve against this machine. Local file links with line numbers open a native
+read-only source preview at that line.
+Expanded/raw states and viewport anchors survive paging, resizing, and switching conversations.
+The reader has no secondary navigation bar.
+
+New Codex turn/phase/lifecycle and Codex/Claude typed attachment metadata is stored
+in optional record fields. Old indexes remain readable; their next ingestion
+rebuilds a private generation before publishing the refreshed metadata. Remote
+machines need the updated backend and indexing before those fields are available.
 The Projects sidebar uses full-index session counts and latest activity from
 `memex projects`. Its ellipsis menu sorts by recent activity, conversation count,
 or name. Cached projects and the selected sort survive restarts; an immediate
@@ -183,6 +210,13 @@ lists, counts, search, and transcript reads proceed independently. This avoids
 launching a CLI process for each request; query collectors still open their
 readers per operation so published index generations remain visible.
 
+Fresh browsing uses the session list's `message_count` to request the latest page
+with its current total in one call (`session_page` over the socket, or
+`session --full --page-info --limit 60` through the CLI). The list count is a hint;
+if the returned total changes the final page offset, the reader fetches that page.
+This uses the existing remote page RPC, so remote peers do not need an upgrade.
+Older local CLI overrides fall back to separate record and metadata reads.
+
 If the daemon is absent, older, or unavailable, requests use the bundled CLI.
 The app does not enable or restart the daemon or change service settings. An older running daemon needs an updated binary and a normal restart
 before it provides the socket. Local socket reads do not trigger auto-indexing;
@@ -209,5 +243,6 @@ The normal build targets the local machine and signs ad hoc for development;
 the app release commands above build universal bundles for distribution.
 
 The SwiftUI shell embeds an AppKit NSTableView transcript with native text selection.
-The transcript has no LazyVStack; row measurements retain TextKit glyph layout across resizes. Messages display their full text; tool bodies are only
-constructed when opened and then display their full input and output. The app never launches itself after you quit it.
+The transcript has no LazyVStack; row measurements retain TextKit glyph layout across resizes. Tool bodies are only
+constructed when opened. Bounded displays preserve full source and selection;
+Find expands the matching content automatically. The app never launches itself after you quit it.

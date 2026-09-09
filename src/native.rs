@@ -22,7 +22,13 @@ const MAX_RESPONSE: usize = 64 * 1024 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const CAPABILITIES: &[&str] = &[
-    "machines", "projects", "sessions", "count", "search", "session",
+    "machines",
+    "projects",
+    "sessions",
+    "count",
+    "search",
+    "session",
+    "session_page",
 ];
 
 #[derive(Deserialize)]
@@ -49,6 +55,13 @@ pub(crate) enum Operation {
         source: Option<String>,
         since: Option<String>,
         origin: SessionOrigin,
+        limit: usize,
+    },
+    SessionPage {
+        machine: String,
+        session_id: String,
+        source_path: String,
+        offset: usize,
         limit: usize,
     },
     Session {
@@ -535,6 +548,81 @@ mod tests {
         writer.wait_merging_threads().unwrap();
         index.publish_generation().unwrap();
         analytics.flush().unwrap();
+    }
+
+    #[test]
+    fn session_page_returns_full_content_and_metadata_from_the_same_scope() {
+        let root = root();
+        let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let records = (1..=4)
+            .map(|id| Record {
+                source: SourceKind::Codex,
+                doc_id: id,
+                ts: id,
+                project: "fixture".into(),
+                session_id: "session-page".into(),
+                turn_id: id as u32,
+                role: "user".into(),
+                text: format!("{id}:{}", "λ".repeat(6000)),
+                tool_name: None,
+                tool_input: Some("argument".repeat(1000)),
+                tool_output: Some("output".repeat(2000)),
+                links: RecordLinks::default(),
+                source_path: if id == 4 {
+                    "/other-source.jsonl"
+                } else {
+                    "/page-source.jsonl"
+                }
+                .into(),
+            })
+            .collect::<Vec<_>>();
+        publish(&paths, &records);
+        let server = spawn(Some(root.path().to_path_buf())).unwrap();
+        let mut stream = connect(&server);
+        let hello = request(&mut stream, json!({"op":"hello"}));
+        assert!(
+            hello["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_page"))
+        );
+        let operation = json!({"op":"session_page", "machine":"local", "session_id":"session-page", "source_path":"/page-source.jsonl", "offset":0, "limit":2});
+        for (offset, expected, next) in [(0, 2, Some(2)), (2, 1, None), (5, 0, None)] {
+            let mut page_operation = operation.clone();
+            page_operation["offset"] = json!(offset);
+            let response = request(&mut stream, page_operation);
+            let items = response["result"].as_array().unwrap();
+            assert_eq!(items.len(), expected + 1);
+            for (item, original) in items[..expected].iter().zip(records.iter().skip(offset)) {
+                assert_eq!(item["record"]["text"], original.text);
+                assert_eq!(
+                    item["record"]["tool_input"],
+                    original.tool_input.as_deref().unwrap()
+                );
+                assert_eq!(
+                    item["record"]["tool_output"],
+                    original.tool_output.as_deref().unwrap()
+                );
+                assert_eq!(item["content"]["truncated"], false);
+                assert!(item["record_id"].is_string());
+            }
+            assert_eq!(
+                items.last().unwrap(),
+                &json!({"type":"page", "machine":"local", "session_id":"session-page", "source_path":"/page-source.jsonl", "offset":offset, "total":3, "next_offset":next})
+            );
+        }
+        let mut legacy = operation.clone();
+        legacy["op"] = json!("session");
+        let response = request(&mut stream, legacy);
+        assert_eq!(response["result"].as_array().unwrap().len(), 2);
+        assert_eq!(response["result"][0]["record"]["text"], records[0].text);
+        let mut invalid = operation;
+        invalid["limit"] = json!(0);
+        assert_eq!(
+            request(&mut stream, invalid)["error"]["code"],
+            "request_failed"
+        );
     }
 
     #[test]

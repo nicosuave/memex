@@ -4,6 +4,7 @@ import Markdown
 /// Render Markdown and prompt sections as selectable native text.
 @MainActor
 enum RichTextRenderer {
+    static let sourceLocationAttribute = NSAttributedString.Key("MemexSourceLocation")
     static func render(_ text: String, font: NSFont) -> NSAttributedString {
         PromptSections.render(text, font: font) ?? renderMarkdown(text, font: font)
     }
@@ -38,13 +39,13 @@ enum RichTextRenderer {
             output.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
                                 range: NSRange(location: start, length: output.length - start))
         } else if let code = node as? CodeBlock {
-            let value = codeText(code.code, font: font)
+            let value = CodeSyntax.render(code.code, language: code.language ?? "text", font: font)
             appendParagraph(value, to: output, style: paragraph(indent: indent + 10, spacing: 12))
         } else if let html = node as? HTMLBlock {
             appendParagraph(codeText(html.rawHTML, font: font), to: output,
                             style: paragraph(indent: indent, spacing: 10))
         } else if let heading = node as? Heading {
-            let headingFont = NSFont.systemFont(ofSize: font.pointSize + CGFloat(max(1, 5 - heading.level)) * 2, weight: .semibold)
+            let headingFont = NSFont.systemFont(ofSize: font.pointSize + CGFloat(max(1, 4 - heading.level)) * 1.5, weight: .semibold)
             let value = inlineChildren(node, attributes: [.font: headingFont, .foregroundColor: NSColor.labelColor])
             let style = paragraph(indent: indent, spacing: 9)
             style.paragraphSpacingBefore = 8
@@ -73,7 +74,7 @@ enum RichTextRenderer {
                 block.setWidth(6, type: .absoluteValueType, for: .padding)
                 block.setWidth(0.5, type: .absoluteValueType, for: .border)
                 block.setBorderColor(.separatorColor)
-                if rowIndex == 0 { block.backgroundColor = .quaternaryLabelColor }
+                if rowIndex == 0 { block.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035) }
                 let style = paragraph(indent: indent, spacing: 0)
                 style.textBlocks = [block]
                 if columnIndex < node.columnAlignments.count {
@@ -148,6 +149,10 @@ enum RichTextRenderer {
             attributes[.link] = url
             attributes[.foregroundColor] = NSColor.linkColor
             attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+        }
+        if let link = node as? Markdown.Link, let destination = link.destination,
+           ContentLocation.parse(destination)?.url.isFileURL == true {
+            attributes[sourceLocationAttribute] = destination
         }
         if let image = node as? Markdown.Image {
             let value = NSMutableAttributedString(string: "[Image: ", attributes: attributes)

@@ -5,6 +5,7 @@ struct ReaderView: View {
     @Bindable var store: Store
     @State private var navigation = TranscriptNavigationState()
     @State private var find: ConversationFindState?
+    @State private var rawTranscript = false
     @FocusState private var findFocused: Bool
 
     var body: some View {
@@ -12,6 +13,7 @@ struct ReaderView: View {
             if let session = store.selected {
                 VStack(spacing: 0) {
                     header(session)
+                        .contextMenu { Toggle("Raw transcript", isOn: $rawTranscript) }
                     Divider().opacity(0.5)
                     if let find, find.isOpen { findBar(find) }
                     NativeTranscript(sessionID: store.readerPositionKey,
@@ -23,7 +25,9 @@ struct ReaderView: View {
                                      anchorID: store.readerAnchorID, navigation: navigation,
                                      onLoadEarlier: { Task { await store.loadEarlierRecords() } },
                                      findQuery: find?.isOpen == true ? find?.query ?? "" : "",
-                                     findHit: find?.selectedHit, findGeneration: find?.generation ?? 0)
+                                     findHit: find?.selectedHit, findGeneration: find?.generation ?? 0,
+                                     rawTranscript: rawTranscript, isLocalHost: session.machineID == "local",
+                                     sourcePath: session.sourcePath)
                     if let error = store.readerError {
                         ErrorBanner(message: error) {
                             Task { await store.retryRecords() }

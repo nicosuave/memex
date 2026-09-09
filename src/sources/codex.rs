@@ -1,3 +1,4 @@
+use super::common::tool_value_text as value_text;
 use super::{
     ConversationKind, IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions,
     SessionIdentity, SourceFile, SourceMetadata, UsageDependency, UsageParseOutput,
@@ -21,9 +22,8 @@ use std::sync::{Arc, Mutex};
 pub const VERSIONS: ParserVersions = ParserVersions {
     // Recompute persisted identities and usage parents for guardian reviews.
     identity: 3,
-    // Bumped for role-string subagent source detection: forces a full
-    // re-parse so stored kinds are recomputed on next index.
-    index: 5,
+    // Preserve pre-reader fallback IDs independently of added display records.
+    index: 8,
     usage: 5,
 };
 
@@ -195,6 +195,7 @@ struct SessionMeta {
     project: String,
     cwd: Option<PathBuf>,
     links: SessionLinks,
+    source_turn_id: Option<String>,
 }
 
 fn fallback_meta(path: &Path) -> SessionMeta {
@@ -202,6 +203,7 @@ fn fallback_meta(path: &Path) -> SessionMeta {
         session_id: session_id_from_path(path).unwrap_or_else(|| "unknown".to_string()),
         project: SourceKind::Codex.label().to_string(),
         cwd: None,
+        source_turn_id: None,
         links: SessionLinks {
             conversation_kind: Some(ConversationKind::Main.as_str().to_string()),
             ..SessionLinks::default()
@@ -305,10 +307,28 @@ fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
         buffer.clear();
         buffer.extend_from_slice(line);
         if let Ok(value) = simd_json::to_borrowed_value(&mut buffer)
-            && value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
             && let Some(payload) = value.get("payload").and_then(|value| value.as_object())
         {
-            apply_meta(payload, &mut metadata);
+            match value.get("type").and_then(|value| value.as_str()) {
+                Some("session_meta") => apply_meta(payload, &mut metadata),
+                Some("turn_context") => {
+                    metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
+                }
+                Some("event_msg")
+                    if payload.get("type").and_then(|v| v.as_str()) == Some("task_started") =>
+                {
+                    metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
+                }
+                Some("event_msg")
+                    if matches!(
+                        payload.get("type").and_then(|v| v.as_str()),
+                        Some("task_complete" | "turn_aborted")
+                    ) =>
+                {
+                    metadata.source_turn_id = None;
+                }
+                _ => {}
+            }
         }
     }
     Ok(metadata)
@@ -344,6 +364,14 @@ pub(crate) fn parse_index_records(
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    let mut legacy_turn_id = state.legacy_ordinal()?;
+    let mut emit = |mut record: Record| {
+        if record.links.source_record_offset.is_none() {
+            record.links.legacy_turn_id = Some(legacy_turn_id);
+            legacy_turn_id += 1;
+        }
+        emit(record)
+    };
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let mut start = state.offset as usize;
@@ -355,6 +383,7 @@ pub(crate) fn parse_index_records(
     let mut diagnostics = ParseDiagnostics::default();
 
     while start < mmap.len() {
+        let source_record_offset = start as u64;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
@@ -391,12 +420,61 @@ pub(crate) fn parse_index_records(
             continue;
         }
         if entry_type == "turn_context" {
+            metadata.source_turn_id = object
+                .get("payload")
+                .and_then(|v| v.as_object())
+                .and_then(|payload| super::common::borrowed_string(payload, "turn_id"));
             continue;
         }
         if entry_type == "event_msg" {
             let Some(payload) = object.get("payload").and_then(|value| value.as_object()) else {
                 continue;
             };
+            let event_type = payload
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if matches!(
+                event_type,
+                "task_started" | "task_complete" | "turn_aborted"
+            ) {
+                if event_type == "task_started" {
+                    metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
+                }
+                let mut links = metadata.links.record_links();
+                links.source_turn_id = super::common::borrowed_string(payload, "turn_id")
+                    .or_else(|| metadata.source_turn_id.clone());
+                links.event_id = super::common::borrowed_string(payload, "id");
+                links.lifecycle_event = Some(event_type.to_string());
+                links.source_record_type = Some(format!("event_msg/{event_type}"));
+                links.source_record_offset = Some(source_record_offset);
+                emit(Record {
+                    source: SourceKind::Codex,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: "lifecycle".to_string(),
+                    text: match event_type {
+                        "task_started" => "Turn started",
+                        "task_complete" => "Turn completed",
+                        _ => "Turn interrupted",
+                    }
+                    .to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    // Keep the complete original event available without repeating its answer.
+                    tool_output: Some(serde_json::to_string(payload)?),
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+                if event_type != "task_started" {
+                    metadata.source_turn_id = None;
+                }
+                continue;
+            }
             if payload.get("type").and_then(|value| value.as_str()) == Some("agent_reasoning")
                 && include_reasoning
                 && let Some(text) = payload
@@ -407,6 +485,8 @@ pub(crate) fn parse_index_records(
             {
                 let mut links = metadata.links.record_links();
                 links.event_id = super::common::borrowed_string(payload, "id");
+                links.source_turn_id = metadata.source_turn_id.clone();
+                links.source_record_type = Some("event_msg/agent_reasoning".to_string());
                 emit(Record {
                     source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -441,6 +521,10 @@ pub(crate) fn parse_index_records(
             .unwrap_or("");
         let mut links = metadata.links.record_links();
         links.event_id = super::common::borrowed_string(payload, "id");
+        links.source_turn_id = super::common::borrowed_string(payload, "turn_id")
+            .or_else(|| metadata.source_turn_id.clone());
+        links.assistant_phase = super::common::borrowed_string(payload, "phase");
+        links.source_record_type = Some(format!("response_item/{payload_type}"));
         match payload_type {
             "message" => {
                 let role = payload
@@ -452,6 +536,44 @@ pub(crate) fn parse_index_records(
                     if let Some(text) = content.as_str() {
                         text_parts.push(text);
                     } else if let Some(array) = content.as_array() {
+                        if array.iter().any(|block| {
+                            matches!(
+                                block.get("type").and_then(|v| v.as_str()),
+                                Some(
+                                    "image"
+                                        | "input_image"
+                                        | "local_image"
+                                        | "localImage"
+                                        | "file"
+                                        | "input_file"
+                                        | "document"
+                                        | "attachment"
+                                )
+                            )
+                        }) {
+                            let display_blocks = array
+                                .iter()
+                                .filter(|block| {
+                                    matches!(
+                                        block.get("type").and_then(|v| v.as_str()),
+                                        Some(
+                                            "text"
+                                                | "input_text"
+                                                | "output_text"
+                                                | "image"
+                                                | "input_image"
+                                                | "local_image"
+                                                | "localImage"
+                                                | "file"
+                                                | "input_file"
+                                                | "document"
+                                                | "attachment"
+                                        )
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            links.source_content = Some(serde_json::to_string(&display_blocks)?);
+                        }
                         for block in array {
                             if let Some(text) = block
                                 .as_object()
@@ -464,9 +586,25 @@ pub(crate) fn parse_index_records(
                     }
                 }
                 let text = text_parts.join("\n").trim().to_string();
-                if text.is_empty() || is_system_instruction(&text) {
+                if text.is_empty() && links.source_content.is_none() {
                     continue;
                 }
+                // The old parser skipped every message with either prefix,
+                // including bundled requests and non-user roles. These records
+                // must not consume another source record's legacy identity.
+                if text.is_empty()
+                    || text.starts_with("<system_instruction>")
+                    || text.starts_with("<system-instruction>")
+                {
+                    links.source_record_offset = Some(source_record_offset);
+                }
+                // Keep injected instructions inspectable in raw transcripts. Only a
+                // standalone wrapper changes role; a bundled user request stays a user record.
+                let role = if role == "user" && is_standalone_system_instruction(&text) {
+                    "system"
+                } else {
+                    role
+                };
                 emit(Record {
                     source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -733,31 +871,11 @@ pub(crate) fn parse_index_records(
     Ok(IndexParseOutput {
         offset: mmap.len() as u64,
         turn_id,
+        legacy_turn_id: Some(legacy_turn_id),
         pending_tool_calls,
         session_id: Some(metadata.session_id),
         diagnostics,
     })
-}
-
-fn value_text(value: &BorrowedValue<'_>) -> Option<String> {
-    if let Some(text) = value.as_str() {
-        return Some(text.to_string());
-    }
-    if let Some(array) = value.as_array() {
-        let text = array
-            .iter()
-            .filter_map(|item| {
-                item.as_object()
-                    .and_then(|object| object.get("text").or_else(|| object.get("content")))
-                    .and_then(|value| value.as_str())
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !text.is_empty() {
-            return Some(text);
-        }
-    }
-    Some(value.to_string())
 }
 
 pub(crate) fn parse_history_records(
@@ -831,6 +949,7 @@ pub(crate) fn parse_history_records(
         turn_id += 1;
     }
     Ok(IndexParseOutput {
+        legacy_turn_id: Some(turn_id),
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
@@ -1437,9 +1556,18 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
     });
 }
 
-fn is_system_instruction(text: &str) -> bool {
-    let text = text.trim_start();
-    text.starts_with("<system_instruction>") || text.starts_with("<system-instruction>")
+fn is_standalone_system_instruction(text: &str) -> bool {
+    let text = text.trim();
+    ["system_instruction", "system-instruction"]
+        .iter()
+        .any(|tag| {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            text.strip_prefix(&open).is_some_and(|rest| {
+                rest.find(&close)
+                    .is_some_and(|end| rest[end + close.len()..].trim().is_empty())
+            })
+        })
 }
 
 #[cfg(test)]
@@ -1454,6 +1582,399 @@ mod tests {
             output,
             reasoning: 0,
         }
+    }
+
+    fn parse_transcript(path: &Path, state: IndexParseState) -> (Vec<Record>, IndexParseOutput) {
+        let mut records = Vec::new();
+        let output = parse_index_records(path, state, false, &AtomicU64::new(1), |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+        (records, output)
+    }
+
+    #[test]
+    fn reader_records_preserve_legacy_ids_across_full_and_incremental_parsing() {
+        use crate::retrieval::canonical_record_id;
+        use serde_json::json;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let response = |payload| json!({"type":"response_item", "payload":payload});
+        // Every pre-reader emitting branch, including native IDs that still
+        // advance the ordinal used by subsequent id-less records.
+        let legacy = vec![
+            response(json!({"type":"message", "role":"user", "content":"Question"})),
+            response(json!({"type":"message", "role":"assistant", "content":"Commentary A"})),
+            response(
+                json!({"type":"message", "role":"assistant", "content":"Commentary B", "id":"native-answer"}),
+            ),
+            response(
+                json!({"type":"function_call", "name":"read", "call_id":"call", "arguments":"{}"}),
+            ),
+            response(
+                json!({"type":"function_call_output", "call_id":"call", "output":"read result"}),
+            ),
+            response(json!({"type":"custom_tool_call", "name":"custom", "input":"custom input"})),
+            response(json!({"type":"custom_tool_call_output", "output":"custom result"})),
+            response(json!({"type":"web_search_call", "query":"web input"})),
+            response(json!({"type":"tool_search_call", "arguments":"tool input"})),
+            response(json!({"type":"tool_search_output", "tools":[{"name":"found"}]})),
+            json!({"type":"event_msg", "payload":{"type":"agent_reasoning", "text":"Reasoning"}}),
+            response(json!({"type":"message", "role":"assistant", "content":""})),
+            response(json!({"type":"function_call_output", "output":""})),
+        ];
+        let added = vec![
+            json!({"type":"event_msg", "payload":{"type":"task_started", "turn_id":"turn"}}),
+            json!({"type":"event_msg", "payload":{"type":"task_complete", "turn_id":"turn"}}),
+            json!({"type":"event_msg", "payload":{"type":"turn_aborted", "turn_id":"turn"}}),
+            response(
+                json!({"type":"message", "role":"user", "content":[{"type":"input_image", "image_url":"/tmp/image.png"}]}),
+            ),
+            response(
+                json!({"type":"message", "role":"user", "content":[{"type":"input_file", "file_id":"file"}]}),
+            ),
+            response(
+                json!({"type":"message", "role":"user", "content":"  <system_instruction>context</system_instruction>"}),
+            ),
+            response(
+                json!({"type":"message", "role":"user", "content":"<system-instruction>context</system-instruction> Actual request"}),
+            ),
+            response(
+                json!({"type":"message", "role":"assistant", "content":"<system_instruction>unclosed prefix"}),
+            ),
+            response(
+                json!({"type":"message", "role":"developer", "content":"<system-instruction>context</system-instruction>"}),
+            ),
+        ];
+        let mut mixed = Vec::new();
+        for index in 0..legacy.len().max(added.len()) {
+            if let Some(value) = added.get(index) {
+                mixed.push(value.clone());
+            }
+            if let Some(value) = legacy.get(index) {
+                mixed.push(value.clone());
+            }
+        }
+        let encoded = |values: &[serde_json::Value]| {
+            values.iter().map(|v| format!("{v}\n")).collect::<String>()
+        };
+        for include_reasoning in [false, true] {
+            let parse = |state| {
+                let mut records = Vec::new();
+                let output = parse_index_records(
+                    &path,
+                    state,
+                    include_reasoning,
+                    &AtomicU64::new(1),
+                    |record| {
+                        records.push(record);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                (records, output)
+            };
+            fs::write(&path, encoded(&legacy)).unwrap();
+            let (baseline, _) = parse(IndexParseState::default());
+            assert_eq!(baseline.len(), 10 + usize::from(include_reasoning));
+            // Strip the added identity fields to calculate precisely the old
+            // canonical hash from each pre-reader ordinal and source identity.
+            let baseline_ids = baseline
+                .iter()
+                .enumerate()
+                .map(|(ordinal, record)| {
+                    let mut original = record.clone();
+                    original.turn_id = ordinal as u32;
+                    original.links.legacy_turn_id = None;
+                    original.links.source_record_offset = None;
+                    canonical_record_id(&original)
+                })
+                .collect::<Vec<_>>();
+            fs::write(&path, encoded(&mixed)).unwrap();
+            let (full, output) = parse(IndexParseState::default());
+            let old_records = full
+                .iter()
+                .filter(|record| record.links.source_record_offset.is_none())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                old_records
+                    .iter()
+                    .map(|record| canonical_record_id(record))
+                    .collect::<Vec<_>>(),
+                baseline_ids
+            );
+            assert_eq!(
+                old_records
+                    .iter()
+                    .map(|record| &record.text)
+                    .collect::<Vec<_>>(),
+                baseline
+                    .iter()
+                    .map(|record| &record.text)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(output.legacy_turn_id, Some(baseline.len() as u32));
+            assert_eq!(full.len(), baseline.len() + added.len());
+            let full_ids = full.iter().map(canonical_record_id).collect::<Vec<_>>();
+            assert_eq!(full_ids.iter().collect::<HashSet<_>>().len(), full.len());
+
+            fs::write(&path, "").unwrap();
+            let mut state = IndexParseState::default();
+            let mut incremental = Vec::new();
+            for value in &mixed {
+                writeln!(
+                    fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                    "{value}"
+                )
+                .unwrap();
+                let (records, output) = parse(state);
+                incremental.extend(records);
+                state = IndexParseState {
+                    offset: output.offset,
+                    turn_id: output.turn_id,
+                    legacy_turn_id: output.legacy_turn_id,
+                    pending_tool_calls: output.pending_tool_calls,
+                };
+            }
+            assert_eq!(
+                incremental
+                    .iter()
+                    .map(canonical_record_id)
+                    .collect::<Vec<_>>(),
+                full_ids
+            );
+            assert_eq!(
+                incremental.iter().map(|r| r.turn_id).collect::<Vec<_>>(),
+                full.iter().map(|r| r.turn_id).collect::<Vec<_>>()
+            );
+            assert_eq!(state.legacy_turn_id, Some(baseline.len() as u32));
+            assert!(
+                parse_index_records(
+                    &path,
+                    IndexParseState {
+                        offset: state.offset,
+                        turn_id: state.turn_id,
+                        ..IndexParseState::default()
+                    },
+                    include_reasoning,
+                    &AtomicU64::new(1),
+                    |_| Ok(())
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn structured_tool_values_preserve_json_and_verbatim_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        for output in [
+            serde_json::json!({"ok":true,"rows":[1,2]}),
+            serde_json::json!([{"type":"text","text":"hello", "extra":42}]),
+            serde_json::json!("plain\noutput"),
+        ] {
+            fs::write(&path, format!("{}\n", serde_json::json!({"type":"response_item", "payload":{"type":"function_call_output", "call_id":"call", "output":output}}))).unwrap();
+            let (records, _) = parse_transcript(&path, IndexParseState::default());
+            let actual = records[0].tool_output.as_ref().unwrap();
+            if let Some(text) = output.as_str() {
+                assert_eq!(actual, text);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(actual).unwrap(),
+                    output
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_content_excludes_non_display_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let image = serde_json::json!({"type":"input_image", "image_url":"/tmp/photo.png"});
+        fs::write(&path, format!("{}\n", serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[image, {"type":"reasoning", "encrypted_content":"private-ciphertext"}, {"type":"tool_use","input":"private-tool"}]}}))).unwrap();
+        let (records, _) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                records[0].links.source_content.as_ref().unwrap()
+            )
+            .unwrap(),
+            serde_json::json!([image])
+        );
+        let serialized = serde_json::to_string(&records).unwrap();
+        assert!(!serialized.contains("private-ciphertext"));
+        assert!(!serialized.contains("private-tool"));
+    }
+
+    #[test]
+    fn source_content_preserves_typed_attachments_and_image_only_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let contents = [
+            serde_json::json!([{"type":"input_image", "image_url":"data:image/png;base64,AAAA", "detail":"original"}]),
+            serde_json::json!([{"type":"input_text", "text":"<<ImageDisplayed>> What is this?"}, {"type":"localImage", "path":"/tmp/photo.png"}]),
+            serde_json::json!([{"type":"input_file", "file_id":"file-123", "filename":"notes.pdf"}]),
+            serde_json::json!([{"type":"input_text", "text":"ordinary message"}]),
+        ];
+        fs::write(&path, contents.iter().map(|content| format!("{}\n", serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":content}}))).collect::<String>()).unwrap();
+        let (records, _) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].text, "");
+        assert_eq!(records[1].text, "<<ImageDisplayed>> What is this?");
+        assert_eq!(records[2].text, "");
+        for (record, content) in records[..3].iter().zip(&contents[..3]) {
+            assert_eq!(
+                &serde_json::from_str::<serde_json::Value>(
+                    record.links.source_content.as_ref().unwrap()
+                )
+                .unwrap(),
+                content
+            );
+            assert!(serde_json::to_value(record).unwrap()["source_content"].is_string());
+        }
+        assert!(records[3].links.source_content.is_none());
+    }
+
+    #[test]
+    fn transcript_preserves_turn_phase_and_explicit_lifecycle_without_echoes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"event_msg", "payload":{"type":"task_started", "turn_id":"turn-a"}}),
+            serde_json::json!({"type":"event_msg", "payload":{"type":"user_message", "message":"Question"}}),
+            serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":"Question", "id":"user-a"}}),
+            serde_json::json!({"type":"turn_context", "payload":{"turn_id":"turn-a"}}),
+            serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "phase":"commentary", "content":"Working"}}),
+            serde_json::json!({"type":"event_msg", "payload":{"type":"agent_message", "message":"Answer"}}),
+            serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "phase":"final_answer", "content":"Answer"}}),
+            serde_json::json!({"type":"event_msg", "payload":{"type":"task_complete", "turn_id":"turn-a", "last_agent_message":"Answer"}}),
+            serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":"Question", "id":"user-b"}}),
+        ];
+        fs::write(
+            &path,
+            lines.iter().map(|v| format!("{v}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let (records, _) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(records.len(), 6);
+        assert!(
+            records[..5]
+                .iter()
+                .all(|r| r.links.source_turn_id.as_deref() == Some("turn-a"))
+        );
+        assert_eq!(
+            records[2].links.assistant_phase.as_deref(),
+            Some("commentary")
+        );
+        assert_eq!(
+            records[3].links.assistant_phase.as_deref(),
+            Some("final_answer")
+        );
+        assert_eq!(
+            records[4].links.lifecycle_event.as_deref(),
+            Some("task_complete")
+        );
+        assert_eq!(records[4].role, "lifecycle");
+        assert!(
+            records[4]
+                .tool_output
+                .as_ref()
+                .unwrap()
+                .contains("last_agent_message")
+        );
+        let lifecycle: serde_json::Value =
+            serde_json::from_str(records[4].tool_output.as_ref().unwrap()).unwrap();
+        assert_eq!(lifecycle["type"], "task_complete");
+        assert_eq!(lifecycle["last_agent_message"], "Answer");
+        assert_eq!(records[5].links.source_turn_id, None);
+        // Equal user text with distinct source records is not discarded.
+        assert_eq!(records.iter().filter(|r| r.text == "Question").count(), 2);
+        assert_eq!(
+            records.iter().map(|r| r.turn_id).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+        let json = serde_json::to_value(&records[3]).unwrap();
+        assert_eq!(json["assistant_phase"], "final_answer");
+        assert_eq!(json["source_turn_id"], "turn-a");
+        assert!(json.get("lifecycle_event").is_none());
+    }
+
+    #[test]
+    fn standalone_injected_instructions_are_preserved_without_hiding_bundled_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let texts = [
+            "<system_instruction>Injected context</system_instruction>",
+            "<system-instruction>Other context</system-instruction>",
+            "<system_instruction>Context</system_instruction>\nActual request",
+            "Please explain <system_instruction> literally",
+        ];
+        fs::write(&path, texts.iter().map(|text| format!("{}\n", serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":text}}))).collect::<String>()).unwrap();
+        let (records, _) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(
+            records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            texts
+        );
+        assert_eq!(
+            records.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(),
+            ["system", "system", "user", "user"]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| r.links.source_record_type.as_deref() == Some("response_item/message"))
+        );
+        fs::write(&path, format!("{}\n", serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":texts[0]}}))).unwrap();
+        let (records, _) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(records[0].role, "assistant");
+        assert_eq!(records[0].text, texts[0]);
+    }
+
+    #[test]
+    fn incremental_transcript_recovers_turn_identity_and_does_not_infer_completion() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-a\"}}\n",
+        )
+        .unwrap();
+        let (_, first) = parse_transcript(&path, IndexParseState::default());
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{}", serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "phase":"final_answer", "content":"Partial answer"}})).unwrap();
+        let (records, second) = parse_transcript(
+            &path,
+            IndexParseState {
+                offset: first.offset,
+                turn_id: first.turn_id,
+                legacy_turn_id: first.legacy_turn_id,
+                ..IndexParseState::default()
+            },
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].links.source_turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(records[0].links.lifecycle_event, None);
+        writeln!(file, "{}", serde_json::json!({"type":"event_msg", "payload":{"type":"turn_aborted", "turn_id":"turn-a", "reason":"interrupted"}})).unwrap();
+        let (records, _) = parse_transcript(
+            &path,
+            IndexParseState {
+                offset: second.offset,
+                turn_id: second.turn_id,
+                legacy_turn_id: second.legacy_turn_id,
+                ..IndexParseState::default()
+            },
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].links.source_turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(
+            records[0].links.lifecycle_event.as_deref(),
+            Some("turn_aborted")
+        );
     }
 
     #[test]

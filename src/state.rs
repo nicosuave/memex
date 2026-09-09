@@ -89,6 +89,8 @@ pub struct FileState {
     pub mtime: i64,
     pub offset: u64,
     pub turn_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_turn_id: Option<u32>,
     #[serde(default)]
     pub parser_version: u32,
     #[serde(default)]

@@ -1314,6 +1314,7 @@ mod tests {
             mtime,
             offset: metadata.len(),
             turn_id: 1,
+            legacy_turn_id: None,
             parser_version: 1,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity {

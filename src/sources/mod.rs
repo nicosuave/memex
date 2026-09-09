@@ -94,6 +94,7 @@ pub struct ParserVersions {
 pub(crate) struct IndexParseState {
     pub offset: u64,
     pub turn_id: u32,
+    pub legacy_turn_id: Option<u32>,
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
 }
 
@@ -101,9 +102,21 @@ pub(crate) struct IndexParseState {
 pub(crate) struct IndexParseOutput {
     pub offset: u64,
     pub turn_id: u32,
+    pub legacy_turn_id: Option<u32>,
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     pub session_id: Option<String>,
     pub diagnostics: ParseDiagnostics,
+}
+
+impl IndexParseState {
+    fn legacy_ordinal(&self) -> anyhow::Result<u32> {
+        if self.offset == 0 {
+            return Ok(0);
+        }
+        self.legacy_turn_id.ok_or_else(|| {
+            anyhow::anyhow!("missing legacy record ordinal; reparse the source from offset zero")
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

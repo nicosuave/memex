@@ -100,6 +100,9 @@ impl ReadBudget {
         record.text.clear();
         record.tool_input = None;
         record.tool_output = None;
+        // Typed source blocks can duplicate every field and include binary data.
+        // A field projection must not return those unselected contents.
+        record.links.source_content = None;
         match field {
             ReadField::Text => record.text = selected.unwrap_or_default(),
             ReadField::ToolInput => record.tool_input = selected,
@@ -126,6 +129,11 @@ impl ReadBudget {
     }
 
     fn apply_all(&mut self, record: &mut Record) -> ContentPage {
+        // Source blocks have no character-continuation contract. Keep them only
+        // for full-record reads so they cannot bypass a bounded content budget.
+        if self.remaining.is_some() {
+            record.links.source_content = None;
+        }
         let text = std::mem::take(&mut record.text);
         let tool_input = record.tool_input.take();
         let tool_output = record.tool_output.take();
@@ -238,6 +246,40 @@ mod tests {
             }]
         );
         assert_eq!(budget.remaining(), Some(0));
+    }
+
+    #[test]
+    fn source_blocks_are_exclusive_to_unbounded_full_record_reads() {
+        let mut original = record("message", Some("input"), Some("output"));
+        original.links.source_content = Some(
+            serde_json::json!([
+                {"type": "text", "text": "message"},
+                {"type": "image", "source": {"type": "base64", "data": "a".repeat(100_000)}}
+            ])
+            .to_string(),
+        );
+        for limit in [Some(0), Some(1), Some(100), None] {
+            for field in [
+                None,
+                Some(ReadField::Text),
+                Some(ReadField::ToolInput),
+                Some(ReadField::ToolOutput),
+            ] {
+                let mut value = original.clone();
+                let mut budget = ReadBudget::from_remaining(limit);
+                let page = budget.apply(&mut value, field, 0).unwrap();
+                if limit.is_none() && field.is_none() {
+                    assert_eq!(value.links.source_content, original.links.source_content);
+                } else {
+                    assert!(value.links.source_content.is_none());
+                    let serialized = serde_json::to_string(&value).unwrap();
+                    assert!(!serialized.contains("base64"));
+                }
+                if let Some(limit) = limit {
+                    assert!(page.returned_chars <= limit);
+                }
+            }
+        }
     }
 
     #[test]

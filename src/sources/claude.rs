@@ -18,9 +18,8 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    // Bumped for the agent-file backfill mirror: forces a full re-parse
-    // so unlabeled agent-*.jsonl transcripts reclassify on next index.
-    index: 4,
+    // Preserve pre-reader fallback IDs independently of attachment-only messages.
+    index: 6,
     usage: 4,
 };
 
@@ -271,6 +270,14 @@ pub(crate) fn parse_index_records(
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    let mut legacy_turn_id = state.legacy_ordinal()?;
+    let mut emit = |mut record: Record| {
+        if record.links.source_record_offset.is_none() {
+            record.links.legacy_turn_id = Some(legacy_turn_id);
+            legacy_turn_id += 1;
+        }
+        emit(record)
+    };
     use memchr::memchr;
     use memmap2::Mmap;
     use simd_json::prelude::*;
@@ -288,6 +295,7 @@ pub(crate) fn parse_index_records(
     let mut diagnostics = ParseDiagnostics::default();
 
     while start < mmap.len() {
+        let source_record_offset = start as u64;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
@@ -360,6 +368,7 @@ pub(crate) fn parse_index_records(
                 object,
                 "sourceToolAssistantUUID",
             ),
+            ..RecordLinks::default()
         };
         let timestamp = object
             .get("timestamp")
@@ -397,8 +406,9 @@ pub(crate) fn parse_index_records(
                                 .get("name")
                                 .and_then(|value| value.as_str())
                                 .map(str::to_string);
-                            let tool_input =
-                                block_object.get("input").map(|value| value.to_string());
+                            let tool_input = block_object
+                                .get("input")
+                                .and_then(super::common::tool_value_text);
                             let text = tool_input.clone().unwrap_or_default();
                             let tool_id = block_object
                                 .get("id")
@@ -482,7 +492,7 @@ pub(crate) fn parse_index_records(
                         "redacted_thinking" => {
                             diagnostics.encrypted_reasoning_dropped += 1;
                         }
-                        "tool_result" | "image" => {}
+                        "tool_result" | "image" | "document" => {}
                         unknown => diagnostics.increment_unknown_semantic(unknown),
                     }
                     content_index += 1;
@@ -501,12 +511,14 @@ pub(crate) fn parse_index_records(
                 {
                     continue;
                 }
-                let tool_output = block_object.get("content").map(|value| value.to_string());
+                let tool_output = block_object
+                    .get("content")
+                    .and_then(super::common::tool_value_text);
                 let mut text = super::common::tool_result_text(block).unwrap_or_default();
                 if text.is_empty()
                     && let Some(content) = block_object.get("content")
                 {
-                    text = content.to_string();
+                    text = super::common::tool_value_text(content).unwrap_or_default();
                 }
                 let tool_use_id = block_object
                     .get("tool_use_id")
@@ -520,6 +532,7 @@ pub(crate) fn parse_index_records(
                 }
                 let tool_name = pending.and_then(|call| call.tool_name);
                 let mut links = entry_links.clone();
+                links.tool_result_is_error = block_object.get("is_error").and_then(|v| v.as_bool());
                 if let Some(tool_use_id) = &tool_use_id {
                     links.event_id = entry_uuid
                         .as_ref()
@@ -547,7 +560,32 @@ pub(crate) fn parse_index_records(
         }
 
         let text = text_parts.join(" ").trim().to_string();
-        if !text.is_empty() {
+        let mut entry_links = entry_links;
+        if let Some(array) = content.and_then(|v| v.as_array())
+            && array.iter().any(|block| {
+                matches!(
+                    block.get("type").and_then(|v| v.as_str()),
+                    Some("image" | "document")
+                )
+            })
+        {
+            // Tool and reasoning blocks have their own governed projections. Do not
+            // duplicate them or expose hidden thinking through attachment metadata.
+            let display_blocks = array
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.get("type").and_then(|v| v.as_str()),
+                        Some("text" | "image" | "document")
+                    )
+                })
+                .collect::<Vec<_>>();
+            entry_links.source_content = Some(serde_json::to_string(&display_blocks)?);
+        }
+        if !text.is_empty() || entry_links.source_content.is_some() {
+            if text.is_empty() {
+                entry_links.source_record_offset = Some(source_record_offset);
+            }
             emit(Record {
                 source: SourceKind::Claude,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -570,6 +608,7 @@ pub(crate) fn parse_index_records(
     Ok(IndexParseOutput {
         offset: mmap.len() as u64,
         turn_id,
+        legacy_turn_id: Some(legacy_turn_id),
         pending_tool_calls,
         session_id: Some(session_id),
         diagnostics,
@@ -880,6 +919,280 @@ mod tests {
         let events = parse_usage_file(&path).unwrap();
         assert_eq!(events[0].timestamp_ms, 1_776_386_452_000);
         assert_eq!(events[1].timestamp_ms, 1_776_386_452_437);
+    }
+
+    #[test]
+    fn structured_tool_values_preserve_json_and_verbatim_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        for output in [
+            serde_json::json!({"ok":true,"rows":[1,2]}),
+            serde_json::json!([{"type":"text","text":"hello", "extra":42}]),
+            serde_json::json!("plain\noutput"),
+        ] {
+            fs::write(&path, format!("{}\n", serde_json::json!({"type":"user", "sessionId":"session", "message":{"content":[{"type":"tool_result", "tool_use_id":"call", "content":output}]}}))).unwrap();
+            let mut records = Vec::new();
+            parse_index_records(
+                &path,
+                IndexParseState::default(),
+                false,
+                &AtomicU64::new(1),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let actual = records[0].tool_output.as_ref().unwrap();
+            if let Some(text) = output.as_str() {
+                assert_eq!(actual, text);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(actual).unwrap(),
+                    output
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_records_preserve_legacy_ids_across_full_and_incremental_parsing() {
+        use crate::retrieval::canonical_record_id;
+        use serde_json::json;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let entry = |role, content| json!({"type":role, "sessionId":"session", "message":{"content":content}});
+        let legacy = vec![
+            entry("user", json!("Question")),
+            entry(
+                "assistant",
+                json!([
+                    {"type":"tool_use", "id":"call", "name":"Read", "input":{}},
+                    {"type":"thinking", "thinking":"Reasoning"},
+                    {"type":"text", "text":"Working"}
+                ]),
+            ),
+            entry(
+                "user",
+                json!([{"type":"tool_result", "tool_use_id":"call", "content":"read result"}]),
+            ),
+            entry("assistant", json!("Answer A")),
+            entry(
+                "assistant",
+                json!([{"type":"tool_use", "name":"Other", "input":"other input"}]),
+            ),
+            json!({"type":"assistant", "uuid":"native-answer", "message":{"content":"Answer B"}}),
+        ];
+        let image =
+            json!({"type":"image", "source":{"type":"url", "url":"https://example.com/image.png"}});
+        let document = json!({"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":"AAAA"}});
+        let mut mixed = legacy.clone();
+        // A tool-only source line gains an attachment-only aggregate message;
+        // the tool's existing identity and the next legacy ordinal both survive.
+        mixed[4]["message"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(image.clone());
+        mixed.insert(2, entry("user", json!([document])));
+        mixed.insert(0, entry("user", json!([image])));
+        let encoded = |values: &[serde_json::Value]| {
+            values.iter().map(|v| format!("{v}\n")).collect::<String>()
+        };
+        for include_reasoning in [false, true] {
+            let parse = |state| {
+                let mut records = Vec::new();
+                let output = parse_index_records(
+                    &path,
+                    state,
+                    include_reasoning,
+                    &AtomicU64::new(1),
+                    |record| {
+                        records.push(record);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                (records, output)
+            };
+            fs::write(&path, encoded(&legacy)).unwrap();
+            let (baseline, _) = parse(IndexParseState::default());
+            assert_eq!(baseline.len(), 7 + usize::from(include_reasoning));
+            let baseline_ids = baseline
+                .iter()
+                .enumerate()
+                .map(|(ordinal, record)| {
+                    let mut original = record.clone();
+                    original.turn_id = ordinal as u32;
+                    original.links.legacy_turn_id = None;
+                    original.links.source_record_offset = None;
+                    canonical_record_id(&original)
+                })
+                .collect::<Vec<_>>();
+            fs::write(&path, encoded(&mixed)).unwrap();
+            let (full, output) = parse(IndexParseState::default());
+            let old_records = full
+                .iter()
+                .filter(|record| record.links.source_record_offset.is_none())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                old_records
+                    .iter()
+                    .map(|record| canonical_record_id(record))
+                    .collect::<Vec<_>>(),
+                baseline_ids
+            );
+            assert_eq!(
+                old_records
+                    .iter()
+                    .map(|record| &record.text)
+                    .collect::<Vec<_>>(),
+                baseline
+                    .iter()
+                    .map(|record| &record.text)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(full.len(), baseline.len() + 3);
+            assert_eq!(output.legacy_turn_id, Some(baseline.len() as u32));
+            let full_ids = full.iter().map(canonical_record_id).collect::<Vec<_>>();
+            assert_eq!(
+                full_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                full.len()
+            );
+
+            fs::write(&path, "").unwrap();
+            let mut state = IndexParseState::default();
+            let mut incremental = Vec::new();
+            for value in &mixed {
+                writeln!(
+                    fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                    "{value}"
+                )
+                .unwrap();
+                let (records, output) = parse(state);
+                incremental.extend(records);
+                state = IndexParseState {
+                    offset: output.offset,
+                    turn_id: output.turn_id,
+                    legacy_turn_id: output.legacy_turn_id,
+                    pending_tool_calls: output.pending_tool_calls,
+                };
+            }
+            assert_eq!(
+                incremental
+                    .iter()
+                    .map(canonical_record_id)
+                    .collect::<Vec<_>>(),
+                full_ids
+            );
+            assert_eq!(state.legacy_turn_id, Some(baseline.len() as u32));
+            assert!(
+                parse_index_records(
+                    &path,
+                    IndexParseState {
+                        offset: state.offset,
+                        turn_id: state.turn_id,
+                        ..IndexParseState::default()
+                    },
+                    include_reasoning,
+                    &AtomicU64::new(1),
+                    |_| Ok(())
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_envelope_failure_survives_plain_text_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        for flag in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            fs::write(&path, format!("{}\n", serde_json::json!({"type":"user", "sessionId":"session", "message":{"content":[{"type":"tool_result", "tool_use_id":"call", "is_error":flag, "content":"permission denied"}]}}))).unwrap();
+            let mut records = Vec::new();
+            parse_index_records(
+                &path,
+                IndexParseState::default(),
+                false,
+                &AtomicU64::new(1),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let result = &records[0];
+            assert_eq!(result.tool_output.as_deref(), Some("permission denied"));
+            assert_eq!(result.links.tool_result_is_error, flag.as_bool());
+            let json = serde_json::to_value(result).unwrap();
+            assert_eq!(
+                json.get("tool_result_is_error").and_then(|v| v.as_bool()),
+                flag.as_bool()
+            );
+        }
+    }
+
+    #[test]
+    fn source_content_preserves_images_documents_without_exposing_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let image = serde_json::json!({"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"AAAA"}});
+        let document = serde_json::json!({"type":"document", "source":{"type":"url", "url":"https://example.com/notes.pdf"}, "title":"Notes"});
+        let contents = [
+            serde_json::json!([image]),
+            serde_json::json!([{"type":"text", "text":"<<ImageDisplayed>>"}, document, {"type":"thinking", "thinking":"private reasoning"}]),
+            serde_json::json!([{"type":"text", "text":"plain text"}]),
+        ];
+        fs::write(&path, contents.iter().map(|content| format!("{}\n", serde_json::json!({"type":"user", "sessionId":"session", "message":{"role":"user", "content":content}}))).collect::<String>()).unwrap();
+        let mut records = Vec::new();
+        let parsed = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            !parsed
+                .diagnostics
+                .unknown_semantic_types
+                .contains_key("document")
+        );
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].text, "");
+        assert_eq!(records[1].text, "<<ImageDisplayed>>");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                records[0].links.source_content.as_ref().unwrap()
+            )
+            .unwrap(),
+            contents[0]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                records[1].links.source_content.as_ref().unwrap()
+            )
+            .unwrap(),
+            serde_json::json!([contents[1][0], document])
+        );
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("private reasoning")
+        );
+        assert!(records[2].links.source_content.is_none());
     }
 
     #[test]

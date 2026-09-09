@@ -91,6 +91,15 @@ pub(crate) fn borrowed_string(
         .map(str::to_string)
 }
 
+/// Preserve string tool payloads verbatim and structured payloads as valid JSON.
+pub(crate) fn tool_value_text(value: &simd_json::BorrowedValue<'_>) -> Option<String> {
+    use simd_json::prelude::*;
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| serde_json::to_string(value).ok())
+}
+
 pub(crate) fn tool_result_text(block: &simd_json::BorrowedValue<'_>) -> Option<String> {
     use simd_json::prelude::*;
     let object = block.as_object()?;

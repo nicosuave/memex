@@ -167,6 +167,7 @@ pub(crate) fn parse_index_records(
     Ok(IndexParseOutput {
         offset,
         turn_id,
+        legacy_turn_id: None,
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id),
         diagnostics,
