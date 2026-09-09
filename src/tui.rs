@@ -417,6 +417,7 @@ enum SourceChoice {
     Hermes,
     Jcode,
     Muse,
+    Antigravity,
 }
 
 impl SourceChoice {
@@ -434,7 +435,8 @@ impl SourceChoice {
             SourceChoice::Grok => SourceChoice::Hermes,
             SourceChoice::Hermes => SourceChoice::Jcode,
             SourceChoice::Jcode => SourceChoice::Muse,
-            SourceChoice::Muse => SourceChoice::All,
+            SourceChoice::Muse => SourceChoice::Antigravity,
+            SourceChoice::Antigravity => SourceChoice::All,
         }
     }
 
@@ -453,6 +455,7 @@ impl SourceChoice {
             SourceChoice::Hermes => Some(SourceFilter::Hermes),
             SourceChoice::Jcode => Some(SourceFilter::Jcode),
             SourceChoice::Muse => Some(SourceFilter::Muse),
+            SourceChoice::Antigravity => Some(SourceFilter::Antigravity),
         }
     }
 
@@ -471,6 +474,7 @@ impl SourceChoice {
             SourceChoice::Hermes => "hermes",
             SourceChoice::Jcode => "jcode",
             SourceChoice::Muse => "muse",
+            SourceChoice::Antigravity => "antigravity",
         }
     }
 
@@ -488,6 +492,7 @@ impl SourceChoice {
             SourceKind::Hermes => SourceChoice::Hermes,
             SourceKind::Jcode => SourceChoice::Jcode,
             SourceKind::Muse => SourceChoice::Muse,
+            SourceKind::Antigravity => SourceChoice::Antigravity,
         }
     }
 }
@@ -1163,6 +1168,7 @@ impl App {
                     include_grok: true,
                     include_jcode: true,
                     include_muse: true,
+                    include_antigravity: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2651,6 +2657,7 @@ impl App {
             SourceKind::Hermes => "hermes",
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
+            SourceKind::Antigravity => "antigravity",
         };
         let source_path = session.source_path.clone();
 
@@ -4107,6 +4114,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Hermes => label == "hermes",
         SourceChoice::Jcode => label == "jcode",
         SourceChoice::Muse => label == "muse",
+        SourceChoice::Antigravity => label == "antigravity",
         SourceChoice::All => false,
     }
 }
@@ -4125,6 +4133,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Hermes => Color::Rgb(190, 150, 220),
         SourceKind::Jcode => Color::Rgb(220, 140, 180),
         SourceKind::Muse => Color::Rgb(180, 130, 240),
+        SourceKind::Antigravity => Color::Rgb(120, 200, 140),
     }
 }
 

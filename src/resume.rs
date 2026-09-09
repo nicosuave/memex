@@ -35,6 +35,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Hermes => None,
         SourceKind::Jcode => config.jcode_resume_cmd.clone(),
         SourceKind::Muse => config.muse_resume_cmd.clone(),
+        SourceKind::Antigravity => None,
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }

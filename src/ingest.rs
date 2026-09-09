@@ -45,6 +45,7 @@ pub struct IngestOptions {
     pub include_grok: bool,
     pub include_jcode: bool,
     pub include_muse: bool,
+    pub include_antigravity: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -155,6 +156,7 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
     };
 
     FileIdentity {
+        sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
         #[cfg(not(unix))]
@@ -221,7 +223,10 @@ fn prepare_file_task(
         })
         .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
         .min(size) as usize;
-    let identity = file_identity(&path, metadata, prefix_bytes);
+    let mut identity = file_identity(&path, metadata, prefix_bytes);
+    if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path) {
+        identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
+    }
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
@@ -232,6 +237,7 @@ fn prepare_file_task(
                 || mtime < previous.mtime
                 || previous.parser_version != parser_version
                 || file_was_replaced(&previous.identity, &identity)
+                || previous.identity.sqlite_wal != identity.sqlite_wal
                 || (size == previous.size
                     && previous
                         .identity
@@ -254,6 +260,10 @@ fn prepare_file_task(
         // atomically instead: delete_first purges the stale rows first, so
         // growing files can neither duplicate records nor inflate counts.
         Some(_) if source == SourceKind::Jcode => (0, 0, true, HashMap::new(), false),
+        // An antigravity .db/overview.txt file is rewritten wholesale as the
+        // conversation grows (SQLite stores the WAL separately); a byte offset
+        // cannot resume mid-file, so reparse atomically instead.
+        Some(_) if source == SourceKind::Antigravity => (0, 0, true, HashMap::new(), false),
         Some(previous) => (
             previous.offset,
             previous.turn_id,
@@ -1418,6 +1428,36 @@ fn ingest_selected(
         }
     }
 
+    if options.include_antigravity && full_scan {
+        let antigravity_files = crate::sources::antigravity::discover();
+        for source_file in antigravity_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Antigravity,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
     let mut excluded_index_paths: Vec<String> = Vec::new();
@@ -1721,6 +1761,14 @@ fn ingest_selected(
                     &progress,
                 ),
                 SourceKind::Muse => parse_muse_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Antigravity => parse_antigravity_file(
                     task,
                     options.include_reasoning,
                     &tx_record,
@@ -2430,6 +2478,39 @@ fn parse_muse_file(
     )
 }
 
+fn parse_antigravity_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::antigravity::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Antigravity, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Antigravity,
+        source_path,
+        parsed,
+    )
+}
+
 fn parse_cursor_file(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -2796,6 +2877,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -3247,6 +3329,74 @@ mod tests {
         let result = ingest_dirty(&paths, &index, &options, &lease, &dirty).unwrap();
         assert!(result.full_scan);
         assert_eq!(indexed_texts(&paths), ["second updated"]);
+    }
+
+    #[test]
+    fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("gemini");
+        let database = source.join("antigravity-ide/conversations/session.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let _env = EnvVarGuard::set_os(&[("ANTIGRAVITY_HOME", Some(source.as_os_str()))]);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);").unwrap();
+        // Protobuf user step: field 19 { field 2: text }.
+        let put = |text: &str| {
+            let mut payload = vec![0x9a, 0x01, (text.len() + 2) as u8, 0x12, text.len() as u8];
+            payload.extend_from_slice(text.as_bytes());
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO steps VALUES (0, 14, 3, ?1)",
+                    [payload],
+                )
+                .unwrap();
+        };
+        put("original");
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_antigravity = true;
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let full = || {
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            ingest_all(&paths, &index, &options, &lease).unwrap()
+        };
+        assert_eq!(full().records_added, 1);
+        assert_eq!(indexed_texts(&paths), ["original"]);
+        assert_eq!(full().records_added, 0);
+        let before = database.metadata().unwrap();
+        put("updated");
+        assert_eq!(
+            database.metadata().unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert_eq!(database.metadata().unwrap().len(), before.len());
+        assert!(
+            crate::watch::dirty_needs_ingest(&paths, &HashSet::from([database.clone()])).unwrap()
+        );
+        let wal = database.with_file_name("session.db-wal");
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result = ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([wal])).unwrap();
+        assert!(!result.full_scan);
+        assert_eq!(result.report.records_added, 1);
+        assert_eq!(indexed_texts(&paths), ["updated"]);
+        assert!(
+            !crate::watch::dirty_needs_ingest(&paths, &HashSet::from([database.clone()])).unwrap()
+        );
+        put("full scan update");
+        assert_eq!(full().records_added, 1);
+        assert_eq!(indexed_texts(&paths), ["full scan update"]);
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        full();
+        assert_eq!(indexed_texts(&paths), ["full scan update"]);
+        drop(writer);
+        full();
+        assert_eq!(indexed_texts(&paths), ["full scan update"]);
+        assert_eq!(full().records_added, 0);
     }
 
     #[test]
@@ -4869,6 +5019,7 @@ mod tests {
             prefix_sha256: Some("same".to_string()),
             prefix_bytes: 4,
             modified_ns: Some(3),
+            sqlite_wal: None,
         };
         let current = FileIdentity {
             device: Some(4),
@@ -4886,6 +5037,7 @@ mod tests {
             prefix_sha256: Some("original".to_string()),
             prefix_bytes: 8,
             modified_ns: Some(3),
+            sqlite_wal: None,
         };
         let different_inode = FileIdentity {
             device: Some(4),
@@ -5147,6 +5299,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -5589,6 +5742,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),

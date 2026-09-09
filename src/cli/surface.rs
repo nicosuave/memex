@@ -174,6 +174,7 @@ pub(super) enum IndexSource {
     Grok,
     Jcode,
     Muse,
+    Antigravity,
 }
 
 impl IndexArgs {
@@ -190,6 +191,7 @@ impl IndexArgs {
             IndexSource::Grok => self.grok && !self.no_grok,
             IndexSource::Jcode => self.jcode && !self.no_jcode,
             IndexSource::Muse => self.muse && !self.no_muse,
+            IndexSource::Antigravity => self.antigravity && !self.no_antigravity,
         };
         legacy_enabled
             && (self.only_source.is_empty() || self.only_source.contains(&source))
@@ -435,6 +437,7 @@ mod tests {
             "--no-grok",
             "--no-jcode",
             "--no-muse",
+            "--no-antigravity",
         ]);
         assert_eq!(
             selected.source.as_deref(),

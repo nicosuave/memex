@@ -349,6 +349,7 @@ fn progress_label(source: SourceKind) -> &'static str {
         SourceKind::Hermes => "hermes",
         SourceKind::Jcode => "jcode",
         SourceKind::Muse => "muse",
+        SourceKind::Antigravity => "antigravity",
     }
 }
 

@@ -518,7 +518,7 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 12] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
@@ -531,6 +531,7 @@ fn assemble_usage_events(
         (SourceFilter::Hermes, scan_hermes),
         (SourceFilter::Jcode, scan_jcode),
         (SourceFilter::Muse, scan_muse),
+        (SourceFilter::Antigravity, scan_antigravity),
     ];
     for (filter, scanner) in SCANNERS {
         if source.is_none_or(|selected| selected == filter) {
@@ -620,6 +621,8 @@ fn usage_project_key(value: &str) -> String {
 /// Reuse cached Cursor state databases this long even when their metadata changed: a
 /// running Cursor rewrites its (potentially multi-GB) databases continuously, and
 /// re-reading them on every scan makes live scans unusable.
+/// Expiry forces a read even when main-file metadata is unchanged: committed
+/// SQLite writes can remain entirely in the WAL until checkpoint.
 const VOLATILE_DB_REUSE_MS: i64 = 60_000;
 /// Cache rows are persisted after every chunk of parsed files, not once per source, so an
 /// interrupted cold scan resumes from the last completed chunk instead of starting over.
@@ -1064,11 +1067,10 @@ fn scan_files_cached_with(
             // copy appeared) invalidates the cached result even when the file itself is
             // unchanged, so it must re-parse.
             Some(row)
-                if ((row.size, row.mtime_ns) == metadata
-                    || volatile_reuse_ms(path).is_some_and(|window| {
-                        now_ms.saturating_sub(row.scanned_at_ms) < window
-                    }))
-                    && row.deps.iter().all(UsageFileDep::is_current)
+                if volatile_reuse_ms(path).map_or_else(
+                    || (row.size, row.mtime_ns) == metadata,
+                    |window| now_ms.saturating_sub(row.scanned_at_ms) < window,
+                ) && row.deps.iter().all(UsageFileDep::is_current)
                     && deps_current(&row.deps) =>
             {
                 hits.push((index, key, row.events_blob));
@@ -1488,6 +1490,27 @@ fn scan_muse(
     Ok(())
 }
 
+fn scan_antigravity(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::antigravity::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "antigravity",
+            parser_version: crate::sources::antigravity::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::antigravity::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
 // Rates are nano-USD per million tokens. The catalog is deliberately small and versioned:
 // unknown models remain unpriced instead of silently inheriting a guessed family rate.
 const PRICE_CATALOG_ID: &str = "official-api-prices-2026-07-15";
@@ -1635,6 +1658,90 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn volatile_sqlite_usage_refreshes_held_open_wal_after_reuse_window() {
+        for source in ["opencode", "cursor"] {
+            let temp = tempfile::tempdir().unwrap();
+            let database = temp.path().join(if source == "opencode" {
+                "opencode.db"
+            } else {
+                "state.vscdb"
+            });
+            let writer = Connection::open(&database).unwrap();
+            writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+                .unwrap();
+            if source == "opencode" {
+                writer
+                    .execute_batch(
+                        "CREATE TABLE message (id TEXT, session_id TEXT, data TEXT);
+                     INSERT INTO message VALUES ('m', 's', '{\"tokens\":{\"input\":10}}');",
+                    )
+                    .unwrap();
+            } else {
+                writer
+                    .execute_batch(
+                        "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);
+                     INSERT INTO cursorDiskKV VALUES ('composerData:s',
+                     '{\"generationUUID\":\"g\",\"inputTokens\":10}');",
+                    )
+                    .unwrap();
+            }
+            writer
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            let metadata = usage_file_metadata(&database).unwrap();
+            let mut cache = UsageCache::open(&temp.path().join("usage-cache.sqlite3")).unwrap();
+            let run = |cache: &mut UsageCache| {
+                let mut warnings = Vec::new();
+                let mut events = Vec::new();
+                scan_files_cached(
+                    SourceScan {
+                        source,
+                        parser_version: 1,
+                        volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+                    },
+                    std::slice::from_ref(&database),
+                    Some(cache),
+                    &mut warnings,
+                    &mut events,
+                    |path| {
+                        if source == "opencode" {
+                            crate::sources::opencode::parse_usage_file(path)
+                        } else {
+                            crate::sources::cursor::parse_usage_database(path)
+                        }
+                        .map(FileParse::cacheable)
+                    },
+                );
+                assert!(warnings.is_empty(), "{source}: {warnings:?}");
+                events
+                    .iter()
+                    .map(|event| event.tokens.additive_total())
+                    .sum::<u64>()
+            };
+            assert_eq!(run(&mut cache), 10, "{source} cold read");
+            if source == "opencode" {
+                writer
+                    .execute(
+                        "UPDATE message SET data = '{\"tokens\":{\"input\":20}}'",
+                        [],
+                    )
+                    .unwrap();
+            } else {
+                writer.execute("UPDATE cursorDiskKV SET value = '{\"generationUUID\":\"g\",\"inputTokens\":20}'", []).unwrap();
+            }
+            assert_eq!(usage_file_metadata(&database).unwrap(), metadata);
+            assert_eq!(run(&mut cache), 10, "{source} preserves reuse window");
+            cache
+                .connection
+                .execute("UPDATE usage_file_cache SET scanned_at_ms = 0", [])
+                .unwrap();
+            assert_eq!(run(&mut cache), 20, "{source} refreshes WAL after expiry");
+            assert_eq!(usage_file_metadata(&database).unwrap(), metadata);
+        }
+    }
 
     #[test]
     fn usage_event_layout_change_rebuilds_cached_rows() {

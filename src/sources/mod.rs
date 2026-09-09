@@ -4,6 +4,7 @@
 //! adapters in this module make them share source identity, discovery, hierarchy, and
 //! parser-version rules without introducing a persisted normalized transcript store.
 
+pub mod antigravity;
 pub mod audit;
 pub mod claude;
 pub mod codex;
@@ -255,6 +256,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Hermes => hermes::VERSIONS,
         SourceKind::Jcode => jcode::VERSIONS,
         SourceKind::Muse => muse::VERSIONS,
+        SourceKind::Antigravity => antigravity::VERSIONS,
     }
 }
 
@@ -276,6 +278,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Jcode
                 | SourceKind::Muse
                 | SourceKind::Grok
+                | SourceKind::Antigravity
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -293,6 +296,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Jcode
     } else if muse::matches_path(path) {
         SourceKind::Muse
+    } else if antigravity::matches_path(path) {
+        SourceKind::Antigravity
     } else if grok::matches_path(path) {
         SourceKind::Grok
     } else if cursor::matches_path(path) {

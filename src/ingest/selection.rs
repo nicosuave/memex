@@ -31,6 +31,7 @@ enum Shape {
     Grok,
     Jcode,
     Muse,
+    Antigravity,
 }
 
 struct Root {
@@ -117,6 +118,12 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
     }
     if options.include_muse {
         roots.push(Root::new(sources::muse::sessions_root(), Shape::Muse));
+    }
+    if options.include_antigravity {
+        roots.push(Root::new(
+            sources::antigravity::sessions_root(),
+            Shape::Antigravity,
+        ));
     }
     roots
 }
@@ -206,6 +213,26 @@ fn classify(root: &Root, path: &Path) -> Match {
             (name.starts_with("session_") && name.ends_with(".json")).then_some(SourceKind::Jcode)
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
+        Shape::Antigravity => {
+            let in_profile = parts.first().is_some_and(|part| {
+                *part == "antigravity-ide"
+                    || *part == "antigravity"
+                    || *part == "antigravity-backup"
+            });
+            if !in_profile {
+                None
+            } else if (name.ends_with(".db")
+                && !name.ends_with("-wal.db")
+                && !name.ends_with("-shm.db")
+                && parts.get(1).is_some_and(|part| *part == "conversations"))
+                || (name == "overview.txt"
+                    && path.to_string_lossy().contains(".system_generated/logs/"))
+            {
+                Some(SourceKind::Antigravity)
+            } else {
+                None
+            }
+        }
     };
     source.map_or(Match::Ignore, Match::File)
 }
@@ -226,6 +253,19 @@ fn resolve(
                 continue;
             };
             if excluder.is_excluded(&path) || excluder.is_excluded(hint) {
+                continue;
+            }
+            let path = if matches!(root.shape, Shape::Antigravity) {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix("-wal"))
+                    .filter(|name| name.ends_with(".db"))
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path)
+            } else {
+                path
+            };
+            if excluder.is_excluded(&path) {
                 continue;
             }
             if path == root.lexical {
@@ -384,6 +424,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -452,6 +493,16 @@ mod tests {
             ),
             (Shape::Jcode, "project/session_one.json", SourceKind::Jcode),
             (Shape::Muse, "project/id/session.jsonl", SourceKind::Muse),
+            (
+                Shape::Antigravity,
+                "antigravity-ide/conversations/abc.db",
+                SourceKind::Antigravity,
+            ),
+            (
+                Shape::Antigravity,
+                "antigravity-ide/brain/comp/.system_generated/logs/overview.txt",
+                SourceKind::Antigravity,
+            ),
         ];
         for (shape, relative, source) in cases {
             let temp = tempfile::tempdir().unwrap();
