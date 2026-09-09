@@ -48,6 +48,7 @@ enum RichContentBlock: Equatable {
     case markdown(String)
     case code(String, language: String)
     case attachment(label: String, source: String, image: Bool)
+    case attachmentNotice(label: String, detail: String)
     case embeddedImage(label: String, data: Data, mimeType: String)
 }
 
@@ -116,6 +117,8 @@ struct RichContentDocument {
             case .code(let source, let language): return CodeContentView(code: source, language: language, font: font)
             case .embeddedImage(let label, let data, let mimeType):
                 return AttachmentContentView(label: label, source: "Embedded image · \(mimeType)", isImage: true, context: context, embeddedData: data)
+            case .attachmentNotice(let label, let detail):
+                return AttachmentContentView(label: label, source: "", isImage: false, context: context, unavailableDetail: detail)
             case .attachment(let label, let source, let image):
                 let card = AttachmentContentView(label: label, source: source, isImage: image, context: context)
                 card.onOpenLocation = { [weak self] location in self?.open(location) }
@@ -309,14 +312,14 @@ struct RichContentDocument {
     let contentHeight: CGFloat
     override var isFlipped: Bool { true }
 
-    init(label: String, source: String, isImage: Bool, context: RichContentContext, embeddedData: Data? = nil) {
+    init(label: String, source: String, isImage: Bool, context: RichContentContext, embeddedData: Data? = nil, unavailableDetail: String? = nil) {
         let location = ContentLocation.parse(source)
         self.location = location
         self.context = context
         let embeddedData = embeddedData.flatMap { $0.count <= 20_000_000 ? $0 : nil }
         self.embeddedData = embeddedData
         title = NSTextField(labelWithString: label.isEmpty ? (location?.url.lastPathComponent ?? "Attachment") : label)
-        detail = NSTextField(wrappingLabelWithString: source + ((location?.url.isFileURL == true && !context.isLocalHost) ? " · Recorded on another host" : ""))
+        detail = NSTextField(wrappingLabelWithString: unavailableDetail ?? (source + ((location?.url.isFileURL == true && !context.isLocalHost) ? " · Recorded on another host" : "")))
         // Never interpret another machine's absolute path on this machine, and
         // never fetch remote media as a side effect of reading a transcript.
         var thumbnail: NSImage?
@@ -342,6 +345,7 @@ struct RichContentDocument {
         preview.image = thumbnail
         preview.imageScaling = .scaleProportionallyUpOrDown
         openButton.title = thumbnail == nil ? "Open" : "Enlarge"
+        openButton.isHidden = unavailableDetail != nil
         openButton.isEnabled = thumbnail != nil || location?.canOpen(in: context) == true
         openButton.target = self
         openButton.action = #selector(openAttachment)
@@ -353,7 +357,7 @@ struct RichContentDocument {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
         }
-        title.frame = NSRect(x: 12, y: 8, width: max(1, bounds.width - 100), height: 20)
+        title.frame = NSRect(x: 12, y: 8, width: max(1, bounds.width - (openButton.isHidden ? 24 : 100)), height: 20)
         openButton.frame = NSRect(x: max(0, bounds.width - 80), y: 6, width: 70, height: 24)
         detail.frame = NSRect(x: 12, y: 31, width: max(1, bounds.width - 24), height: 32)
         preview.frame = NSRect(x: 12, y: 68, width: max(1, bounds.width - 24), height: max(0, bounds.height - 80))

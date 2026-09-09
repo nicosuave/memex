@@ -75,6 +75,7 @@ struct FileTask {
     source: SourceKind,
     offset: u64,
     turn_id: u32,
+    legacy_turn_id: Option<u32>,
     size: u64,
     mtime: i64,
     delete_first: bool,
@@ -223,14 +224,17 @@ fn prepare_file_task(
         .min(size) as usize;
     let identity = file_identity(&path, metadata, prefix_bytes);
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
-    let parser_version_invalidated =
-        previous.is_some_and(|previous| previous.parser_version != parser_version);
+    let tracks_legacy_ordinal = matches!(source, SourceKind::Claude | SourceKind::Codex);
+    let parser_version_invalidated = previous.is_some_and(|previous| {
+        previous.parser_version != parser_version
+            || (tracks_legacy_ordinal && previous.offset > 0 && previous.legacy_turn_id.is_none())
+    });
     let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
         None => (0, 0, false, HashMap::new(), false),
         Some(previous)
             if size < previous.size
                 || mtime < previous.mtime
-                || previous.parser_version != parser_version
+                || parser_version_invalidated
                 || file_was_replaced(&previous.identity, &identity)
                 || (size == previous.size
                     && previous
@@ -269,6 +273,11 @@ fn prepare_file_task(
             source,
             offset,
             turn_id,
+            legacy_turn_id: if tracks_legacy_ordinal && offset == 0 {
+                Some(0)
+            } else {
+                previous.and_then(|previous| previous.legacy_turn_id)
+            },
             size,
             mtime,
             delete_first,
@@ -326,6 +335,7 @@ fn completed_file_state(
     task: &FileTask,
     offset: u64,
     turn_id: u32,
+    legacy_turn_id: Option<u32>,
     pending_tool_calls: HashMap<String, PendingToolCall>,
 ) -> FileState {
     FileState {
@@ -333,6 +343,7 @@ fn completed_file_state(
         mtime: task.mtime,
         offset,
         turn_id,
+        legacy_turn_id,
         parser_version: task.parser_version,
         pending_tool_calls,
         identity: task.identity.clone(),
@@ -2222,6 +2233,7 @@ fn parse_claude_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2255,6 +2267,7 @@ fn parse_codex_session(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2288,6 +2301,7 @@ fn parse_codex_history(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         session_ids,
@@ -2321,6 +2335,7 @@ fn finish_source_parse(
         task,
         parsed.offset,
         parsed.turn_id,
+        parsed.legacy_turn_id,
         parsed.pending_tool_calls,
     );
     tx_update.send(FileUpdate {
@@ -2345,6 +2360,7 @@ fn parse_opencode_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         opencode_session_links,
@@ -2378,6 +2394,7 @@ fn parse_jcode_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2411,6 +2428,7 @@ fn parse_muse_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2444,6 +2462,7 @@ fn parse_cursor_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         next_doc_id,
@@ -2475,6 +2494,7 @@ fn parse_pi_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2507,6 +2527,7 @@ fn parse_omp_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2539,6 +2560,7 @@ fn parse_openclaw_file(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -2570,6 +2592,7 @@ fn parse_copilot_session(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         next_doc_id,
@@ -2602,6 +2625,7 @@ fn parse_grok_session(
         crate::sources::IndexParseState {
             offset: task.offset,
             turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
@@ -3761,6 +3785,7 @@ mod tests {
             source,
             offset,
             turn_id,
+            legacy_turn_id: Some(turn_id),
             size: metadata.len(),
             mtime: metadata
                 .modified()
@@ -4823,6 +4848,7 @@ mod tests {
             &original,
             metadata.len(),
             1,
+            Some(1),
             original.pending_tool_calls.clone(),
         );
 
@@ -4919,8 +4945,13 @@ mod tests {
                 ..PendingToolCall::default()
             },
         );
-        let previous =
-            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+        let previous = completed_file_state(
+            &first,
+            metadata.len(),
+            1,
+            Some(1),
+            first.pending_tool_calls.clone(),
+        );
 
         fs::OpenOptions::new()
             .append(true)
@@ -4958,8 +4989,13 @@ mod tests {
         fs::write(&path, r#"{"id":"s1","messages":[]}"#).expect("write session");
         let metadata = path.metadata().expect("session metadata");
         let (first, _) = prepare_file_task(path.clone(), SourceKind::Jcode, false, &metadata, None);
-        let previous =
-            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+        let previous = completed_file_state(
+            &first,
+            metadata.len(),
+            1,
+            Some(1),
+            first.pending_tool_calls.clone(),
+        );
 
         fs::OpenOptions::new()
             .append(true)
@@ -5003,6 +5039,7 @@ mod tests {
                 .unwrap_or(0),
             offset: metadata.len(),
             turn_id: 1,
+            legacy_turn_id: Some(1),
             parser_version: crate::sources::index_state_version(SourceKind::Claude)
                 .saturating_sub(1),
             pending_tool_calls: HashMap::from([(
@@ -5021,6 +5058,105 @@ mod tests {
         assert!(task.parser_version_invalidated);
         assert_eq!(task.offset, 0);
         assert!(task.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reader_identity_counter_survives_ingest_state_and_missing_counter_reparses() {
+        use crate::retrieval::canonical_record_id;
+        use serde_json::json;
+        use std::io::Write;
+        for source in [SourceKind::Codex, SourceKind::Claude] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("session.jsonl");
+            let (added, question, answer) = if source == SourceKind::Codex {
+                (
+                    json!({"type":"event_msg", "payload":{"type":"task_started", "turn_id":"turn"}}),
+                    json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":"Question"}}),
+                    json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":"Answer"}}),
+                )
+            } else {
+                (
+                    json!({"type":"user", "message":{"content":[{"type":"image", "source":{"type":"url", "url":"https://example.com/image.png"}}]}}),
+                    json!({"type":"user", "message":{"content":"Question"}}),
+                    json!({"type":"assistant", "message":{"content":"Answer"}}),
+                )
+            };
+            fs::write(&path, format!("{added}\n{question}\n")).unwrap();
+            let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
+            let next_doc_id = AtomicU64::new(1);
+            let (tx_record, rx_record, tx_update, rx_update) = parser_channels();
+            let parse = |task: &FileTask| match source {
+                SourceKind::Codex => parse_codex_session(
+                    task,
+                    false,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Claude => {
+                    parse_claude_file(task, false, &tx_record, &tx_update, &next_doc_id, &progress)
+                }
+                _ => unreachable!(),
+            };
+            let metadata = path.metadata().unwrap();
+            let (first, _) = prepare_file_task(path.clone(), source, false, &metadata, None);
+            parse(&first).unwrap();
+            let mut incremental = rx_record.try_iter().collect::<Vec<_>>();
+            let state = rx_update.try_recv().unwrap().state;
+            assert_eq!(state.turn_id, 2);
+            assert_eq!(state.legacy_turn_id, Some(1));
+            let serialized = serde_json::to_value(state).unwrap();
+            let persisted: FileState = serde_json::from_value(serialized.clone()).unwrap();
+            let mut missing_counter = serialized;
+            missing_counter
+                .as_object_mut()
+                .unwrap()
+                .remove("legacy_turn_id");
+            let missing_counter: FileState = serde_json::from_value(missing_counter).unwrap();
+            let (rebuild, skip) = prepare_file_task(
+                path.clone(),
+                source,
+                false,
+                &metadata,
+                Some(&missing_counter),
+            );
+            assert!(!skip);
+            assert!(rebuild.delete_first && rebuild.parser_version_invalidated);
+            assert_eq!(rebuild.offset, 0);
+            assert_eq!(rebuild.legacy_turn_id, Some(0));
+
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                "{answer}"
+            )
+            .unwrap();
+            let (resumed, _) = prepare_file_task(
+                path.clone(),
+                source,
+                false,
+                &path.metadata().unwrap(),
+                Some(&persisted),
+            );
+            assert!(!resumed.delete_first);
+            assert_eq!(resumed.legacy_turn_id, Some(1));
+            parse(&resumed).unwrap();
+            incremental.extend(rx_record.try_iter());
+            let state = rx_update.try_recv().unwrap().state;
+            assert_eq!(state.legacy_turn_id, Some(2));
+            assert_eq!(incremental.last().unwrap().links.legacy_turn_id, Some(1));
+            let (full, _) =
+                prepare_file_task(path.clone(), source, false, &path.metadata().unwrap(), None);
+            parse(&full).unwrap();
+            let full = rx_record.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                incremental
+                    .iter()
+                    .map(canonical_record_id)
+                    .collect::<Vec<_>>(),
+                full.iter().map(canonical_record_id).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
@@ -5049,6 +5185,7 @@ mod tests {
             mtime,
             offset: metadata.len() - 100,
             turn_id: 3,
+            legacy_turn_id: Some(3),
             parser_version: version,
             pending_tool_calls: HashMap::new(),
             identity,
@@ -5840,6 +5977,7 @@ mod tests {
             source: SourceKind::Pi,
             offset: existing.len() as u64,
             turn_id: 1,
+            legacy_turn_id: Some(1),
             size: (existing.len() + appended.len()) as u64,
             mtime: 0,
             delete_first: false,
@@ -5919,6 +6057,7 @@ mod tests {
             source: SourceKind::Copilot,
             offset: 0,
             turn_id: 0,
+            legacy_turn_id: Some(0),
             size: meta.len(),
             mtime: 0,
             delete_first: false,

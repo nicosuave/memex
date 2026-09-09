@@ -623,6 +623,7 @@ mod tests {
                 mtime: 0,
                 offset: 3,
                 turn_id: 0,
+                legacy_turn_id: None,
                 parser_version: 0,
                 pending_tool_calls: Default::default(),
                 identity: Default::default(),

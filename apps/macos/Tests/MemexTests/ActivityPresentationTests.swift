@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Memex
 
@@ -65,6 +66,19 @@ struct ActivityPresentationTests {
         #expect(original.presentation.title.hasSuffix("…"))
         #expect(original.records[0].record.toolInput == input)
         #expect(original.body == body)
+    }
+
+    @MainActor @Test func decodedClaudeEnvelopeFailuresStayVisibleWithPlainTextOutput() throws {
+        let data = Data(#"[{"record_id":"a","record":{"role":"tool_result","text":"ok","tool_output":"ok","tool_result_is_error":false}},{"record_id":"b","record":{"role":"tool_result","text":"permission denied","tool_output":"permission denied","tool_result_is_error":true}},{"record_id":"c","record":{"role":"tool_result","text":"ordinary"}}]"#.utf8)
+        let records = try JSONDecoder().decode([TranscriptRecord].self, from: data)
+        #expect(!TranscriptActivity(records: [records[0]]).presentation.hasFailure)
+        #expect(TranscriptActivity(records: [records[1]]).presentation.hasFailure)
+        #expect(!TranscriptActivity(records: [records[2]]).presentation.hasFailure)
+        let reader = TranscriptController()
+        reader.update(sessionID: "claude-errors", records: records, provider: "claude")
+        #expect(reader.rows.count == 3)
+        #expect(reader.measurement(at: 1).title.hasPrefix("Failed"))
+        #expect(records[1].rawTranscriptBody.contains("tool_result_is_error"))
     }
 
     private func activity(_ name: String?, input: String? = nil, output: String? = nil) -> TranscriptActivity {

@@ -2581,8 +2581,8 @@ struct MemorySurfaceSearchArgs {
 }
 
 enum UnifiedSearchResult {
-    Conversation(LocatedRecord),
-    Memory(LocatedMemoryHit),
+    Conversation(Box<LocatedRecord>),
+    Memory(Box<LocatedMemoryHit>),
 }
 
 impl UnifiedSearchResult {
@@ -2761,19 +2761,19 @@ fn collect_search_with_memories(
     let mut results = if content == SearchContent::Memories {
         memory_results
             .into_iter()
-            .map(UnifiedSearchResult::Memory)
+            .map(|result| UnifiedSearchResult::Memory(Box::new(result)))
             .collect::<Vec<_>>()
     } else {
         // Scores from independent conversation and memory indexes are not comparable. Rank each
         // corpus with reciprocal-rank fusion before merging them.
         let mut merged = Vec::with_capacity(conversation_results.len() + memory_results.len());
         for (rank, result) in conversation_results.into_iter().enumerate() {
-            let mut result = UnifiedSearchResult::Conversation(result);
+            let mut result = UnifiedSearchResult::Conversation(Box::new(result));
             result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
             merged.push(result);
         }
         for (rank, result) in memory_results.into_iter().enumerate() {
-            let mut result = UnifiedSearchResult::Memory(result);
+            let mut result = UnifiedSearchResult::Memory(Box::new(result));
             result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
             merged.push(result);
         }
@@ -2794,7 +2794,7 @@ fn collect_search_with_memories(
         match result {
             UnifiedSearchResult::Conversation(result) => {
                 let mut projected = project_located_results(
-                    vec![result],
+                    vec![*result],
                     &RenderOptions {
                         verbose: false,
                         pretty,
@@ -2816,7 +2816,7 @@ fn collect_search_with_memories(
                 values.extend(projected);
             }
             UnifiedSearchResult::Memory(result) => {
-                let mut projected = project_memory_result(result, &fields)?;
+                let mut projected = project_memory_result(*result, &fields)?;
                 if content == SearchContent::All
                     && fields.as_ref().is_none_or(|set| set.contains("kind"))
                 {

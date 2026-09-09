@@ -337,6 +337,7 @@ pub(crate) fn parse_index_records(
     }
 
     Ok(IndexParseOutput {
+        legacy_turn_id: None,
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls,

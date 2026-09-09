@@ -27,6 +27,7 @@ extension TranscriptActivity {
         }.first
         let failed = records.contains { entry in
             let message = entry.record
+            if message.role == "tool_result", message.toolResultIsError == true { return true }
             // A call's arguments may themselves contain error/status fields.
             if let output = message.toolOutput, Self.explicitFailure(output) { return true }
             return ["tool_result", "tool"].contains(message.role) && Self.explicitFailure(message.text)

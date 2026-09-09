@@ -690,6 +690,7 @@ pub(crate) fn parse_index_records(
         turn_id += 1;
     }
     Ok(IndexParseOutput {
+        legacy_turn_id: None,
         offset: 0,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
@@ -719,6 +720,7 @@ pub(crate) fn parse_database_records(
     require_modern_schema(&connection, path)?;
     let Some(session) = enumerate_session_from_connection(&connection, path, session_id)? else {
         return Ok(IndexParseOutput {
+            legacy_turn_id: None,
             offset: 0,
             turn_id: state.turn_id,
             pending_tool_calls: state.pending_tool_calls,
@@ -844,6 +846,7 @@ pub(crate) fn parse_database_records(
         )?;
     }
     Ok(IndexParseOutput {
+        legacy_turn_id: None,
         offset: 0,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,

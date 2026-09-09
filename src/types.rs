@@ -202,6 +202,12 @@ impl SourceFilter {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecordLinks {
+    /// Original parser ordinal for fallback IDs, independent of added display records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_turn_id: Option<u32>,
+    /// Disjoint identity for newly retained records that had no legacy ordinal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_record_offset: Option<u64>,
     /// Provider turn identity; `Record::turn_id` remains the ordered record sequence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_turn_id: Option<String>,
@@ -215,6 +221,9 @@ pub struct RecordLinks {
     /// Typed display content when a message includes attachments, serialized as JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_content: Option<String>,
+    /// Provider tool-result envelope status; distinct from the result body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

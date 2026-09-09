@@ -2581,6 +2581,9 @@ mod tests {
         let mut writer = index.writer().unwrap();
         let mut record = test_record(1, "Turn completed");
         record.links.source_turn_id = Some("provider-turn".to_string());
+        record.links.legacy_turn_id = Some(0);
+        record.links.source_record_offset = Some(123);
+        record.links.tool_result_is_error = Some(true);
         record.links.assistant_phase = Some("final_answer".to_string());
         record.links.lifecycle_event = Some("task_complete".to_string());
         record.links.source_record_type = Some("event_msg/task_complete".to_string());

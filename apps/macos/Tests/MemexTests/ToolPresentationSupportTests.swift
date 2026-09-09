@@ -47,7 +47,7 @@ struct ToolPresentationSupportTests {
             switch block {
             case .attributed(let text): return text.string
             case .code(let source, _), .markdown(let source): return source
-            case .attachment, .embeddedImage: return ""
+            case .attachment, .attachmentNotice, .embeddedImage: return ""
             }
         }.joined()
         #expect(combined == ToolContentRenderer.render([entry]).string)

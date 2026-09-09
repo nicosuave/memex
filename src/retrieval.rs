@@ -166,7 +166,13 @@ pub fn canonical_record_id(record: &Record) -> String {
     hash_field(&mut hasher, "source", record.source.storage_label());
     let has_native_event = record.links.event_id.is_some();
     let has_native_tool = record.role == "tool_use" && record.links.source_tool_use_id.is_some();
-    if has_native_event || has_native_tool {
+    if let Some(offset) = record.links.source_record_offset {
+        // Newly retained display records never occupied a legacy ordinal. Keep
+        // their physical source identity separate from both legacy and native IDs.
+        hash_field(&mut hasher, "session", &record.session_id);
+        hash_field(&mut hasher, "source-path", &record.source_path);
+        hash_field(&mut hasher, "source-record-offset", &offset.to_string());
+    } else if has_native_event || has_native_tool {
         // Event/tool IDs are source-native identities.  Do not include optional parent/thread
         // metadata here: parsers may learn to populate those fields later without changing the
         // identity of an already-indexed source event.
@@ -191,7 +197,15 @@ pub fn canonical_record_id(record: &Record) -> String {
         // remain distinct and deterministic across local index rebuilds.
         hash_field(&mut hasher, "session", &record.session_id);
         hash_field(&mut hasher, "source-path", &record.source_path);
-        hash_field(&mut hasher, "turn", &record.turn_id.to_string());
+        hash_field(
+            &mut hasher,
+            "turn",
+            &record
+                .links
+                .legacy_turn_id
+                .unwrap_or(record.turn_id)
+                .to_string(),
+        );
     }
     hash_field(&mut hasher, "role", &record.role);
     hash_field(

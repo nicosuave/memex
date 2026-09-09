@@ -30,11 +30,17 @@ enum SourceContent {
                 if source?["type"] as? String == "text", let text = source?["data"] as? String {
                     return .code(text, language: "text")
                 }
+                if source?["type"] as? String == "base64" || value["file_data"] != nil {
+                    let mime = source?["media_type"] as? String
+                    return .attachmentNotice(label: label,
+                        detail: "Embedded document" + (mime.map { " · " + $0 } ?? "") + ". Preview unavailable; contents are retained in the raw transcript.")
+                }
                 // Unavailable provider file IDs remain inspectable without treating
                 // their identifier as a local path or guessing a download URL.
                 if let id = value["file_id"] as? String {
-                    return .markdown("\(label) · `\(id)`\n\nAttachment is stored with the provider.")
+                    return .attachmentNotice(label: label, detail: "\(id) · Attachment is stored with the provider.")
                 }
+                return .attachmentNotice(label: label, detail: "Preview unavailable; attachment details are retained in the raw transcript.")
             }
             return nil
         }

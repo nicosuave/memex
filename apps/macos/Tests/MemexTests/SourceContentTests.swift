@@ -64,3 +64,33 @@ import Testing
     #expect(reader.rows.count == 3)
     #expect(reader.measurement(at: 1).title.hasPrefix("Cancelled"))
 }
+
+@MainActor @Test func embeddedAndUnavailableDocumentsHaveVisibleCardsAndPreserveRawPayload() throws {
+    let sources = [
+        #"[{"type":"document","title":"Report.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQ="}}]"#,
+        #"[{"type":"input_file","filename":"Report.pdf","file_data":"data:application/pdf;base64,JVBERi0xLjQ="}]"#,
+        #"[{"type":"input_file","filename":"Report.pdf","file_id":"file-123"}]"#,
+        #"[{"type":"document","title":"Report.pdf","source":{"type":"base64","media_type":"application/pdf","data":"invalid"}}]"#,
+        #"[{"type":"document","title":"Report.pdf","source":{"type":"unknown"}}]"#
+    ]
+    for source in sources {
+        let record = TranscriptRecord(recordID: "document", record: Message(role: "user", text: "", toolName: nil,
+            toolInput: nil, toolOutput: nil, sourceContent: source))
+        let reader = TranscriptController()
+        reader.view.frame = NSRect(x: 0, y: 0, width: 700, height: 500)
+        reader.update(sessionID: source, records: [record], provider: "claude")
+        let measurement = reader.measurement(at: 0)
+        let rich = try #require(measurement.richContent)
+        #expect(measurement.hasBody)
+        #expect(measurement.textHeight >= 70)
+        let card = try #require(rich.subviews.first as? AttachmentContentView)
+        let labels = card.subviews.compactMap { ($0 as? NSTextField)?.stringValue }
+        #expect(labels.contains("Report.pdf"))
+        #expect(labels.contains { $0.contains("raw transcript") || $0.contains("provider") })
+        #expect(card.subviews.compactMap { $0 as? NSButton }.allSatisfy { $0.isHidden })
+        #expect(record.record.sourceContent == source)
+        reader.update(sessionID: source, records: [record], provider: "claude", rawTranscript: true)
+        #expect(reader.measurement(at: 0).body.contains("source_content"))
+        #expect(reader.measurement(at: 0).body.contains("Report.pdf"))
+    }
+}

@@ -157,6 +157,7 @@ pub(crate) fn parse_index_records(
     let Ok(value) = simd_json::to_borrowed_value(&mut bytes) else {
         diagnostics.malformed_json_lines += 1;
         return Ok(IndexParseOutput {
+            legacy_turn_id: None,
             offset: JCODE_PARSE_ORIGIN,
             turn_id: state.turn_id,
             pending_tool_calls: state.pending_tool_calls,
@@ -506,6 +507,7 @@ pub(crate) fn parse_index_records(
     }
 
     Ok(IndexParseOutput {
+        legacy_turn_id: None,
         // Change marker only: resume always restarts at JCODE_PARSE_ORIGIN.
         offset: bytes_len,
         turn_id,

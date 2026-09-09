@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 pub const VERSIONS: ParserVersions = ParserVersions {
     // Recompute persisted identities and usage parents for guardian reviews.
     identity: 3,
-    // Reparse turn identity, assistant phase, and explicit lifecycle events.
-    index: 7,
+    // Preserve pre-reader fallback IDs independently of added display records.
+    index: 8,
     usage: 5,
 };
 
@@ -364,6 +364,14 @@ pub(crate) fn parse_index_records(
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    let mut legacy_turn_id = state.legacy_ordinal()?;
+    let mut emit = |mut record: Record| {
+        if record.links.source_record_offset.is_none() {
+            record.links.legacy_turn_id = Some(legacy_turn_id);
+            legacy_turn_id += 1;
+        }
+        emit(record)
+    };
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let mut start = state.offset as usize;
@@ -375,6 +383,7 @@ pub(crate) fn parse_index_records(
     let mut diagnostics = ParseDiagnostics::default();
 
     while start < mmap.len() {
+        let source_record_offset = start as u64;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
@@ -438,6 +447,7 @@ pub(crate) fn parse_index_records(
                 links.event_id = super::common::borrowed_string(payload, "id");
                 links.lifecycle_event = Some(event_type.to_string());
                 links.source_record_type = Some(format!("event_msg/{event_type}"));
+                links.source_record_offset = Some(source_record_offset);
                 emit(Record {
                     source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -578,6 +588,15 @@ pub(crate) fn parse_index_records(
                 let text = text_parts.join("\n").trim().to_string();
                 if text.is_empty() && links.source_content.is_none() {
                     continue;
+                }
+                // The old parser skipped every message with either prefix,
+                // including bundled requests and non-user roles. These records
+                // must not consume another source record's legacy identity.
+                if text.is_empty()
+                    || text.starts_with("<system_instruction>")
+                    || text.starts_with("<system-instruction>")
+                {
+                    links.source_record_offset = Some(source_record_offset);
                 }
                 // Keep injected instructions inspectable in raw transcripts. Only a
                 // standalone wrapper changes role; a bundled user request stays a user record.
@@ -852,6 +871,7 @@ pub(crate) fn parse_index_records(
     Ok(IndexParseOutput {
         offset: mmap.len() as u64,
         turn_id,
+        legacy_turn_id: Some(legacy_turn_id),
         pending_tool_calls,
         session_id: Some(metadata.session_id),
         diagnostics,
@@ -929,6 +949,7 @@ pub(crate) fn parse_history_records(
         turn_id += 1;
     }
     Ok(IndexParseOutput {
+        legacy_turn_id: Some(turn_id),
         offset: mmap.len() as u64,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
@@ -1574,6 +1595,179 @@ mod tests {
     }
 
     #[test]
+    fn reader_records_preserve_legacy_ids_across_full_and_incremental_parsing() {
+        use crate::retrieval::canonical_record_id;
+        use serde_json::json;
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let response = |payload| json!({"type":"response_item", "payload":payload});
+        // Every pre-reader emitting branch, including native IDs that still
+        // advance the ordinal used by subsequent id-less records.
+        let legacy = vec![
+            response(json!({"type":"message", "role":"user", "content":"Question"})),
+            response(json!({"type":"message", "role":"assistant", "content":"Commentary A"})),
+            response(
+                json!({"type":"message", "role":"assistant", "content":"Commentary B", "id":"native-answer"}),
+            ),
+            response(
+                json!({"type":"function_call", "name":"read", "call_id":"call", "arguments":"{}"}),
+            ),
+            response(
+                json!({"type":"function_call_output", "call_id":"call", "output":"read result"}),
+            ),
+            response(json!({"type":"custom_tool_call", "name":"custom", "input":"custom input"})),
+            response(json!({"type":"custom_tool_call_output", "output":"custom result"})),
+            response(json!({"type":"web_search_call", "query":"web input"})),
+            response(json!({"type":"tool_search_call", "arguments":"tool input"})),
+            response(json!({"type":"tool_search_output", "tools":[{"name":"found"}]})),
+            json!({"type":"event_msg", "payload":{"type":"agent_reasoning", "text":"Reasoning"}}),
+            response(json!({"type":"message", "role":"assistant", "content":""})),
+            response(json!({"type":"function_call_output", "output":""})),
+        ];
+        let added = vec![
+            json!({"type":"event_msg", "payload":{"type":"task_started", "turn_id":"turn"}}),
+            json!({"type":"event_msg", "payload":{"type":"task_complete", "turn_id":"turn"}}),
+            json!({"type":"event_msg", "payload":{"type":"turn_aborted", "turn_id":"turn"}}),
+            response(
+                json!({"type":"message", "role":"user", "content":[{"type":"input_image", "image_url":"/tmp/image.png"}]}),
+            ),
+            response(
+                json!({"type":"message", "role":"user", "content":[{"type":"input_file", "file_id":"file"}]}),
+            ),
+            response(
+                json!({"type":"message", "role":"user", "content":"  <system_instruction>context</system_instruction>"}),
+            ),
+            response(
+                json!({"type":"message", "role":"user", "content":"<system-instruction>context</system-instruction> Actual request"}),
+            ),
+            response(
+                json!({"type":"message", "role":"assistant", "content":"<system_instruction>unclosed prefix"}),
+            ),
+            response(
+                json!({"type":"message", "role":"developer", "content":"<system-instruction>context</system-instruction>"}),
+            ),
+        ];
+        let mut mixed = Vec::new();
+        for index in 0..legacy.len().max(added.len()) {
+            if let Some(value) = added.get(index) {
+                mixed.push(value.clone());
+            }
+            if let Some(value) = legacy.get(index) {
+                mixed.push(value.clone());
+            }
+        }
+        let encoded = |values: &[serde_json::Value]| {
+            values.iter().map(|v| format!("{v}\n")).collect::<String>()
+        };
+        for include_reasoning in [false, true] {
+            let parse = |state| {
+                let mut records = Vec::new();
+                let output = parse_index_records(
+                    &path,
+                    state,
+                    include_reasoning,
+                    &AtomicU64::new(1),
+                    |record| {
+                        records.push(record);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                (records, output)
+            };
+            fs::write(&path, encoded(&legacy)).unwrap();
+            let (baseline, _) = parse(IndexParseState::default());
+            assert_eq!(baseline.len(), 10 + usize::from(include_reasoning));
+            // Strip the added identity fields to calculate precisely the old
+            // canonical hash from each pre-reader ordinal and source identity.
+            let baseline_ids = baseline
+                .iter()
+                .enumerate()
+                .map(|(ordinal, record)| {
+                    let mut original = record.clone();
+                    original.turn_id = ordinal as u32;
+                    original.links.legacy_turn_id = None;
+                    original.links.source_record_offset = None;
+                    canonical_record_id(&original)
+                })
+                .collect::<Vec<_>>();
+            fs::write(&path, encoded(&mixed)).unwrap();
+            let (full, output) = parse(IndexParseState::default());
+            let old_records = full
+                .iter()
+                .filter(|record| record.links.source_record_offset.is_none())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                old_records
+                    .iter()
+                    .map(|record| canonical_record_id(record))
+                    .collect::<Vec<_>>(),
+                baseline_ids
+            );
+            assert_eq!(
+                old_records
+                    .iter()
+                    .map(|record| &record.text)
+                    .collect::<Vec<_>>(),
+                baseline
+                    .iter()
+                    .map(|record| &record.text)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(output.legacy_turn_id, Some(baseline.len() as u32));
+            assert_eq!(full.len(), baseline.len() + added.len());
+            let full_ids = full.iter().map(canonical_record_id).collect::<Vec<_>>();
+            assert_eq!(full_ids.iter().collect::<HashSet<_>>().len(), full.len());
+
+            fs::write(&path, "").unwrap();
+            let mut state = IndexParseState::default();
+            let mut incremental = Vec::new();
+            for value in &mixed {
+                writeln!(
+                    fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                    "{value}"
+                )
+                .unwrap();
+                let (records, output) = parse(state);
+                incremental.extend(records);
+                state = IndexParseState {
+                    offset: output.offset,
+                    turn_id: output.turn_id,
+                    legacy_turn_id: output.legacy_turn_id,
+                    pending_tool_calls: output.pending_tool_calls,
+                };
+            }
+            assert_eq!(
+                incremental
+                    .iter()
+                    .map(canonical_record_id)
+                    .collect::<Vec<_>>(),
+                full_ids
+            );
+            assert_eq!(
+                incremental.iter().map(|r| r.turn_id).collect::<Vec<_>>(),
+                full.iter().map(|r| r.turn_id).collect::<Vec<_>>()
+            );
+            assert_eq!(state.legacy_turn_id, Some(baseline.len() as u32));
+            assert!(
+                parse_index_records(
+                    &path,
+                    IndexParseState {
+                        offset: state.offset,
+                        turn_id: state.turn_id,
+                        ..IndexParseState::default()
+                    },
+                    include_reasoning,
+                    &AtomicU64::new(1),
+                    |_| Ok(())
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn structured_tool_values_preserve_json_and_verbatim_strings() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session.jsonl");
@@ -1758,6 +1952,7 @@ mod tests {
             IndexParseState {
                 offset: first.offset,
                 turn_id: first.turn_id,
+                legacy_turn_id: first.legacy_turn_id,
                 ..IndexParseState::default()
             },
         );
@@ -1770,6 +1965,7 @@ mod tests {
             IndexParseState {
                 offset: second.offset,
                 turn_id: second.turn_id,
+                legacy_turn_id: second.legacy_turn_id,
                 ..IndexParseState::default()
             },
         );

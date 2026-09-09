@@ -107,6 +107,7 @@ struct TranscriptRecord: Decodable, Identifiable, Equatable, Sendable {
             if let value { fields[key] = .string(value) }
         }
         if let content = record.sourceContent { fields["source_content"] = .string(content) }
+        if let isError = record.toolResultIsError { fields["tool_result_is_error"] = .bool(isError) }
         return (try? RawTranscriptJSON.object(["record_id": .string(sourceID), "record": .object(fields)]).prettyPrinted()) ?? record.text
     }
 }
@@ -124,6 +125,7 @@ struct Message: Decodable, Equatable, Sendable {
     var lifecycleEvent: String? = nil
     var sourceRecordType: String? = nil
     var sourceContent: String? = nil
+    var toolResultIsError: Bool? = nil
     // Display-only classification; source records and serialized content stay intact.
     var contextLabel: String? = nil
 
@@ -134,6 +136,7 @@ struct Message: Decodable, Equatable, Sendable {
         case sourceTurnID = "source_turn_id", assistantPhase = "assistant_phase"
         case lifecycleEvent = "lifecycle_event", sourceRecordType = "source_record_type"
         case sourceContent = "source_content"
+        case toolResultIsError = "tool_result_is_error"
     }
 
     var isActivity: Bool { ["tool_use", "tool_result", "tool", "reasoning"].contains(role) }
