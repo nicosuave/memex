@@ -165,6 +165,12 @@ struct IndexArgs {
     /// Skip indexing Muse sessions
     #[arg(long = "no-muse", default_value_t = false, hide = true)]
     no_muse: bool,
+    /// Index Antigravity conversations from ~/.gemini [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    antigravity: bool,
+    /// Skip indexing Antigravity conversations
+    #[arg(long = "no-antigravity", default_value_t = false, hide = true)]
+    no_antigravity: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2156,6 +2162,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_grok: index.source_enabled(IndexSource::Grok),
         include_jcode: index.source_enabled(IndexSource::Jcode),
         include_muse: index.source_enabled(IndexSource::Muse),
+        include_antigravity: index.source_enabled(IndexSource::Antigravity),
         exclude_patterns: excludes,
         embeddings,
         backfill_embeddings: false,
@@ -5539,6 +5546,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Hermes => "hermes",
         crate::types::SourceKind::Jcode => "jcode",
         crate::types::SourceKind::Muse => "muse",
+        crate::types::SourceKind::Antigravity => "antigravity",
     };
     let source_path = &record.source_path;
 
@@ -8192,6 +8200,7 @@ mod tests {
             grok: false,
             jcode: false,
             muse: false,
+            antigravity: false,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8201,6 +8210,7 @@ mod tests {
             no_grok: false,
             no_jcode: false,
             no_muse: false,
+            no_antigravity: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8249,6 +8259,7 @@ mod tests {
             grok: true,
             jcode: true,
             muse: true,
+            antigravity: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8258,6 +8269,7 @@ mod tests {
             no_grok: false,
             no_jcode: false,
             no_muse: false,
+            no_antigravity: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8300,6 +8312,7 @@ mod tests {
             grok: true,
             jcode: true,
             muse: true,
+            antigravity: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8309,6 +8322,7 @@ mod tests {
             no_grok: false,
             no_jcode: false,
             no_muse: false,
+            no_antigravity: false,
             embeddings: false,
             no_embeddings: false,
             model: None,
@@ -8353,6 +8367,7 @@ mod tests {
             grok: true,
             jcode: true,
             muse: true,
+            antigravity: true,
             no_codex: false,
             no_opencode: false,
             no_pi: false,
@@ -8362,6 +8377,7 @@ mod tests {
             no_grok: false,
             no_jcode: false,
             no_muse: false,
+            no_antigravity: false,
             embeddings: false,
             no_embeddings: false,
             model: None,

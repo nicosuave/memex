@@ -1546,6 +1546,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Muse => {
             crate::sources::muse::cwd_from_muse_session(Path::new(&first.source_path))
         }
+        SourceKind::Antigravity => {
+            crate::sources::antigravity::session_cwd(Path::new(&first.source_path))
+        }
     }
     .filter(|path| path.is_dir())
 }

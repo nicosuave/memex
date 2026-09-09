@@ -101,6 +101,13 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(
+        SourceKind::Antigravity,
+        super::antigravity::discover()
+            .into_iter()
+            .map(|file| file.path)
+            .collect(),
+    );
 
     push(
         SourceKind::Omp,
@@ -134,6 +141,14 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
             // Hermes usage truth is SQLite aggregate data. Audit must not
             // reinterpret the database as JSON, and in particular must not
             // read transcript/message columns: count the file, skip content.
+            continue;
+        }
+        if source == SourceKind::Antigravity
+            && file.file_name().and_then(|name| name.to_str()) != Some("overview.txt")
+        {
+            // Antigravity conversation stores are SQLite. Audit must not
+            // reinterpret the database as JSON: count the file, skip content.
+            // overview.txt transcripts are JSONL and audit normally below.
             continue;
         }
         let Ok(file) = std::fs::File::open(file) else {
@@ -332,6 +347,12 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         SourceKind::Hermes => {
             if value.get("records").and_then(Value::as_array).is_some() {
                 increment(&mut audit.semantic_types, "records");
+            }
+        }
+        SourceKind::Antigravity => {
+            increment(&mut audit.semantic_types, top_level);
+            if value.get("tool_calls").and_then(Value::as_array).is_some() {
+                increment(&mut audit.semantic_types, "tool_calls");
             }
         }
     }

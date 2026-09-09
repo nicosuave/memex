@@ -165,6 +165,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_muse {
         roots.push(crate::sources::muse::sessions_root());
     }
+    if options.include_antigravity {
+        roots.push(crate::sources::antigravity::sessions_root());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -203,13 +206,18 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
     }
     let mut paths = Vec::with_capacity(event.paths.len());
     for path in &event.paths {
-        // OpenCode commits can live entirely in the WAL until checkpoint.
+        // SQLite commits can live entirely in the WAL until checkpoint.
         // Route the hint to the database that ingestion knows how to read.
         if let Some(name) = path
             .file_name()
             .and_then(|name| name.to_str())
             .and_then(|name| name.strip_suffix("-wal"))
-            .filter(|name| crate::sources::opencode::is_database_path(name))
+            .filter(|name| {
+                let database = path.with_file_name(name);
+                crate::sources::opencode::is_database_path(name)
+                    || (crate::sources::antigravity::is_db_path(&database)
+                        && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
+            })
         {
             let database = path.with_file_name(name);
             if !excluder.is_excluded(path) && !excluder.is_excluded(&database) {
@@ -272,6 +280,11 @@ pub(crate) fn dirty_needs_ingest(paths: &Paths, dirty: &HashSet<PathBuf>) -> Res
         let Some(previous) = state.files.get(&key) else {
             return Ok(true);
         };
+        if let Some(wal) = &previous.identity.sqlite_wal
+            && *wal != crate::state::SqliteWalIdentity::read(path)
+        {
+            return Ok(true);
+        }
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -659,9 +672,9 @@ impl WatchService {
     /// macOS; everywhere else events plus the resync timer suffice.
     ///
     /// Cost is bounded: `ingest.json` is re-parsed only when it changed, and
-    /// only files ingested within `window` are stat-compared. Cold history
-    /// is rediscovered through events/resync. Each tracked OpenCode database
-    /// also needs two stats: its main file and its possibly held-open WAL.
+    /// ordinary files are stat-compared only within `window`. Cold file history
+    /// is rediscovered through events/resync. Each tracked OpenCode or Antigravity
+    /// database also needs two stats regardless of age: its main file and WAL.
     pub(crate) fn hot_sweep_dirty(
         &mut self,
         paths: &Paths,
@@ -683,7 +696,7 @@ impl WatchService {
                 state
                     .files
                     .iter()
-                    .filter(|(_, file)| file.mtime >= cutoff)
+                    .filter(|(_, file)| file.mtime >= cutoff && file.identity.sqlite_wal.is_none())
                     .map(|(key, file)| {
                         (
                             key.clone(),
@@ -696,13 +709,24 @@ impl WatchService {
                     })
                     .collect(),
             );
-            self.hot_databases.retain(|path, _| {
-                state
-                    .opencode_databases
-                    .contains_key(path.to_string_lossy().as_ref())
-            });
-            for key in state.opencode_databases.keys() {
-                self.hot_databases.entry(PathBuf::from(key)).or_insert(None);
+            // Keep databases even when their main-file mtime is old: active
+            // writers may commit exclusively to the WAL for the whole session.
+            let databases = state
+                .opencode_databases
+                .keys()
+                .chain(
+                    state
+                        .files
+                        .iter()
+                        .filter(|(_, file)| file.identity.sqlite_wal.is_some())
+                        .map(|(key, _)| key),
+                )
+                .map(PathBuf::from)
+                .collect::<HashSet<_>>();
+            self.hot_databases
+                .retain(|path, _| databases.contains(path));
+            for path in databases {
+                self.hot_databases.entry(path).or_insert(None);
             }
             self.hot_state_mtime = state_mtime;
         }
@@ -773,6 +797,7 @@ mod tests {
             include_grok: true,
             include_jcode: true,
             include_muse: true,
+            include_antigravity: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -883,6 +908,7 @@ mod tests {
         options.include_grok = false;
         options.include_jcode = false;
         options.include_muse = false;
+        options.include_antigravity = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -947,7 +973,11 @@ mod tests {
     fn wal_events_target_database_and_honor_database_exclusions() {
         let _guard = env_lock();
         let mut options = test_options();
-        for name in ["opencode.db", "opencode-work.db"] {
+        for name in [
+            "opencode.db",
+            "opencode-work.db",
+            "antigravity-ide/conversations/session.db",
+        ] {
             let database = PathBuf::from(format!("/tmp/sessions/{name}"));
             let wal = PathBuf::from(format!("/tmp/sessions/{name}-wal"));
             let event = Event {
@@ -1288,6 +1318,7 @@ mod tests {
             parser_version: 1,
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity {
+                sqlite_wal: None,
                 device: None,
                 inode: None,
                 prefix_sha256: None,
@@ -1430,16 +1461,31 @@ mod tests {
     #[test]
     fn hot_sweep_observes_held_open_database_wal_commits() {
         let _guard = env_lock();
-        for name in ["opencode.db", "opencode-work.db"] {
+        for name in [
+            "opencode.db",
+            "opencode-work.db",
+            "antigravity-ide/conversations/session.db",
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
             let database = temp.path().join(name);
+            std::fs::create_dir_all(database.parent().unwrap()).unwrap();
             let writer = rusqlite::Connection::open(&database).unwrap();
             writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE messages (body TEXT);").unwrap();
             let mut state = IngestState::default();
-            state
-                .opencode_databases
-                .insert(database.to_string_lossy().into_owned(), Default::default());
+            if name.starts_with("antigravity") {
+                let mut file = file_state_for(&database);
+                file.identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&database));
+                // Main DB age must not remove WAL-backed databases from the sweep.
+                file.mtime = 1;
+                state
+                    .files
+                    .insert(database.to_string_lossy().into_owned(), file);
+            } else {
+                state
+                    .opencode_databases
+                    .insert(database.to_string_lossy().into_owned(), Default::default());
+            }
             state.save(&paths.state.join("ingest.json")).unwrap();
             let mut service = test_service();
             // A newly tracked database gets one conservative reconciliation.

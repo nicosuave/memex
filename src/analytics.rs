@@ -1382,6 +1382,11 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd.to_string_lossy().to_string());
     }
+    if source == SourceKind::Antigravity
+        && let Some(cwd) = crate::sources::antigravity::session_cwd(Path::new(source_path))
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;

@@ -7,6 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileIdentity {
+    /// SQLite commits can change only the WAL while the main file stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite_wal: Option<SqliteWalIdentity>,
     /// Stable filesystem identity when the platform exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<u64>,
@@ -22,6 +25,37 @@ pub struct FileIdentity {
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SqliteWalIdentity {
+    pub exists: bool,
+    pub size: u64,
+    pub modified_ns: Option<i64>,
+}
+
+impl SqliteWalIdentity {
+    pub fn read(database: &Path) -> Self {
+        let mut wal = database.as_os_str().to_os_string();
+        wal.push("-wal");
+        let Ok(metadata) = fs::metadata(Path::new(&wal)) else {
+            return Self::default();
+        };
+        // Opening a checkpointed WAL-mode database can create an empty WAL.
+        // Its creation/removal contains no commits and must not cause a reparse loop.
+        if metadata.len() == 0 {
+            return Self::default();
+        }
+        Self {
+            exists: true,
+            size: metadata.len(),
+            modified_ns: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

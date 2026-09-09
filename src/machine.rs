@@ -2558,6 +2558,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         include_grok: true,
         include_jcode: true,
         include_muse: true,
+        include_antigravity: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),
         backfill_embeddings: false,
