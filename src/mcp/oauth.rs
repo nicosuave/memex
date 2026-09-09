@@ -1276,11 +1276,18 @@ fn open_database_path(path: &Path, create: bool) -> Result<Connection> {
             create_private_file(path)?;
         }
     }
+    // SQLite's NOFOLLOW flag rejects macOS's system-level /var -> /private/var
+    // alias even though it is not a user-controlled database symlink. Validate
+    // the requested final file first, then open its canonical path so that
+    // trusted directory aliases work without allowing a symlink database file.
     validate_private_file(path)?;
+    let canonical_path = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize OAuth database {}", path.display()))?;
+    validate_private_file(&canonical_path)?;
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let connection = Connection::open_with_flags(path, flags)
+    let connection = Connection::open_with_flags(&canonical_path, flags)
         .with_context(|| format!("failed to open OAuth database {}", path.display()))?;
     connection.busy_timeout(Duration::from_millis(250))?;
     connection.pragma_update(None, "foreign_keys", "on")?;
