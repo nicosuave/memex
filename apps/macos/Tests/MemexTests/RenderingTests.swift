@@ -5,6 +5,55 @@ import Testing
 
 @Suite(.serialized) @MainActor
 struct RenderingTests {
+    @Test func messagesUseUnlabelledContentSizedBubblesAndKeepAccessibleSpeakers() throws {
+        let controller = TranscriptController()
+        let window = readerWindow(controller)
+        defer { window.close() }
+        let records = ["user", "assistant"].enumerated().map { index, role in
+            TranscriptRecord(recordID: "clean-\(index)", record: Message(role: role, text: "Short reply",
+                toolName: nil, toolInput: nil, toolOutput: nil))
+        }
+        controller.update(sessionID: "clean", records: records, provider: "codex")
+        pump(window)
+        #expect(controller.measurement(at: 0).contentWidth < 150)
+        for row in 0..<2 {
+            let cell = try #require(controller.table.view(atColumn: 0, row: row, makeIfNecessary: true))
+            cell.layoutSubtreeIfNeeded()
+            #expect(descendants(of: cell, as: NSTextField.self).allSatisfy {
+                $0.isHiddenOrHasHiddenAncestor || !["You", "codex"].contains($0.stringValue)
+            })
+            let text = try #require(descendants(of: cell, as: NSTextView.self).first)
+            #expect(text.accessibilityLabel() == (row == 0 ? "You" : "codex"))
+            #expect(text.isSelectable)
+            #expect(text.frame.maxY <= controller.measurement(at: row).height)
+        }
+    }
+
+    @Test func userBubblesWrapWithinReaderAtNarrowAndWideSizes() throws {
+        let controller = TranscriptController()
+        let window = readerWindow(controller)
+        defer { window.close() }
+        let record = TranscriptRecord(recordID: "wrapped", record: Message(role: "user",
+            text: String(repeating: "A longer message that needs room to wrap. ", count: 30),
+            toolName: nil, toolInput: nil, toolOutput: nil))
+        controller.update(sessionID: "wrapped", records: [record], provider: "codex")
+        for width in [350.0, 700.0, 1200.0] {
+            window.setContentSize(NSSize(width: width, height: 600))
+            pump(window)
+            let readerWidth = controller.table.bounds.width
+            let value = controller.measurement(at: 0)
+            #expect(value.contentWidth <= min(800, readerWidth - 60) * 0.77)
+            #expect(abs(value.contentX + value.contentWidth - (readerWidth - 30)) < 1)
+            let cell = try #require(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true))
+            cell.layoutSubtreeIfNeeded()
+            let text = try #require(descendants(of: cell, as: NSTextView.self).first)
+            let manager = try #require(text.layoutManager)
+            let container = try #require(text.textContainer)
+            manager.ensureLayout(for: container)
+            #expect(manager.usedRect(for: container).height <= value.fullTextHeight + 1)
+        }
+    }
+
     @Test func wideReaderKeepsAssistantAndToolsAtLeftGutter() {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 1600, height: 700)
@@ -59,7 +108,11 @@ struct RenderingTests {
             let manager = try #require(text.layoutManager)
             let container = try #require(text.textContainer)
             manager.ensureLayout(for: container)
-            #expect(manager.usedRect(for: container).height <= measured.textHeight + 1)
+            if let rich = measured.richContent {
+                #expect(rich.height(for: measured.contentWidth) == measured.fullTextHeight)
+            } else {
+                #expect(manager.usedRect(for: container).height <= measured.fullTextHeight + 1)
+            }
             if width == 500, let path = ProcessInfo.processInfo.environment["MEMEX_RENDER_SNAPSHOT"],
                let bitmap = cell.bitmapImageRepForCachingDisplay(in: cell.bounds) {
                 cell.wantsLayer = true
@@ -149,7 +202,7 @@ struct RenderingTests {
         #expect(controller.measurement(at: 0).body == "Complete instructions")
     }
 
-    @Test func messagesShowFullTextWithoutCharacterCounterControls() throws {
+    @Test func longMessagesRetainFullSelectableTextBehindShowAll() throws {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 600)
         let text = String(repeating: "Complete message content. ", count: 400) + "END OF MESSAGE"
@@ -161,7 +214,10 @@ struct RenderingTests {
             #expect(controller.measurement(at: row).body == text)
             let cell = try #require(controller.table.view(atColumn: 0, row: row, makeIfNecessary: true))
             #expect(descendants(of: cell, as: NSTextView.self).contains { $0.string.hasSuffix("END OF MESSAGE") })
-            #expect(descendants(of: cell, as: NSButton.self).allSatisfy { $0.isHidden })
+            #expect(descendants(of: cell, as: NSButton.self).contains { !$0.isHidden && $0.title == "Show all" })
+            #expect(controller.measurement(at: row).textHeight < controller.measurement(at: row).fullTextHeight)
+            controller.toggleFullBody(controller.rows[row].id)
+            #expect(controller.measurement(at: row).textHeight == controller.measurement(at: row).fullTextHeight)
         }
     }
 
@@ -308,6 +364,15 @@ struct RenderingTests {
         let index = try #require(controller.rows.firstIndex { $0.id == "activity:tool" })
         #expect(controller.measurement(at: index).body == "matching tool content")
         #expect(abs(controller.scrollView.contentView.bounds.minY - controller.table.rect(ofRow: index).minY) < 1)
+    }
+
+    private func readerWindow(_ controller: TranscriptController) -> NSWindow {
+        _ = NSApplication.shared
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 600),
+                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = controller
+        return window
     }
 
     private func simpleRecords(_ range: Range<Int>) -> [TranscriptRecord] {

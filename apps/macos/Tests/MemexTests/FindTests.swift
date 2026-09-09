@@ -51,15 +51,15 @@ struct FindTests {
         #expect(controller.selectedFindRange?.location == 13)
     }
 
-    @Test func hiddenMarkdownSourceMatchDoesNotSelectAnotherVisibleOccurrence() {
+    @Test func hiddenMarkdownSourceMatchRevealsAndSelectsItsOriginalOccurrence() {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 400)
         let record = entry("link", "[label](https://example.com/needle) needle")
         let hit = ConversationMatcher.matches([record], query: "needle")[0]
         controller.update(sessionID: "link", records: [record], provider: "codex",
                           findQuery: "needle", findHit: hit, findGeneration: 1)
-        #expect(controller.measurement(at: 0).attributedBody.string == "label needle")
-        #expect(controller.selectedFindRange == nil)
+        #expect(controller.measurement(at: 0).attributedBody.string == record.record.text)
+        #expect(controller.selectedFindRange == NSRange(location: 28, length: 6))
     }
 
     @Test func scansBeyondFirstPageAndIsolatesCancelledQueryAndSession() async throws {

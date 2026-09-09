@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Observation
 
 /// AppKit owns transcript scrolling and row reuse. SwiftUI never estimates the
 /// height of a lazy transcript row or feeds those estimates back into layout.
@@ -18,6 +19,11 @@ struct NativeTranscript: NSViewControllerRepresentable {
     var findQuery = ""
     var findHit: ConversationFindHit?
     var findGeneration = 0
+    var rawTranscript = false
+    var isLocalHost = false
+    var sourcePath = ""
+    var requestedRecordID: String?
+    var requestGeneration = 0
 
     func makeNSViewController(context: Context) -> TranscriptController { TranscriptController() }
     func updateNSViewController(_ controller: TranscriptController, context: Context) {
@@ -25,19 +31,25 @@ struct NativeTranscript: NSViewControllerRepresentable {
                           hasMore: hasMore, isLoading: isLoading, onLoadMore: onLoadMore,
                           hasEarlier: hasEarlier, startsAtEnd: startsAtEnd, anchorID: anchorID,
                           navigation: navigation, onLoadEarlier: onLoadEarlier,
-                          findQuery: findQuery, findHit: findHit, findGeneration: findGeneration)
+                          findQuery: findQuery, findHit: findHit, findGeneration: findGeneration,
+                          rawTranscript: rawTranscript, isLocalHost: isLocalHost, sourcePath: sourcePath,
+                          requestedRecordID: requestedRecordID, requestGeneration: requestGeneration)
     }
 }
 
 /// In-memory reading positions outlive the controller when the selection is empty.
-@MainActor final class TranscriptNavigationState {
+@Observable @MainActor final class TranscriptNavigationState {
     struct Position {
         let recordID: String
         let offset: CGFloat
         let expanded: Set<String>
+        var fullBodies: Set<String> = []
+        var rawRows: Set<String> = []
+        var rowID: String? = nil
     }
-    var positions: [String: Position] = [:]
-    private var order: [String] = []
+    @ObservationIgnored var positions: [String: Position] = [:]
+    var visibleRecordID: String?
+    @ObservationIgnored private var order: [String] = []
 
     func save(_ position: Position, for key: String) {
         positions[key] = position
@@ -54,13 +66,20 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     private(set) var rows: [Row] = []
     private var sessionID = ""
     private var records: [TranscriptRecord] = []
+    private var groupedItems: [TranscriptItem] = []
     private var provider = ""
     private var expanded = Set<String>()
     private var rawTools = Set<String>()
+    private var fullBodies = Set<String>()
+    private var rawTranscript = false
+    private var isLocalHost = false
+    private var sourcePath = ""
+    private var appliedRequestGeneration = -1
     private var measurements: [String: Measurement] = [:]
     private var measuredWidth: CGFloat = 0
     private var notifiedWidth: CGFloat = 0
     private var textLayouts: [String: TranscriptTextLayout] = [:]
+    private var richLayouts: [String: RichContentView] = [:]
     private var findRecordBodies: [String: String] = [:]
     private var hasMore = false
     private var isLoading = false
@@ -101,6 +120,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     struct Measurement {
+        let rowID: String
         let title: String
         let body: String
         let attributedBody: NSAttributedString
@@ -115,6 +135,16 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let showsRawControl: Bool
         let showsRaw: Bool
         let finding: Bool
+        let symbolName: String?
+        let hasFailure: Bool
+        var isLong = false
+        var showsFullBody = false
+        var fullTextHeight: CGFloat = 0
+        var originalRecords: [TranscriptRecord] = []
+        var originalBody: String { originalRecords.map { $0.rawTranscriptBody }.joined(separator: "\n\n") }
+        var richContent: RichContentView?
+        var isLocalHost = false
+        var hasBody: Bool { !body.isEmpty || richContent != nil }
     }
 
     override func loadView() {
@@ -141,6 +171,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(scrolled),
             name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(refreshVisibleActions), name: name, object: nil)
+        }
         view = scrollView
     }
 
@@ -148,9 +181,15 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 hasMore: Bool = false, isLoading: Bool = false, onLoadMore: (() -> Void)? = nil,
                 hasEarlier: Bool = false, startsAtEnd: Bool = false, anchorID: String? = nil,
                 navigation: TranscriptNavigationState? = nil, onLoadEarlier: (() -> Void)? = nil,
-                findQuery: String = "", findHit: ConversationFindHit? = nil, findGeneration: Int = 0) {
+                findQuery: String = "", findHit: ConversationFindHit? = nil, findGeneration: Int = 0,
+                rawTranscript: Bool = false, isLocalHost: Bool = false, sourcePath: String = "",
+                requestedRecordID: String? = nil, requestGeneration: Int = 0) {
         _ = view
         let changedSession = self.sessionID != sessionID
+        let changedMode = self.rawTranscript != rawTranscript
+        self.rawTranscript = rawTranscript
+        self.isLocalHost = isLocalHost
+        self.sourcePath = sourcePath
         let changedQuery = self.findQuery != findQuery
         let changedFind = self.findQuery != findQuery || self.findHit != findHit || self.findGeneration != findGeneration
         self.findQuery = findQuery
@@ -166,7 +205,16 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             measurements.removeAll(keepingCapacity: true)
             textLayouts.removeAll(keepingCapacity: true)
         }
-        defer { applyFindPosition() }
+        defer {
+            applyFindPosition()
+            if let requestedRecordID, appliedRequestGeneration != requestGeneration,
+               let row = rowIndex(for: requestedRecordID) {
+                table.scrollRowToVisible(row)
+                appliedRequestGeneration = requestGeneration
+                savePosition()
+            }
+            savePosition()
+        }
         if changedSession { savePosition() }
         if let navigation { self.navigation = navigation }
         self.hasEarlier = hasEarlier
@@ -179,7 +227,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         self.hasMore = hasMore
         self.isLoading = isLoading
         self.onLoadMore = onLoadMore
-        guard changedSession || self.records != records || self.provider != provider else {
+        guard changedSession || changedMode || changedFind || self.records != records || self.provider != provider else {
             if changedQuery { table.reloadData() }
             return
         }
@@ -192,6 +240,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             // The final tool/instruction group may gain records across pages.
             measurements.removeValue(forKey: last.id)
             textLayouts.removeValue(forKey: last.id)
+            richLayouts.removeValue(forKey: last.id)
         }
         findRecordBodies.removeAll(keepingCapacity: true)
         self.sessionID = sessionID
@@ -200,7 +249,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         if changedSession {
             table.minimumDocumentHeight = 0
             needsInitialPosition = true
-            rawTools.removeAll()
+            rawTools = self.navigation.positions[sessionID]?.rawRows ?? []
+            fullBodies = self.navigation.positions[sessionID]?.fullBodies ?? []
+            appliedRequestGeneration = -1
             expanded = self.navigation.positions[sessionID]?.expanded ?? []
         }
         if needsInitialPosition, self.navigation.positions[sessionID] == nil, let anchorID,
@@ -211,7 +262,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 expanded.insert("activity:\(activity.id)")
             }
         }
-        rebuildRows(resetMeasurements: !appendOnly)
+        rebuildRows(resetMeasurements: !appendOnly || changedMode || changedQuery)
         if needsInitialPosition {
             applyInitialPosition()
         } else if let visiblePosition {
@@ -304,6 +355,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             if case .group = row { return false }
             return row.records.contains { $0.id == recordID }
         } ?? rows.firstIndex { $0.records.contains { $0.id == recordID } }
+          ?? rows.firstIndex { $0.records.contains { $0.sourceID == recordID } }
     }
 
     private func currentPosition() -> TranscriptNavigationState.Position? {
@@ -311,16 +363,22 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let y = scrollView.contentView.bounds.minY
         let row = table.row(at: NSPoint(x: 1, y: y + 1))
         guard rows.indices.contains(row) else { return nil }
-        return .init(recordID: recordID(at: row), offset: y - table.rect(ofRow: row).minY,
-                     expanded: expanded)
+        return .init(recordID: rows[row].records[0].sourceID, offset: y - table.rect(ofRow: row).minY,
+                     expanded: expanded, fullBodies: fullBodies, rawRows: rawTools, rowID: rows[row].id)
     }
 
     private func savePosition() {
-        if let position = currentPosition() { navigation.save(position, for: sessionID) }
+        if let position = currentPosition() {
+            navigation.save(position, for: sessionID)
+            let navigation = navigation
+            Task { @MainActor in
+                if navigation.visibleRecordID != position.recordID { navigation.visibleRecordID = position.recordID }
+            }
+        }
     }
 
     private func restore(_ position: TranscriptNavigationState.Position) {
-        guard let row = rowIndex(for: position.recordID) else { return }
+        guard let row = rows.firstIndex(where: { $0.id == position.rowID }) ?? rowIndex(for: position.recordID) else { return }
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, table.rect(ofRow: row).minY + position.offset)))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
@@ -344,7 +402,14 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
-    private func rebuildRows(resetMeasurements: Bool = false) {
+    private func rebuildRows(resetMeasurements: Bool = false, regroup: Bool = true) {
+        if regroup {
+            groupedItems = rawTranscript ? [] : TranscriptItem.group(records).map { entry in
+                var item = entry
+                if item.isActivity || item.isInstructions { item.groupedActivities = item.activities }
+                return item
+            }
+        }
         let previous = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let openedRecords = Set(rows.filter {
             if case .activity = $0 { return expanded.contains($0.id) }
@@ -354,31 +419,63 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             if case .activity(_, false) = $0 { return expanded.contains($0.id) }
             return false
         }.flatMap(\.records).map(\.id))
-        rows = TranscriptItem.group(records).flatMap { item -> [Row] in
+        let openedGroupRecords = Set(rows.filter {
+            if case .group = $0 { return expanded.contains($0.id) }
+            return false
+        }.flatMap(\.records).map(\.id))
+        rows = rawTranscript ? records.map { .message($0) } : groupedItems.flatMap { item -> [Row] in
             guard item.isActivity || item.isInstructions else { return [.message(item.records[0])] }
             let activities = item.activities
             for activity in activities where activity.records.contains(where: { openedRecords.contains($0.id) }) {
                 expanded.insert("activity:\(activity.id)")
             }
-            if activities.count == 1 { return [.activity(activities[0], nested: false)] }
+            if activities.count == 1 && !item.isCompletedWork { return [.activity(activities[0], nested: false)] }
             let group = Row.group(item)
-            if item.records.contains(where: { openedSingletons.contains($0.id) }) { expanded.insert(group.id) }
-            return expanded.contains(group.id)
-                ? [group] + activities.map { .activity($0, nested: true) } : [group]
+            if item.records.contains(where: { openedSingletons.contains($0.id) || openedGroupRecords.contains($0.id) }) {
+                expanded.insert(group.id)
+            }
+            return expanded.contains(group.id) && !rawTools.contains(group.id)
+                ? [group] + activities.map {
+                    item.isCompletedWork && $0.records.count == 1 && $0.records[0].record.role == "assistant"
+                        ? .message($0.records[0]) : .activity($0, nested: true)
+                } : [group]
+        }
+        // Searching injected text reveals the original mixed record once, so a
+        // source occurrence cannot be confused with a projected request segment.
+        if !rawTranscript, let hit = findHit, !findQuery.isEmpty,
+           let original = records.first(where: { $0.id == hit.recordID }),
+           TranscriptPresentation.project([original]) != [original] {
+            let insertion = rows.firstIndex { $0.records.contains { $0.sourceID == hit.recordID } } ?? rows.count
+            rows = rows.compactMap { row in
+                let remaining = row.records.filter { $0.sourceID != hit.recordID }
+                if remaining.count == row.records.count { return row }
+                if remaining.isEmpty { return nil }
+                switch row {
+                case .group: return .group(TranscriptItem(records: remaining))
+                case .activity(_, let nested): return .activity(TranscriptActivity(records: remaining), nested: nested)
+                case .message: return nil
+                }
+            }
+            rows.insert(.message(original), at: min(insertion, rows.count))
         }
         if resetMeasurements {
             measurements.removeAll(keepingCapacity: true)
             textLayouts.removeAll(keepingCapacity: true)
+            richLayouts.removeAll(keepingCapacity: true)
         } else {
             // A result can join an already visible call after paging, and a
             // singleton can become nested. Retain only unchanged row layouts.
             for row in rows {
-                if previous[row.id]?.records != row.records {
+                if (previous[row.id]?.records ?? measurements[row.id]?.originalRecords) != row.records {
                     measurements.removeValue(forKey: row.id)
                     textLayouts.removeValue(forKey: row.id)
-                } else if case .activity(_, let nested) = row,
-                          case .activity(_, let wasNested)? = previous[row.id], nested != wasNested {
-                    measurements.removeValue(forKey: row.id)
+                    richLayouts.removeValue(forKey: row.id)
+                } else if case .activity(_, let nested) = row {
+                    if case .activity(_, let wasNested)? = previous[row.id], nested != wasNested {
+                        measurements.removeValue(forKey: row.id)
+                    } else if let measurement = measurements[row.id], measurement.contentX != (nested ? 50 : 30) {
+                        measurements.removeValue(forKey: row.id)
+                    }
                 }
             }
         }
@@ -386,7 +483,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     func toggle(_ id: String) {
-        updateDisclosure(id) {
+        updateDisclosure(id, resetText: false) {
             if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
         }
     }
@@ -394,10 +491,17 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     func toggleRaw(_ id: String) {
         updateDisclosure(id) {
             if rawTools.contains(id) { rawTools.remove(id) } else { rawTools.insert(id) }
+            expanded.insert(id)
         }
     }
 
-    private func updateDisclosure(_ id: String, change: () -> Void) {
+    func toggleFullBody(_ id: String) {
+        updateDisclosure(id, resetText: false) {
+            if fullBodies.contains(id) { fullBodies.remove(id) } else { fullBodies.insert(id) }
+        }
+    }
+
+    private func updateDisclosure(_ id: String, resetText: Bool = true, change: () -> Void) {
         guard let row = rows.firstIndex(where: { $0.id == id }) else { return }
         view.layoutSubtreeIfNeeded()
         // Anchor the clicked header, not the first record in the viewport: a
@@ -415,8 +519,20 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         // releases it again without moving the reader's content.
         table.minimumDocumentHeight = scrollView.contentView.bounds.maxY
         measurements.removeValue(forKey: id)
-        textLayouts.removeValue(forKey: id)
-        rebuildRows()
+        if resetText { textLayouts.removeValue(forKey: id) }
+        // A tool's formatted contents do not change when hidden or shown. Keep
+        // its rich view, and refresh only this row unless a group changes membership.
+        if case .group = rows[row] {
+            rebuildRows(regroup: false)
+        } else {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
+            }
+            if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptCell {
+                configure(cell, row: row)
+            }
+        }
         view.layoutSubtreeIfNeeded()
         guard let updatedRow = rows.firstIndex(where: { $0.id == id }) else { return }
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, table.rect(ofRow: updatedRow).minY - offset)))
@@ -428,6 +544,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { measurement(at: row).height }
 
     @objc private func scrolled(_ notification: Notification) {
+        refreshVisibleActions()
         if !updatingRows {
             if table.minimumDocumentHeight > scrollView.contentView.bounds.maxY {
                 table.minimumDocumentHeight = scrollView.contentView.bounds.maxY
@@ -437,6 +554,14 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             savePosition()
         }
         loadNextPageIfNeeded()
+    }
+
+    @objc private func refreshVisibleActions() {
+        let visible = table.rows(in: scrollView.documentVisibleRect)
+        guard visible.location != NSNotFound else { return }
+        for row in visible.location..<min(rows.count, NSMaxRange(visible)) {
+            (table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptCell)?.refreshActions()
+        }
     }
 
     func loadNextPageIfNeeded() {
@@ -464,6 +589,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     private func resizeRowsIfNeeded() {
         let width = table.bounds.width
         guard abs(width - notifiedWidth) > 0.5 else { return }
+        let position = currentPosition()
         notifiedWidth = width
         measuredWidth = width
         measurements.removeAll(keepingCapacity: true)
@@ -476,6 +602,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 configure(cell, row: row)
             }
         }
+        if let position { restore(position) }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -489,7 +616,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     private func configure(_ cell: TranscriptCell, row: Int) {
         let id = rows[row].id
         cell.configure(measurement(at: row), toggle: { [weak self] in self?.toggle(id) },
-                       toggleRaw: { [weak self] in self?.toggleRaw(id) })
+                       toggleRaw: { [weak self] in self?.toggleRaw(id) },
+                       toggleFull: { [weak self] in self?.toggleFullBody(id) })
     }
 
     func measurement(at index: Int) -> Measurement {
@@ -507,40 +635,94 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let isDisclosure: Bool
         let isTool: Bool
         let indent: CGFloat
+        var symbolName: String?
+        var hasFailure = false
         switch row {
         case .group(let item):
-            title = item.title
+            title = item.activitySummary
+            symbolName = item.isInstructions ? "doc.text" : "list.bullet"
             isUser = false; isDisclosure = true; isTool = true; indent = 0
         case .activity(let entry, let nested):
-            title = entry.title
+            let presentation = entry.presentation
+            title = presentation.title
+            symbolName = presentation.symbolName
+            hasFailure = presentation.needsAttention
             isUser = false; isDisclosure = true
-            isTool = !entry.records[0].record.isInstruction && entry.records[0].record.role != "reasoning"
+            isTool = entry.records[0].record.isActivity && entry.records[0].record.role != "reasoning"
             indent = nested ? 20 : 0
             if isExpanded { fullText = entry.body }
         case .message(let entry):
-            isUser = entry.record.role == "user"
-            isDisclosure = !["user", "assistant"].contains(entry.record.role)
+            isUser = !rawTranscript && entry.record.role == "user"
+            isDisclosure = !rawTranscript && !["user", "assistant"].contains(entry.record.role)
             isTool = false; indent = 0
-            title = isUser ? "You" : (entry.record.role == "assistant" ? provider : entry.record.role.capitalized)
+            if let event = entry.record.lifecycleEvent {
+                switch event {
+                case "task_complete": title = "Completed"; symbolName = "checkmark.circle"
+                case "turn_aborted": title = "Interrupted"; symbolName = "pause.circle"; hasFailure = true
+                case "task_started": title = "Turn started"; symbolName = "clock"
+                default: title = entry.record.text; symbolName = "info.circle"
+                }
+            } else {
+                title = isUser ? "You" : (entry.record.role == "assistant" ? provider : entry.record.role.capitalized)
+                symbolName = isDisclosure ? "doc.text" : nil
+            }
             if !isDisclosure || isExpanded { fullText = entry.record.text }
         }
+        let rawMessage: Bool
+        if case .activity = row { rawMessage = rawTranscript || (rawTools.contains(row.id) && !isTool) }
+        else { rawMessage = rawTranscript || rawTools.contains(row.id) }
+        if rawMessage { fullText = row.records.map { $0.rawTranscriptBody }.joined(separator: "\n\n") }
         let body = fullText
         let font: NSFont = isTool ? .monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 14)
         let available = max(120, min(800, width - 60) - indent)
-        let contentWidth = isUser ? min(620, available) : available
-        let contentX = isUser ? width - 30 - contentWidth : 30 + indent
-        let bodyWidth = contentWidth - (isUser ? 30 : 0)
-        let showsRaw = rawTools.contains(row.id) || !findQuery.isEmpty
+        let maximumContentWidth = isUser ? available * 0.77 : available
+        let showsRaw = rawMessage || rawTools.contains(row.id) || !findQuery.isEmpty
+        let attachments = !showsRaw && !isTool ? row.records.flatMap { SourceContent.blocks($0.record) } : []
         let textLayout: TranscriptTextLayout
-        if let cached = textLayouts[row.id] { textLayout = cached }
-        else if isTool && isExpanded && !body.isEmpty {
-            textLayout = TranscriptTextLayout(rendered: ToolContentRenderer.render(row.records, raw: showsRaw), trimEdges: false)
+        var renderedTool: NSAttributedString?
+        if body.isEmpty { textLayout = TranscriptTextLayout(text: "", font: font) }
+        else if let cached = textLayouts[row.id] { textLayout = cached }
+        else if rawMessage {
+            textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: body, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular), .foregroundColor: NSColor.labelColor]), trimEdges: false)
+        } else if isTool && isExpanded && !body.isEmpty {
+            let rendered = ToolContentRenderer.render(row.records, raw: showsRaw)
+            renderedTool = rendered
+            textLayout = TranscriptTextLayout(rendered: rendered, trimEdges: !showsRaw)
+        } else if !findQuery.isEmpty {
+            // Source-only matches (Markdown destinations and context wrappers)
+            // remain selectable at their exact occurrence in plain source text.
+            textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: body, attributes: [.font: font, .foregroundColor: NSColor.labelColor]), trimEdges: false)
         } else { textLayout = TranscriptTextLayout(text: body, font: font) }
-        textLayouts[row.id] = textLayout
-        let textHeight = textLayout.height(for: bodyWidth)
-        let bodyHeight = textHeight + (isUser && !body.isEmpty ? 30 : 0)
-        let showsRawControl = isTool && isExpanded && !body.isEmpty
-        let height = 38 + bodyHeight + (body.isEmpty ? 0 : 20) + (showsRawControl ? 28 : 0)
+        if !body.isEmpty { textLayouts[row.id] = textLayout }
+        let contentWidth = isUser && attachments.isEmpty
+            ? min(maximumContentWidth, max(44, textLayout.width(for: maximumContentWidth - 24) + 24))
+            : maximumContentWidth
+        let contentX = isUser ? width - 30 - contentWidth : 30 + indent
+        let bodyWidth = contentWidth - (isUser || isDisclosure ? 24 : 0)
+        var richContent: RichContentView?
+        let mayHaveRichBlocks = body.contains("```") || body.contains("~~~") || body.contains("![") || body.contains("](/") || body.contains("](file:")
+        if !showsRaw && (!attachments.isEmpty || (!body.isEmpty && (isTool || (mayHaveRichBlocks && RichContentDocument(body).hasRichBlocks)))) {
+            if let cached = richLayouts[row.id] { richContent = cached }
+            else {
+                let view = RichContentView()
+                if isTool {
+                    view.configure(blocks: ToolContentRenderer.richBlocks(row.records, rendered: renderedTool), font: font, context: RichContentContext(isLocalHost: isLocalHost))
+                } else {
+                    view.configure(blocks: RichContentDocument(body).blocks + attachments, font: font, context: RichContentContext(isLocalHost: isLocalHost))
+                }
+                richLayouts[row.id] = view
+                richContent = view
+            }
+        }
+        let fullTextHeight = richContent?.height(for: bodyWidth) ?? textLayout.height(for: bodyWidth)
+        let isLong = fullTextHeight > 440
+        let showsFullBody = fullBodies.contains(row.id) || !findQuery.isEmpty
+        let textHeight = isLong && !showsFullBody ? 360 : fullTextHeight
+        let hasBody = !body.isEmpty || richContent != nil
+        let showsRawControl = isTool && isExpanded && !body.isEmpty && !findQuery.isEmpty
+        let bodyY: CGFloat = isDisclosure ? (showsRawControl ? 74 : 44) : 16
+        let bodyBottom = bodyY + textHeight + (isUser ? 16 : 0)
+        let height: CGFloat = hasBody ? bodyBottom + (isLong ? 26 : 0) + (isDisclosure ? 12 : 0) + 4 + 18 + 10 : 38
         let highlighted: NSAttributedString
         if findQuery.isEmpty {
             highlighted = textLayout.attributedText
@@ -551,9 +733,16 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             }
             highlighted = value
         }
-        let result = Measurement(title: title, body: body, attributedBody: highlighted, font: font, textHeight: textHeight, height: height,
+        var result = Measurement(rowID: row.id, title: title, body: body, attributedBody: highlighted, font: font, textHeight: textHeight, height: height,
             contentX: contentX, contentWidth: contentWidth, isUser: isUser, isDisclosure: isDisclosure,
-            isExpanded: isExpanded, showsRawControl: showsRawControl, showsRaw: showsRaw, finding: !findQuery.isEmpty)
+            isExpanded: isExpanded, showsRawControl: showsRawControl, showsRaw: showsRaw, finding: !findQuery.isEmpty,
+            symbolName: symbolName, hasFailure: hasFailure)
+        result.isLong = isLong
+        result.showsFullBody = showsFullBody
+        result.fullTextHeight = fullTextHeight
+        result.originalRecords = row.records
+        result.richContent = richContent
+        result.isLocalHost = isLocalHost
         measurements[row.id] = result
         return result
     }
@@ -570,23 +759,27 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
 }
 
 @MainActor
-private final class TranscriptCell: NSTableCellView {
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let disclosure = NSButton()
+private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
+    private let disclosure = TranscriptDisclosureButton()
     private let rawDisclosure = NSButton()
     private let message = NSTextView()
     private let bubble = NSView()
+    private let activityIcon = NSImageView()
+    private let detailPanel = NSView()
+    private let richClip = TranscriptContentClip()
+    private weak var installedRichContent: RichContentView?
+    private let showAll = NSButton()
+    private let copyButton = TranscriptActionButton()
+    private var tracking: NSTrackingArea?
     private var measurement: TranscriptController.Measurement?
     private var onToggle: (() -> Void)?
     private var onToggleRaw: (() -> Void)?
+    private var onToggleFull: (() -> Void)?
     private var displayedText: NSAttributedString?
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        titleLabel.textColor = .secondaryLabelColor
-        titleLabel.lineBreakMode = .byTruncatingTail
         disclosure.cell = TranscriptDisclosureCell()
         disclosure.isBordered = false
         disclosure.alignment = .left
@@ -601,6 +794,8 @@ private final class TranscriptCell: NSTableCellView {
         rawDisclosure.contentTintColor = .secondaryLabelColor
         rawDisclosure.target = self
         rawDisclosure.action = #selector(toggleRaw)
+        message.wantsLayer = true
+        message.layer?.masksToBounds = true
         message.isEditable = false
         message.isSelectable = true
         message.drawsBackground = false
@@ -609,26 +804,62 @@ private final class TranscriptCell: NSTableCellView {
         message.isVerticallyResizable = false
         message.isHorizontallyResizable = false
         message.textContainer?.widthTracksTextView = true
+        message.delegate = self
         bubble.wantsLayer = true
         bubble.layer?.cornerRadius = 16
+        detailPanel.wantsLayer = true
+        detailPanel.layer?.cornerRadius = 8
+        activityIcon.imageScaling = .scaleProportionallyDown
+        addSubview(detailPanel)
         addSubview(bubble)
-        addSubview(titleLabel)
+        addSubview(activityIcon)
         addSubview(disclosure)
         addSubview(rawDisclosure)
         addSubview(message)
+        richClip.wantsLayer = true
+        richClip.layer?.masksToBounds = true
+        addSubview(richClip)
+        copyButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy message")
+        copyButton.imagePosition = .imageOnly
+        copyButton.title = ""
+        copyButton.setAccessibilityLabel("Copy message")
+        copyButton.toolTip = "Copy message"
+        copyButton.isBordered = false
+        copyButton.contentTintColor = .secondaryLabelColor
+        copyButton.target = self
+        copyButton.action = #selector(copyBody)
+        copyButton.wantsLayer = true
+        copyButton.onFocus = { [weak self] in self?.refreshActions() }
+        addSubview(copyButton)
+        showAll.isBordered = false
+        showAll.alignment = .left
+        showAll.font = .systemFont(ofSize: 12)
+        showAll.target = self
+        showAll.action = #selector(toggleFull)
+        addSubview(showAll)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func configure(_ value: TranscriptController.Measurement, toggle: @escaping () -> Void, toggleRaw: @escaping () -> Void) {
+    func configure(_ value: TranscriptController.Measurement, toggle: @escaping () -> Void, toggleRaw: @escaping () -> Void,
+                   toggleFull: @escaping () -> Void) {
         measurement = value
         onToggle = toggle
         onToggleRaw = toggleRaw
+        onToggleFull = toggleFull
+        showAll.isHidden = !value.isLong
+        showAll.title = value.showsFullBody ? "Show less" : "Show all"
+        showAll.isEnabled = !value.finding
+        refreshActions()
         rawDisclosure.isHidden = !value.showsRawControl
         rawDisclosure.title = value.finding ? "Raw content shown for Find" : (value.showsRaw ? "Show formatted content" : "Show raw content")
         rawDisclosure.isEnabled = !value.finding
-        titleLabel.stringValue = value.title
-        titleLabel.alignment = value.isUser ? .right : .left
-        titleLabel.isHidden = value.isDisclosure
+        message.setAccessibilityLabel(value.title)
+        activityIcon.isHidden = value.symbolName == nil
+        activityIcon.image = value.symbolName.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
+        activityIcon.contentTintColor = value.hasFailure ? .systemOrange : .tertiaryLabelColor
+        disclosure.restingTint = value.hasFailure ? .systemOrange : .secondaryLabelColor
+        disclosure.toolTip = value.title
+        detailPanel.isHidden = !value.isDisclosure || !value.hasBody
         disclosure.isHidden = !value.isDisclosure
         disclosure.title = value.title
         disclosure.image = NSImage(systemSymbolName: value.isExpanded ? "chevron.down" : "chevron.right",
@@ -637,14 +868,39 @@ private final class TranscriptCell: NSTableCellView {
         disclosure.setAccessibilityLabel(value.title)
         disclosure.setAccessibilityValue(value.isExpanded ? "Expanded" : "Collapsed")
         if displayedText !== value.attributedBody {
-            message.textStorage?.setAttributedString(value.attributedBody)
+            let rendered = NSMutableAttributedString(attributedString: value.attributedBody)
+            rendered.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: rendered.length)) { source, range, _ in
+                if value.isLocalHost, let source = source as? String {
+                    rendered.addAttributes([.link: source, .foregroundColor: NSColor.linkColor], range: range)
+                }
+            }
+            message.textStorage?.setAttributedString(rendered)
             message.setSelectedRange(NSRange(location: 0, length: 0))
             displayedText = value.attributedBody
         }
-        message.isHidden = value.body.isEmpty
-        bubble.isHidden = !value.isUser || value.body.isEmpty
-        bubble.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.10).cgColor
+        if installedRichContent !== value.richContent {
+            installedRichContent?.removeFromSuperview()
+            if let rich = value.richContent { richClip.addSubview(rich) }
+            installedRichContent = value.richContent
+        }
+        richClip.isHidden = value.richContent == nil
+        message.isHidden = !value.hasBody || value.richContent != nil
+        bubble.isHidden = !value.isUser || !value.hasBody
+        updateBubbleColor()
         needsLayout = true
+        message.alphaValue = 1
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateBubbleColor()
+    }
+
+    private func updateBubbleColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            bubble.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            detailPanel.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+        }
     }
 
     override func layout() {
@@ -652,13 +908,25 @@ private final class TranscriptCell: NSTableCellView {
         guard let value = measurement else { return }
         let x = value.contentX
         let width = value.contentWidth
-        titleLabel.frame = NSRect(x: x, y: 10, width: width, height: 18)
-        disclosure.frame = NSRect(x: x, y: 8, width: width, height: 22)
-        rawDisclosure.frame = NSRect(x: x, y: 32, width: width, height: 22)
-        let bodyY: CGFloat = value.showsRawControl ? 62 : 34
-        let inset: CGFloat = value.isUser ? 15 : 0
-        message.frame = NSRect(x: x + inset, y: bodyY + inset, width: width - 2 * inset, height: value.textHeight)
-        bubble.frame = NSRect(x: x, y: 34, width: width, height: value.textHeight + 2 * inset)
+        activityIcon.frame = NSRect(x: x, y: 12, width: 14, height: 14)
+        // Reserve the action gutter before hover so the title and chevron never move.
+        let actionGutter: CGFloat = value.isDisclosure ? 32 : 0
+        disclosure.frame = NSRect(x: x + 22, y: 8, width: max(0, width - 22 - actionGutter), height: 22)
+        rawDisclosure.frame = NSRect(x: x + 12, y: 44, width: width - 24, height: 22)
+        let bodyY: CGFloat = value.isDisclosure ? (value.showsRawControl ? 74 : 44) : 16
+        let inset: CGFloat = value.isUser || value.isDisclosure ? 12 : 0
+        let verticalInset: CGFloat = value.isUser ? 8 : 0
+        message.frame = NSRect(x: x + inset, y: bodyY + verticalInset, width: width - 2 * inset, height: value.textHeight)
+        richClip.frame = message.frame
+        installedRichContent?.frame = NSRect(x: 0, y: 0, width: message.frame.width, height: value.fullTextHeight)
+        bubble.frame = NSRect(x: x, y: bodyY, width: width, height: value.textHeight + 2 * verticalInset)
+        let bodyBottom = message.frame.maxY + verticalInset
+        let footerY = bodyBottom + (value.isLong ? 26 : 0) + (value.isDisclosure ? 12 : 0) + 4
+        detailPanel.frame = NSRect(x: x, y: 32, width: width, height: max(0, footerY - 4 - 32))
+        showAll.frame = NSRect(x: x + inset, y: bodyBottom + 4, width: 100, height: 22)
+        let actionY = value.hasBody ? footerY : 10
+        copyButton.frame = NSRect(x: x + width - 24, y: actionY - 3, width: 24, height: 24)
+        refreshActions()
     }
 
     func clearFindSelection() { message.setSelectedRange(NSRange(location: 0, length: 0)) }
@@ -675,6 +943,83 @@ private final class TranscriptCell: NSTableCellView {
 
     @objc private func toggle() { onToggle?() }
     @objc private func toggleRaw() { onToggleRaw?() }
+    @objc private func toggleFull() { onToggleFull?() }
+    @objc private func copyBody() {
+        guard let measurement else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(measurement.body.isEmpty ? measurement.originalBody : measurement.body, forType: .string)
+    }
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        let source = (link as? String) ?? (link as? URL)?.absoluteString
+        guard let source, let location = ContentLocation.parse(source),
+              location.canOpen(in: RichContentContext(isLocalHost: measurement?.isLocalHost == true)) else { return true }
+        location.open(in: RichContentContext(isLocalHost: measurement?.isLocalHost == true))
+        return true
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        tracking = area
+        addTrackingArea(area)
+        refreshActions()
+    }
+    override func mouseEntered(with event: NSEvent) { refreshActions() }
+    override func mouseExited(with event: NSEvent) { refreshActions() }
+    func refreshActions() {
+        let hovered = window.map { $0.isKeyWindow && visibleRect.contains(convert($0.mouseLocationOutsideOfEventStream, from: nil)) } ?? false
+        let focused = window?.firstResponder === copyButton
+        copyButton.alphaValue = hovered || focused ? 1 : 0
+    }
+}
+
+@MainActor private final class TranscriptContentClip: NSView {
+    override var isFlipped: Bool { true }
+}
+
+@MainActor private final class TranscriptActionButton: NSButton {
+    var onFocus: (() -> Void)?
+    override func becomeFirstResponder() -> Bool {
+        let result = super.becomeFirstResponder()
+        onFocus?()
+        return result
+    }
+    override func resignFirstResponder() -> Bool {
+        let result = super.resignFirstResponder()
+        onFocus?()
+        return result
+    }
+}
+
+@MainActor private final class TranscriptDisclosureButton: NSButton {
+    var restingTint: NSColor = .secondaryLabelColor { didSet { refreshTint() } }
+    private var hovering = false
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        tracking = area
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true; refreshTint() }
+    override func mouseExited(with event: NSEvent) { hovering = false; refreshTint() }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        refreshTint()
+        return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        contentTintColor = restingTint
+        return accepted
+    }
+    private func refreshTint() {
+        contentTintColor = hovering || window?.firstResponder === self ? .labelColor : restingTint
+    }
 }
 
 /// Reserve identical text and symbol geometry in both disclosure states. The
@@ -728,6 +1073,11 @@ private final class TranscriptCell: NSTableCellView {
         container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
         manager.ensureLayout(for: container)
         return ceil(manager.usedRect(for: container).height)
+    }
+
+    func width(for width: CGFloat) -> CGFloat {
+        _ = height(for: width)
+        return ceil(manager.usedRect(for: container).width)
     }
 }
 

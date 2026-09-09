@@ -259,7 +259,8 @@ func isolatedRustDaemonServesSwiftClientAndReconnects() async throws {
     try FileManager.default.createDirectory(at: inputs, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: root) }
     let transcript = #"{"type":"user","uuid":"native-fixture-message","sessionId":"native-fixture","timestamp":"2026-09-07T12:00:00Z","message":{"role":"user","content":"hello persistent native connection"}}"#
-    try (transcript + "\n").write(to: inputs.appendingPathComponent("native-fixture.jsonl"), atomically: true, encoding: .utf8)
+    let image = #"{"type":"user","uuid":"native-fixture-image","sessionId":"native-fixture","timestamp":"2026-09-07T12:00:01Z","message":{"role":"user","content":[{"type":"text","text":"<<ImageDisplayed>>\nInspect this image"},{"type":"image","source":{"type":"url","url":"https://example.com/native-fixture.png"}}]}}"#
+    try (transcript + "\n" + image + "\n").write(to: inputs.appendingPathComponent("native-fixture.jsonl"), atomically: true, encoding: .utf8)
     let logURL = root.appendingPathComponent("daemon.log")
     FileManager.default.createFile(atPath: logURL.path, contents: nil)
     let log = try FileHandle(forWritingTo: logURL)
@@ -282,16 +283,36 @@ func isolatedRustDaemonServesSwiftClientAndReconnects() async throws {
         daemonSocket: root.appendingPathComponent("state/native/app.sock"))
     func waitForSession() async throws -> Session {
         let deadline = ContinuousClock.now.advanced(by: .seconds(20))
+        var lastObservation = "No client request completed"
         while child.isRunning, ContinuousClock.now < deadline {
-            if let rows = try? await client.sessions(limit: 5), let session = rows.first,
-               let hits = try? await client.search("persistent", project: nil, source: nil, limit: 5),
-               !hits.isEmpty { return session }
+            do {
+                let rows = try await client.sessions(limit: 5)
+                if let session = rows.first {
+                    let hits = try await client.search("persistent", project: nil, source: nil, limit: 5)
+                    if !hits.isEmpty { return session }
+                    lastObservation = "Sessions returned \(rows.count) rows, but fixture search returned no matches"
+                } else {
+                    lastObservation = "Sessions returned no rows"
+                }
+            } catch {
+                lastObservation = "Client request failed: \(error)"
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
-        throw ClientError(message: "Isolated daemon did not publish fixture: \((try? String(contentsOf: logURL, encoding: .utf8)) ?? "")")
+        let socket = root.appendingPathComponent("state/native/app.sock")
+        let socketExists = FileManager.default.fileExists(atPath: socket.path)
+        let processStatus = child.isRunning ? "running" : "exited with status \(child.terminationStatus)"
+        let daemonLog = (try? String(contentsOf: logURL, encoding: .utf8)) ?? "Log unavailable"
+        throw ClientError(message: "Isolated daemon did not publish fixture. Process: \(processStatus). Socket: \(socket.path) (exists: \(socketExists)). \(lastObservation). Daemon log:\n\(daemonLog)")
     }
     let session = try await waitForSession()
     #expect(session.sessionID == "native-fixture")
+    #expect(session.messageCount == 2)
+    let initial = try await client.initialRecords(for: session, anchor: nil)
+    #expect(initial.total == 2)
+    #expect(initial.offset == 0)
+    #expect(initial.records.count == 2)
+    #expect(initial.records.last?.record.sourceContent != nil)
     #expect(try await client.machines() == [.local])
     #expect(try await client.projects().reduce(0) { $0 + $1.sessionCount } == 1)
     #expect(try await client.sessionCount() == 1)
@@ -299,7 +320,13 @@ func isolatedRustDaemonServesSwiftClientAndReconnects() async throws {
     #expect(try await client.search("persistent", project: nil, source: nil, limit: 1000).first?.sessionID == session.sessionID)
     #expect(try await client.sessionDetails(for: session).id == session.id)
     #expect(try await client.records(for: session, offset: 0).first?.record.text == "hello persistent native connection")
-    #expect(try await client.recordMetadata(for: session, offset: 0, limit: 1).total == 1)
+    #expect(try await client.recordMetadata(for: session, offset: 0, limit: 1).total == 2)
+    let records = try await client.records(for: session, offset: 0)
+    let imageMessage = try #require(records.last?.record)
+    #expect(imageMessage.sourceContent != nil)
+    #expect(SourceContent.blocks(imageMessage).contains(.attachment(label: "Image", source: "https://example.com/native-fixture.png", image: true)))
+    #expect(SourceContent.displayText(imageMessage) == "Inspect this image")
+    #expect(records.last?.rawTranscriptBody.contains("ImageDisplayed") == true)
     child.terminate()
     child.waitUntilExit()
     child = try start()

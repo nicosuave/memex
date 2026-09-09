@@ -18,9 +18,8 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    // Bumped for the agent-file backfill mirror: forces a full re-parse
-    // so unlabeled agent-*.jsonl transcripts reclassify on next index.
-    index: 4,
+    // Preserve image/document content, including attachment-only messages.
+    index: 5,
     usage: 4,
 };
 
@@ -360,6 +359,7 @@ pub(crate) fn parse_index_records(
                 object,
                 "sourceToolAssistantUUID",
             ),
+            ..RecordLinks::default()
         };
         let timestamp = object
             .get("timestamp")
@@ -397,8 +397,9 @@ pub(crate) fn parse_index_records(
                                 .get("name")
                                 .and_then(|value| value.as_str())
                                 .map(str::to_string);
-                            let tool_input =
-                                block_object.get("input").map(|value| value.to_string());
+                            let tool_input = block_object
+                                .get("input")
+                                .and_then(super::common::tool_value_text);
                             let text = tool_input.clone().unwrap_or_default();
                             let tool_id = block_object
                                 .get("id")
@@ -482,7 +483,7 @@ pub(crate) fn parse_index_records(
                         "redacted_thinking" => {
                             diagnostics.encrypted_reasoning_dropped += 1;
                         }
-                        "tool_result" | "image" => {}
+                        "tool_result" | "image" | "document" => {}
                         unknown => diagnostics.increment_unknown_semantic(unknown),
                     }
                     content_index += 1;
@@ -501,12 +502,14 @@ pub(crate) fn parse_index_records(
                 {
                     continue;
                 }
-                let tool_output = block_object.get("content").map(|value| value.to_string());
+                let tool_output = block_object
+                    .get("content")
+                    .and_then(super::common::tool_value_text);
                 let mut text = super::common::tool_result_text(block).unwrap_or_default();
                 if text.is_empty()
                     && let Some(content) = block_object.get("content")
                 {
-                    text = content.to_string();
+                    text = super::common::tool_value_text(content).unwrap_or_default();
                 }
                 let tool_use_id = block_object
                     .get("tool_use_id")
@@ -547,7 +550,29 @@ pub(crate) fn parse_index_records(
         }
 
         let text = text_parts.join(" ").trim().to_string();
-        if !text.is_empty() {
+        let mut entry_links = entry_links;
+        if let Some(array) = content.and_then(|v| v.as_array())
+            && array.iter().any(|block| {
+                matches!(
+                    block.get("type").and_then(|v| v.as_str()),
+                    Some("image" | "document")
+                )
+            })
+        {
+            // Tool and reasoning blocks have their own governed projections. Do not
+            // duplicate them or expose hidden thinking through attachment metadata.
+            let display_blocks = array
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.get("type").and_then(|v| v.as_str()),
+                        Some("text" | "image" | "document")
+                    )
+                })
+                .collect::<Vec<_>>();
+            entry_links.source_content = Some(serde_json::to_string(&display_blocks)?);
+        }
+        if !text.is_empty() || entry_links.source_content.is_some() {
             emit(Record {
                 source: SourceKind::Claude,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -880,6 +905,95 @@ mod tests {
         let events = parse_usage_file(&path).unwrap();
         assert_eq!(events[0].timestamp_ms, 1_776_386_452_000);
         assert_eq!(events[1].timestamp_ms, 1_776_386_452_437);
+    }
+
+    #[test]
+    fn structured_tool_values_preserve_json_and_verbatim_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        for output in [
+            serde_json::json!({"ok":true,"rows":[1,2]}),
+            serde_json::json!([{"type":"text","text":"hello", "extra":42}]),
+            serde_json::json!("plain\noutput"),
+        ] {
+            fs::write(&path, format!("{}\n", serde_json::json!({"type":"user", "sessionId":"session", "message":{"content":[{"type":"tool_result", "tool_use_id":"call", "content":output}]}}))).unwrap();
+            let mut records = Vec::new();
+            parse_index_records(
+                &path,
+                IndexParseState::default(),
+                false,
+                &AtomicU64::new(1),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let actual = records[0].tool_output.as_ref().unwrap();
+            if let Some(text) = output.as_str() {
+                assert_eq!(actual, text);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(actual).unwrap(),
+                    output
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_content_preserves_images_documents_without_exposing_reasoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let image = serde_json::json!({"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"AAAA"}});
+        let document = serde_json::json!({"type":"document", "source":{"type":"url", "url":"https://example.com/notes.pdf"}, "title":"Notes"});
+        let contents = [
+            serde_json::json!([image]),
+            serde_json::json!([{"type":"text", "text":"<<ImageDisplayed>>"}, document, {"type":"thinking", "thinking":"private reasoning"}]),
+            serde_json::json!([{"type":"text", "text":"plain text"}]),
+        ];
+        fs::write(&path, contents.iter().map(|content| format!("{}\n", serde_json::json!({"type":"user", "sessionId":"session", "message":{"role":"user", "content":content}}))).collect::<String>()).unwrap();
+        let mut records = Vec::new();
+        let parsed = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            !parsed
+                .diagnostics
+                .unknown_semantic_types
+                .contains_key("document")
+        );
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].text, "");
+        assert_eq!(records[1].text, "<<ImageDisplayed>>");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                records[0].links.source_content.as_ref().unwrap()
+            )
+            .unwrap(),
+            contents[0]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                records[1].links.source_content.as_ref().unwrap()
+            )
+            .unwrap(),
+            serde_json::json!([contents[1][0], document])
+        );
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("private reasoning")
+        );
+        assert!(records[2].links.source_content.is_none());
     }
 
     #[test]

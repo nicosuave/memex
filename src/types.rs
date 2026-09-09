@@ -202,6 +202,19 @@ impl SourceFilter {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecordLinks {
+    /// Provider turn identity; `Record::turn_id` remains the ordered record sequence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_phase: Option<String>,
+    /// Explicit provider event, never inferred from an answer or missing output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_record_type: Option<String>,
+    /// Typed display content when a message includes attachments, serialized as JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

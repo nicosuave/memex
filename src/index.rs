@@ -33,6 +33,8 @@ use tantivy::{
 
 #[derive(Clone)]
 pub struct IndexFields {
+    /// Optional for reading generations built before transcript presentation metadata.
+    pub reader_metadata: Option<Field>,
     /// Present in indexes created after canonical record lookup was introduced. Older indexes
     /// remain readable and use a scoped stored-record fallback until they are rebuilt.
     pub canonical_record_id: Option<Field>,
@@ -551,7 +553,10 @@ impl SearchIndex {
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {
             let index = Index::open_in_dir(dir)?;
-            if !schema_is_current(&index.schema()) {
+            if !schema_is_current(&index.schema())
+                || (matches!(stale_schema_policy, StaleSchemaPolicy::Recreate)
+                    && index.schema().get_field("reader_metadata").is_err())
+            {
                 return match stale_schema_policy {
                     StaleSchemaPolicy::Error => Err(stale_schema_error(dir)),
                     StaleSchemaPolicy::Recreate => {
@@ -803,6 +808,9 @@ impl SearchIndex {
             self.fields.source_tool_assistant_uuid,
             &record.links.source_tool_assistant_uuid,
         );
+        if let Some(field) = self.fields.reader_metadata {
+            doc.add_text(field, serde_json::to_string(&record.links)?);
+        }
         doc.add_text(self.fields.source_path, &record.source_path);
         writer.add_document(doc)?;
         Ok(())
@@ -2266,6 +2274,7 @@ fn build_schema_with_options(
     builder.add_text_field("parent_tool_use_id", STRING | STORED);
     builder.add_text_field("source_tool_use_id", STRING | STORED);
     builder.add_text_field("source_tool_assistant_uuid", STRING | STORED);
+    builder.add_text_field("reader_metadata", STORED);
     builder.add_text_field("source_path", session_identity_options);
 
     Ok(builder.build())
@@ -2306,6 +2315,7 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
             .map_err(|_| anyhow!(format!("missing field {name}")))
     };
     Ok(IndexFields {
+        reader_metadata: schema.get_field("reader_metadata").ok(),
         canonical_record_id: schema.get_field("canonical_record_id").ok(),
         doc_id: get("doc_id")?,
         ts: get("ts")?,
@@ -2491,6 +2501,11 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
             parent_tool_use_id: get_str(fields.parent_tool_use_id),
             source_tool_use_id: get_str(fields.source_tool_use_id),
             source_tool_assistant_uuid: get_str(fields.source_tool_assistant_uuid),
+            ..fields
+                .reader_metadata
+                .and_then(&get_str)
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default()
         },
         source_path,
     }
@@ -2557,6 +2572,80 @@ mod tests {
         assert!(err.to_string().contains("index schema"));
         assert!(tmp.path().join("meta.json").exists());
         assert!(tmp.path().join("sentinel").exists());
+    }
+
+    #[test]
+    fn reader_metadata_round_trips_without_changing_record_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(tmp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        let mut record = test_record(1, "Turn completed");
+        record.links.source_turn_id = Some("provider-turn".to_string());
+        record.links.assistant_phase = Some("final_answer".to_string());
+        record.links.lifecycle_event = Some("task_complete".to_string());
+        record.links.source_record_type = Some("event_msg/task_complete".to_string());
+        record.links.source_content =
+            Some(r#"[{"type":"input_image","image_url":"/tmp/photo.png"}]"#.to_string());
+        index.add_record(&mut writer, &record).unwrap();
+        writer.commit().unwrap();
+        let rows = index
+            .records_by_context_scope(Some("session"), Some(crate::types::SourceKind::Codex))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn_id, record.turn_id);
+        assert_eq!(
+            serde_json::to_value(&rows[0].links).unwrap(),
+            serde_json::to_value(&record.links).unwrap()
+        );
+    }
+
+    #[test]
+    fn reader_metadata_upgrade_keeps_old_generation_readable_until_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut schema =
+            serde_json::to_value(build_schema_with_canonical_record_id(true).unwrap()).unwrap();
+        schema
+            .as_array_mut()
+            .unwrap()
+            .retain(|field| field["name"] != "reader_metadata");
+        let schema: Schema = serde_json::from_value(schema).unwrap();
+        drop(Index::create_in_dir(tmp.path(), schema).unwrap());
+        let legacy = SearchIndex::open_or_create(tmp.path()).unwrap();
+        assert!(legacy.fields.reader_metadata.is_none());
+        let mut writer = legacy.writer().unwrap();
+        legacy
+            .add_record(&mut writer, &test_record(1, "legacy record"))
+            .unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        let fresh = SearchIndex::open_or_create_for_ingest(tmp.path()).unwrap();
+        assert!(fresh.fields.reader_metadata.is_some());
+        assert_eq!(fresh.doc_count().unwrap(), 0);
+        // Ingest detects the empty private generation and reparses all source files;
+        // the published generation remains intact throughout that rebuild.
+        assert_eq!(
+            SearchIndex::open_or_create(tmp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            1
+        );
+        let mut reparsed = test_record(1, "legacy record");
+        reparsed.links.source_turn_id = Some("recovered-turn".to_string());
+        let mut writer = fresh.writer().unwrap();
+        fresh.add_record(&mut writer, &reparsed).unwrap();
+        writer.commit().unwrap();
+        drop(writer);
+        fresh.publish_generation().unwrap();
+        let reopened = SearchIndex::open_or_create(tmp.path()).unwrap();
+        let rows = reopened
+            .records_by_context_scope(Some("session"), Some(crate::types::SourceKind::Codex))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].links.source_turn_id.as_deref(),
+            Some("recovered-turn")
+        );
     }
 
     #[test]

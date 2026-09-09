@@ -427,6 +427,9 @@ EXAMPLES:
         /// Return at most this many records (default 50, maximum 500; --full defaults to all)
         #[arg(long)]
         limit: Option<usize>,
+        /// Include total and next_offset with a bounded full-content page
+        #[arg(long, requires_all = ["full", "limit"])]
+        page_info: bool,
         /// Show human-readable output with timestamps and role labels
         #[arg(short, long, hide = true)]
         verbose: bool,
@@ -1546,6 +1549,7 @@ pub fn run() -> Result<()> {
             source_path,
             offset,
             limit,
+            page_info,
             verbose,
             output,
             read,
@@ -1557,6 +1561,7 @@ pub fn run() -> Result<()> {
                 source_path,
                 offset,
                 limit,
+                page_info,
                 output: output.resolve(
                     OutputFormat::Jsonl,
                     verbose.then_some(OutputFormat::Text),
@@ -1907,6 +1912,16 @@ fn run_index_loop(
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
 ) -> Result<()> {
+    // Keep the native listener alive for every daemon watch mode, including
+    // the default event loop, and release it when that loop exits or fails.
+    #[cfg(unix)]
+    let _native_server = match crate::native::spawn(index.root.clone()) {
+        Ok(server) => Some(server),
+        Err(error) => {
+            eprintln!("native app socket unavailable: {error:#}");
+            None
+        }
+    };
     if mode == WatchMode::Poll {
         run_poll_loop(index, interval_secs, web_listen, mcp)
     } else {
@@ -1920,14 +1935,6 @@ fn run_poll_loop(
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
 ) -> Result<()> {
-    #[cfg(unix)]
-    let _native_server = match crate::native::spawn(index.root.clone()) {
-        Ok(server) => Some(server),
-        Err(error) => {
-            eprintln!("native app socket unavailable: {error:#}");
-            None
-        }
-    };
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
@@ -3053,6 +3060,36 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                 &collected.render,
             )?))
         }
+        Operation::SessionPage {
+            machine,
+            session_id,
+            source_path,
+            offset,
+            limit,
+        } => {
+            check_index(&machine)?;
+            let (records, page) = collect_session_page(
+                paths,
+                &config,
+                &machine,
+                &session_id,
+                &source_path,
+                offset,
+                Some(limit),
+                &ReadArgs {
+                    full: true,
+                    max_chars: None,
+                },
+                true,
+            )?;
+            let mut items = records
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let (total, next_offset) = page.expect("full page requested with metadata");
+            items.push(serde_json::json!({"type":"page", "machine":machine, "session_id":session_id, "source_path":source_path, "offset":offset, "total":total, "next_offset":next_offset}));
+            Ok(tag(items, machine))
+        }
         Operation::Session {
             machine,
             session_id,
@@ -3074,6 +3111,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     full: max_chars.is_none(),
                     max_chars,
                 },
+                false,
             )?;
             let mut items = records
                 .into_iter()
@@ -4039,6 +4077,7 @@ struct SessionRunArgs {
     source_path: Option<String>,
     offset: usize,
     limit: Option<usize>,
+    page_info: bool,
     output: OutputOptions,
     read: ReadArgs,
     root: Option<PathBuf>,
@@ -4056,33 +4095,58 @@ fn collect_session_page(
     offset: usize,
     limit: Option<usize>,
     read: &ReadArgs,
+    page_info: bool,
 ) -> Result<CollectedSessionPage> {
     let mut budget = read.budget()?;
     if session_id.is_empty() {
         return Err(anyhow!("session_id must not be empty"));
     }
+    if page_info && (!read.full || limit.is_none()) {
+        return Err(anyhow!(
+            "--page-info requires --full and an explicit --limit"
+        ));
+    }
     if read.full {
-        let records = hydrate_session_records(
-            paths,
-            config,
-            machine,
-            session_id,
-            source_path,
-            offset,
-            limit,
-        )?
-        .into_iter()
-        .map(|mut record| {
-            let record_id = canonical_record_id(&record);
-            let content = budget.apply(&mut record, None, 0)?;
-            Ok(BoundedRecord {
-                record_id,
-                record,
-                content,
+        let (records, page) = if page_info {
+            let context = session_page_context(
+                paths,
+                config,
+                machine,
+                &SessionPageRequest {
+                    session_id: session_id.to_owned(),
+                    source_path: source_path.to_owned(),
+                    offset,
+                    limit: limit.expect("validated above"),
+                },
+            )?;
+            (context.records, Some((context.total, context.next_offset)))
+        } else {
+            (
+                hydrate_session_records(
+                    paths,
+                    config,
+                    machine,
+                    session_id,
+                    source_path,
+                    offset,
+                    limit,
+                )?,
+                None,
+            )
+        };
+        let records = records
+            .into_iter()
+            .map(|mut record| {
+                let record_id = canonical_record_id(&record);
+                let content = budget.apply(&mut record, None, 0)?;
+                Ok(BoundedRecord {
+                    record_id,
+                    record,
+                    content,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-        Ok((records, None))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((records, page))
     } else {
         let request = SessionPageRequest {
             session_id: session_id.to_owned(),
@@ -4105,6 +4169,7 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
         source_path,
         offset,
         limit,
+        page_info,
         output,
         read,
         root,
@@ -4121,6 +4186,7 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
         offset,
         limit,
         &read,
+        page_info,
     )?;
     let text = output.format == OutputFormat::Text;
     let mut writer = output.writer();
@@ -9172,6 +9238,52 @@ arguments = {
             panic!("expected hydrate command");
         };
         assert_eq!(input, Some(PathBuf::from("requests.jsonl")));
+    }
+
+    #[test]
+    fn session_page_info_requires_an_explicit_full_page() {
+        let parsed = Cli::try_parse_from([
+            "memex",
+            "session",
+            "fixture",
+            "--full",
+            "--limit",
+            "60",
+            "--page-info",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                page_info: true,
+                read: ReadArgs { full: true, .. },
+                limit: Some(60),
+                ..
+            })
+        ));
+        for arguments in [
+            vec![
+                "memex",
+                "session",
+                "fixture",
+                "--page-info",
+                "--limit",
+                "60",
+            ],
+            vec!["memex", "session", "fixture", "--page-info", "--full"],
+            vec!["memex", "show", "1", "--page-info"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        let legacy = Cli::try_parse_from(["memex", "session", "fixture", "--full"]).unwrap();
+        assert!(matches!(
+            legacy.command,
+            Some(Commands::Session {
+                page_info: false,
+                limit: None,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -228,6 +228,58 @@ struct MemexClient: Sendable {
             daemonRequest: sessionRequest(session, offset: offset, limit: limit)))
     }
 
+    /// A list count is a hint, not a snapshot: the page response supplies its
+    /// current total, so newly indexed or removed records can correct the offset.
+    func initialRecords(for session: Session, anchor: String?) async throws -> TranscriptPage {
+        let offset: Int
+        if anchor == nil, let count = session.messageCount, count >= 0 {
+            offset = max(0, count - Self.pageSize)
+        } else {
+            offset = try await initialRecordOffset(for: session, anchor: anchor).offset
+        }
+        var page = try await recordPage(for: session, offset: offset)
+        if anchor == nil {
+            let latestOffset = max(0, page.total - Self.pageSize)
+            if latestOffset != page.offset {
+                try Task.checkCancellation()
+                page = try await recordPage(for: session, offset: latestOffset)
+            }
+        }
+        return page
+    }
+
+    func recordPage(for session: Session, offset: Int, limit: Int = Self.pageSize) async throws -> TranscriptPage {
+        let args = ["session", "--machine", session.machineID, "--source-path", session.sourcePath,
+                    "--offset", String(offset), "--limit", String(limit), "--full", "--page-info", "--format", "json",
+                    "--", session.sessionID]
+        var request = DaemonRequest(op: "session_page")
+        request.machine = session.machineID
+        request.sessionID = session.sessionID
+        request.sourcePath = session.sourcePath
+        request.offset = offset
+        request.limit = limit
+        let data: Data
+        do {
+            data = try await run(args, daemonRequest: request)
+        } catch let error as ClientError where error.message.contains("--page-info") &&
+            (error.message.contains("unexpected argument") || error.message.contains("unrecognized option")) {
+            // Older local CLI overrides still work. Older remote peers already
+            // return page totals through the existing SessionPage RPC.
+            let records = try await records(for: session, offset: offset, limit: limit)
+            let metadata = try await recordMetadata(for: session, offset: offset, limit: 1)
+            return TranscriptPage(records: records, offset: offset, total: metadata.total)
+        }
+        let items = try JSONDecoder().decode([TranscriptPageItem].self, from: data)
+        let records = items.compactMap { if case .record(let record) = $0 { record } else { nil } }
+        if let total = items.compactMap({ if case .total(let total) = $0 { total } else { nil } }).last {
+            guard total >= 0 else { throw ClientError(message: "Memex returned an invalid transcript total.") }
+            return TranscriptPage(records: records, offset: offset, total: total)
+        }
+        // Tolerate an older CLI wrapper that accepts but does not emit page info.
+        let metadata = try await recordMetadata(for: session, offset: offset, limit: 1)
+        return TranscriptPage(records: records, offset: offset, total: metadata.total)
+    }
+
     /// The CLI has no ID-only session mode. Bound search scans to 256K characters
     /// and discard their bodies; a one-record total probe needs only one character.
     func recordMetadata(for session: Session, offset: Int, limit: Int) async throws -> RecordMetadataPage {
@@ -267,6 +319,26 @@ struct MemexClient: Sendable {
             }
             offset = next
             page = try await recordMetadata(for: session, offset: offset, limit: 500)
+        }
+    }
+}
+
+struct TranscriptPage: Sendable {
+    let records: [TranscriptRecord]
+    let offset: Int
+    let total: Int
+}
+
+private enum TranscriptPageItem: Decodable {
+    case record(TranscriptRecord)
+    case total(Int)
+    private enum CodingKeys: String, CodingKey { case type, total }
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        if try fields.decodeIfPresent(String.self, forKey: .type) == "page" {
+            self = .total(try fields.decode(Int.self, forKey: .total))
+        } else {
+            self = .record(try TranscriptRecord(from: decoder))
         }
     }
 }

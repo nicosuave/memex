@@ -376,15 +376,12 @@ final class Store {
         defer { if readerGeneration == generation { loadingRecords = false } }
         let anchor = readerAnchorID
         do {
-            let start = try await client.initialRecordOffset(for: selected, anchor: anchor)
+            let page = try await client.initialRecords(for: selected, anchor: anchor)
             try Task.checkCancellation()
             guard readerGeneration == generation, readerRequestID == request else { return }
-            let page = try await client.records(for: selected, offset: start.offset)
-            try Task.checkCancellation()
-            guard readerGeneration == generation, readerRequestID == request else { return }
-            records = page
-            recordsOffset = start.offset
-            recordsTotal = start.total
+            records = page.records
+            recordsOffset = page.offset
+            recordsTotal = page.total
             loadedReaderKey = key
             updateRecordBounds()
             cacheReaderWindow()
@@ -405,23 +402,17 @@ final class Store {
         failedPageWasEarlier = nil
         defer { if readerGeneration == generation { loadingRecords = false } }
         do {
-            let start: (offset: Int, total: Int)
+            let page: TranscriptPage
             if let offset {
-                let total: Int
-                if loadedReaderKey == key { total = recordsTotal }
-                else { total = try await client.recordMetadata(for: selected, offset: 0, limit: 1).total }
-                start = (max(0, offset - MemexClient.pageSize / 2), total)
+                page = try await client.recordPage(for: selected, offset: max(0, offset - MemexClient.pageSize / 2))
             } else {
-                start = try await client.initialRecordOffset(for: selected, anchor: recordID)
+                page = try await client.initialRecords(for: selected, anchor: recordID)
             }
             try Task.checkCancellation()
             guard readerGeneration == generation, readerRequestID == request else { return }
-            let page = try await client.records(for: selected, offset: start.offset)
-            try Task.checkCancellation()
-            guard readerGeneration == generation, readerRequestID == request else { return }
-            records = page
-            recordsOffset = start.offset
-            recordsTotal = start.total
+            records = page.records
+            recordsOffset = page.offset
+            recordsTotal = page.total
             loadedReaderKey = key
             updateRecordBounds()
             cacheReaderWindow()

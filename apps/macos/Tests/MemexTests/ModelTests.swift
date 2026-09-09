@@ -77,7 +77,7 @@ private func record(_ id: String, _ role: String, _ tool: String? = nil) -> Tran
                  record("7", "developer"), record("8", "assistant")]
     let items = TranscriptItem.group(input)
     #expect(items.count == 5)
-    #expect(items[0].title == "Session instructions")
+    #expect(items[0].title == "Session context")
     #expect(items[0].records.count == 3)
     #expect(items[1].records[0].record.role == "user")
     #expect(items[2].isActivity)
