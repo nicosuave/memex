@@ -61,11 +61,17 @@ struct ToolPresentationSupportTests {
         #expect(ToolContentRenderer.imageSources([call, result]) == ["/tmp/image.png", "https://example.com/image.png"])
     }
 
-    @Test func embeddedImagesKeepOriginalPayloadInRawContent() {
-        let source = #"{"content":[{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]}"#
+    @Test(arguments: ["mimeType", "mime_type"]) func embeddedImagesKeepOriginalPayloadInRawContent(mimeKey: String) {
+        let source = "{\"content\":[{\"type\":\"image\",\"data\":\"aGVsbG8=\",\"\(mimeKey)\":\"image/png\"}]}"
         let entry = TranscriptRecord(recordID: "image", record: Message(role: "tool_result", text: source, toolName: "custom", toolInput: nil, toolOutput: nil))
         #expect(ToolContentRenderer.richBlocks([entry]).contains(.embeddedImage(label: "Image result", data: Data("hello".utf8), mimeType: "image/png")))
         #expect(ToolContentRenderer.render([entry], raw: true).string == source)
+    }
+
+    @Test func imageURLFieldsPreservePrecedenceAndFallbacks() {
+        let source = #"{"content":[{"type":"image","image_url":"/tmp/first.png","url":"/tmp/ignored.png"},{"type":"image_url","url":"/tmp/second.png"},{"type":"image_url","image_url":{"url":"/tmp/third.png"}}]}"#
+        let entry = TranscriptRecord(recordID: "images", record: Message(role: "tool_result", text: source, toolName: "custom", toolInput: nil, toolOutput: nil))
+        #expect(ToolContentRenderer.imageSources([entry]) == ["/tmp/first.png", "/tmp/second.png", "/tmp/third.png"])
     }
 
     @Test func explicitInterruptionsAreDistinctFromFailure() {

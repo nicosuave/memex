@@ -7,14 +7,18 @@ import AppKit
     /// Relative paths stay as transcript text because their host/workdir is unknown.
     static func imageSources(_ records: [TranscriptRecord]) -> [String] {
         var sources: [String] = []
-        func add(_ source: String?) {
+        @MainActor func add(_ source: String?) {
             guard let source, source.hasPrefix("/") || source.hasPrefix("https://") || source.hasPrefix("http://"), !sources.contains(source) else { return }
             sources.append(source)
         }
-        func inspect(_ value: Any) {
+        @MainActor func inspect(_ value: Any) {
             if let object = value as? [String: Any] {
-                if object["type"] as? String == "image" || object["type"] as? String == "image_url" {
-                    add(object["image_url"] as? String ?? object["url"] as? String ?? (object["image_url"] as? [String: Any])?["url"] as? String)
+                let type = object["type"] as? String
+                if type == "image" || type == "image_url" {
+                    let imageURL = object["image_url"] as? String
+                    let url = object["url"] as? String
+                    let nestedURL = (object["image_url"] as? [String: Any])?["url"] as? String
+                    add(imageURL ?? url ?? nestedURL)
                 }
                 for key in ["content", "result"] { if let nested = object[key] { inspect(nested) } }
             } else if let array = value as? [Any] { for item in array { inspect(item) } }
@@ -43,10 +47,12 @@ import AppKit
             else { blocks.append(.attributed(part)) }
         }
         var seenImages = Set<Data>()
-        func embeddedImages(_ value: Any) {
+        @MainActor func embeddedImages(_ value: Any) {
             if let object = value as? [String: Any] {
+                let mimeType = object["mimeType"] as? String
+                let legacyMimeType = object["mime_type"] as? String
                 if object["type"] as? String == "image", let encoded = object["data"] as? String,
-                   let mime = object["mimeType"] as? String ?? object["mime_type"] as? String,
+                   let mime = mimeType ?? legacyMimeType,
                    mime.hasPrefix("image/"), encoded.utf8.count <= 28_000_000,
                    let data = Data(base64Encoded: encoded), data.count <= 20_000_000, seenImages.insert(data).inserted {
                     blocks.append(.embeddedImage(label: "Image result", data: data, mimeType: mime))
