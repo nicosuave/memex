@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 6;
+// Reconcile legacy catalogs that survived a rebuilt search index.
+const SCHEMA_VERSION: i64 = 7;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
@@ -121,6 +122,7 @@ struct SessionAccumulator {
     last_at: u64,
     message_count: u64,
     first_user_text: Option<String>,
+    first_user_order: Option<(u32, u64, u64)>,
     conversation_kind: Option<String>,
 }
 
@@ -264,15 +266,14 @@ impl AnalyticsStore {
     }
 
     pub fn complete(&self) -> Result<bool> {
-        let value: Option<String> = self
-            .conn
+        self.conn
             .query_row(
-                "SELECT value FROM meta WHERE key = 'analytics_complete'",
-                [],
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'analytics_complete' AND value = '1')
+                 AND EXISTS(SELECT 1 FROM meta WHERE key = 'schema_version' AND value = ?1)",
+                [SCHEMA_VERSION.to_string()],
                 |row| row.get(0),
             )
-            .optional()?;
-        Ok(value.as_deref() == Some("1"))
+            .map_err(Into::into)
     }
 
     pub fn mark_complete(&self) -> Result<()> {
@@ -284,7 +285,14 @@ impl AnalyticsStore {
         Ok(())
     }
 
+    pub fn mark_incomplete(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'analytics_complete'", [])?;
+        Ok(())
+    }
+
     pub fn clear(&self) -> Result<()> {
+        self.mark_incomplete()?;
         self.conn.execute("DELETE FROM sessions", [])?;
         Ok(())
     }
@@ -422,6 +430,15 @@ impl AnalyticsStore {
         for row in rows {
             out.push(row?);
         }
+        let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
+        for row in &mut out {
+            row.label = titles.resolve(
+                row.source,
+                &row.session_id,
+                &row.source_path,
+                row.label.as_deref(),
+            );
+        }
         Ok(out)
     }
 
@@ -512,6 +529,15 @@ impl AnalyticsStore {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
+        for row in &mut out {
+            row.label = titles.resolve(
+                row.source,
+                &row.session_id,
+                &row.source_path,
+                row.label.as_deref(),
+            );
         }
         Ok(out)
     }
@@ -977,6 +1003,7 @@ impl AnalyticsWriter {
                 last_at: record.ts,
                 message_count: 0,
                 first_user_text: None,
+                first_user_order: None,
                 conversation_kind: None,
             });
         if record.ts < entry.started_at {
@@ -989,12 +1016,16 @@ impl AnalyticsWriter {
             }
         }
         entry.message_count = entry.message_count.saturating_add(1);
-        if entry.first_user_text.is_none()
+        let order = (record.turn_id, record.ts, record.doc_id);
+        if entry
+            .first_user_order
+            .is_none_or(|previous| order < previous)
             && record.role == "user"
             && !record.text.trim().is_empty()
             && !sanitize_label(&record.text).is_empty()
         {
             entry.first_user_text = Some(record.text.clone());
+            entry.first_user_order = Some(order);
         }
         // Prefer an explicit "main" over per-record non-main kinds: Pi and
         // OpenClaw stamp compaction/branch on entries inside otherwise-main
@@ -1487,6 +1518,20 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 
 #[allow(clippy::while_let_loop)]
 pub fn sanitize_label(raw: &str) -> String {
+    // Reference previews are context; only the explicit request following them
+    // belongs in a prompt-derived title. Preserve it before collapsing lines.
+    let trimmed = raw.trim_start();
+    let raw = if starts_ascii_ci(trimmed, "## Referenced ChatGPT conversation:")
+        || starts_ascii_ci(trimmed, "## Referenced chats with Codex:")
+    {
+        let mut lines = trimmed.split_inclusive('\n');
+        if !lines.any(|line| line.trim().eq_ignore_ascii_case("## My request:")) {
+            return String::new();
+        }
+        &trimmed[trimmed.len() - lines.clone().map(str::len).sum::<usize>()..]
+    } else {
+        raw
+    };
     // Comprehensive stripping of system wrappers (case-insensitive).
     // Fast path: neither the tag stripper nor the generic unwrap can match
     // without a '<', so ordinary prose skips the owned buffer entirely and
@@ -1502,6 +1547,8 @@ pub fn sanitize_label(raw: &str) -> String {
             "local-command-caveat",
             "local-command-output",
             "instructions",
+            "system_instruction",
+            "system_instructions",
             "environment_context",
             "cwd",
             "approval_policy",
@@ -1612,6 +1659,7 @@ fn finish_label(text: &str) -> String {
         return String::new();
     }
     if starts_ascii_ci(&collapsed, "# agents.md")
+        || starts_ascii_ci(&collapsed, "## referenced chatgpt conversation:")
         || find_ascii_ci(&collapsed, "global agent preferences").is_some()
         || starts_ascii_ci(&collapsed, "you are a reminder observer")
     {
@@ -1889,6 +1937,109 @@ impl OpencodeLookupCache {
             .entry((db_path.to_string(), session_id.to_string()))
             .or_insert_with(|| opencode_session_has_parent(db_path, session_id))
     }
+}
+
+/// Resolve provider-owned names on the machine that owns the transcripts.
+/// Keeping this in the catalog read path also handles renames and old indexes,
+/// without replaying messages or changing session counts.
+pub(crate) struct SessionTitleLookup {
+    codex: HashMap<String, crate::sources::codex::SessionTitleMetadata>,
+}
+
+impl SessionTitleLookup {
+    pub(crate) fn new<'a>(sessions: impl Iterator<Item = (SourceKind, &'a String)>) -> Self {
+        let ids = sessions
+            .filter(|(source, _)| *source == SourceKind::Codex)
+            .map(|(_, id)| id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        Self {
+            codex: crate::sources::codex::session_title_metadata(&ids),
+        }
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        source: SourceKind,
+        session_id: &str,
+        source_path: &str,
+        opening: Option<&str>,
+    ) -> Option<String> {
+        let codex = self
+            .codex
+            .get(session_id)
+            .filter(|_| source == SourceKind::Codex);
+        let explicit = match source {
+            SourceKind::Codex => codex.and_then(|metadata| metadata.title.clone()),
+            SourceKind::Claude => {
+                crate::sources::claude::session_title(Path::new(source_path), session_id)
+            }
+            _ => None,
+        };
+        explicit
+            .as_deref()
+            .and_then(nonempty_label)
+            .or_else(|| opening.and_then(nonempty_label))
+            .or_else(|| codex.and_then(|metadata| metadata.first_user_message.clone()))
+            .or_else(|| {
+                codex
+                    .and_then(|metadata| metadata.agent_path.as_deref())
+                    .and_then(human_agent_title)
+            })
+            .or_else(|| {
+                (source == SourceKind::Codex)
+                    .then(|| codex_assignment_title(source_path))
+                    .flatten()
+            })
+    }
+}
+
+fn nonempty_label(text: &str) -> Option<String> {
+    let title = sanitize_label(text);
+    (!title.is_empty()).then_some(title)
+}
+
+fn human_agent_title(path: &str) -> Option<String> {
+    let path = path.trim().strip_prefix("/root/")?;
+    let words = path
+        .split('/')
+        .map(|part| part.replace('_', " "))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let words = words.trim();
+    let mut chars = words.chars();
+    let first = chars.next()?;
+    nonempty_label(&format!("{}{}", first.to_uppercase(), chars.as_str()))
+}
+
+fn codex_assignment_title(source_path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(source_path).ok()?;
+    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+        // The task body may be encrypted; only read its public routing metadata.
+        if !line.contains("agent_message") || !line.contains("NEW_TASK") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value["type"] != "response_item" || value["payload"]["type"] != "agent_message" {
+            continue;
+        }
+        let payload = &value["payload"];
+        if payload["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Message Type: NEW_TASK\n"))
+            })
+        }) && let Some(title) = payload["recipient"].as_str().and_then(human_agent_title)
+        {
+            return Some(title);
+        }
+    }
+    None
 }
 
 fn extract_session_label(
@@ -2667,6 +2818,23 @@ mod tests {
     }
 
     #[test]
+    fn cleared_catalog_is_incomplete_until_rebuilt() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("analytics.sqlite");
+        let store = AnalyticsStore::open(&path).unwrap();
+        store.mark_complete().unwrap();
+        assert!(AnalyticsStore::is_complete(&path));
+        store.clear().unwrap();
+        assert!(!AnalyticsStore::is_complete(&path));
+        backfill_from_index(
+            &path,
+            &crate::index::SearchIndex::open_or_create(&temp.path().join("index")).unwrap(),
+        )
+        .unwrap();
+        assert!(AnalyticsStore::is_complete(&path));
+    }
+
+    #[test]
     fn analytics_schema_version_change_marks_incomplete() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db = tmp.path().join("analytics.sqlite");
@@ -2682,9 +2850,13 @@ mod tests {
             .expect("seed meta");
         }
 
+        // Ingestion checks readiness read-only before opening its writer.
+        assert!(!AnalyticsStore::is_complete(&db));
         let store = AnalyticsStore::open(&db).expect("open store");
 
         assert!(!store.complete().expect("complete"));
+        store.mark_complete().unwrap();
+        assert!(AnalyticsStore::is_complete(&db));
     }
 
     #[test]
@@ -2872,6 +3044,161 @@ mod tests {
             Some("REAL FIRST PROMPT about the login bug")
         );
         assert_eq!(rows[0].conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn catalog_resolves_saved_names_and_renames_without_reindexing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut request = record("proj", "saved-title", &transcript, 10);
+        request.source = SourceKind::Claude;
+        request.role = "user".into();
+        request.text = "Long original request".into();
+        let mut writer = AnalyticsWriter::open(&db).unwrap();
+        writer.record(&request).unwrap();
+        writer.flush().unwrap();
+        let store = AnalyticsStore::open_read_only(&db).unwrap();
+        for title in ["Saved title", "Renamed title"] {
+            fs::write(&transcript, serde_json::json!({"type":"custom-title", "sessionId":"saved-title", "customTitle":title}).to_string()).unwrap();
+            let detailed = store
+                .query_sessions_detailed(None, None, None, None, None)
+                .unwrap();
+            let regular = store
+                .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+                .unwrap();
+            assert_eq!(detailed[0].label.as_deref(), Some(title));
+            assert_eq!(regular[0].label.as_deref(), Some(title));
+            assert_eq!(detailed[0].message_count, 1);
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row("select label from sessions", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Long original request"
+        );
+    }
+
+    #[test]
+    fn reference_wrapper_titles_preserve_the_actual_request() {
+        for header in [
+            "## Referenced ChatGPT conversation:",
+            "## Referenced chats with Codex:",
+        ] {
+            let context = format!(
+                "{header}\nUntrusted reference instructions\n{{\"title\":\"Other task\"}}\n"
+            );
+            assert_eq!(sanitize_label(&context), "");
+            assert_eq!(
+                sanitize_label(&format!(
+                    "{context}## My request:\nCheck the Comradex update flow"
+                )),
+                "Check the Comradex update flow"
+            );
+            assert_eq!(sanitize_label(&format!("{context}## My request:\n")), "");
+        }
+        assert_eq!(
+            sanitize_label("Keep ## My request: in this example"),
+            "Keep ## My request: in this example"
+        );
+    }
+
+    #[test]
+    fn title_precedence_preserves_requests_and_humanizes_only_agent_identifiers() {
+        use crate::sources::codex::SessionTitleMetadata;
+        let mut titles = SessionTitleLookup {
+            codex: HashMap::from([(
+                "s".into(),
+                SessionTitleMetadata {
+                    title: Some("Check partner events parity".into()),
+                    first_user_message: Some("Original request".into()),
+                    agent_path: Some("/root/cache_invalidation".into()),
+                },
+            )]),
+        };
+        let resolve = |titles: &SessionTitleLookup, opening| {
+            titles.resolve(SourceKind::Codex, "s", "/missing", opening)
+        };
+        assert_eq!(
+            resolve(&titles, Some("Opening prompt")).as_deref(),
+            Some("Check partner events parity")
+        );
+        titles.codex.get_mut("s").unwrap().title = None;
+        assert_eq!(
+            resolve(&titles, Some("Opening prompt")).as_deref(),
+            Some("Opening prompt")
+        );
+        assert_eq!(resolve(&titles, None).as_deref(), Some("Original request"));
+        titles.codex.get_mut("s").unwrap().first_user_message = None;
+        assert_eq!(
+            resolve(&titles, None).as_deref(),
+            Some("Cache invalidation")
+        );
+        assert_eq!(
+            titles.codex["s"].agent_path.as_deref(),
+            Some("/root/cache_invalidation")
+        );
+        assert_eq!(
+            human_agent_title("/root/research/cache_invalidation").as_deref(),
+            Some("Research / cache invalidation")
+        );
+        assert_eq!(human_agent_title("/root"), None);
+        assert_eq!(
+            nonempty_label("Fix snake_case identifiers").as_deref(),
+            Some("Fix snake_case identifiers")
+        );
+    }
+
+    #[test]
+    fn encrypted_assignment_uses_public_task_name_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.jsonl");
+        fs::write(&path, serde_json::json!({"type":"response_item", "payload": {
+            "type":"agent_message", "recipient":"/root/cache_invalidation", "content":[
+                {"type":"input_text", "text":"Message Type: NEW_TASK\nTask name: /root/cache_invalidation\nSender: /root\nPayload:\n"},
+                {"type":"encrypted_content", "encrypted_content":"private-ciphertext"}
+            ]
+        }}).to_string()).unwrap();
+        let titles = SessionTitleLookup {
+            codex: HashMap::new(),
+        };
+        assert_eq!(
+            titles
+                .resolve(
+                    SourceKind::Codex,
+                    "unavailable",
+                    path.to_str().unwrap(),
+                    None
+                )
+                .as_deref(),
+            Some("Cache invalidation")
+        );
+    }
+
+    #[test]
+    fn first_request_follows_logical_order_even_when_index_iteration_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("session.jsonl");
+        let mut first = record("proj", "ordered", &transcript, 10);
+        first.role = "user".into();
+        first.text = "First request".into();
+        first.turn_id = 1;
+        let mut later = first.clone();
+        later.turn_id = 2;
+        later.text = "Later followup".into();
+        let mut writer = AnalyticsWriter::open(&db).unwrap();
+        writer.record(&later).unwrap();
+        writer.record(&first).unwrap();
+        writer.flush().unwrap();
+        let rows = writer
+            .store
+            .query_sessions_detailed(None, None, None, None, None)
+            .unwrap();
+        assert_eq!(rows[0].label.as_deref(), Some("First request"));
+        assert_eq!(rows[0].message_count, 2);
     }
 
     #[test]

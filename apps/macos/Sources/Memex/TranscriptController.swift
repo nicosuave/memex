@@ -234,6 +234,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         updatingRows = true
         defer { updatingRows = false }
         let appendOnly = !changedSession && self.provider == provider && records.starts(with: self.records)
+        let prependOnly = !changedSession && self.provider == provider
+            && records.suffix(self.records.count).elementsEqual(self.records)
         let oldOrigin = scrollView.contentView.bounds.origin
         let visiblePosition = changedSession ? nil : currentPosition()
         if appendOnly, self.records != records, let last = rows.last {
@@ -262,7 +264,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 expanded.insert("activity:\(activity.id)")
             }
         }
-        rebuildRows(resetMeasurements: !appendOnly || changedMode || changedQuery)
+        // Both paging directions retain unchanged layouts; rebuildRows invalidates
+        // boundary groups whose records or nesting changed.
+        rebuildRows(resetMeasurements: !(appendOnly || prependOnly) || changedMode || changedQuery)
         if needsInitialPosition {
             applyInitialPosition()
         } else if let visiblePosition {
@@ -360,7 +364,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
 
     private func currentPosition() -> TranscriptNavigationState.Position? {
         guard !needsInitialPosition, !rows.isEmpty else { return nil }
-        let y = scrollView.contentView.bounds.minY
+        // Rubber-banding can put the clip origin above the first row while
+        // an earlier page arrives. Anchor to that row, not an invalid hit-test
+        // that would restore the old pixel origin into the newly prepended page.
+        let y = max(0, scrollView.contentView.bounds.minY)
         let row = table.row(at: NSPoint(x: 1, y: y + 1))
         guard rows.indices.contains(row) else { return nil }
         return .init(recordID: rows[row].records[0].sourceID, offset: y - table.rect(ofRow: row).minY,
@@ -700,7 +707,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let contentX = isUser ? width - 30 - contentWidth : 30 + indent
         let bodyWidth = contentWidth - (isUser || isDisclosure ? 24 : 0)
         var richContent: RichContentView?
-        let mayHaveRichBlocks = body.contains("```") || body.contains("~~~") || body.contains("![") || body.contains("](/") || body.contains("](file:")
+        let mayHaveRichBlocks = !PromptSections.hasOpeningSection(body) && (body.contains("```") || body.contains("~~~") || body.contains("![") || body.contains("](/") || body.contains("](file:"))
         if !showsRaw && (!attachments.isEmpty || (!body.isEmpty && (isTool || (mayHaveRichBlocks && RichContentDocument(body).hasRichBlocks)))) {
             if let cached = richLayouts[row.id] { richContent = cached }
             else {
@@ -854,7 +861,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         rawDisclosure.title = value.finding ? "Raw content shown for Find" : (value.showsRaw ? "Show formatted content" : "Show raw content")
         rawDisclosure.isEnabled = !value.finding
         message.setAccessibilityLabel(value.title)
-        activityIcon.isHidden = value.symbolName == nil
+        activityIcon.isHidden = value.isDisclosure || value.symbolName == nil
         activityIcon.image = value.symbolName.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
         activityIcon.contentTintColor = value.hasFailure ? .systemOrange : .tertiaryLabelColor
         disclosure.restingTint = value.hasFailure ? .systemOrange : .secondaryLabelColor
@@ -911,7 +918,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         activityIcon.frame = NSRect(x: x, y: 12, width: 14, height: 14)
         // Reserve the action gutter before hover so the title and chevron never move.
         let actionGutter: CGFloat = value.isDisclosure ? 32 : 0
-        disclosure.frame = NSRect(x: x + 22, y: 8, width: max(0, width - 22 - actionGutter), height: 22)
+        disclosure.frame = NSRect(x: x, y: 8, width: max(0, width - actionGutter), height: 22)
         rawDisclosure.frame = NSRect(x: x + 12, y: 44, width: width - 24, height: 22)
         let bodyY: CGFloat = value.isDisclosure ? (value.showsRawControl ? 74 : 44) : 16
         let inset: CGFloat = value.isUser || value.isDisclosure ? 12 : 0

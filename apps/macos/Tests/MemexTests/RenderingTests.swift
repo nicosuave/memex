@@ -336,6 +336,36 @@ struct RenderingTests {
         #expect(abs(controller.scrollView.contentView.bounds.minY - savedY) < 1)
     }
 
+    @Test func prependingPageReusesUnchangedLayoutsAndInvalidatesChangedText() {
+        let controller = TranscriptController()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 450)
+        controller.update(sessionID: "cache", records: simpleRecords(60..<120), provider: "codex")
+        let cached = controller.measurement(at: 10).attributedBody
+        controller.update(sessionID: "cache", records: simpleRecords(0..<120), provider: "codex")
+        #expect(controller.measurement(at: 70).attributedBody === cached)
+        var edited = simpleRecords(0..<120)
+        var message = edited[70].record
+        message.text = "Updated message"
+        edited[70] = TranscriptRecord(recordID: edited[70].id, record: message)
+        controller.update(sessionID: "cache", records: edited, provider: "codex")
+        #expect(controller.measurement(at: 70).attributedBody !== cached)
+        #expect(controller.measurement(at: 70).attributedBody.string.contains("Updated message"))
+    }
+
+    @Test func prependingDuringTopOverscrollKeepsOldFirstMessageVisible() {
+        let controller = TranscriptController()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 450)
+        controller.scrollView.contentView = OverscrollClipView(frame: controller.scrollView.bounds)
+        controller.scrollView.documentView = controller.table
+        controller.update(sessionID: "overscroll", records: simpleRecords(60..<120), provider: "codex", hasEarlier: true)
+        // Trackpad rubber-banding allows a negative clip origin while the
+        // asynchronous earlier-page request completes.
+        controller.scrollView.contentView.setBoundsOrigin(NSPoint(x: 0, y: -32))
+        #expect(controller.scrollView.contentView.bounds.minY < 0)
+        controller.update(sessionID: "overscroll", records: simpleRecords(0..<120), provider: "codex")
+        #expect(abs(controller.scrollView.contentView.bounds.minY - controller.table.rect(ofRow: 60).minY) < 1)
+    }
+
     @Test func prependingEarlierMessagesKeepsVisibleMessageAtSameOffset() {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 450)
@@ -403,4 +433,9 @@ struct RenderingTests {
 
 @MainActor private func descendants<T: NSView>(of view: NSView, as type: T.Type) -> [T] {
     ((view as? T).map { [$0] } ?? []) + view.subviews.flatMap { descendants(of: $0, as: type) }
+}
+
+/// Model the unconstrained clip bounds AppKit permits during rubber-banding.
+@MainActor private final class OverscrollClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect { proposedBounds }
 }

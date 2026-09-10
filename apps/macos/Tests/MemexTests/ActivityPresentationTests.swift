@@ -41,7 +41,7 @@ struct ActivityPresentationTests {
     }
 
     @Test func failureRequiresAnExplicitStructuredOutputStatus() {
-        for output in [#"{"isError":true}"#, #"{"is_error":true}"#, #"{"exit_code":1}"#, #"{"exit_code":-9}"#] {
+        for output in [" \n\t{\"exit_code\":2}", "\u{FEFF}{\"exit_code\":2}", #"{"isError":true}"#, #"{"is_error":true}"#, #"{"exit_code":1}"#, #"{"exit_code":-9}"#] {
             #expect(activity("Bash", output: output).presentation.hasFailure)
             #expect(activity("Bash", output: output).presentation.title == "Failed · Run")
         }

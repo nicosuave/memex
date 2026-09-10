@@ -88,3 +88,28 @@ import Testing
     #expect(title.minY <= 16) // Six-point outer margin plus ten-point card padding.
     #expect(text.string.contains("Context Window Reminder\nBody text."))
 }
+
+@MainActor @Test func inlineAndCompactPromptSectionsRenderWithoutRawTags() {
+    let source = "<multi_agent_role>You are an agent.\nMore **rules**.</multi_agent_role>\n<filesystem><workspace_roots><root>/tmp/project</root><root>/tmp/other</root></workspace_roots><entry access=\"read\"><path>/tmp/project</path></entry></filesystem>"
+    let rendered = RichTextRenderer.render(source, font: .systemFont(ofSize: 14)).string
+    #expect(rendered.contains("Multi Agent Role"))
+    #expect(rendered.contains("You are an agent."))
+    #expect(rendered.contains("Workspace Roots"))
+    #expect(rendered.contains("/tmp/other"))
+    #expect(rendered.contains("access=\"read\""))
+    #expect(!rendered.contains("<"))
+}
+
+@MainActor @Test func promptWithFencedCodeKeepsSectionRenderingInReader() {
+    let source = "<app-context>\n# Desktop context\n```swift\nlet x = 1\n```\n</app-context>"
+    let record = TranscriptRecord(recordID: "context", record: Message(role: "developer", text: source, toolName: nil, toolInput: nil, toolOutput: nil))
+    let controller = TranscriptController()
+    controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 500)
+    controller.update(sessionID: "prompt", records: [record], provider: "codex")
+    controller.toggle(controller.rows[0].id)
+    let measurement = controller.measurement(at: 0)
+    #expect(measurement.richContent == nil)
+    #expect(measurement.attributedBody.string.contains("App Context"))
+    #expect(!measurement.attributedBody.string.contains("<app-context>"))
+    #expect(measurement.attributedBody.string.contains("let x = 1"))
+}

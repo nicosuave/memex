@@ -91,6 +91,10 @@ extension TranscriptActivity {
     }
 
     private static func object(_ text: String) -> [String: Any]? {
+        // Status and arguments must be objects. Most tool output is plain text;
+        // do not allocate and invoke a failing JSON parser for each group pass.
+        let first = text.first(where: { !$0.isWhitespace })
+        guard first == "{" || first == "\u{FEFF}" else { return nil }
         guard let data = text.data(using: .utf8) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }

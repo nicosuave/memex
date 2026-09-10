@@ -13,6 +13,10 @@ import AppKit
     private static let tag = try! NSRegularExpression(pattern: #"^\s*<(/?)([A-Za-z_][\w:.-]*)([^<>]*?)(/?)>\s*$"#)
     private static let inlinePair = try! NSRegularExpression(pattern: #"^\s*<([A-Za-z_][\w:.-]*)([^<>]*)>(.+)</\1>\s*$"#)
 
+    static func hasOpeningSection(_ text: String) -> Bool {
+        text.range(of: #"^\s*<[A-Za-z_][\w:.-]*(?:\s[^<>]*)?>"#, options: .regularExpression) != nil
+    }
+
     static func render(_ text: String, font: NSFont) -> NSAttributedString? {
         let root = Section()
         var stack = [root]
@@ -22,7 +26,29 @@ import AppKit
         func flush() {
             if !buffer.isEmpty { stack.last!.parts.append(.text(buffer)); buffer = "" }
         }
-        for original in text.components(separatedBy: "\n") {
+        // Put boundary tags on their own lines, except inside literal code fences.
+        var lines: [String] = []
+        var literalFence: Character?
+        for line in text.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                if literalFence == nil { literalFence = trimmed.first }
+                else if literalFence == trimmed.first { literalFence = nil }
+                lines.append(line)
+            } else if literalFence != nil { lines.append(line) }
+            else {
+                let separated: String
+                if trimmed.hasPrefix("<") {
+                    separated = line.replacingOccurrences(of: #"</?[A-Za-z_][\w:.-]*(?:\s[^<>]*?)?/?>"#,
+                        with: "\n$0\n", options: .regularExpression)
+                } else {
+                    separated = line.replacingOccurrences(of: #"(?<=\S)(</[A-Za-z_][\w:.-]*>\s*)$"#,
+                        with: "\n$1", options: .regularExpression)
+                }
+                lines += separated.components(separatedBy: "\n")
+            }
+        }
+        for original in lines {
             let trimmed = original.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 if fence == nil { fence = trimmed.first }
