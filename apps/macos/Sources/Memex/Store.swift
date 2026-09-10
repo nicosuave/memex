@@ -315,13 +315,18 @@ final class Store {
         sessionMetadataGeneration = generation
         loadingSessionMetadata = false
         sessionMetadataError = nil
-        guard let session = selected, session.machineID == "local",
-              session.searchRecordID != nil, session.resumeCommand == nil else { return }
+        guard let session = selected,
+              session.label?.nilIfBlank == nil || (session.searchRecordID != nil && session.machineID == "local" && session.resumeCommand == nil) else { return }
         let request = readerRequestID
         loadingSessionMetadata = true
         defer { if sessionMetadataGeneration == generation { loadingSessionMetadata = false } }
         do {
-            let detail = try await client.sessionDetails(for: session)
+            var detail = try await client.sessionDetails(for: session)
+            if detail.label?.nilIfBlank == nil { detail.label = session.label?.nilIfBlank }
+            if detail.label?.nilIfBlank == nil {
+                let opening = try await client.records(for: session, offset: 0, limit: 16)
+                detail.label = Session.openingTitle(opening)
+            }
             try Task.checkCancellation()
             guard sessionMetadataGeneration == generation, readerRequestID == request,
                   let index = sessions.firstIndex(where: { $0.id == session.id }) else { return }

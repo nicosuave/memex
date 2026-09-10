@@ -101,6 +101,53 @@ import Testing
         #expect(reader.measurement(at: toolIndex).isExpanded)
     }
 
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["MEMEX_READER_PERF_INPUT"] != nil))
+    func capturedPagePrependLatency() throws {
+        let path = try #require(ProcessInfo.processInfo.environment["MEMEX_READER_PERF_INPUT"])
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let decodeStart = ContinuousClock.now
+        let records = try JSONDecoder().decode([TranscriptRecord].self, from: data)
+        print(String(format: "pagination_decode bytes=%d records=%d ms=%.2f", data.count, records.count, milliseconds(since: decodeStart)))
+        #expect(records.count > 60)
+        let projectionCosts = records.map { record in
+            let start = ContinuousClock.now
+            _ = TranscriptPresentation.project([record])
+            return (record.record.role, record.record.text.utf8.count, milliseconds(since: start))
+        }
+        for (role, bytes, ms) in projectionCosts.sorted(by: { $0.2 > $1.2 }).prefix(5) {
+            print(String(format: "pagination_projection role=%@ bytes=%d ms=%.2f", role, bytes, ms))
+        }
+        _ = NSApplication.shared
+        for iteration in 0..<3 {
+            let reader = TranscriptController()
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 800, height: 700),
+                styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentViewController = reader
+            defer { window.close() }
+            window.contentView?.layoutSubtreeIfNeeded()
+            reader.update(sessionID: "pagination", records: Array(records.suffix(60)), provider: "codex", hasEarlier: true)
+            window.contentView?.layoutSubtreeIfNeeded()
+            reader.scrollView.contentView.scroll(to: .zero)
+            let projectStart = ContinuousClock.now
+            let projected = TranscriptPresentation.project(records)
+            let projectMS = milliseconds(since: projectStart)
+            let consecutiveStart = ContinuousClock.now
+            _ = TranscriptItem.groupConsecutive(projected)
+            let consecutiveMS = milliseconds(since: consecutiveStart)
+            let groupStart = ContinuousClock.now
+            _ = TranscriptItem.group(records)
+            let groupingMS = milliseconds(since: groupStart)
+            let start = ContinuousClock.now
+            reader.update(sessionID: "pagination", records: records, provider: "codex")
+            let updateMS = milliseconds(since: start)
+            window.contentView?.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            print(String(format: "pagination_prepend iteration=%d project_ms=%.2f consecutive_ms=%.2f group_ms=%.2f update_ms=%.2f total_ms=%.2f rows=%d",
+                iteration, projectMS, consecutiveMS, groupingMS, updateMS, milliseconds(since: start), reader.rows.count))
+        }
+    }
+
     private func milliseconds(since start: ContinuousClock.Instant) -> Double {
         let duration = start.duration(to: .now).components
         return Double(duration.seconds) * 1_000 + Double(duration.attoseconds) / 1_000_000_000_000_000

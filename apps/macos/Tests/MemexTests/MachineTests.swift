@@ -20,7 +20,9 @@ import Testing
     let local = Session(source: "codex", sessionID: "same", sourcePath: "/same", project: "memex", label: "Local title")
     let unmatched = hit.session(known: [local.id: local])
     #expect(unmatched.machineID == "fixture-remote")
-    #expect(unmatched.title == "match")
+    #expect(unmatched.label == nil)
+    #expect(unmatched.title == "Untitled conversation")
+    #expect(unmatched.snippet == "match")
     var remote = local
     remote.machine = "fixture-remote"
     remote.label = "Remote title"

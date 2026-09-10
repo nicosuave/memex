@@ -105,6 +105,24 @@ struct ToolContentTests {
         #expect(!controller.measurement(at: 0).attributedBody.string.contains(payload))
     }
 
+    @Test func adjacentExecutionResultsDecodeNestedJSONAndPreserveRaw() {
+        let first = #"{"chunk_id":"one","output":"{\"conditions\":[{\"message\":\"failed } [\"}]}"}"#
+        let second = #"{"chunk_id":"two","output":"log\nnext"}"#
+        let source = "Script completed\nOutput:\n" + first + second
+        let record = entry("result", output: source)
+        let rendered = ToolContentRenderer.render([record]).string
+        #expect(rendered.contains("conditions[0].message\nfailed } ["))
+        #expect(rendered.contains("chunk_id\ntwo"))
+        #expect(rendered.contains("output\nlog\nnext"))
+        #expect(ToolContentRenderer.render([record], raw: true).string == source)
+    }
+
+    @Test func malformedAndOversizedResultsRemainLiteral() {
+        for source in ["Output:\n{broken}", "Output:\n{\"output\":\"" + String(repeating: "x", count: 256_000) + "\"}"] {
+            #expect(ToolContentRenderer.render([entry("result", output: source)]).string == source)
+        }
+    }
+
     private func entry(_ id: String, input: String? = nil, output: String? = nil) -> TranscriptRecord {
         TranscriptRecord(recordID: id, record: Message(role: input == nil ? "tool_result" : "tool_use", text: "",
             toolName: "exec", toolInput: input, toolOutput: output))

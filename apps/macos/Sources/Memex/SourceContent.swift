@@ -47,7 +47,9 @@ enum SourceContent {
     }
 
     static func displayText(_ message: Message) -> String {
-        guard message.text.contains("<<ImageDisplayed>>") else { return message.text }
+        // Without typed source content there cannot be an image to replace a
+        // placeholder. Avoid scanning large tool transcripts during every page update.
+        guard message.sourceContent != nil, message.text.contains("<<ImageDisplayed>>") else { return message.text }
         let imageCount = blocks(message).filter {
             switch $0 { case .embeddedImage, .attachment(_, _, true): true; default: false }
         }.count

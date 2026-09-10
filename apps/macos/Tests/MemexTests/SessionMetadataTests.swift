@@ -15,7 +15,7 @@ private struct MetadataFixture {
         printf '%s\n' "$@" > "$base/arguments"
         touch "$base/started"
         while [ -e "$base/hold" ]; do sleep 0.01; done
-        cat "$base/result"
+        if [ "$3" = session ] && [ -f "$base/opening" ]; then cat "$base/opening"; else cat "$base/result"; fi
         """#.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         try #"[{"source":"codex","session_id":"old","source_path":"/old file","project":"p","resume_cmd":"custom-resume old","cwd":"/tmp/p"}]"#
@@ -49,16 +49,11 @@ private struct MetadataFixture {
     #expect(args.contains("--session-id=old\n--source-path=/old file\n--origin\nall\n--limit\n1"))
 }
 
-@MainActor @Test func metadataRejectsWrongIdentityAndSkipsRemoteSessions() async throws {
+@MainActor @Test func metadataRejectsWrongIdentity() async throws {
     let fixture = try MetadataFixture()
     defer { fixture.cleanup() }
     let store = Store(client: fixture.client)
     var hit = fixture.hit
-    hit.machine = "nicbook-atm"
-    store.sessions = [hit]
-    store.selectedID = hit.id
-    await store.loadSelectedSessionMetadata()
-    #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("started").path))
     hit.machine = nil
     store.sessions = [hit]
     store.selectedID = hit.id
@@ -91,4 +86,52 @@ private struct MetadataFixture {
     #expect(store.sessions.first?.resumeCommand == nil)
     #expect(!store.loadingSessionMetadata)
     #expect(store.sessionMetadataError == nil)
+}
+
+@MainActor @Test func remoteSearchLoadsOpeningMessageTitleWithoutReplacingMatch() async throws {
+    let fixture = try MetadataFixture()
+    defer { fixture.cleanup() }
+    var hit = fixture.hit
+    hit.machine = "nicbook-atm"
+    hit.label = nil
+    try #"[{"source":"codex","session_id":"old","source_path":"/old file","project":"p","machine":"nicbook-atm","label":"Investigate equality deletes"}]"#
+        .write(to: fixture.directory.appendingPathComponent("result"), atomically: true, encoding: .utf8)
+    let store = Store(client: fixture.client)
+    store.sessions = [hit]
+    store.selectedID = hit.id
+    let readerID = store.readerRequestID
+    await store.loadSelectedSessionMetadata()
+    #expect(store.selected?.title == "Investigate equality deletes")
+    #expect(store.selected?.snippet == "matched text")
+    #expect(store.selected?.searchRecordID == "anchor")
+    #expect(store.readerRequestID == readerID)
+    #expect(store.sessionMetadataError == nil)
+    let args = try String(contentsOf: fixture.directory.appendingPathComponent("arguments"), encoding: .utf8)
+    #expect(args.contains("--machine\nnicbook-atm\n"))
+    try FileManager.default.removeItem(at: fixture.directory.appendingPathComponent("started"))
+    await store.loadSelectedSessionMetadata()
+    #expect(!FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("started").path))
+}
+
+@MainActor @Test func untitledRecentSubagentUsesOpeningContextName() async throws {
+    let fixture = try MetadataFixture()
+    defer { fixture.cleanup() }
+    var hit = fixture.hit
+    hit.machine = "nicbook-atm"
+    hit.label = nil
+    hit.searchRecordID = nil
+    try #"[{"source":"codex","session_id":"old","source_path":"/old file","project":"p","machine":"nicbook-atm"}]"#
+        .write(to: fixture.directory.appendingPathComponent("result"), atomically: true, encoding: .utf8)
+    try #"[{"record_id":"context","record":{"role":"developer","text":"<context_window>\nAgent name: /root/activity_backfill\n</context_window>"}},{"record_id":"user","record":{"role":"user","text":"<recommended_plugins>plugins</recommended_plugins><environment_context>env</environment_context>"}}]"#
+        .write(to: fixture.directory.appendingPathComponent("opening"), atomically: true, encoding: .utf8)
+    let store = Store(client: fixture.client)
+    store.sessions = [hit]
+    store.selectedID = hit.id
+    let readerID = store.readerRequestID
+    await store.loadSelectedSessionMetadata()
+    #expect(store.selected?.title == "Activity backfill")
+    #expect(store.readerRequestID == readerID)
+    #expect(store.sessionMetadataError == nil)
+    let args = try String(contentsOf: fixture.directory.appendingPathComponent("arguments"), encoding: .utf8)
+    #expect(args.contains("--offset\n0\n--limit\n16\n"))
 }

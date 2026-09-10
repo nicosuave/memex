@@ -40,6 +40,9 @@ enum TranscriptPresentation {
     /// These are transport markers, not arbitrary XML or Markdown directives. Keep
     /// examples in Markdown code/quotes intact and retain the complete source in rawJSON.
     private static func assistantDisplayText(_ text: String) -> String {
+        // Most messages contain no transport markers. Avoid scanning every
+        // Markdown code span again whenever an earlier page is inserted.
+        guard text.contains(":codex-annotation") || text.contains("<oai-mem-citation>") else { return text }
         let source = text as NSString
         let protected = protectedMarkdownRanges(text)
         func isProtected(_ range: NSRange) -> Bool {

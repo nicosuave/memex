@@ -19,6 +19,23 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
     var machineID: String { machine ?? "local" }
     var id: String { [machineID, source, sessionID, sourcePath].joined(separator: "\u{1f}") }
     var title: String { label?.nilIfBlank ?? "Untitled conversation" }
+    static func openingTitle(_ records: [TranscriptRecord]) -> String? {
+        if let request = TranscriptPresentation.project(records).first(where: {
+            $0.record.role == "user" && !$0.record.isInstruction && $0.record.text.nilIfBlank != nil
+        }) {
+            let text = request.record.text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            return String(text.prefix(160)) + (text.count > 160 ? "…" : "")
+        }
+        for entry in records where entry.record.role == "developer" && entry.record.text.hasPrefix("<context_window>") {
+            if let line = entry.record.text.components(separatedBy: "\n").first(where: { $0.hasPrefix("Agent name: /root/") }) {
+                let name = line.dropFirst("Agent name: /root/".count).replacingOccurrences(of: "_", with: " ")
+                let title = String(name.prefix(160))
+                return title.prefix(1).uppercased() + title.dropFirst()
+            }
+        }
+        return nil
+    }
+
     var projectName: String { repoProject?.nilIfBlank ?? project.nilIfBlank ?? "No project" }
     var date: Date? { lastAt.flatMap { try? Date.ISO8601FormatStyle().parse($0) } }
 
@@ -65,7 +82,6 @@ struct SearchHit: Decodable, Sendable {
         if let existing = known[value.id] { value = existing }
         value.snippet = snippet
         value.searchRecordID = recordID
-        if value.label == nil { value.label = snippet?.nilIfBlank }
         if value.lastAt == nil, let ts {
             value.lastAt = ts
         }

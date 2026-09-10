@@ -5341,7 +5341,7 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
         last_ts: row.last_at,
         hit_count: row.message_count.max(1) as usize,
         top_score: 0.0,
-        title: String::new(),
+        title: row.label.clone().unwrap_or_default(),
         snippet: String::new(),
         source_dir: row
             .cwd
@@ -5354,24 +5354,23 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
 }
 
 fn enrich_session_titles(index: &SearchIndex, sessions: &mut [SessionSummary]) {
-    let codex_ids = sessions
-        .iter()
-        .filter(|session| session.source == SourceKind::Codex)
-        .map(|session| session.session_id.clone())
-        .collect::<Vec<_>>();
-    let codex_titles = crate::sources::codex::session_titles(&codex_ids);
-
+    let titles = crate::analytics::SessionTitleLookup::new(
+        sessions
+            .iter()
+            .map(|session| (session.source, &session.session_id)),
+    );
     for session in sessions {
-        let source_title = match session.source {
-            SourceKind::Codex => codex_titles.get(&session.session_id).cloned(),
-            SourceKind::Claude => crate::sources::claude::session_title(
-                std::path::Path::new(&session.source_path),
+        let opening = session
+            .label
+            .clone()
+            .or_else(|| first_user_prompt(index, session));
+        session.title = titles
+            .resolve(
+                session.source,
                 &session.session_id,
-            ),
-            _ => None,
-        };
-        session.title = source_title
-            .or_else(|| first_user_prompt(index, session))
+                &session.source_path,
+                opening.as_deref(),
+            )
             .map(|title| summarize(&title, 120))
             .unwrap_or_default();
     }
@@ -5390,7 +5389,10 @@ fn first_user_prompt(index: &SearchIndex, session: &SessionSummary) -> Option<St
             .then_with(|| left.ts.cmp(&right.ts))
             .then_with(|| left.doc_id.cmp(&right.doc_id))
     });
-    records.into_iter().next().map(|record| record.text)
+    records
+        .into_iter()
+        .map(|record| crate::analytics::sanitize_label(&record.text))
+        .find(|text| !text.is_empty())
 }
 
 fn enrich_session_projects(
@@ -5738,9 +5740,9 @@ fn run_search_request(
             if sessions.is_empty() {
                 anyhow::bail!("no analytics sessions");
             }
+            enrich_session_titles(index, &mut sessions);
             Ok(sessions)
         })?;
-        enrich_session_titles(index, &mut sessions);
         sessions.retain(|session| {
             session_matches_kind(request.kind, session.conversation_kind.as_deref())
         });

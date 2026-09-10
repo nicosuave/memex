@@ -1539,8 +1539,20 @@ fn ingest_selected(
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     let analytics_db = analytics_path(&paths.state);
-    let analytics_needs_backfill =
-        !AnalyticsStore::is_complete(&analytics_db) && index.doc_count()? > 0;
+    // A replacement/empty index cannot inherit a complete catalog from its
+    // predecessor: otherwise moved paths remain as rows with no indexed records
+    // and reparsed messages get added to the old counts.
+    let analytics_needs_backfill = empty_index_rebuild
+        || if index.doc_count()? == 0 {
+            AnalyticsStore::is_ready(&analytics_db)
+        } else {
+            !AnalyticsStore::is_complete(&analytics_db)
+        };
+    if analytics_needs_backfill {
+        // Persist this before publishing any new index records. Recovery must
+        // retry reconciliation even if interrupted before the backfill starts.
+        AnalyticsStore::open(&analytics_db)?.mark_incomplete()?;
+    }
     if !recover_vectors
         && tasks.is_empty()
         && delete_paths.is_empty()
@@ -4385,6 +4397,49 @@ mod tests {
         .unwrap();
         assert!(!stale.exists());
         assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn rebuilding_empty_index_replaces_stale_catalog_rows() {
+        for has_transcript in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+            paths.ensure_dirs().unwrap();
+            let source_dir = temp.path().join("transcripts");
+            fs::create_dir_all(&source_dir).unwrap();
+            let transcript = source_dir.join("archived.jsonl");
+            if has_transcript {
+                fs::write(&transcript, br#"{"type":"user","sessionId":"session","message":{"role":"user","content":[{"type":"text","text":"Actual request"}]},"uuid":"u1","timestamp":"2024-01-01T00:00:00Z"}
+"#).unwrap();
+            }
+            let db = analytics_path(&paths.state);
+            let mut old = AnalyticsWriter::open(&db).unwrap();
+            for path in [temp.path().join("old-active.jsonl"), transcript.clone()] {
+                let mut stale = record(1, "user", "Previous request");
+                stale.source = SourceKind::Claude;
+                stale.session_id = "session".into();
+                stale.source_path = path.to_string_lossy().into_owned();
+                old.record(&stale).unwrap();
+            }
+            old.flush().unwrap();
+            AnalyticsStore::open(&db).unwrap().mark_complete().unwrap();
+            // The old catalog remains even if ingest state was lost as well.
+            let index = open_search_index(&paths);
+            let mut options = ingest_options(false, ModelChoice::default());
+            options.claude_sources = vec![source_dir];
+            ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+            let store = AnalyticsStore::open_read_only(&db).unwrap();
+            let rows = store
+                .query_sessions_detailed(None, None, None, None, None)
+                .unwrap();
+            assert_eq!(rows.len(), usize::from(has_transcript));
+            if has_transcript {
+                assert_eq!(rows[0].source_path, transcript.to_string_lossy());
+                assert_eq!(rows[0].message_count, 1);
+                assert_eq!(rows[0].label.as_deref(), Some("Actual request"));
+            }
+            assert!(store.complete().unwrap());
+        }
     }
 
     #[test]

@@ -20,11 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
-    // Recompute persisted identities and usage parents for guardian reviews.
-    identity: 3,
-    // Preserve pre-reader fallback IDs independently of added display records.
-    index: 8,
-    usage: 5,
+    // Recompute ownership after excluding copied parent session metadata.
+    identity: 4,
+    index: 9,
+    usage: 6,
 };
 
 pub fn classify_path(path: &str) -> Option<SourceKind> {
@@ -90,10 +89,33 @@ pub fn history_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Load the human-facing titles maintained by Codex's local thread database.
-/// The rollout JSONL files do not carry this value themselves.
+/// Provider metadata stays separate from transcript-derived title fallbacks.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SessionTitleMetadata {
+    pub title: Option<String>,
+    pub first_user_message: Option<String>,
+    pub agent_path: Option<String>,
+}
+
+/// Load titles without treating an agent identifier as a conversation title.
 pub fn session_titles(session_ids: &[String]) -> HashMap<String, String> {
+    session_title_metadata(session_ids)
+        .into_iter()
+        .filter_map(|(id, metadata)| {
+            metadata
+                .title
+                .or(metadata.first_user_message)
+                .map(|title| (id, title))
+        })
+        .collect()
+}
+
+/// Read each database's schema and prepare its lookup once for the whole batch.
+pub fn session_title_metadata(session_ids: &[String]) -> HashMap<String, SessionTitleMetadata> {
     let mut titles = HashMap::new();
+    if session_ids.is_empty() {
+        return titles;
+    }
     for home in homes() {
         for path in state_database_paths(&home) {
             let Ok(connection) = Connection::open_with_flags(
@@ -102,12 +124,18 @@ pub fn session_titles(session_ids: &[String]) -> HashMap<String, String> {
             ) else {
                 continue;
             };
+            let Some(query) = title_metadata_query(&connection) else {
+                continue;
+            };
+            let Ok(mut statement) = connection.prepare(&query) else {
+                continue;
+            };
             for session_id in session_ids {
                 if titles.contains_key(session_id) {
                     continue;
                 }
-                if let Some(title) = codex_thread_title(&connection, session_id) {
-                    titles.insert(session_id.clone(), title);
+                if let Some(metadata) = codex_thread_title_metadata(&mut statement, session_id) {
+                    titles.insert(session_id.clone(), metadata);
                 }
             }
         }
@@ -136,28 +164,63 @@ fn state_database_paths(home: &Path) -> Vec<PathBuf> {
     versioned_paths.into_iter().map(|(_, path)| path).collect()
 }
 
-fn codex_thread_title(connection: &Connection, session_id: &str) -> Option<String> {
-    // Current Codex builds have all three columns. The second query keeps the
-    // reader useful with older databases that only stored `title`.
-    for sql in [
-        "SELECT COALESCE(NULLIF(name, ''), NULLIF(title, ''), NULLIF(first_user_message, '')) FROM threads WHERE id = ?1",
-        "SELECT NULLIF(title, '') FROM threads WHERE id = ?1",
-    ] {
-        let title = connection
-            .query_row(sql, params![session_id], |row| {
-                row.get::<_, Option<String>>(0)
-            })
-            .optional()
-            .ok()
-            .flatten()
-            .flatten()
-            .map(|title| title.trim().to_string())
-            .filter(|title| !title.is_empty());
-        if title.is_some() {
-            return title;
-        }
+fn title_metadata_query(connection: &Connection) -> Option<String> {
+    let mut statement = connection.prepare("PRAGMA table_info(threads)").ok()?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .ok()?;
+    if !columns.contains("id") {
+        return None;
     }
-    None
+    // Only these fixed identifiers enter SQL; unavailable older columns are NULL.
+    let fields = ["name", "title", "first_user_message", "agent_path"].map(|field| {
+        if columns.contains(field) {
+            field
+        } else {
+            "NULL"
+        }
+    });
+    Some(format!(
+        "SELECT {} FROM threads WHERE id = ?1",
+        fields.join(", ")
+    ))
+}
+
+fn codex_thread_title_metadata(
+    statement: &mut rusqlite::Statement<'_>,
+    session_id: &str,
+) -> Option<SessionTitleMetadata> {
+    let (name, title, first_user_message, agent_path) = statement
+        .query_row(params![session_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .optional()
+        .ok()
+        .flatten()?;
+    let normalize = |value: Option<String>| {
+        value
+            .map(|text| crate::analytics::sanitize_label(&text))
+            .filter(|text| !text.is_empty())
+    };
+    let metadata = SessionTitleMetadata {
+        title: normalize(name).or_else(|| normalize(title)),
+        first_user_message: normalize(first_user_message),
+        agent_path: agent_path.filter(|path| {
+            path.strip_prefix("/root/")
+                .is_some_and(|name| !name.trim().is_empty())
+        }),
+    };
+    (metadata.title.is_some()
+        || metadata.first_user_message.is_some()
+        || metadata.agent_path.is_some())
+    .then_some(metadata)
 }
 
 pub fn session_id_from_path(path: &Path) -> Option<String> {
@@ -192,6 +255,7 @@ impl SessionLinks {
 #[derive(Clone)]
 struct SessionMeta {
     session_id: String,
+    owner_id: Option<String>,
     project: String,
     cwd: Option<PathBuf>,
     links: SessionLinks,
@@ -201,6 +265,7 @@ struct SessionMeta {
 fn fallback_meta(path: &Path) -> SessionMeta {
     SessionMeta {
         session_id: session_id_from_path(path).unwrap_or_else(|| "unknown".to_string()),
+        owner_id: session_id_from_path(path),
         project: SourceKind::Codex.label().to_string(),
         cwd: None,
         source_turn_id: None,
@@ -224,9 +289,31 @@ fn is_guardian_review(payload: &simd_json::borrowed::Object<'_>) -> bool {
             == Some("guardian")
 }
 
+// A rollout filename identifies its owner even when copied history precedes its
+// metadata. For nonstandard filenames, the first declared ID establishes ownership.
+fn accepts_meta(owner: &mut Option<String>, id: Option<&str>) -> bool {
+    let Some(id) = id.filter(|id| !id.is_empty()) else {
+        return true;
+    };
+    match owner {
+        Some(owner) => owner == id,
+        None => {
+            *owner = Some(id.to_string());
+            true
+        }
+    }
+}
+
 fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionMeta) {
-    if let Some(id) = payload.get("id").and_then(|value| value.as_str()) {
-        metadata.session_id = id.to_string();
+    let id = payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .and_then(|value| value.as_str());
+    if !accepts_meta(&mut metadata.owner_id, id) {
+        return;
+    }
+    if let Some(id) = &metadata.owner_id {
+        metadata.session_id = id.clone();
     }
     if let Some(cwd) = payload.get("cwd").and_then(|value| value.as_str()) {
         metadata.project = super::common::project_from_path(cwd);
@@ -1389,7 +1476,10 @@ pub(crate) fn parse_usage_file(
         let payload = value.get("payload");
         match (kind, payload) {
             ("session_meta", Some(payload)) => {
-                session = borrowed_string(payload, &["id", "session_id"]).or(session);
+                let id = borrowed_string(payload, &["id", "session_id"]);
+                if !accepts_meta(&mut session, id.as_deref()) {
+                    continue;
+                }
                 permission_review = payload.as_object().is_some_and(is_guardian_review);
                 // Review sessions do not inherit the parent task's token counters.
                 parent = if permission_review {
@@ -1592,6 +1682,98 @@ mod tests {
         })
         .unwrap();
         (records, output)
+    }
+
+    #[test]
+    fn copied_parent_metadata_cannot_replace_rollout_ownership() {
+        use serde_json::json;
+        let owner = "01a08752-673e-7032-bfac-faf9eb95ae40";
+        let parent = "01a08749-9316-72b0-a489-1ae139f6789f";
+        for filename in [format!("rollout-{owner}.jsonl"), "session.jsonl".into()] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(&filename);
+            let own_meta = |cwd| {
+                json!({"type":"session_meta", "timestamp": 1, "payload": {
+                    "id": owner, "cwd": cwd, "forked_from_id": parent,
+                    "source": {"subagent": {"thread_spawn": {
+                        "parent_thread_id": parent, "agent_path": "/root/review_placeholder_fix"
+                    }}}
+                }})
+            };
+            let foreign = json!({"type":"session_meta", "timestamp": 2, "payload": {
+                "id": parent, "cwd": "/repo/parent", "source": "vscode"
+            }});
+            let message = json!({"type":"response_item", "payload": {
+                "type":"message", "role":"assistant", "content":"Review result"
+            }});
+            let mut lines = Vec::new();
+            if filename.starts_with("rollout-") {
+                // The filename also protects against foreign metadata before our header.
+                lines.push(foreign.clone());
+            }
+            lines.extend([own_meta("/repo/initial"), foreign.clone(), message.clone()]);
+            let prefix = lines.iter().map(|v| format!("{v}\n")).collect::<String>();
+            let suffix = [own_meta("/repo/updated"), foreign, message,
+                json!({"type":"response", "timestamp":3, "usage":{"input_tokens":20,"output_tokens":3}})]
+                .iter().map(|v| format!("{v}\n")).collect::<String>();
+            fs::write(&path, &prefix).unwrap();
+            let (_, checkpoint) = parse_transcript(&path, IndexParseState::default());
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(suffix.as_bytes())
+                .unwrap();
+            let metadata = probe(&path).unwrap();
+            assert_eq!(metadata.session.session_id, owner);
+            assert_eq!(
+                metadata.session.conversation_kind,
+                ConversationKind::Subagent
+            );
+            assert_eq!(metadata.session.parent_session_id.as_deref(), Some(parent));
+            assert_eq!(metadata.cwd, Some(PathBuf::from("/repo/updated")));
+            let (records, output) = parse_transcript(&path, IndexParseState::default());
+            assert_eq!(output.session_id.as_deref(), Some(owner));
+            assert_eq!(records.len(), 2);
+            for record in &records {
+                assert_eq!(record.session_id, owner);
+                assert_eq!(record.links.conversation_kind.as_deref(), Some("subagent"));
+                assert_eq!(record.links.parent_session_id.as_deref(), Some(parent));
+            }
+            assert_eq!(records[0].project, "initial");
+            assert_eq!(records[1].project, "updated");
+            let (incremental, _) = parse_transcript(
+                &path,
+                IndexParseState {
+                    offset: checkpoint.offset,
+                    turn_id: checkpoint.turn_id,
+                    legacy_turn_id: checkpoint.legacy_turn_id,
+                    pending_tool_calls: checkpoint.pending_tool_calls,
+                },
+            );
+            assert_eq!(incremental.len(), 1);
+            assert_eq!(incremental[0].session_id, owner);
+            assert_eq!(
+                incremental[0].links.conversation_kind.as_deref(),
+                Some("subagent")
+            );
+            let usage = parse_usage_file(&path, &UsageParentIndex::new(&[])).unwrap();
+            assert_eq!(usage.events.len(), 1);
+            assert_eq!(usage.events[0].session_id.as_deref(), Some(owner));
+            assert_eq!(usage.events[0].project.as_deref(), Some("/repo/updated"));
+        }
+    }
+
+    #[test]
+    fn metadata_without_an_id_preserves_filename_fallback() {
+        let owner = "01a08752-673e-7032-bfac-faf9eb95ae40";
+        let mut metadata = fallback_meta(Path::new(&format!("rollout-{owner}.jsonl")));
+        let mut bytes = br#"{"cwd":"/repo/fallback","source":"vscode"}"#.to_vec();
+        let value = simd_json::to_borrowed_value(&mut bytes).unwrap();
+        apply_meta(value.as_object().unwrap(), &mut metadata);
+        assert_eq!(metadata.session_id, owner);
+        assert_eq!(metadata.project, "fallback");
     }
 
     #[test]
@@ -2034,10 +2216,104 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            codex_thread_title(&connection, "session-1").as_deref(),
+            codex_thread_title_metadata(
+                &mut connection
+                    .prepare(&title_metadata_query(&connection).unwrap())
+                    .unwrap(),
+                "session-1"
+            )
+            .unwrap()
+            .title
+            .as_deref(),
             Some("Pinned name")
         );
-        assert_eq!(codex_thread_title(&connection, "missing"), None);
+        assert_eq!(
+            codex_thread_title_metadata(
+                &mut connection
+                    .prepare(&title_metadata_query(&connection).unwrap())
+                    .unwrap(),
+                "missing"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_title_metadata_filters_each_candidate_before_falling_back() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE threads (id TEXT, name TEXT, title TEXT, first_user_message TEXT, agent_path TEXT);
+             INSERT INTO threads VALUES ('title', '<environment_context>injected</environment_context>', 'Useful title', 'Actual request', '/root/cache_invalidation');
+             INSERT INTO threads VALUES ('first', '  ', '<recommended_plugins>injected</recommended_plugins>', 'Actual request', '/root');
+             INSERT INTO threads VALUES ('empty', NULL, '', '<INSTRUCTIONS>injected</INSTRUCTIONS>', '/root/');"
+        ).unwrap();
+        let mut statement = connection
+            .prepare(&title_metadata_query(&connection).unwrap())
+            .unwrap();
+        assert_eq!(
+            codex_thread_title_metadata(&mut statement, "title"),
+            Some(SessionTitleMetadata {
+                title: Some("Useful title".into()),
+                first_user_message: Some("Actual request".into()),
+                agent_path: Some("/root/cache_invalidation".into()),
+            })
+        );
+        assert_eq!(
+            codex_thread_title_metadata(&mut statement, "first"),
+            Some(SessionTitleMetadata {
+                title: None,
+                first_user_message: Some("Actual request".into()),
+                agent_path: None,
+            })
+        );
+        assert_eq!(codex_thread_title_metadata(&mut statement, "empty"), None);
+    }
+
+    #[test]
+    fn codex_title_metadata_reads_older_optional_column_sets() {
+        for schema in [
+            "CREATE TABLE threads (id TEXT, title TEXT); INSERT INTO threads VALUES ('s', 'Older title');",
+            "CREATE TABLE threads (id TEXT, title TEXT, first_user_message TEXT); INSERT INTO threads VALUES ('s', 'Older title', 'First prompt');",
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            connection.execute_batch(schema).unwrap();
+            let mut statement = connection
+                .prepare(&title_metadata_query(&connection).unwrap())
+                .unwrap();
+            let metadata = codex_thread_title_metadata(&mut statement, "s").unwrap();
+            assert_eq!(metadata.title.as_deref(), Some("Older title"));
+            assert_eq!(metadata.agent_path, None);
+            if schema.contains("first_user_message") {
+                assert_eq!(metadata.first_user_message.as_deref(), Some("First prompt"));
+            } else {
+                assert_eq!(metadata.first_user_message, None);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_title_metadata_preserves_only_rooted_agent_paths() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, agent_path TEXT);
+            INSERT INTO threads VALUES ('valid', '/root/research/cache_invalidation'),
+                ('root', '/root'), ('blank', '/root/  '), ('relative', 'cache_invalidation');",
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(&title_metadata_query(&connection).unwrap())
+            .unwrap();
+        assert_eq!(
+            codex_thread_title_metadata(&mut statement, "valid"),
+            Some(SessionTitleMetadata {
+                agent_path: Some("/root/research/cache_invalidation".into()),
+                ..Default::default()
+            })
+        );
+        for id in ["root", "blank", "relative"] {
+            assert_eq!(codex_thread_title_metadata(&mut statement, id), None);
+        }
     }
 
     #[test]

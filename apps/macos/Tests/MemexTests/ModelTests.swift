@@ -198,3 +198,27 @@ private func linkedRecord(_ id: String, _ role: String, _ invocation: String?,
     #expect(instruction.body == "instructions")
     #expect(instruction.title == "Developer instructions")
 }
+
+@Test func searchExcerptNeverBecomesConversationTitle() {
+    let hit = SearchHit(source: "claude", sessionID: "s", sourcePath: "/a", project: "p",
+                        snippet: "old_string: String(large tool payload)", ts: nil)
+    let unknown = hit.session(known: [:])
+    #expect(unknown.label == nil)
+    #expect(unknown.title == "Untitled conversation")
+    #expect(unknown.snippet == hit.snippet)
+    var known = unknown
+    known.label = "Investigate equality deletes"
+    #expect(hit.session(known: [known.id: known]).title == "Investigate equality deletes")
+}
+
+@Test func openingTitleSkipsInjectedContextAndUsesRequestOrSubagentName() {
+    func entry(_ role: String, _ text: String) -> TranscriptRecord {
+        TranscriptRecord(recordID: text, record: Message(role: role, text: text, toolName: nil, toolInput: nil, toolOutput: nil))
+    }
+    let context = entry("user", "<recommended_plugins>plugins</recommended_plugins>\n<environment_context>environment</environment_context>")
+    let agent = entry("developer", "<context_window>\nAgent name: /root/activity_backfill\n</context_window>")
+    #expect(Session.openingTitle([agent, context]) == "Activity backfill")
+    #expect(Session.openingTitle([context, entry("user", "Please fix\n the backfill")]) == "Please fix the backfill")
+    #expect(Session.openingTitle([agent, context, entry("user", "Actual assignment")]) == "Actual assignment")
+    #expect(Session.openingTitle([context]) == nil)
+}

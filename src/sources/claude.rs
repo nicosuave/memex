@@ -26,16 +26,38 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// Return the human-facing title Claude stores alongside a conversation.
 ///
 /// Title records are metadata rather than transcript messages, so the search
-/// index intentionally does not contain them. The TUI uses this lightweight
-/// reader when it builds the recent-session list.
+/// index intentionally does not contain them. The shared session catalog reads
+/// this metadata so every client sees saved names and subsequent renames.
 pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
-    let reader = BufReader::new(File::open(path).ok()?);
+    use memchr::memchr;
+    use memmap2::Mmap;
+    let file = File::open(path).ok()?;
+    let bytes = unsafe { Mmap::map(&file).ok()? };
     let mut custom_title = None;
     let mut ai_title = None;
     let mut agent_name = None;
 
-    for line in reader.lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = &bytes[offset..];
+        let length = memchr(b'\n', remaining).unwrap_or(remaining.len());
+        let line = &remaining[..length];
+        offset += length + usize::from(length < remaining.len());
+        // Most lines contain large transcript/tool bodies. Only metadata
+        // candidates need JSON decoding; still inspect every line for renames.
+        // Escaped JSON strings may encode the type using Unicode escapes.
+        if ![
+            b"custom-title".as_slice(),
+            b"ai-title",
+            b"agent-name",
+            b"\\u",
+        ]
+        .iter()
+        .any(|needle| memmem::find(line, needle).is_some())
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         if value
@@ -60,9 +82,8 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
                 .and_then(Value::as_str),
             _ => None,
         }
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(str::to_string);
+        .map(crate::analytics::sanitize_label)
+        .filter(|title| !title.is_empty());
 
         match entry_type {
             "custom-title" if title.is_some() => custom_title = title,
@@ -879,6 +900,52 @@ mod tests {
             Some("My title")
         );
         assert_eq!(session_title(&path, "another-session"), None);
+    }
+
+    #[test]
+    fn session_title_scans_past_large_messages_and_keeps_last_matching_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"custom-title", "sessionId":"s", "customTitle":"Original"}),
+            serde_json::json!({"type":"assistant", "message":{"content":"x".repeat(262144)}}),
+            serde_json::json!({"type":"assistant", "customTitle":"False match", "message":{"content":"custom-title"}}),
+            serde_json::json!({"type":"custom-title", "sessionId":"other", "customTitle":"Other session"}),
+            serde_json::json!({"type":"agent-name", "sessionId":"s", "agentName":"Agent name"}),
+            serde_json::json!({"type":"custom-title", "sessionId":"s", "customTitle":"Renamed"}),
+            serde_json::json!({"type":"ai-title", "sessionId":"s", "aiTitle":"Later generated title"}),
+        ];
+        // The final event intentionally has no trailing newline.
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(session_title(&path, "s").as_deref(), Some("Renamed"));
+        assert_eq!(
+            session_title(&path, "other").as_deref(),
+            Some("Other session")
+        );
+    }
+
+    #[test]
+    fn session_title_keeps_agent_fallback_and_empty_file_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        fs::write(&path, "").unwrap();
+        assert_eq!(session_title(&path, "s"), None);
+        fs::write(&path, "malformed custom-title\n{\"type\":\"agent-name\",\"sessionId\":\"s\",\"name\":\"Task name\"}").unwrap();
+        assert_eq!(session_title(&path, "s").as_deref(), Some("Task name"));
+        fs::write(
+            &path,
+            r#"{"type":"ai\u002dtitle","sessionId":"s","aiTitle":"Escaped type"}"#,
+        )
+        .unwrap();
+        assert_eq!(session_title(&path, "s").as_deref(), Some("Escaped type"));
     }
 
     #[test]

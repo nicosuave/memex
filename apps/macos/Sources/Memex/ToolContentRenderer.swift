@@ -98,18 +98,42 @@ import AppKit
             valueBlocks(value, to: result, toolName: toolName)
             return
         }
-        // Execution wrappers prepend timing/status lines to a JSON result. Only
-        // split at a line boundary when the entire remaining suffix parses.
-        for boundary in text.indices where text[boundary] == "\n" {
-            var next = text.index(after: boundary)
-            while next < text.endIndex, text[next] == " " || text[next] == "\t" {
-                next = text.index(after: next)
+        // Scan once for complete JSON containers, including adjacent exec results.
+        // Bound presentation work; raw content and Find retain the original bytes.
+        if !code, text.utf8.count <= 256_000 {
+            var cursor = text.startIndex
+            var plainStart = cursor
+            while cursor < text.endIndex {
+                let character = text[cursor]
+                let atBoundary = cursor == text.startIndex || text[text.index(before: cursor)].isWhitespace
+                    || text[text.index(before: cursor)] == "}" || text[text.index(before: cursor)] == "]"
+                guard atBoundary, character == "{" || character == "[" else {
+                    cursor = text.index(after: cursor)
+                    continue
+                }
+                let start = cursor
+                var depth = 0
+                var quoted = false
+                var escaped = false
+                repeat {
+                    let c = text[cursor]
+                    if quoted {
+                        if escaped { escaped = false }
+                        else if c == "\\" { escaped = true }
+                        else if c == "\"" { quoted = false }
+                    } else if c == "\"" { quoted = true }
+                    else if c == "{" || c == "[" { depth += 1 }
+                    else if c == "}" || c == "]" { depth -= 1 }
+                    cursor = text.index(after: cursor)
+                } while cursor < text.endIndex && depth > 0
+                if depth == 0, let value = json(String(text[start..<cursor])) {
+                    append(String(text[plainStart..<start]), to: result, code: code)
+                    valueBlocks(value, to: result, toolName: toolName)
+                    plainStart = cursor
+                }
             }
-            guard next < text.endIndex, text[next] == "{" || text[next] == "[" else { continue }
-            let suffix = String(text[next...])
-            if let value = json(suffix) {
-                append(String(text[...boundary]), to: result, code: code)
-                valueBlocks(value, to: result, toolName: toolName)
+            if plainStart != text.startIndex {
+                append(String(text[plainStart...]), to: result, code: code)
                 return
             }
         }
@@ -120,7 +144,7 @@ import AppKit
 
     private static func json(_ text: String) -> Any? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
+        guard trimmed.utf8.count <= 256_000, trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
         return try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))
     }
 
