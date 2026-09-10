@@ -144,7 +144,10 @@ import AppKit
 
     private static func json(_ text: String) -> Any? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.utf8.count <= 256_000, trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
+        // The size budget belongs to the adjacent-container scan, not complete
+        // JSON: typed image payloads can exceed it and still need previews and
+        // opaque-data suppression. Image decoding has its own limits above.
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("[") else { return nil }
         return try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))
     }
 
