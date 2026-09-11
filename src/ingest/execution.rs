@@ -1061,6 +1061,7 @@ pub(super) fn execute_refresh(
 ) -> Result<IngestReport> {
     let discovery::PreparedRefresh {
         full_scan,
+        scan_cache,
         state_path,
         mut state,
         recovering_pending_ingest,
@@ -1137,8 +1138,8 @@ pub(super) fn execute_refresh(
         if opencode_database_state_changed {
             state.save(&state_path)?;
         }
-        if full_scan {
-            update_scan_cache(paths, files_scanned, total_bytes)?;
+        if let Some(scan_cache) = scan_cache {
+            update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
         }
         if recovering_pending_ingest {
             finalize_pending_ingest(
@@ -1377,8 +1378,8 @@ pub(super) fn execute_refresh(
         state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
         state.save(&state_path)?;
 
-        if full_scan {
-            update_scan_cache(paths, files_scanned, total_bytes)?;
+        if let Some(scan_cache) = scan_cache {
+            update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
         }
         finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
 

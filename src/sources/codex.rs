@@ -81,6 +81,20 @@ pub fn discover_rollouts() -> Vec<SourceFile> {
         .collect()
 }
 
+pub(crate) fn discover_rollouts_with_inventory(
+    inventory: &mut crate::directory_inventory::DiscoveryInventory,
+) -> Result<Vec<SourceFile>> {
+    Ok(
+        super::common::jsonl_files_with_inventory(rollout_roots(), inventory)?
+            .into_iter()
+            .map(|path| SourceFile {
+                source: SourceKind::Codex,
+                path,
+            })
+            .collect(),
+    )
+}
+
 pub fn history_paths() -> Vec<PathBuf> {
     homes()
         .into_iter()
@@ -558,11 +572,13 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
     };
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
     let mut pending_tool_calls = state.pending_tool_calls;
     let source_path = path.to_string_lossy().to_string();
-    let prefix_len = (state.offset as usize).min(mmap.len());
+    let prefix_len = start;
     let (mut metadata, mut metadata_offsets) = read_meta_prefix(
         path,
         &mmap[..prefix_len],
@@ -577,7 +593,7 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
-        start += relative + 1;
+        start += relative + usize::from(relative < slice.len());
         if line.is_empty() {
             continue;
         }
@@ -586,6 +602,11 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
         let value = match simd_json::to_borrowed_value(&mut buffer) {
             Ok(value) => value,
             Err(_) => {
+                if relative == slice.len() {
+                    start = line_start;
+                    break;
+                }
+
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -1063,7 +1084,7 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
 
     Ok((
         IndexParseOutput {
-            offset: mmap.len() as u64,
+            offset: start as u64,
             turn_id,
             legacy_turn_id: Some(legacy_turn_id),
             pending_tool_calls,
@@ -1083,15 +1104,18 @@ pub(crate) fn parse_history_records(
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
-        start += relative + 1;
+        start += relative + usize::from(relative < slice.len());
         if line.is_empty() {
             continue;
         }
@@ -1099,6 +1123,10 @@ pub(crate) fn parse_history_records(
         buffer.extend_from_slice(line);
         let Ok(value): Result<BorrowedValue<'_>, _> = simd_json::to_borrowed_value(&mut buffer)
         else {
+            if relative == slice.len() {
+                start = line_start;
+                break;
+            }
             continue;
         };
         let Some(object) = value.as_object() else {
@@ -1146,7 +1174,7 @@ pub(crate) fn parse_history_records(
     }
     Ok(IndexParseOutput {
         legacy_turn_id: Some(turn_id),
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
         session_id: None,

@@ -344,9 +344,9 @@ pub(super) fn update_scan_cache(
     paths: &Paths,
     files_scanned: usize,
     total_bytes: u64,
+    mut cache: ScanCache,
 ) -> Result<()> {
     let cache_path = paths.state.join("scan_cache.json");
-    let mut cache = ScanCache::load(&cache_path)?;
     cache.update(files_scanned, total_bytes);
     cache.save(&cache_path)
 }
