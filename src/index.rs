@@ -1,3 +1,7 @@
+#[cfg(test)]
+mod cleanup_tests;
+mod storage;
+
 use crate::state::SessionScope;
 use crate::types::{Record, RecordLinks, SourceFilter};
 use anyhow::{Context, Result, anyhow, bail};
@@ -10,19 +14,20 @@ use std::io::{self, Write};
 use std::ops::Bound;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
+use tantivy::SegmentId;
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
-use tantivy::merge_policy::NoMergePolicy;
+use tantivy::merge_policy::{LogMergePolicy, NoMergePolicy};
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
-    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
+    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions,
 };
 use tantivy::store::StoreReader;
@@ -69,21 +74,30 @@ pub struct SearchIndex {
     writable: bool,
     pending_generation: Option<Arc<PendingGeneration>>,
     _generation_lease: Option<Arc<GenerationLease>>,
-    suppress_automatic_merges: bool,
+    incremental_merge_policy: bool,
+    defer_merges: bool,
+    shared_reader: Arc<OnceLock<IndexReader>>,
 }
 
 const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
-const CONTINUOUS_MERGE_BATCH_SEGMENTS: usize = 128;
-const CONTINUOUS_MERGE_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
+/// Small-segment count above which a search-triggered refresh schedules background compaction.
+pub const SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS: usize = 8;
+/// Largest segments a background compaction leaves alone; everything smaller merges into one.
+pub const COMPACTION_RETAINED_SEGMENTS: usize = 3;
+/// A segment holding at least this share of the corpus is never folded by background
+/// compaction, so each compaction costs a bounded slice of the corpus, not a rewrite of it.
+const COMPACTION_SMALL_SEGMENT_SHARE: f64 = 0.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationGcReport {
     pub generations_removed: usize,
     pub abandoned_workdirs_removed: usize,
     pub legacy_files_removed: usize,
+    pub shared_files_removed: usize,
     pub dry_run: bool,
 }
 
@@ -98,9 +112,10 @@ struct PendingGeneration {
     index_root: PathBuf,
     staging_dir: PathBuf,
     generation_name: String,
-    replaces_published_generation: bool,
+    requires_initial_publication: bool,
     published: AtomicBool,
-    _staging_lease: GenerationLease,
+    _staging_lease: Arc<GenerationLease>,
+    directory: storage::SharedDirectory,
 }
 
 impl Drop for PendingGeneration {
@@ -115,35 +130,38 @@ impl Drop for PendingGeneration {
 /// garbage collector cannot remove a segment concurrently. Published generations are immutable,
 /// so Tantivy cannot remove their segments and the lock is unnecessary for sealed readers.
 #[derive(Clone, Debug)]
-struct SealedDirectory(MmapDirectory);
+struct SealedDirectory {
+    directory: MmapDirectory,
+    _generation_lease: Option<Arc<GenerationLease>>,
+}
 
 impl Directory for SealedDirectory {
     fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
-        self.0.get_file_handle(path)
+        self.directory.get_file_handle(path)
     }
 
     fn delete(&self, path: &Path) -> Result<(), DeleteError> {
-        self.0.delete(path)
+        self.directory.delete(path)
     }
 
     fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
-        self.0.exists(path)
+        self.directory.exists(path)
     }
 
     fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
-        self.0.open_write(path)
+        self.directory.open_write(path)
     }
 
     fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
-        self.0.atomic_read(path)
+        self.directory.atomic_read(path)
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        self.0.atomic_write(path, data)
+        self.directory.atomic_write(path, data)
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        self.0.sync_directory()
+        self.directory.sync_directory()
     }
 
     fn acquire_lock(&self, _lock: &Lock) -> Result<DirectoryLock, LockError> {
@@ -151,7 +169,7 @@ impl Directory for SealedDirectory {
     }
 
     fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
-        self.0.watch(callback)
+        self.directory.watch(callback)
     }
 }
 
@@ -369,23 +387,35 @@ impl SearchIndex {
         dir: &Path,
         dry_run: bool,
     ) -> Result<GenerationGcReport> {
+        let _store_guard = if dry_run {
+            storage::lock_existing_store(dir)?
+        } else {
+            Some(storage::lock_store(dir)?)
+        };
         let source = resolve_current_generation(dir).unwrap_or_else(|| dir.to_path_buf());
         if !source.join("meta.json").is_file() {
             bail!("no committed index exists at {}", dir.display());
         }
 
         let generations = dir.join(GENERATIONS_DIR);
-        fs::create_dir_all(&generations)?;
-        let old_generations = fs::read_dir(&generations)?
-            .filter_map(|entry| entry.ok())
+        if !dry_run {
+            fs::create_dir_all(&generations)?;
+        }
+        let entries = match fs::read_dir(&generations) {
+            Ok(entries) => entries.collect::<io::Result<Vec<_>>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let old_generations = entries
+            .iter()
             .filter(|entry| {
                 entry.file_type().is_ok_and(|kind| kind.is_dir())
                     && !entry.file_name().to_string_lossy().starts_with('.')
             })
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
-        let abandoned_workdirs = fs::read_dir(&generations)?
-            .filter_map(|entry| entry.ok())
+        let abandoned_workdirs = entries
+            .iter()
             .filter(|entry| {
                 entry.file_type().is_ok_and(|kind| kind.is_dir())
                     && is_abandoned_generation_workdir(&entry.file_name())
@@ -400,13 +430,21 @@ impl SearchIndex {
             })
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
-        let report = GenerationGcReport {
+        let mut report = GenerationGcReport {
             generations_removed: old_generations.len(),
             abandoned_workdirs_removed: abandoned_workdirs.len(),
             legacy_files_removed: legacy_files.len(),
+            shared_files_removed: 0,
             dry_run,
         };
         if dry_run {
+            let doomed = old_generations
+                .iter()
+                .chain(abandoned_workdirs.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            report.shared_files_removed =
+                storage::collect_unreachable_excluding(dir, true, &doomed)?;
             return Ok(report);
         }
 
@@ -442,9 +480,17 @@ impl SearchIndex {
         let temp = tempfile::Builder::new()
             .prefix(".gc-")
             .tempdir_in(&generations)?;
-        clone_generation(&source, temp.path())?;
+        let generation_name = new_generation_name();
+        create_generation_lease_file(temp.path())?;
+        let shared =
+            storage::SharedDirectory::stage(dir, temp.path(), Some(&source), &generation_name)?;
         rewrite_managed_files_to_committed_set(temp.path())?;
         create_generation_lease_file(temp.path())?;
+        shared.prepare_publication(
+            dir,
+            &generation_name,
+            &committed_generation_files(temp.path())?,
+        )?;
         let actual = validate_committed_generation(temp.path())?;
         if actual != expected {
             bail!(
@@ -453,10 +499,10 @@ impl SearchIndex {
             );
         }
 
-        let generation_name = new_generation_name();
         let final_dir = generations.join(&generation_name);
         let staging = temp.keep();
         fs::rename(&staging, &final_dir)?;
+        shared.seal_at(&final_dir)?;
         sync_directory(&generations)?;
         atomic_write_current(dir, &generation_name)?;
 
@@ -483,13 +529,14 @@ impl SearchIndex {
         drop(exclusive_leases);
         sync_directory(&generations)?;
         sync_directory(dir)?;
+        report.shared_files_removed = storage::collect_unreachable(dir, false)?;
         Ok(report)
     }
 
     pub fn open_or_create(dir: &Path) -> Result<Self> {
         loop {
             let Some(generation) = resolve_current_generation(dir) else {
-                return Self::open_or_create_with_policy(dir, StaleSchemaPolicy::Error);
+                return Self::open_or_create_legacy(dir);
             };
             match open_sealed_generation(&generation) {
                 Ok(index) => return Ok(index),
@@ -510,60 +557,134 @@ impl SearchIndex {
         Self::open_or_create_for_ingest_with_merge_policy(dir, true)
     }
 
+    /// Search-triggered refreshes never merge in the foreground. A detached
+    /// `memex index compact` process folds the small segments once their count passes
+    /// [`SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS`].
+    pub fn open_or_create_for_search_refresh(dir: &Path) -> Result<Self> {
+        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, true)?;
+        index.defer_merges = true;
+        Ok(index)
+    }
+
+    pub fn segment_count(&self) -> Result<usize> {
+        Ok(self.index.searchable_segment_metas()?.len())
+    }
+
+    /// Segments background compaction would fold: not among the `keep_largest` biggest and
+    /// below [`COMPACTION_SMALL_SEGMENT_SHARE`] of the corpus.
+    fn small_segment_ids(&self, keep_largest: usize) -> Result<Vec<SegmentId>> {
+        let mut segments = self.index.searchable_segment_metas()?;
+        segments.sort_by_key(|segment| std::cmp::Reverse(segment.num_docs()));
+        let total = segments
+            .iter()
+            .map(|segment| u64::from(segment.num_docs()))
+            .sum::<u64>();
+        let ceiling = (total as f64 * COMPACTION_SMALL_SEGMENT_SHARE).ceil() as u64;
+        Ok(segments
+            .iter()
+            .skip(keep_largest)
+            .filter(|segment| u64::from(segment.num_docs()) < ceiling.max(1))
+            .map(|segment| segment.id())
+            .collect())
+    }
+
+    pub fn small_segment_count(&self, keep_largest: usize) -> Result<usize> {
+        Ok(self.small_segment_ids(keep_largest)?.len())
+    }
+
+    /// Merge the small segments (see [`Self::small_segment_ids`]) into one segment. Returns
+    /// how many were merged; fewer than two candidates is a no-op.
+    pub fn compact_small_segments(&self, keep_largest: usize) -> Result<usize> {
+        let remainder = self.small_segment_ids(keep_largest)?;
+        if remainder.len() < 2 {
+            return Ok(0);
+        }
+        let mut writer: IndexWriter = self.index.writer_with_num_threads(1, 64_000_000)?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        writer.merge(&remainder).wait()?;
+        writer.wait_merging_threads()?;
+        Ok(remainder.len())
+    }
+
     fn open_or_create_for_ingest_with_merge_policy(
         dir: &Path,
-        suppress_automatic_merges: bool,
+        incremental_merge_policy: bool,
     ) -> Result<Self> {
+        crate::profiling::span!("lexical.stage");
         fs::create_dir_all(dir)?;
         let generations = dir.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;
         let generation_name = new_generation_name();
         let staging_dir = generations.join(format!(".{generation_name}.tmp"));
 
+        let _store_guard = storage::lock_store(dir)?;
         let current = resolve_current_generation(dir);
-        if let Some(current) = &current {
-            clone_generation(current, &staging_dir)?;
-        } else if dir.join("meta.json").exists() {
-            clone_generation(dir, &staging_dir)?;
-        } else {
-            fs::create_dir_all(&staging_dir)?;
-        }
+        let source = current
+            .as_deref()
+            .or_else(|| dir.join("meta.json").is_file().then_some(dir));
+        fs::create_dir(&staging_dir)?;
+        #[cfg(target_os = "macos")]
+        let durability = storage::StagingDurability::prepare(dir, &staging_dir)?;
+        #[cfg(not(target_os = "macos"))]
         create_generation_lease_file(&staging_dir)?;
-        let staging_lease = acquire_generation_lease(&staging_dir)?;
-
-        let mut index =
-            Self::open_or_create_with_policy(&staging_dir, StaleSchemaPolicy::Recreate)?;
-        index.pending_generation = Some(Arc::new(PendingGeneration {
+        let staging_lease = Arc::new(acquire_generation_lease(&staging_dir)?);
+        let directory =
+            match storage::SharedDirectory::stage(dir, &staging_dir, source, &generation_name) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&staging_dir);
+                    return Err(error);
+                }
+            };
+        #[cfg(target_os = "macos")]
+        directory.set_durability(durability);
+        directory.pin_generation(Arc::clone(&staging_lease));
+        let pending = Arc::new(PendingGeneration {
             index_root: dir.to_path_buf(),
-            staging_dir,
+            staging_dir: staging_dir.clone(),
             generation_name,
-            replaces_published_generation: current.is_some(),
+            requires_initial_publication: current.is_none()
+                || source.is_some_and(|path| !path.join(storage::FORMAT).exists()),
             published: AtomicBool::new(false),
             _staging_lease: staging_lease,
-        }));
-        index.suppress_automatic_merges = suppress_automatic_merges;
-        Ok(index)
+            directory: directory.clone(),
+        });
+        let index = if staging_dir.join("meta.json").exists() {
+            let existing = Index::open(directory.clone())?;
+            // A staged generation is what future writes go into, so it must also gain
+            // the optional reader_metadata field that published generations may lack.
+            if schema_is_current(&existing.schema())
+                && existing.schema().get_field("reader_metadata").is_ok()
+            {
+                existing
+            } else {
+                drop(existing);
+                directory.reset()?;
+                Index::create(directory, build_schema()?, Default::default())?
+            }
+        } else {
+            Index::create(directory, build_schema()?, Default::default())?
+        };
+        Ok(Self {
+            fields: load_fields(index.schema())?,
+            index,
+            snapshot_version: snapshot_version_for_path(&staging_dir),
+            writable: true,
+            pending_generation: Some(pending),
+            _generation_lease: None,
+            incremental_merge_policy,
+            defer_merges: false,
+            shared_reader: Arc::new(OnceLock::new()),
+        })
     }
 
-    fn open_or_create_with_policy(
-        dir: &Path,
-        stale_schema_policy: StaleSchemaPolicy,
-    ) -> Result<Self> {
+    fn open_or_create_legacy(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let meta_path = dir.join("meta.json");
         if meta_path.exists() {
             let index = Index::open_in_dir(dir)?;
-            if !schema_is_current(&index.schema())
-                || (matches!(stale_schema_policy, StaleSchemaPolicy::Recreate)
-                    && index.schema().get_field("reader_metadata").is_err())
-            {
-                return match stale_schema_policy {
-                    StaleSchemaPolicy::Error => Err(stale_schema_error(dir)),
-                    StaleSchemaPolicy::Recreate => {
-                        drop(index);
-                        recreate_index_dir(dir)
-                    }
-                };
+            if !schema_is_current(&index.schema()) {
+                return Err(stale_schema_error(dir));
             }
             let fields = load_fields(index.schema())?;
             Ok(Self {
@@ -573,30 +694,68 @@ impl SearchIndex {
                 writable: true,
                 pending_generation: None,
                 _generation_lease: None,
-                suppress_automatic_merges: false,
+                incremental_merge_policy: false,
+                defer_merges: false,
+                shared_reader: Arc::new(OnceLock::new()),
             })
         } else {
             create_index_in_dir(dir)
         }
     }
 
+    pub(crate) fn is_writable(&self) -> bool {
+        self.writable
+    }
+
     pub fn writer(&self) -> Result<IndexWriter> {
-        if !self.writable {
+        self.writer_for_ingest(None)
+    }
+
+    pub(crate) fn writer_for_ingest(&self, input_bytes: Option<u64>) -> Result<IndexWriter> {
+        crate::profiling::span!("lexical.writer_open");
+        if !self.writable
+            || self
+                .pending_generation
+                .as_ref()
+                .is_some_and(|pending| pending.published.load(AtomicOrdering::Acquire))
+        {
             bail!("cannot create a writer for a sealed index generation");
         }
-        let writer = self.index.writer(256_000_000)?;
-        if self.suppress_automatic_merges {
+        let writer = if input_bytes.is_some_and(|bytes| bytes <= SMALL_INGEST_MAX_BYTES) {
+            crate::profiling::count!("lexical.single_thread_batches", 1);
+            self.index.writer_with_num_threads(1, 64_000_000)?
+        } else {
+            self.index.writer(256_000_000)?
+        };
+        if self.defer_merges {
             writer.set_merge_policy(Box::new(NoMergePolicy));
+        } else if self.incremental_merge_policy {
+            let mut policy = LogMergePolicy::default();
+            policy.set_min_layer_size(1);
+            writer.set_merge_policy(Box::new(policy));
         }
         Ok(writer)
     }
 
+    /// One reader per instance. Sealed generations never change; writable instances reload
+    /// the shared reader so committed segments become visible without reopening every file.
     pub fn reader(&self) -> Result<IndexReader> {
-        Ok(self
+        if let Some(reader) = self.shared_reader.get() {
+            if self.writable {
+                crate::profiling::span!("lexical.reader_reload");
+                reader.reload()?;
+            }
+            return Ok(reader.clone());
+        }
+        crate::profiling::span!("lexical.reader_open");
+        let reader: IndexReader = self
             .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
-            .try_into()?)
+            .try_into()?;
+        crate::profiling::count!("lexical.readers_opened", 1);
+        let _ = self.shared_reader.set(reader.clone());
+        Ok(reader)
     }
 
     /// Open-time snapshot identity. It remains stable for this instance; writable callers must
@@ -605,59 +764,23 @@ impl SearchIndex {
         &self.snapshot_version
     }
 
-    pub(crate) fn maybe_compact_continuous_segments(&self, writer: &mut IndexWriter) -> Result<()> {
-        if !self.suppress_automatic_merges {
+    pub(crate) fn check_continuous_segment_limit(&self) -> Result<()> {
+        if !self.incremental_merge_policy || self.pending_generation.is_none() {
             return Ok(());
         }
-        let Some(pending) = &self.pending_generation else {
-            return Ok(());
-        };
         let segments = self.index.searchable_segment_metas()?;
         if segments.len() > CONTINUOUS_MAX_SEGMENTS {
             bail!(
                 "refusing to continue indexing: {} continuous index segments exceed the safety \
-                 limit of {CONTINUOUS_MAX_SEGMENTS}; run an explicit compaction or reindex",
+                 limit of {CONTINUOUS_MAX_SEGMENTS}; run `memex index rebuild`",
                 segments.len()
             );
         }
-        if segments.len() < CONTINUOUS_MERGE_BATCH_SEGMENTS {
-            return Ok(());
-        }
-
-        let mut sized_segments = segments
-            .into_iter()
-            .map(|segment| {
-                let bytes = segment
-                    .list_files()
-                    .into_iter()
-                    .try_fold(0u64, |total, file| {
-                        let path = pending.staging_dir.join(file);
-                        match fs::metadata(path) {
-                            Ok(metadata) => Ok(total.saturating_add(metadata.len())),
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(total),
-                            Err(error) => Err(error),
-                        }
-                    })?;
-                Ok((bytes, segment.id()))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        sized_segments.sort_unstable_by_key(|(bytes, _)| *bytes);
-        let candidates = &sized_segments[..CONTINUOUS_MERGE_BATCH_SEGMENTS];
-        let input_bytes = candidates
-            .iter()
-            .fold(0u64, |total, (bytes, _)| total.saturating_add(*bytes));
-        if input_bytes > CONTINUOUS_MERGE_MAX_INPUT_BYTES {
-            return Ok(());
-        }
-        let candidate_ids: Vec<_> = candidates.iter().map(|(_, id)| *id).collect();
-        writer
-            .merge(&candidate_ids)
-            .wait()
-            .context("compact bounded continuous index segment batch")?;
         Ok(())
     }
 
     pub(crate) fn publish_generation(&self) -> Result<()> {
+        crate::profiling::span!("lexical.publish");
         let Some(pending) = &self.pending_generation else {
             return Ok(());
         };
@@ -665,12 +788,21 @@ impl SearchIndex {
             return Ok(());
         }
 
+        let _store_guard = storage::lock_store(&pending.index_root)?;
+        if pending.staging_dir.exists() {
+            let committed = committed_files(&self.index)?;
+            pending.directory.prepare_publication(
+                &pending.index_root,
+                &pending.generation_name,
+                &committed,
+            )?;
+        }
         let final_dir = pending
             .index_root
             .join(GENERATIONS_DIR)
             .join(&pending.generation_name);
         if pending.staging_dir.exists() {
-            create_generation_lease_file(&pending.staging_dir)?;
+            pending.directory.sync_for_publication()?;
             fs::rename(&pending.staging_dir, &final_dir)
                 .with_context(|| format!("publish index generation {}", pending.generation_name))?;
         } else if !final_dir.exists() {
@@ -679,11 +811,13 @@ impl SearchIndex {
                 pending.generation_name
             );
         }
-        sync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
+        pending.directory.seal_at(&final_dir)?;
+        fsync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
         atomic_write_current(&pending.index_root, &pending.generation_name)?;
         pending.published.store(true, AtomicOrdering::Release);
         prune_superseded_generations(&pending.index_root, &pending.generation_name)?;
         prune_legacy_index_files(&pending.index_root)?;
+        storage::collect_unreachable(&pending.index_root, false)?;
         Ok(())
     }
 
@@ -691,7 +825,7 @@ impl SearchIndex {
         if self
             .pending_generation
             .as_ref()
-            .is_some_and(|pending| !pending.replaces_published_generation)
+            .is_some_and(|pending| pending.requires_initial_publication)
         {
             self.publish_generation()?;
         }
@@ -707,6 +841,30 @@ impl SearchIndex {
         self.doc_ids_matching_query(Box::new(source_scope_query(&self.fields, scope)))
     }
 
+    pub(crate) fn source_paths_with_records(
+        &self,
+        candidates: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        crate::profiling::span!("lexical.source_presence");
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let mut present = HashSet::new();
+        for path in candidates {
+            let query = TermQuery::new(
+                Term::from_field_text(self.fields.source_path, path),
+                IndexRecordOption::Basic,
+            );
+            crate::profiling::count!("lexical.source_presence_queries", 1);
+            if searcher.search(&query, &Count)? > 0 {
+                present.insert(path.clone());
+            }
+        }
+        Ok(present)
+    }
+
     pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
         let query = TermQuery::new(
             Term::from_field_text(self.fields.source_path, path),
@@ -716,6 +874,7 @@ impl SearchIndex {
     }
 
     fn doc_ids_matching_query(&self, query: Box<dyn Query>) -> Result<Vec<u64>> {
+        crate::profiling::span!("lexical.source_ids");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let limit = (searcher.num_docs() as usize).max(1);
@@ -731,6 +890,8 @@ impl SearchIndex {
             }
         }
         doc_ids.sort_unstable();
+        crate::profiling::count!("lexical.source_id_queries", 1);
+        crate::profiling::count!("lexical.source_ids_found", doc_ids.len());
         Ok(doc_ids)
     }
 
@@ -951,6 +1112,7 @@ impl SearchIndex {
     }
 
     pub fn search(&self, options: &QueryOptions) -> Result<Vec<(f32, Record)>> {
+        crate::profiling::span!("lexical.search");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let query = build_query(&self.fields, options, &self.index)?;
@@ -1586,6 +1748,7 @@ impl SearchIndex {
     where
         F: FnMut(Record) -> Result<()>,
     {
+        crate::profiling::span!("lexical.walk_records");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         for segment_reader in searcher.segment_readers() {
@@ -1593,6 +1756,7 @@ impl SearchIndex {
             for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
                 let doc = doc?;
                 let record = record_from_doc(&self.fields, &doc);
+                crate::profiling::count!("lexical.records_walked", 1);
                 f(record)?;
             }
         }
@@ -1871,23 +2035,11 @@ impl tantivy::collector::CustomSegmentScorer<SessionReverseOrder> for SessionOrd
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum StaleSchemaPolicy {
-    Error,
-    Recreate,
-}
-
 fn stale_schema_error(dir: &Path) -> anyhow::Error {
     anyhow!(
         "index schema at {} is stale; run `memex index` or `memex index rebuild` to rebuild it",
         dir.display()
     )
-}
-
-fn recreate_index_dir(dir: &Path) -> Result<SearchIndex> {
-    std::fs::remove_dir_all(dir)?;
-    std::fs::create_dir_all(dir)?;
-    create_index_in_dir(dir)
 }
 
 fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
@@ -1901,15 +2053,26 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         writable: true,
         pending_generation: None,
         _generation_lease: None,
-        suppress_automatic_merges: false,
+        incremental_merge_policy: false,
+        defer_merges: false,
+        shared_reader: Arc::new(OnceLock::new()),
     })
 }
 
 fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
-    let generation_lease = acquire_generation_lease(dir)?;
-    let directory = MmapDirectory::open(dir)
-        .with_context(|| format!("open sealed index generation {}", dir.display()))?;
-    let index = Index::open(SealedDirectory(directory))?;
+    let generation_lease = Arc::new(acquire_generation_lease(dir)?);
+    let directory: Box<dyn Directory> = if let Some(shared) =
+        storage::SharedDirectory::open(storage::index_root(dir), dir, true)?
+    {
+        shared.pin_generation(Arc::clone(&generation_lease));
+        Box::new(shared)
+    } else {
+        Box::new(SealedDirectory {
+            directory: MmapDirectory::open(dir)?,
+            _generation_lease: Some(Arc::clone(&generation_lease)),
+        })
+    };
+    let index = Index::open(directory)?;
     if !schema_is_current(&index.schema()) {
         return Err(stale_schema_error(dir));
     }
@@ -1920,8 +2083,10 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         snapshot_version: snapshot_version_for_path(dir),
         writable: false,
         pending_generation: None,
-        _generation_lease: Some(Arc::new(generation_lease)),
-        suppress_automatic_merges: false,
+        _generation_lease: Some(generation_lease),
+        incremental_merge_policy: false,
+        defer_merges: false,
+        shared_reader: Arc::new(OnceLock::new()),
     })
 }
 
@@ -1988,32 +2153,27 @@ fn is_abandoned_generation_workdir(name: &std::ffi::OsStr) -> bool {
         && pid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[cfg(test)]
 fn clone_generation(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
+    let directory = storage::open_directory(storage::index_root(source), source)?;
     for name in committed_generation_files(source)? {
-        let source_file = source.join(&name);
-        if !source_file.is_file() {
-            continue;
-        }
-        let target = destination.join(&name);
-        let name_text = name.to_string_lossy();
-        if should_copy_generation_file(&name_text) || fs::hard_link(&source_file, &target).is_err()
-        {
-            fs::copy(&source_file, &target).with_context(|| {
-                format!(
-                    "copy index generation file {} to {}",
-                    source_file.display(),
-                    target.display()
-                )
-            })?;
+        if directory.exists(&name)? {
+            fs::write(destination.join(&name), directory.atomic_read(&name)?)?;
         }
     }
     Ok(())
 }
 
 fn committed_generation_files(source: &Path) -> Result<HashSet<PathBuf>> {
-    let index = Index::open_in_dir(source)
-        .with_context(|| format!("open committed index generation {}", source.display()))?;
+    let index = Index::open(storage::open_directory(
+        storage::index_root(source),
+        source,
+    )?)?;
+    committed_files(&index)
+}
+
+fn committed_files(index: &Index) -> Result<HashSet<PathBuf>> {
     let mut files: HashSet<PathBuf> = index
         .searchable_segment_metas()?
         .into_iter()
@@ -2025,15 +2185,17 @@ fn committed_generation_files(source: &Path) -> Result<HashSet<PathBuf>> {
 }
 
 fn rewrite_managed_files_to_committed_set(generation: &Path) -> Result<()> {
-    let managed: HashSet<PathBuf> = committed_generation_files(generation)?
-        .into_iter()
-        .filter(|path| {
-            generation.join(path).is_file()
-                && path
-                    .file_name()
-                    .is_none_or(|name| !name.to_string_lossy().starts_with('.'))
-        })
-        .collect();
+    let directory = storage::open_directory(storage::index_root(generation), generation)?;
+    let mut managed = HashSet::new();
+    for path in committed_generation_files(generation)? {
+        if directory.exists(&path)?
+            && path
+                .file_name()
+                .is_none_or(|name| !name.to_string_lossy().starts_with('.'))
+        {
+            managed.insert(path);
+        }
+    }
     let mut encoded = serde_json::to_vec(&managed)?;
     encoded.push(b'\n');
     fs::write(generation.join(".managed.json"), encoded)?;
@@ -2041,8 +2203,11 @@ fn rewrite_managed_files_to_committed_set(generation: &Path) -> Result<()> {
 }
 
 fn validate_committed_generation(generation: &Path) -> Result<u64> {
-    let index = Index::open_in_dir(generation)
-        .with_context(|| format!("validate committed generation {}", generation.display()))?;
+    let index = Index::open(storage::open_directory(
+        storage::index_root(generation),
+        generation,
+    )?)
+    .with_context(|| format!("validate committed generation {}", generation.display()))?;
     let damaged = index.validate_checksum()?;
     if !damaged.is_empty() {
         bail!(
@@ -2055,16 +2220,12 @@ fn validate_committed_generation(generation: &Path) -> Result<u64> {
     Ok(reader.searcher().num_docs())
 }
 
-fn should_copy_generation_file(name: &str) -> bool {
-    matches!(name, "meta.json" | ".managed.json")
-}
-
 fn create_generation_lease_file(generation: &Path) -> Result<()> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(generation.join(GENERATION_LEASE_FILE))?
-        .sync_all()?;
+        .open(generation.join(GENERATION_LEASE_FILE))?;
+    fsync_file(&file)?;
     Ok(())
 }
 
@@ -2082,7 +2243,18 @@ fn acquire_generation_lease(generation: &Path) -> Result<GenerationLease> {
 }
 
 fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> {
+    prune_superseded_generations_with_sync(index_root, current, fsync_directory)
+}
+
+fn prune_superseded_generations_with_sync(
+    index_root: &Path,
+    current: &str,
+    synchronize: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<()> {
+    crate::profiling::span!("lexical.cleanup.generations");
+    crate::profiling::count!("lexical.cleanup.generations.calls", 1);
     let generations = index_root.join(GENERATIONS_DIR);
+    let mut removal_attempted = false;
     for entry in fs::read_dir(&generations)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -2105,6 +2277,7 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             let Some(_lease) = try_lock_generation_exclusive(&entry.path())? else {
                 continue;
             };
+            removal_attempted = true;
             fs::remove_dir_all(entry.path()).with_context(|| {
                 format!(
                     "remove abandoned index generation work directory {}",
@@ -2129,6 +2302,7 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             // platforms that prohibit deleting open files, leave the generation for a later pass.
             None
         };
+        removal_attempted = true;
         if let Err(error) = fs::remove_dir_all(entry.path())
             && error.kind() != io::ErrorKind::PermissionDenied
         {
@@ -2140,16 +2314,32 @@ fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> 
             });
         }
     }
-    sync_directory(&generations)?;
+    if removal_attempted {
+        crate::profiling::count!("lexical.cleanup.generations.sync_requests", 1);
+        synchronize(&generations)?;
+    } else {
+        crate::profiling::count!("lexical.cleanup.generations.sync_skips", 1);
+    }
     Ok(())
 }
 
 fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
+    prune_legacy_index_files_with_sync(index_root, fsync_directory)
+}
+
+fn prune_legacy_index_files_with_sync(
+    index_root: &Path,
+    synchronize: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<()> {
+    crate::profiling::span!("lexical.cleanup.legacy");
+    crate::profiling::count!("lexical.cleanup.legacy.calls", 1);
+    let mut removal_attempted = false;
     for entry in fs::read_dir(index_root)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() || entry.file_name() == CURRENT_FILE {
             continue;
         }
+        removal_attempted = true;
         if let Err(error) = fs::remove_file(entry.path())
             && error.kind() != io::ErrorKind::PermissionDenied
         {
@@ -2157,7 +2347,12 @@ fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
                 .with_context(|| format!("prune legacy index file {}", entry.path().display()));
         }
     }
-    sync_directory(index_root)?;
+    if removal_attempted {
+        crate::profiling::count!("lexical.cleanup.legacy.sync_requests", 1);
+        synchronize(index_root)?;
+    } else {
+        crate::profiling::count!("lexical.cleanup.legacy.sync_skips", 1);
+    }
     Ok(())
 }
 
@@ -2205,8 +2400,9 @@ fn try_lock_generation_exclusive(_generation: &Path) -> Result<Option<File>> {
 fn atomic_write_current(index_root: &Path, generation_name: &str) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(index_root)?;
     temp.write_all(format!("{generation_name}\n").as_bytes())?;
-    temp.as_file_mut().sync_all()?;
+    fsync_file(temp.as_file())?;
     temp.persist(index_root.join(CURRENT_FILE))?;
+    // The one drive-cache flush of publication: everything written before it lands with it.
     sync_directory(index_root)?;
     Ok(())
 }
@@ -2215,6 +2411,32 @@ fn atomic_write_current(index_root: &Path, generation_name: &str) -> Result<()> 
 fn sync_directory(dir: &Path) -> io::Result<()> {
     use std::fs::File;
     File::open(dir)?.sync_all()
+}
+
+/// Orders writes without a drive-cache flush; the next full sync makes them durable.
+#[cfg(unix)]
+fn fsync_directory(dir: &Path) -> io::Result<()> {
+    fsync_file(&File::open(dir)?)
+}
+
+#[cfg(unix)]
+fn fsync_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_directory(dir: &Path) -> io::Result<()> {
+    sync_directory(dir)
+}
+
+#[cfg(not(unix))]
+fn fsync_file(file: &File) -> io::Result<()> {
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -2254,8 +2476,11 @@ fn build_schema_with_options(
     builder.add_text_field("role", STRING | STORED);
     builder.add_text_field("source", session_identity_options.clone());
 
+    // `en_stem` lowercases and applies the English Snowball stemmer, so a query for
+    // "migration" also matches "migrations" and "migrated". Existing indexes keep the
+    // tokenizer recorded in their on-disk schema until `memex index rebuild`.
     let text_indexing = TextFieldIndexing::default()
-        .set_tokenizer("default")
+        .set_tokenizer("en_stem")
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let text_options = TextOptions::default()
         .set_indexing_options(text_indexing)
@@ -2263,8 +2488,11 @@ fn build_schema_with_options(
     builder.add_text_field("text", text_options);
 
     builder.add_text_field("tool_name", STRING | STORED);
-    builder.add_text_field("tool_input", TEXT | STORED);
-    builder.add_text_field("tool_output", TEXT | STORED);
+    // Queries only parse against `text`, which already carries a tool result's content;
+    // indexing these too roughly doubled each segment's vocabulary. Existing indexes keep
+    // their on-disk schema until `memex index rebuild`.
+    builder.add_text_field("tool_input", STORED);
+    builder.add_text_field("tool_output", STORED);
     builder.add_text_field("event_id", STRING | STORED);
     builder.add_text_field("parent_event_id", STRING | STORED);
     builder.add_text_field("logical_parent_event_id", STRING | STORED);
@@ -2521,6 +2749,21 @@ fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<Str
 mod tests {
     use super::*;
 
+    #[test]
+    fn tool_payload_fields_are_stored_without_indexing() {
+        let schema = build_schema().unwrap();
+        for name in ["tool_input", "tool_output"] {
+            let field = schema.get_field(name).unwrap();
+            let entry = schema.get_field_entry(field);
+            assert!(entry.is_stored(), "{name} must remain retrievable");
+            assert!(
+                !entry.is_indexed(),
+                "{name} must not duplicate the text vocabulary"
+            );
+        }
+    }
+    use tantivy::schema::TEXT;
+
     fn test_record(doc_id: u64, text: &str) -> Record {
         Record {
             source: crate::types::SourceKind::Codex,
@@ -2537,6 +2780,166 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "session.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn small_ingest_produces_one_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..32 {
+            index
+                .add_record(&mut writer, &test_record(id, "small update"))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.index.searchable_segment_metas().unwrap().len(), 1);
+        assert_eq!(index.doc_count().unwrap(), 32);
+    }
+
+    #[test]
+    fn search_refresh_never_merges_and_the_shared_reader_sees_each_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..6 {
+            index
+                .add_record(&mut writer, &test_record(id, "deferred"))
+                .unwrap();
+            writer.commit().unwrap();
+            assert_eq!(index.doc_count().unwrap(), id as usize + 1);
+        }
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 6);
+    }
+
+    #[test]
+    fn compaction_folds_small_segments_and_keeps_the_largest() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..40 {
+            index
+                .add_record(&mut writer, &test_record(id, "big"))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        for id in 40..46 {
+            index
+                .add_record(&mut writer, &test_record(id, "small"))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 7);
+        assert_eq!(index.compact_small_segments(1).unwrap(), 6);
+        assert_eq!(index.segment_count().unwrap(), 2);
+        assert_eq!(index.doc_count().unwrap(), 46);
+        assert_eq!(index.compact_small_segments(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn compaction_includes_one_document_below_five_percent() {
+        for total in [20, 21, 39, 40] {
+            let temp = tempfile::tempdir().unwrap();
+            let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+            let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+            for id in 0..total - 1 {
+                index
+                    .add_record(&mut writer, &test_record(id, "large"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            index
+                .add_record(&mut writer, &test_record(total, "small"))
+                .unwrap();
+            writer.commit().unwrap();
+            writer.wait_merging_threads().unwrap();
+            assert_eq!(
+                index.small_segment_count(1).unwrap(),
+                usize::from(total > 20)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_shared_file_publication_keeps_the_previous_current_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = first.writer().unwrap();
+        first
+            .add_record(&mut writer, &test_record(1, "original"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        first.publish_generation().unwrap();
+        let current = fs::read(temp.path().join(CURRENT_FILE)).unwrap();
+        let update = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = update.writer().unwrap();
+        update
+            .add_record(&mut writer, &test_record(2, "replacement"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let staging = &update.pending_generation.as_ref().unwrap().staging_dir;
+        let file = fs::read_dir(staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "store")
+            })
+            .unwrap();
+        fs::remove_file(file).unwrap();
+        assert!(update.publish_generation().is_err());
+        assert_eq!(fs::read(temp.path().join(CURRENT_FILE)).unwrap(), current);
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_reader_keeps_its_generation_lease_after_search_index_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = first.writer().unwrap();
+        first
+            .add_record(&mut writer, &test_record(1, "old snapshot"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        first.publish_generation().unwrap();
+        drop(first);
+        let snapshot = SearchIndex::open_or_create(temp.path()).unwrap();
+        let reader = snapshot.reader().unwrap();
+        drop(snapshot);
+        let update = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = update.writer().unwrap();
+        update
+            .add_record(&mut writer, &test_record(2, "new snapshot"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        update.publish_generation().unwrap();
+        drop(update);
+        reader.reload().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 1);
+        assert!(SearchIndex::garbage_collect_generations_offline(temp.path(), false).is_err());
+        drop(reader);
+        SearchIndex::garbage_collect_generations_offline(temp.path(), false).unwrap();
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            2
+        );
     }
 
     fn create_stale_schema_index(dir: &Path) {
@@ -3293,6 +3696,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_gc_dry_run_does_not_create_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = Index::create_in_dir(temp.path(), build_schema().unwrap()).unwrap();
+        drop(index);
+        let before = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<HashSet<_>>();
+        let report = SearchIndex::garbage_collect_generations_offline(temp.path(), true).unwrap();
+        assert!(report.dry_run);
+        let after = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<HashSet<_>>();
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn normal_indexing_reclaims_pre_lease_generations_automatically() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
@@ -3385,8 +3806,7 @@ mod tests {
     #[test]
     fn normal_indexing_migrates_flat_legacy_index_automatically() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let legacy = SearchIndex::open_or_create_with_policy(tmp.path(), StaleSchemaPolicy::Error)
-            .expect("legacy flat index");
+        let legacy = SearchIndex::open_or_create_legacy(tmp.path()).expect("legacy flat index");
         let mut writer = legacy.writer().expect("legacy writer");
         legacy
             .add_record(&mut writer, &test_record(1, "preserved"))
@@ -3408,90 +3828,88 @@ mod tests {
     }
 
     #[test]
-    fn continuous_refreshes_do_not_automatically_merge_existing_segments() {
+    fn continuous_refreshes_compact_small_peers_and_retain_large_inherited_segment() {
+        const SEED_RECORDS: u64 = 1024;
+        const REFRESHES: u64 = 129;
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
-        let mut writer = first.writer().expect("first writer");
-        first
-            .add_record(&mut writer, &test_record(1, "baseline"))
-            .expect("add baseline");
-        writer.commit().expect("commit baseline");
-        writer
-            .wait_merging_threads()
-            .expect("finish baseline writer");
-        first.publish_generation().expect("publish baseline");
-
-        for doc_id in 2..=21 {
-            let refresh = SearchIndex::open_or_create_for_continuous_ingest(tmp.path())
-                .expect("continuous refresh");
-            let mut writer = refresh.writer().expect("continuous writer");
-            refresh
+        let mut writer = first.writer_for_ingest(Some(1024)).expect("first writer");
+        for doc_id in 1..=SEED_RECORDS {
+            first
                 .add_record(
                     &mut writer,
-                    &test_record(doc_id, &format!("refresh-{doc_id}")),
+                    &test_record(doc_id, &format!("record{doc_id}")),
                 )
-                .expect("add refresh record");
-            writer.commit().expect("commit refresh");
-            refresh
-                .maybe_compact_continuous_segments(&mut writer)
-                .expect("bounded compaction");
-            writer
-                .wait_merging_threads()
-                .expect("finish refresh writer");
-            refresh.publish_generation().expect("publish refresh");
+                .expect("add baseline");
         }
-
-        let published = SearchIndex::open_or_create(tmp.path()).expect("published index");
-        assert_eq!(
-            published
-                .index
-                .searchable_segment_ids()
-                .expect("searchable segments")
-                .len(),
-            21,
-            "continuous refresh must not rewrite prior segments through automatic merging"
-        );
-    }
-
-    #[test]
-    fn continuous_compaction_batches_many_small_segments_without_major_rewrites() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
-        let mut writer = first.writer().expect("first writer");
-        first
-            .add_record(&mut writer, &test_record(1, "baseline"))
-            .expect("add baseline");
         writer.commit().expect("commit baseline");
         writer.wait_merging_threads().expect("finish baseline");
         first.publish_generation().expect("publish baseline");
+        let seed_segments = first.index.searchable_segment_ids().expect("seed segments");
+        assert_eq!(seed_segments.len(), 1);
+        let seed_segment = seed_segments[0];
+        drop(first);
 
-        for doc_id in 2..=130 {
+        for refresh_number in 1..=REFRESHES {
             let refresh = SearchIndex::open_or_create_for_continuous_ingest(tmp.path())
                 .expect("continuous refresh");
-            let mut writer = refresh.writer().expect("continuous writer");
+            let mut writer = refresh
+                .writer_for_ingest(Some(1024))
+                .expect("continuous writer");
+            let doc_id = SEED_RECORDS + refresh_number;
             refresh
                 .add_record(
                     &mut writer,
-                    &test_record(doc_id, &format!("refresh{doc_id}")),
+                    &test_record(doc_id, &format!("record{doc_id}")),
                 )
                 .expect("add refresh record");
             writer.commit().expect("commit refresh");
-            refresh
-                .maybe_compact_continuous_segments(&mut writer)
-                .expect("bounded compaction");
             writer.wait_merging_threads().expect("finish refresh");
+            refresh
+                .check_continuous_segment_limit()
+                .expect("segment safety limit");
             refresh.publish_generation().expect("publish refresh");
+
+            let segments = refresh
+                .index
+                .searchable_segment_metas()
+                .expect("searchable segments");
+            assert!(
+                segments.iter().any(|segment| segment.id() == seed_segment),
+                "small peer merges must retain the large inherited segment"
+            );
+            if refresh_number >= 8 {
+                assert!(
+                    segments.len() < refresh_number as usize + 1,
+                    "small peers must compact once eight peers accumulate"
+                );
+                assert!(
+                    segments
+                        .iter()
+                        .any(|segment| { segment.id() != seed_segment && segment.num_docs() > 1 })
+                );
+            }
         }
 
         let published = SearchIndex::open_or_create(tmp.path()).expect("published index");
         assert_eq!(
-            published
-                .index
-                .searchable_segment_ids()
-                .expect("searchable segments")
-                .len(),
-            3,
-            "128 small segments should compact once, leaving two subsequent segments"
+            published.doc_count().expect("document count"),
+            (SEED_RECORDS + REFRESHES) as usize
+        );
+        let mut records = Vec::new();
+        published
+            .for_each_record(|record| {
+                records.push((record.doc_id, record.text));
+                Ok(())
+            })
+            .expect("read every surviving record");
+        records.sort_unstable();
+        assert_eq!(
+            records,
+            (1..=SEED_RECORDS + REFRESHES)
+                .map(|doc_id| (doc_id, format!("record{doc_id}")))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3523,6 +3941,90 @@ mod tests {
         let new_reader = SearchIndex::open_or_create(tmp.path()).expect("new reader");
         assert_eq!(search_text_count(&new_reader, "beforeupdate"), 0);
         assert_eq!(search_text_count(&new_reader, "afterupdate"), 1);
+    }
+
+    #[test]
+    fn text_search_matches_inflected_forms_through_stemming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(1, "ran the database migrations"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "migration"), 1);
+        assert_eq!(search_text_count(&index, "migrated"), 1);
+        assert_eq!(search_text_count(&index, "Databases"), 1);
+        assert_eq!(search_text_count(&index, "rollback"), 0);
+    }
+
+    #[test]
+    fn existing_default_tokenizer_is_preserved_until_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("index");
+        fs::create_dir(&dir).expect("index directory");
+        let mut schema =
+            serde_json::to_value(build_schema().expect("schema")).expect("serialize schema");
+        let fields = schema.as_array_mut().expect("schema fields");
+        let text = fields
+            .iter_mut()
+            .find(|field| field["name"] == "text")
+            .expect("text field");
+        text["options"]["indexing"]["tokenizer"] = "default".into();
+        let legacy_indexing = text["options"]["indexing"].clone();
+        for field in fields {
+            if field["name"] == "tool_input" || field["name"] == "tool_output" {
+                field["options"]["indexing"] = legacy_indexing.clone();
+            }
+        }
+        let schema: Schema = serde_json::from_value(schema).expect("legacy schema");
+        drop(Index::create_in_dir(&dir, schema).expect("create legacy index"));
+
+        let record = test_record(1, "ran the database migrations");
+        let legacy = SearchIndex::open_or_create(&dir).expect("open legacy index");
+        let mut writer = legacy.writer().expect("legacy writer");
+        legacy
+            .add_record(&mut writer, &record)
+            .expect("legacy record");
+        writer.commit().expect("commit legacy record");
+        writer.wait_merging_threads().expect("finish legacy writer");
+        drop(legacy);
+
+        let reopened = SearchIndex::open_or_create(&dir).expect("reopen legacy index");
+        assert_eq!(search_text_count(&reopened, "migrations"), 1);
+        assert_eq!(search_text_count(&reopened, "migration"), 0);
+        drop(reopened);
+
+        let incremental =
+            SearchIndex::open_or_create_for_ingest(&dir).expect("stage existing schema for ingest");
+        assert_eq!(search_text_count(&incremental, "migrations"), 1);
+        assert_eq!(search_text_count(&incremental, "migration"), 0);
+        incremental
+            .publish_generation()
+            .expect("publish existing schema");
+        drop(incremental);
+        let published = SearchIndex::open_or_create(&dir).expect("reopen published schema");
+        assert_eq!(search_text_count(&published, "migrations"), 1);
+        assert_eq!(search_text_count(&published, "migration"), 0);
+        drop(published);
+
+        // Explicit rebuild removes the derived index and reparses the source records.
+        fs::remove_dir_all(&dir).expect("reset index for rebuild");
+        let rebuilt = SearchIndex::open_or_create_for_ingest(&dir).expect("rebuild index");
+        let mut writer = rebuilt.writer().expect("rebuild writer");
+        rebuilt
+            .add_record(&mut writer, &record)
+            .expect("rebuild record");
+        writer.commit().expect("commit rebuilt record");
+        writer
+            .wait_merging_threads()
+            .expect("finish rebuild writer");
+        rebuilt.publish_generation().expect("publish rebuilt index");
+        drop(rebuilt);
+        let reopened = SearchIndex::open_or_create(&dir).expect("reopen rebuilt index");
+        assert_eq!(search_text_count(&reopened, "migrations"), 1);
+        assert_eq!(search_text_count(&reopened, "migration"), 1);
     }
 
     fn search_text_count(index: &SearchIndex, query: &str) -> usize {

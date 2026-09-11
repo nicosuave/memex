@@ -137,6 +137,27 @@ fn seed_index(root: &Path, records: &[Record]) {
     }
     writer.commit().unwrap();
     writer.wait_merging_threads().unwrap();
+    // Indexing refuses to initialize state for an index that already holds records,
+    // because that would mean the checkpoint was lost. Record the seeded documents so
+    // the fixture looks like the result of a real ingest rather than state loss.
+    std::fs::create_dir_all(&paths.state).unwrap();
+    let lease = memex::lease::IngestLease::acquire(
+        &paths,
+        "mcp fixture",
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    memex::state::IngestState {
+        next_doc_id: records
+            .iter()
+            .map(|record| record.doc_id)
+            .max()
+            .unwrap_or(0)
+            + 1,
+        ..Default::default()
+    }
+    .save_with_lease(&paths.state.join("ingest.json"), &lease)
+    .unwrap();
 }
 fn fixture() -> (tempfile::TempDir, Vec<Record>) {
     let root = tempfile::tempdir().unwrap();

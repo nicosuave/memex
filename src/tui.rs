@@ -1150,7 +1150,10 @@ impl App {
                     LeaseAttempt::Acquired(lease) => lease,
                     LeaseAttempt::Busy(_) => return Ok(None),
                 };
-                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+                let index = match SearchIndex::open_or_create(&paths.index) {
+                    Ok(index) if !index.is_writable() => index,
+                    _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+                };
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
@@ -1175,6 +1178,7 @@ impl App {
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
+                    defer_merges: true,
                 };
                 ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl(), &lease)
             })();
@@ -5681,6 +5685,7 @@ fn run_search_request(
                     recency_half_life_days: 30.0,
                     min_score: None,
                     project_grouping: Some(request.grouping),
+                    text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
                 },
                 false,
             )?
