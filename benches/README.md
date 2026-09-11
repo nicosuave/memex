@@ -35,8 +35,8 @@ search case reuses a read-only fixture and includes result destruction.
 These are warm filesystem microbenchmarks through the public index API. They use
 a flat index, not the ingest coordinator: generation staging/publication,
 checkpoint maintenance, source discovery, and process startup are not measured.
-Use the recorded end-to-end experiments in `docs/index-merge-cost-model.md` and
-`docs/shared-segments-benchmark.md` when evaluating those costs.
+Use the recorded end-to-end experiments in [the merge cost model](reports/index-merge-cost-model.md) and
+[the shared-segment report](reports/shared-segments-benchmark.md) when evaluating those costs.
 
 The old `index::benchmark::{terminal_merge,fingerprint}` ignored tests were
 one-off helpers for frozen-corpus experiments. They are retired; historical
