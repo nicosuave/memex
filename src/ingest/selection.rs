@@ -678,6 +678,7 @@ mod tests {
                 parser_version: 0,
                 pending_tool_calls: Default::default(),
                 identity: Default::default(),
+                claude_background: None,
             },
         );
         let DirtySelection::Paths { files, databases } = resolve_dirty(

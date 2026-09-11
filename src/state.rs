@@ -97,6 +97,11 @@ pub struct FileState {
     pub pending_tool_calls: HashMap<String, PendingToolCall>,
     #[serde(default)]
     pub identity: FileIdentity,
+    /// Claude's file-level `sessionKind: "bg"` classification. `None` is
+    /// retained for states written before this was tracked, so they can be
+    /// migrated safely on their next ingest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_background: Option<bool>,
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip
@@ -177,10 +182,20 @@ pub struct SessionScope {
 pub struct PendingIngest {
     pub next_doc_id: u64,
     pub source_paths: Vec<String>,
+    /// Source paths whose records must also be removed from the vector store.
+    /// This is deliberately narrower than `source_paths`: parser replacement
+    /// only republishes lexical and analytics state.
+    #[serde(default)]
+    pub vector_delete_paths: Vec<String>,
     #[serde(default)]
     pub session_scopes: Vec<SessionScope>,
     #[serde(default)]
     pub vector_publication: bool,
+    /// Whether the interrupted vector publication required embeddings. Older
+    /// markers omitted this field, and therefore retain the historical
+    /// `vector_publication` behavior during recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_publication: Option<bool>,
 }
 
 impl Default for IngestState {
@@ -329,8 +344,10 @@ mod tests {
         let pending = PendingIngest {
             next_doc_id: 17,
             source_paths: vec!["session.jsonl".to_string()],
+            vector_delete_paths: vec!["session.jsonl".to_string()],
             session_scopes: Vec::new(),
             vector_publication: true,
+            embedding_publication: Some(true),
         };
 
         pending.save(&path).expect("save pending ingest");

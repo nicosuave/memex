@@ -1325,6 +1325,7 @@ mod tests {
                 prefix_bytes: 0,
                 modified_ns: Some(modified_ns),
             },
+            claude_background: None,
         }
     }
 

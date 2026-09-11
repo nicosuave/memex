@@ -84,6 +84,7 @@ struct FileTask {
     pending_tool_calls: HashMap<String, PendingToolCall>,
     identity: FileIdentity,
     parser_version: u32,
+    claude_background: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -234,7 +235,7 @@ fn prepare_file_task(
         previous.parser_version != parser_version
             || (tracks_legacy_ordinal && previous.offset > 0 && previous.legacy_turn_id.is_none())
     });
-    let (offset, turn_id, delete_first, pending_tool_calls, skip) = match previous {
+    let (mut offset, mut turn_id, mut delete_first, mut pending_tool_calls, skip) = match previous {
         None => (0, 0, false, HashMap::new(), false),
         Some(previous)
             if size < previous.size
@@ -277,6 +278,50 @@ fn prepare_file_task(
         ),
     };
 
+    let mut claude_background = previous.and_then(|state| state.claude_background);
+    if source == SourceKind::Claude && !delete_first {
+        match claude_background {
+            Some(true) => {}
+            Some(false) if size > previous.map_or(0, |state| state.offset) => {
+                match crate::sources::claude::has_background_session_kind_since(
+                    &path,
+                    previous.map_or(0, |state| state.offset),
+                    size,
+                ) {
+                    Ok(true) | Err(_) => {
+                        // A late marker changes every record's classification. If
+                        // the tail cannot be inspected, fail safe by reparsing;
+                        // parsing will surface a persistent read failure.
+                        claude_background = None;
+                        offset = 0;
+                        turn_id = 0;
+                        delete_first = true;
+                        pending_tool_calls.clear();
+                    }
+                    Ok(false) => {}
+                }
+            }
+            None if previous.is_some() => {
+                // State written before Claude classification tracking needs a
+                // one-time full check; future appends inspect only their tail.
+                claude_background =
+                    crate::sources::claude::has_background_session_kind_since(&path, 0, size).ok();
+                if claude_background == Some(true) && previous.is_some_and(|state| state.offset > 0)
+                {
+                    offset = 0;
+                    turn_id = 0;
+                    delete_first = true;
+                    pending_tool_calls.clear();
+                }
+            }
+            None => {}
+            Some(false) => {}
+        }
+    } else if source == SourceKind::Claude {
+        // A rewrite/reparse must rediscover the marker from the replacement.
+        claude_background = None;
+    }
+
     (
         FileTask {
             path,
@@ -295,6 +340,7 @@ fn prepare_file_task(
             pending_tool_calls,
             identity,
             parser_version,
+            claude_background,
         },
         skip,
     )
@@ -357,6 +403,7 @@ fn completed_file_state(
         parser_version: task.parser_version,
         pending_tool_calls,
         identity: task.identity.clone(),
+        claude_background: task.claude_background,
     }
 }
 
@@ -650,8 +697,10 @@ fn finalize_pending_ingest(
     PendingIngest {
         next_doc_id,
         source_paths: Vec::new(),
+        vector_delete_paths: Vec::new(),
         session_scopes: deferred_scopes.to_vec(),
         vector_publication: false,
+        embedding_publication: Some(false),
     }
     .save(pending_path)
 }
@@ -1469,6 +1518,29 @@ fn ingest_selected(
         }
     }
 
+    // Discovery inventories can be incomplete when a source is disabled or a
+    // root is unavailable, so absence from discovery is never enough to
+    // remove state. A direct NotFound is confirmation only when the file's
+    // immediate container remains available: otherwise an unavailable root or
+    // ancestor would look like every transcript was individually deleted.
+    let mut missing_state_paths = Vec::new();
+    if full_scan {
+        state
+            .files
+            .retain(|path, _| match Path::new(path).metadata() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && Path::new(path).parent().is_some_and(|parent| {
+                            parent.metadata().is_ok_and(|meta| meta.is_dir())
+                        }) =>
+                {
+                    missing_state_paths.push(path.clone());
+                    false
+                }
+                _ => true,
+            });
+    }
+
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
     let mut excluded_index_paths: Vec<String> = Vec::new();
@@ -1490,7 +1562,32 @@ fn ingest_selected(
         HashMap::new()
     };
 
-    let recover_vectors = pending_recovery
+    // Markers written before `embedding_publication` existed represented every
+    // vector publication as an embedding publication. Preserve that recovery
+    // behavior. Pure deletion recovery needs no model, but a mixed batch can
+    // also replay surviving files with new document IDs. Restore their vector
+    // coverage before live-ID reconciliation discards the previous IDs.
+    let recover_embeddings = pending_recovery.as_ref().is_some_and(|pending| {
+        pending
+            .embedding_publication
+            .unwrap_or(pending.vector_publication)
+            || (pending.vector_publication
+                && crate::vector::VectorIndex::exists(&paths.vectors)
+                && tasks.iter().any(|task| {
+                    let path = task.path.to_string_lossy();
+                    pending
+                        .source_paths
+                        .iter()
+                        .any(|source| source == path.as_ref())
+                        && !pending
+                            .vector_delete_paths
+                            .iter()
+                            .any(|source| source == path.as_ref())
+                }))
+    });
+    // Pure deletion recovery does not need an embedder, but it still crossed
+    // the vector publication boundary and must remove every non-live vector.
+    let reconcile_pending_vector_ids = pending_recovery
         .as_ref()
         .is_some_and(|pending| pending.vector_publication);
     let pending_ready_scope_recovery = pending_recovery.as_ref().is_some_and(|pending| {
@@ -1508,27 +1605,43 @@ fn ingest_selected(
                 .iter()
                 .any(|path| crate::sources::opencode::is_database_path(path))
         });
+    let mut vector_delete_paths: HashSet<String> = pending_recovery
+        .as_ref()
+        .map(|pending| pending.vector_delete_paths.iter().cloned().collect())
+        .unwrap_or_default();
+    // Pending markers written before vector_delete_paths existed only recorded
+    // OpenCode database deletions; preserve that recovery behavior.
+    if let Some(pending) = &pending_recovery {
+        vector_delete_paths.extend(
+            pending
+                .source_paths
+                .iter()
+                .filter(|path| crate::sources::opencode::is_database_path(path))
+                .cloned(),
+        );
+    }
+    vector_delete_paths.extend(opencode_database_paths_to_delete.iter().cloned());
+    vector_delete_paths.extend(opencode_legacy_paths_to_delete.iter().cloned());
+    vector_delete_paths.extend(missing_state_paths.iter().cloned());
     let mut delete_paths = pending_recovery
         .as_ref()
         .map(|pending| pending.source_paths.clone())
         .unwrap_or_default();
     delete_paths.extend(opencode_database_paths_to_delete.clone());
     delete_paths.extend(opencode_legacy_paths_to_delete.clone());
+    delete_paths.extend(missing_state_paths);
     delete_paths.extend(excluded_state_paths);
     delete_paths.extend(excluded_index_paths);
     delete_paths.sort();
     delete_paths.dedup();
-    let pending_database_paths_to_delete = pending_recovery
-        .as_ref()
-        .map(|pending| {
-            pending
-                .source_paths
-                .iter()
-                .filter(|path| crate::sources::opencode::is_database_path(path))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    delete_paths.extend(
+        tasks
+            .iter()
+            .filter(|task| task.delete_first)
+            .map(|task| task.path.to_string_lossy().to_string()),
+    );
+    delete_paths.sort();
+    delete_paths.dedup();
     let mut installed_opencode_states = state.opencode_databases.clone();
     for path in &opencode_database_paths_to_delete {
         installed_opencode_states.remove(path);
@@ -1553,7 +1666,8 @@ fn ingest_selected(
         // retry reconciliation even if interrupted before the backfill starts.
         AnalyticsStore::open(&analytics_db)?.mark_incomplete()?;
     }
-    if !recover_vectors
+    if !recover_embeddings
+        && !reconcile_pending_vector_ids
         && tasks.is_empty()
         && delete_paths.is_empty()
         && opencode_scope_targets.is_empty()
@@ -1596,7 +1710,7 @@ fn ingest_selected(
     }
 
     let mut vector_migration = vector_migration(&paths.vectors, &tasks, options.model);
-    if recover_vectors
+    if recover_embeddings
         && !options.embeddings
         && crate::vector::VectorIndex::exists(&paths.vectors)
         && let Some(model) = crate::vector::VectorIndex::open(&paths.vectors)?
@@ -1605,12 +1719,14 @@ fn ingest_selected(
     {
         vector_migration.model = model;
     }
-    let embeddings = options.embeddings || vector_migration.rebuild || recover_vectors;
+    let embeddings = options.embeddings || vector_migration.rebuild || recover_embeddings;
     let vector_publication = embeddings
-        || ((recover_vector_cleanup
+        || reconcile_pending_vector_ids
+        || (recover_vector_cleanup
             || !opencode_scope_targets.is_empty()
-            || !opencode_database_paths_to_delete.is_empty())
-            && crate::vector::VectorIndex::exists(&paths.vectors));
+            || !opencode_database_paths_to_delete.is_empty()
+            || !vector_delete_paths.is_empty())
+            && crate::vector::VectorIndex::exists(&paths.vectors);
     let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
@@ -1626,15 +1742,6 @@ fn ingest_selected(
     );
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
-    delete_paths.extend(
-        tasks
-            .iter()
-            .filter(|t| t.delete_first)
-            .map(|t| t.path.to_string_lossy().to_string()),
-    );
-    delete_paths.sort();
-    delete_paths.dedup();
-
     let mut affected_paths = delete_paths.clone();
     affected_paths.extend(
         tasks
@@ -1647,8 +1754,10 @@ fn ingest_selected(
     let mut pending_ingest = PendingIngest {
         next_doc_id: state.next_doc_id,
         source_paths: affected_paths,
+        vector_delete_paths: vector_delete_paths.iter().cloned().collect(),
         session_scopes: pending_scopes,
         vector_publication,
+        embedding_publication: Some(embeddings),
     };
     let pending_path = pending_ingest_path(paths);
     pending_ingest
@@ -1663,7 +1772,7 @@ fn ingest_selected(
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild
-            || recover_vectors,
+            || recover_embeddings,
         reset_vector_store: vector_migration.rebuild,
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_db.clone(),
@@ -1671,15 +1780,10 @@ fn ingest_selected(
         model: vector_migration.model,
         embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
-        reconcile_vector_ids: recover_vectors,
+        reconcile_vector_ids: reconcile_pending_vector_ids,
         scope_targets: opencode_scope_targets.clone(),
         opencode_session_cwds: opencode_session_cwds.clone(),
-        vector_delete_paths: opencode_database_paths_to_delete
-            .iter()
-            .chain(pending_database_paths_to_delete.iter())
-            .chain(opencode_legacy_paths_to_delete.iter())
-            .cloned()
-            .collect(),
+        vector_delete_paths,
     };
     let (decision_tx, decision_rx) = bounded(1);
     let writer_handle = std::thread::spawn(move || {
@@ -2288,7 +2392,7 @@ fn parse_claude_file(
     progress: &Arc<Progress>,
 ) -> Result<()> {
     let source_path = task.path.to_string_lossy().to_string();
-    let parsed = crate::sources::claude::parse_index_records(
+    let (parsed, background_session) = crate::sources::claude::parse_index_records_with_background(
         &task.path,
         crate::sources::IndexParseState {
             offset: task.offset,
@@ -2297,19 +2401,22 @@ fn parse_claude_file(
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
         include_reasoning,
+        task.claude_background,
+        task.size,
         next_doc_id,
         |record| {
             progress.add_produced(SourceKind::Claude, 1);
             tx_record.send(record)
         },
     )?;
-    finish_source_parse(
+    finish_source_parse_with_background(
         task,
         tx_update,
         progress,
         SourceKind::Claude,
         source_path,
         parsed,
+        Some(background_session),
     )
 }
 
@@ -2389,6 +2496,26 @@ fn finish_source_parse(
     source_path: String,
     parsed: crate::sources::IndexParseOutput,
 ) -> Result<()> {
+    finish_source_parse_with_background(
+        task,
+        tx_update,
+        progress,
+        source,
+        source_path,
+        parsed,
+        None,
+    )
+}
+
+fn finish_source_parse_with_background(
+    task: &FileTask,
+    tx_update: &Sender<FileUpdate>,
+    progress: &Arc<Progress>,
+    source: SourceKind,
+    source_path: String,
+    parsed: crate::sources::IndexParseOutput,
+    background_session: Option<bool>,
+) -> Result<()> {
     progress.add_parsed_bytes(source, parsed.offset.saturating_sub(task.offset));
     progress.add_files_done(source, 1);
     let state = completed_file_state(
@@ -2398,6 +2525,10 @@ fn finish_source_parse(
         parsed.legacy_turn_id,
         parsed.pending_tool_calls,
     );
+    let mut state = state;
+    if source == SourceKind::Claude {
+        state.claude_background = background_session;
+    }
     tx_update.send(FileUpdate {
         path: source_path,
         state,
@@ -3182,6 +3313,377 @@ mod tests {
     }
 
     #[test]
+    fn full_reconciliation_removes_confirmed_missing_transcript_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let removed = source.join("removed.jsonl");
+        let surviving = source.join("surviving.jsonl");
+        append_claude_message(&removed, "remove this transcript");
+        append_claude_message(&surviving, "keep this transcript");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap();
+        drop(index);
+
+        let removed_path = removed.to_string_lossy().into_owned();
+        let surviving_path = surviving.to_string_lossy().into_owned();
+        let mut removed_doc_ids = HashSet::new();
+        let mut surviving_doc_ids = HashSet::new();
+        SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .for_each_record(|record| {
+                if record.source_path == removed_path {
+                    removed_doc_ids.insert(record.doc_id);
+                } else if record.source_path == surviving_path {
+                    surviving_doc_ids.insert(record.doc_id);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut vectors =
+            VectorIndex::open_or_create(&paths.vectors, 4, Some("test-model")).unwrap();
+        for doc_id in removed_doc_ids.iter().chain(surviving_doc_ids.iter()) {
+            vectors.add(*doc_id, &[0.0; 4]).unwrap();
+        }
+        vectors.save().unwrap();
+
+        fs::remove_file(&removed).unwrap();
+        // A targeted event for the surviving file must not infer global
+        // absence from its partial inventory.
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let dirty = ingest_dirty(
+            &paths,
+            &index,
+            &options,
+            &lease,
+            &HashSet::from([surviving.clone()]),
+        )
+        .unwrap();
+        assert!(!dirty.full_scan);
+        assert!(
+            IngestState::load(&paths.state.join("ingest.json"))
+                .unwrap()
+                .files
+                .contains_key(&removed_path)
+        );
+
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+        assert_eq!(report.records_added, 0);
+        assert_eq!(indexed_texts(&paths), ["keep this transcript"]);
+
+        let analytics = AnalyticsStore::open(analytics_path(&paths.state)).unwrap();
+        let sessions = analytics
+            .query_sessions_detailed(None, None, None, None, None)
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_path, surviving_path);
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert!(!state.files.contains_key(&removed_path));
+        assert!(state.files.contains_key(&surviving_path));
+        let vector_inventory = VectorIndex::inventory(&paths.vectors).unwrap().unwrap();
+        assert_eq!(vector_inventory.doc_ids, surviving_doc_ids);
+
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            0,
+            "a repeated full reconciliation is idempotent"
+        );
+
+        append_claude_message(&removed, "recreated transcript");
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            1
+        );
+        assert_eq!(
+            indexed_texts(&paths),
+            ["keep this transcript", "recreated transcript"]
+        );
+        assert!(
+            IngestState::load(&paths.state.join("ingest.json"))
+                .unwrap()
+                .files
+                .contains_key(&removed_path)
+        );
+    }
+
+    #[test]
+    fn full_reconciliation_keeps_history_when_a_transcript_parent_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("claude");
+        let project = root.join("project");
+        let transcript = project.join("session.jsonl");
+        fs::create_dir_all(&project).unwrap();
+        append_claude_message(&transcript, "must survive unavailable parent");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![root];
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+
+        let source_path = transcript.to_string_lossy().into_owned();
+        fs::remove_dir_all(&project).unwrap();
+        let report = ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+
+        assert_eq!(report.records_added, 0);
+        assert_eq!(indexed_texts(&paths), ["must survive unavailable parent"]);
+        assert!(
+            IngestState::load(&paths.state.join("ingest.json"))
+                .unwrap()
+                .files
+                .contains_key(&source_path)
+        );
+    }
+
+    #[test]
+    fn background_marker_completed_after_partial_ingest_reclassifies_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let transcript = source.join("session.jsonl");
+        // Keep appends beyond the identity prefix so only incremental parsing
+        // can discover the marker, rather than a replacement-triggered parse.
+        append_claude_message(&transcript, &"initial text ".repeat(500));
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let marker =
+            r#"{"type":"assistant","sessionKind":"bg","message":{"content":"background"}}"#;
+        let split = marker.len() / 2;
+        let marker_offset = transcript.metadata().unwrap().len();
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(&marker.as_bytes()[..split]).unwrap();
+        }
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(
+            state.files[transcript.to_str().unwrap()].offset,
+            marker_offset
+        );
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(&marker.as_bytes()[split..]).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        append_claude_message(&transcript, "after background marker");
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(
+            state.files[transcript.to_str().unwrap()].claude_background,
+            Some(true)
+        );
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut count = 0;
+        index
+            .for_each_record(|record| {
+                count += 1;
+                assert_eq!(record.links.conversation_kind.as_deref(), Some("subagent"));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn incremental_claude_background_marker_reclassifies_prior_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let transcript = source.join("session.jsonl");
+        append_claude_message(&transcript, "before background marker");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant", "sessionKind": "bg", "uuid": "background-marker",
+                "message": {"role": "assistant", "content": "background marker"},
+            })
+        )
+        .unwrap();
+        ingest_dirty(
+            &paths,
+            &open_search_index(&paths),
+            &options,
+            &lease,
+            &HashSet::from([transcript.clone()]),
+        )
+        .unwrap();
+
+        let source_path = transcript.to_string_lossy().into_owned();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut records = Vec::new();
+        index
+            .for_each_record(|record| {
+                if record.source_path == source_path {
+                    records.push(record);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| { record.links.conversation_kind.as_deref() == Some("subagent") })
+        );
+        let sessions = AnalyticsStore::open(analytics_path(&paths.state))
+            .unwrap()
+            .query_sessions_detailed(None, None, None, None, None)
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].conversation_kind.as_deref(), Some("subagent"));
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(state.files[&source_path].claude_background, Some(true));
+    }
+
+    #[test]
+    fn claude_parser_defers_background_marker_appended_after_task_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let transcript = source.join("session.jsonl");
+        append_claude_message(&transcript, "initial record");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+
+        let source_path = transcript.to_string_lossy().into_owned();
+        let mut state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        append_claude_message(&transcript, "within task boundary");
+        let background_marker = serde_json::to_string(&serde_json::json!({
+            "type": "assistant", "sessionKind": "bg", "uuid": "late-background-marker",
+            "message": {"role": "assistant", "content": "late background marker"},
+        }))
+        .unwrap();
+        let split_at = background_marker.len() / 2;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(&background_marker.as_bytes()[..split_at])
+            .unwrap();
+        drop(file);
+        let metadata = transcript.metadata().unwrap();
+        let (task, skip) = prepare_file_task(
+            transcript.clone(),
+            SourceKind::Claude,
+            false,
+            &metadata,
+            state.files.get(&source_path),
+        );
+        assert!(!skip);
+        assert_eq!(task.claude_background, Some(false));
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(&background_marker.as_bytes()[split_at..])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let mut parsed_records = Vec::new();
+        let (parsed, background_session) =
+            crate::sources::claude::parse_index_records_with_background(
+                &task.path,
+                crate::sources::IndexParseState {
+                    offset: task.offset,
+                    turn_id: task.turn_id,
+                    legacy_turn_id: task.legacy_turn_id,
+                    pending_tool_calls: task.pending_tool_calls.clone(),
+                },
+                false,
+                task.claude_background,
+                task.size,
+                &AtomicU64::new(state.next_doc_id),
+                |record| {
+                    parsed_records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(parsed.offset < task.size);
+        assert!(!background_session);
+        assert_eq!(parsed_records.len(), 1);
+
+        let mut bounded_state = completed_file_state(
+            &task,
+            parsed.offset,
+            parsed.turn_id,
+            parsed.legacy_turn_id,
+            parsed.pending_tool_calls,
+        );
+        bounded_state.claude_background = Some(background_session);
+        state.files.insert(source_path.clone(), bounded_state);
+        state.save(&paths.state.join("ingest.json")).unwrap();
+
+        ingest_dirty(
+            &paths,
+            &open_search_index(&paths),
+            &options,
+            &lease,
+            &HashSet::from([transcript]),
+        )
+        .unwrap();
+
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut records = Vec::new();
+        index
+            .for_each_record(|record| {
+                if record.source_path == source_path {
+                    records.push(record);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(
+            records
+                .iter()
+                .all(|record| { record.links.conversation_kind.as_deref() == Some("subagent") })
+        );
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(state.files[&source_path].claude_background, Some(true));
+    }
+
+    #[test]
     fn targeted_ingest_creates_and_replaces_files_without_unrelated_discovery() {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -3248,8 +3750,10 @@ mod tests {
         PendingIngest {
             next_doc_id: state.next_doc_id,
             source_paths: vec![second.to_string_lossy().into_owned()],
+            vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_ingest_path(&paths))
         .unwrap();
@@ -3578,8 +4082,10 @@ mod tests {
         PendingIngest {
             next_doc_id: 100,
             source_paths: vec![source_path.clone()],
+            vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save interrupted ingest marker");
@@ -3669,7 +4175,10 @@ mod tests {
         assert_recovers_cross_store_crash(true);
     }
 
-    fn assert_recovers_vector_crash(publish_interrupted_vectors: bool) {
+    fn assert_recovers_vector_crash(
+        publish_interrupted_vectors: bool,
+        embedding_publication: bool,
+    ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let claude_root = tmp.path().join("claude-projects");
         let project = claude_root.join("-Users-nico-Code-memex");
@@ -3709,8 +4218,10 @@ mod tests {
         PendingIngest {
             next_doc_id: 100,
             source_paths: vec![source_path.clone()],
+            vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: true,
+            embedding_publication: Some(embedding_publication),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save interrupted ingest marker");
@@ -3772,6 +4283,7 @@ mod tests {
             std::mem::forget(staged_vectors);
         }
 
+        options.embeddings = false;
         {
             let index =
                 SearchIndex::open_or_create_for_ingest(&paths.index).expect("recovery generation");
@@ -3821,12 +4333,18 @@ mod tests {
 
     #[test]
     fn recovery_reconciles_lexical_publish_before_vector_publish() {
-        assert_recovers_vector_crash(false);
+        assert_recovers_vector_crash(false, true);
     }
 
     #[test]
     fn recovery_removes_vectors_published_before_marker_clear() {
-        assert_recovers_vector_crash(true);
+        assert_recovers_vector_crash(true, true);
+    }
+
+    #[test]
+    fn cleanup_recovery_restores_reparsed_survivor_vectors() {
+        assert_recovers_vector_crash(false, false);
+        assert_recovers_vector_crash(true, false);
     }
 
     #[test]
@@ -3845,8 +4363,10 @@ mod tests {
         PendingIngest {
             next_doc_id: 3,
             source_paths: Vec::new(),
+            vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: true,
+            embedding_publication: Some(true),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save vector-only pending marker");
@@ -3863,6 +4383,61 @@ mod tests {
         assert_eq!(vectors.doc_ids, HashSet::from([1, 2]));
         assert_eq!(
             PendingIngest::load(&pending_ingest_path(&paths)).expect("pending marker"),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_only_vector_recovery_reconciles_orphans_without_deletion_targets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = save_search_records(
+            &paths,
+            &[record(1, "user", "first"), record(2, "assistant", "second")],
+        );
+        index.publish_generation_if_uninitialized().unwrap();
+        let mut vectors = VectorIndex::open_or_create(&paths.vectors, 4, Some("test-model"))
+            .expect("create vectors");
+        vectors.add(1, &[0.0; 4]).unwrap();
+        vectors.add(2, &[0.0; 4]).unwrap();
+        // This is an orphan from the interrupted vector generation. The marker
+        // has no deletion path or session scope, so only live-ID reconciliation
+        // can remove it after lexical publication has already completed.
+        vectors.add(99, &[0.0; 4]).unwrap();
+        vectors.save().unwrap();
+
+        PendingIngest {
+            next_doc_id: 3,
+            source_paths: Vec::new(),
+            vector_delete_paths: Vec::new(),
+            session_scopes: Vec::new(),
+            vector_publication: true,
+            embedding_publication: Some(false),
+        }
+        .save(&pending_ingest_path(&paths))
+        .unwrap();
+
+        // A cleanup-only recovery must be able to use the existing vector
+        // store even when the configured embedding model is unavailable.
+        let options = ingest_options(false, ModelChoice::Gemma);
+        ingest_all(
+            &paths,
+            &open_search_index(&paths),
+            &options,
+            &ingest_lease(&paths),
+        )
+        .unwrap();
+
+        assert_eq!(
+            VectorIndex::inventory(&paths.vectors)
+                .unwrap()
+                .unwrap()
+                .doc_ids,
+            HashSet::from([1, 2])
+        );
+        assert_eq!(
+            PendingIngest::load(&pending_ingest_path(&paths)).unwrap(),
             None
         );
     }
@@ -3887,11 +4462,13 @@ mod tests {
         PendingIngest {
             next_doc_id: 3,
             source_paths: Vec::new(),
+            vector_delete_paths: Vec::new(),
             session_scopes: vec![SessionScope {
                 source_path: "/unavailable/opencode.db".to_string(),
                 session_id: "deferred-session".to_string(),
             }],
             vector_publication: true,
+            embedding_publication: Some(true),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending vector publication with deferred scope");
@@ -3965,6 +4542,7 @@ mod tests {
                 metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
             ),
             parser_version: crate::sources::index_state_version(source),
+            claude_background: None,
         }
     }
 
@@ -4353,8 +4931,10 @@ mod tests {
         PendingIngest {
             next_doc_id: 1,
             source_paths: Vec::new(),
+            vector_delete_paths: Vec::new(),
             session_scopes: vec![scope],
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_ingest_path(&paths))
         .unwrap();
@@ -4367,8 +4947,10 @@ mod tests {
         PendingIngest {
             next_doc_id: 1,
             source_paths: vec![database_path.clone()],
+            vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_ingest_path(&paths))
         .unwrap();
@@ -4612,11 +5194,13 @@ mod tests {
         PendingIngest {
             next_doc_id: 1,
             source_paths: Vec::new(),
+            vector_delete_paths: Vec::new(),
             session_scopes: vec![SessionScope {
                 source_path: source_path.clone(),
                 session_id: "ses_db-session".to_string(),
             }],
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending database scope");
@@ -5258,6 +5842,7 @@ mod tests {
                 },
             )]),
             identity,
+            claude_background: None,
         };
         let (task, skip) =
             prepare_file_task(path, SourceKind::Claude, false, &metadata, Some(&previous));
@@ -5397,6 +5982,7 @@ mod tests {
             parser_version: version,
             pending_tool_calls: HashMap::new(),
             identity,
+            claude_background: None,
         };
         let (task, skip) =
             prepare_file_task(path, SourceKind::Jcode, false, &metadata, Some(&previous));
@@ -5637,8 +6223,10 @@ mod tests {
         PendingIngest {
             next_doc_id: 2,
             source_paths: vec!["source-1.jsonl".to_string()],
+            vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: false,
+            embedding_publication: Some(false),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending ingest");
@@ -6195,6 +6783,7 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Pi),
+            claude_background: None,
         };
         let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], false));
         let next_doc_id = AtomicU64::new(1);
@@ -6275,6 +6864,7 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             identity: FileIdentity::default(),
             parser_version: crate::sources::index_state_version(SourceKind::Copilot),
+            claude_background: None,
         };
         let (raw_tx_record, rx_record) = unbounded();
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
