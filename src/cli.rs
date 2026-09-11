@@ -1282,6 +1282,7 @@ enum IndexServiceCommand {
 }
 
 pub fn run() -> Result<()> {
+    crate::profiling::span!("cli.run");
     let cli = Cli::parse();
     let interactive = interaction_allowed(
         cli.non_interactive,
@@ -1365,11 +1366,11 @@ pub fn run() -> Result<()> {
             } else if web_ui || web_listen.is_some() || mcp || no_mcp || mcp_listen.is_some() {
                 return Err(anyhow!("server options require `memex daemon run`"));
             } else {
-                run_index_args(&index, false, false)?;
+                run_index_args(&index, false)?;
             }
         }
         Commands::Reindex { index } => {
-            run_index_args(&index, true, false)?;
+            run_index_args(&index, true)?;
         }
         Commands::IndexGc {
             root,
@@ -2058,7 +2059,7 @@ fn run_poll_loop(
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || run_index_args(index, false),
         || {
             web_listen
                 .as_deref()
@@ -2082,7 +2083,7 @@ fn run_poll_loop(
                 std::thread::sleep(remaining);
             }
         }
-        run_index_args(index, false, true)?;
+        run_index_args(index, false)?;
         std::io::stdout().flush().ok();
     }
 }
@@ -2135,7 +2136,7 @@ fn run_event_loop(
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || run_index_args(index, false),
         || {
             web_listen
                 .as_deref()
@@ -2154,7 +2155,7 @@ fn run_event_loop(
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
                     eprintln!("watch: root refresh failed: {error:#}");
                 }
-                match run_index_args(index, false, true) {
+                match run_index_args(index, false) {
                     Ok(()) => {
                         service.mark_complete(FireCause::Resync);
                         log_watch_stats(&service);
@@ -2166,7 +2167,7 @@ fn run_event_loop(
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
                     Ok(false) => service.mark_skipped(),
-                    Ok(true) => match run_index_selection(index, false, true, Some(&dirty)) {
+                    Ok(true) => match run_index_selection(index, false, Some(&dirty)) {
                         Ok(full_scan) => {
                             if full_scan
                                 && let Err(error) = refresh_watch_roots(&mut service, index)
@@ -2186,7 +2187,7 @@ fn run_event_loop(
                     },
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
-                        if run_index_args(index, false, true).is_ok() {
+                        if run_index_args(index, false).is_ok() {
                             service.mark_complete(FireCause::Resync);
                             log_watch_stats(&service);
                         }
@@ -2242,8 +2243,8 @@ fn log_watch_stats(service: &WatchService) {
         stats.hot_hits,
     );
 }
-fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index(index, reindex, continuous)
+fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index(index, reindex)
 }
 
 /// Resolve the ingest projection from CLI flags plus config. Shared by the
@@ -2294,11 +2295,12 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         model: model_choice,
         embed_runtime,
         tool_content_limits,
+        defer_merges: false,
     })
 }
 
-fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index_selection(index, reindex, continuous, None).map(|_| ())
+fn run_index(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index_selection(index, reindex, None).map(|_| ())
 }
 
 /// Return whether discovery covered all sources, so only reconciliation
@@ -2306,7 +2308,6 @@ fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
 fn run_index_selection(
     index: &IndexArgs,
     reindex: bool,
-    continuous: bool,
     dirty: Option<&HashSet<PathBuf>>,
 ) -> Result<bool> {
     let paths = Paths::new(index.root.clone())?;
@@ -2316,13 +2317,16 @@ fn run_index_selection(
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex {
-        reset_reindex_artifacts(&paths)?;
+        reset_reindex_artifacts(&paths, &lease)?;
     }
     paths.ensure_dirs()?;
-    let index = if continuous {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
-    } else {
+    let index = if reindex {
         SearchIndex::open_or_create_for_ingest(&paths.index)?
+    } else {
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+        }
     };
 
     let (report, full_scan) = if let Some(dirty) = dirty {
@@ -2354,15 +2358,13 @@ fn run_index_selection(
     Ok(full_scan)
 }
 
-fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
+fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
+    crate::state::checkpoint::reset(&paths.state.join("ingest.json"), lease)?;
     remove_generated_path(&paths.index)?;
     remove_generated_path(&paths.vectors)?;
     remove_generated_path(&paths.root.join("memory"))?;
 
     for name in [
-        "ingest.json",
-        "ingest.pending.json",
-        "scan_cache.json",
         "analytics.sqlite",
         "analytics.sqlite-wal",
         "analytics.sqlite-shm",
@@ -2412,18 +2414,20 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
     let memory_generations = gc_memory_vectors(&paths, dry_run)?;
     if report.dry_run {
         println!(
-            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; no rebuild required",
+            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, {} unreferenced shared segment files, and {} obsolete memory vector generations; no rebuild required",
             report.generations_removed,
             report.abandoned_workdirs_removed,
             report.legacy_files_removed,
+            report.shared_files_removed,
             memory_generations
         );
     } else {
         println!(
-            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
+            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, {} unreferenced shared segment files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
             report.generations_removed,
             report.abandoned_workdirs_removed,
             report.legacy_files_removed,
+            report.shared_files_removed,
             memory_generations
         );
     }
@@ -2573,6 +2577,7 @@ fn run_search(
     machines: Vec<String>,
     trace: bool,
 ) -> Result<()> {
+    crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
         SearchFormat::Json
     } else {
@@ -8924,7 +8929,8 @@ arguments = {
             std::fs::write(paths.state.join(name), "derived").unwrap();
         }
 
-        reset_reindex_artifacts(&paths).unwrap();
+        let lease = IngestLease::acquire(&paths, "rebuild test", INGEST_LEASE_TIMEOUT).unwrap();
+        reset_reindex_artifacts(&paths, &lease).unwrap();
 
         assert!(!paths.index.exists());
         assert!(!paths.vectors.exists());

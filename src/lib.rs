@@ -13,8 +13,11 @@ pub mod memory;
 pub mod memory_search;
 #[cfg(unix)]
 mod native;
+#[doc(hidden)]
+pub mod profiling;
 pub mod progress;
 pub mod read_budget;
+mod repository;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;

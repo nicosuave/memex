@@ -136,7 +136,9 @@ pub(crate) fn parse_index_records(
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        serde_json::from_slice::<serde_json::Value>(line).is_ok()
+    });
     let mut turn_id = state.turn_id;
     let mut pending_tool_calls = state.pending_tool_calls;
     let mut diagnostics = ParseDiagnostics::default();
@@ -156,6 +158,7 @@ pub(crate) fn parse_index_records(
     });
 
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let rel = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..rel];
@@ -166,6 +169,11 @@ pub(crate) fn parse_index_records(
         let value: Value = match serde_json::from_slice(line) {
             Ok(value) => value,
             Err(_) => {
+                if rel == slice.len() {
+                    start = line_start;
+                    break;
+                }
+
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -379,7 +387,7 @@ pub(crate) fn parse_index_records(
 
     Ok(IndexParseOutput {
         legacy_turn_id: None,
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),

@@ -9,6 +9,7 @@ repository = "https://github.com/nicosuave/memex"
 
 [features]
 default = []
+profiling = []
 cuda = ["ort/cuda", "dep:libloading"]
 
 [dependencies]
@@ -39,6 +40,7 @@ toml_edit = "0.22"
 walkdir = "2.5"
 globset = "0.4"
 notify = "8"
+gix = { version = "0.84", default-features = false, features = ["sha1", "sha256"] }
 indicatif = "0.17"
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm_0_29",
@@ -62,4 +64,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[[bench]]
+name = "index"
+harness = false
