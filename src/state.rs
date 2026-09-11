@@ -25,6 +25,8 @@ pub struct FileIdentity {
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +104,8 @@ pub struct FileState {
     /// migrated safely on their next ingest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_metadata_offsets: Option<Vec<u64>>,
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip
@@ -118,6 +122,7 @@ pub struct ScanCache {
 
 impl ScanCache {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.scan_cache.load");
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -127,6 +132,7 @@ impl ScanCache {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.scan_cache.save");
         let data = serde_json::to_string(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -210,6 +216,7 @@ impl Default for IngestState {
 
 impl IngestState {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.ingest.load");
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -219,6 +226,7 @@ impl IngestState {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.ingest.save");
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -226,6 +234,7 @@ impl IngestState {
 
 impl PendingIngest {
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        crate::profiling::span!("state.pending.load");
         if !path.exists() {
             return Ok(None);
         }
@@ -234,6 +243,7 @@ impl PendingIngest {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.pending.save");
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
     }
