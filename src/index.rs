@@ -1,6 +1,4 @@
 #[cfg(test)]
-mod benchmark;
-#[cfg(test)]
 mod cleanup_tests;
 mod storage;
 

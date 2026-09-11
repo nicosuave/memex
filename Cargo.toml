@@ -68,4 +68,9 @@ url = "2"
 ort = { version = "2.0.0-rc.13", features = ["coreml"] }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[[bench]]
+name = "index"
+harness = false
