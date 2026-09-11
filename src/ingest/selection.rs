@@ -677,6 +677,7 @@ mod tests {
                 legacy_turn_id: None,
                 parser_version: 0,
                 pending_tool_calls: Default::default(),
+                codex_metadata_offsets: None,
                 identity: Default::default(),
                 claude_background: None,
             },

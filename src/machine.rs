@@ -2663,7 +2663,14 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
     crate::profiling::span!("index.local");
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
-    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+    let index = if stale_only {
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+        }
+    } else {
+        SearchIndex::open_or_create_for_ingest(&paths.index)?
+    };
     let options = IngestOptions {
         claude_sources: default_claude_sources(),
         include_agents: false,

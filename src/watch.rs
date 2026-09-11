@@ -1317,6 +1317,7 @@ mod tests {
             legacy_turn_id: None,
             parser_version: 1,
             pending_tool_calls: HashMap::new(),
+            codex_metadata_offsets: None,
             identity: FileIdentity {
                 sqlite_wal: None,
                 device: None,
@@ -1324,6 +1325,7 @@ mod tests {
                 prefix_sha256: None,
                 prefix_bytes: 0,
                 modified_ns: Some(modified_ns),
+                changed_ns: None,
             },
             claude_background: None,
         }

@@ -1150,7 +1150,10 @@ impl App {
                     LeaseAttempt::Acquired(lease) => lease,
                     LeaseAttempt::Busy(_) => return Ok(None),
                 };
-                let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
+                let index = match SearchIndex::open_or_create(&paths.index) {
+                    Ok(index) if !index.is_writable() => index,
+                    _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+                };
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;

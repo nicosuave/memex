@@ -2321,7 +2321,10 @@ fn run_index_selection(
     }
     paths.ensure_dirs()?;
     let index = if continuous {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+        }
     } else {
         SearchIndex::open_or_create_for_ingest(&paths.index)?
     };
