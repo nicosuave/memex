@@ -241,6 +241,13 @@ EXAMPLES:
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Merge segments below 5% of the corpus, excluding the three largest
+    #[command(hide = true)]
+    IndexCompact {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Reclaim unreachable immutable index generations without rebuilding
     #[command(hide = true)]
     IndexGc {
@@ -1372,6 +1379,9 @@ pub fn run() -> Result<()> {
         Commands::Reindex { index } => {
             run_index_args(&index, true)?;
         }
+        Commands::IndexCompact { root } => {
+            run_index_compact(root)?;
+        }
         Commands::IndexGc {
             root,
             dry_run,
@@ -2401,6 +2411,49 @@ fn remove_generated_path(path: &Path) -> Result<()> {
     result.with_context(|| format!("remove reindex artifact {}", path.display()))
 }
 
+/// Search refreshes append without merging; this folds the accumulated small segments into
+/// one while leaving the largest untouched, so a compaction costs the small segments' size,
+/// not the corpus's.
+///
+/// The ingest lease is held only to stage from the current generation and to publish; the
+/// merge itself runs unleased so search refreshes never wait on it. Publication is skipped
+/// when another writer published in between, leaving the next compaction to fold again.
+fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
+    let paths = Paths::new(root)?;
+    if !SearchIndex::exists(&paths.index) {
+        println!("no index to compact");
+        return Ok(());
+    }
+    let Some(_compaction) = crate::lease::CompactionLock::try_acquire(&paths)? else {
+        println!("compaction already running");
+        return Ok(());
+    };
+    let (index, base) = {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let base = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        (SearchIndex::open_or_create_for_ingest(&paths.index)?, base)
+    };
+    let merged = index.compact_small_segments(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
+    if merged > 0 {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let current = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        if current != base {
+            println!("compaction skipped: the index moved while merging");
+            return Ok(());
+        }
+        index.publish_generation()?;
+    }
+    println!(
+        "compacted {merged} segments; {} remain",
+        SearchIndex::open_or_create(&paths.index)?.segment_count()?
+    );
+    Ok(())
+}
+
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
     if !dry_run && !offline {
         return Err(anyhow!(
@@ -3363,6 +3416,8 @@ fn collect_search_with_auto_index(
         top_n_per_session
     };
     let kind_filter: crate::analytics::SessionKindFilter = origin.into();
+    // `--full` clears the field set and asks for whole records; everything else renders excerpts.
+    let text_limit = fields.as_ref().map(|_| crate::machine::SEARCH_TEXT_BUDGET);
     let render = RenderOptions {
         verbose,
         pretty: false,
@@ -3420,6 +3475,7 @@ fn collect_search_with_auto_index(
                 recency_half_life_days,
                 min_score,
                 project_grouping: None,
+                text_limit,
             };
             let federated = federated_search(
                 &paths,
@@ -7517,7 +7573,7 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+pub(crate) fn query_literals(query: &str) -> Vec<String> {
     use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
     fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
         match ast {
@@ -7556,13 +7612,20 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         if term.is_empty() || !seen.insert(term.clone()) {
             continue;
         }
-        out.push(
-            RegexBuilder::new(&regex::escape(&term))
-                .case_insensitive(true)
-                .build()?,
-        );
+        out.push(term);
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+    query_literals(query)
+        .into_iter()
+        .map(|term| {
+            Ok(RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?)
+        })
+        .collect()
 }
 
 // Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.

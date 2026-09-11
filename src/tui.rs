@@ -5685,6 +5685,7 @@ fn run_search_request(
                     recency_half_life_days: 30.0,
                     min_score: None,
                     project_grouping: Some(request.grouping),
+                    text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
                 },
                 false,
             )?
