@@ -1152,7 +1152,7 @@ impl App {
                 };
                 let index = match SearchIndex::open_or_create(&paths.index) {
                     Ok(index) if !index.is_writable() => index,
-                    _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+                    _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
                 };
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
@@ -1178,6 +1178,7 @@ impl App {
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
+                    defer_merges: true,
                 };
                 ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl(), &lease)
             })();

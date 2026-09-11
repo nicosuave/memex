@@ -2654,8 +2654,44 @@ fn apply_project_grouping(
 
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
     if config.auto_index_on_search_default() {
-        let _ = index_local(paths, config, true)?;
+        let report = index_local(paths, config, true)?;
+        if report.records_added > 0 {
+            schedule_compaction_if_fragmented(paths)?;
+        }
     }
+    Ok(())
+}
+
+/// Search refreshes append without merging; once segments accumulate, one detached
+/// `memex index` process compacts them with the tiered policy and exits. The probe skips
+/// spawning while ingest is busy; duplicate children serialize on the ingest lease they
+/// acquire for their entire run.
+fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
+    let segments = SearchIndex::open_or_create(&paths.index)?.segment_count()?;
+    if segments <= crate::index::SEARCH_REFRESH_COMPACTION_SEGMENTS {
+        return Ok(());
+    }
+    if !matches!(
+        IngestLease::try_acquire(paths, "compaction-check")?,
+        crate::lease::LeaseAttempt::Acquired(_)
+    ) {
+        return Ok(());
+    }
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args(["--no-update-check", "--non-interactive", "index", "--root"])
+        .arg(&paths.root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .spawn()
+        .context("spawn background index compaction")?;
     Ok(())
 }
 
@@ -2666,7 +2702,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
     let index = if stale_only {
         match SearchIndex::open_or_create(&paths.index) {
             Ok(index) if !index.is_writable() => index,
-            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
         }
     } else {
         SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
@@ -2692,6 +2728,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         model: config.resolve_model(None)?,
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
+        defer_merges: stale_only,
     };
     if stale_only {
         Ok(

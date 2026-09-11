@@ -40,9 +40,6 @@ impl StagingDurability {
             }
             directories.push((path, directory));
         }
-        if !probe_full_sync(&lease)? {
-            return Ok(None);
-        }
         Ok(Some(Arc::new(Self {
             device,
             directories,
@@ -94,7 +91,7 @@ impl StagingDurability {
         }
         if full {
             crate::profiling::count!("lexical.full_syncs", 1);
-            full_sync(file)
+            finish_probe(file, full_sync(file)).map(drop)
         } else {
             crate::profiling::count!("lexical.staging_fsyncs", 1);
             retry_sync(|| unsafe { libc::fsync(file.as_raw_fd()) })
@@ -181,10 +178,6 @@ fn supported_filesystem(file: &File) -> io::Result<bool> {
     let stat = unsafe { stat.assume_init() };
     let name = unsafe { CStr::from_ptr(stat.f_fstypename.as_ptr()) }.to_bytes();
     Ok(stat.f_flags & libc::MNT_LOCAL as u32 != 0 && matches!(name, b"apfs" | b"hfs"))
-}
-
-fn probe_full_sync(file: &File) -> io::Result<bool> {
-    finish_probe(file, full_sync(file))
 }
 
 fn finish_probe(file: &File, result: io::Result<()>) -> io::Result<bool> {

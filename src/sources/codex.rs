@@ -81,20 +81,6 @@ pub fn discover_rollouts() -> Vec<SourceFile> {
         .collect()
 }
 
-pub(crate) fn discover_rollouts_with_inventory(
-    inventory: &mut crate::directory_inventory::DiscoveryInventory,
-) -> Result<Vec<SourceFile>> {
-    Ok(
-        super::common::jsonl_files_with_inventory(rollout_roots(), inventory)?
-            .into_iter()
-            .map(|path| SourceFile {
-                source: SourceKind::Codex,
-                path,
-            })
-            .collect(),
-    )
-}
-
 pub fn history_paths() -> Vec<PathBuf> {
     homes()
         .into_iter()
