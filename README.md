@@ -6,6 +6,8 @@ Agents can use Memex through its MCP server or CLI skill. Ask about a previous s
 
 Includes a TUI for browsing, finding and resuming agent CLI sessions, with optional [token usage](#token-usage) tracking.
 
+Developer profiling: [index/search traces and flamegraphs](docs/profiling.md).
+
 ![memex tui](docs/tui.png?raw=1&v=4)
 
 A native macOS companion is available in [apps/macos](apps/macos/README.md), with

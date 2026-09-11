@@ -118,6 +118,7 @@ pub struct ScanCache {
 
 impl ScanCache {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.scan_cache.load");
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -127,6 +128,7 @@ impl ScanCache {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.scan_cache.save");
         let data = serde_json::to_string(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -210,6 +212,7 @@ impl Default for IngestState {
 
 impl IngestState {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.ingest.load");
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -219,6 +222,7 @@ impl IngestState {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.ingest.save");
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -226,6 +230,7 @@ impl IngestState {
 
 impl PendingIngest {
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        crate::profiling::span!("state.pending.load");
         if !path.exists() {
             return Ok(None);
         }
@@ -234,6 +239,7 @@ impl PendingIngest {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.pending.save");
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
     }

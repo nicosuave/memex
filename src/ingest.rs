@@ -150,6 +150,8 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
         File::open(path).ok().and_then(|mut file| {
             let mut bytes = vec![0; prefix_bytes];
             let read = file.read(&mut bytes).ok()?;
+            crate::profiling::count!("ingest.prefix_reads", 1);
+            crate::profiling::count!("ingest.prefix_bytes", read);
             bytes.truncate(read);
             Some(format!("{:x}", Sha256::digest(&bytes)))
         })
@@ -208,6 +210,7 @@ fn prepare_file_task(
     metadata: &std::fs::Metadata,
     previous: Option<&FileState>,
 ) -> (FileTask, bool) {
+    crate::profiling::span!("ingest.file_check");
     let size = metadata.len();
     let mtime = metadata
         .modified()
@@ -456,6 +459,7 @@ fn prehydrate_opencode_database(
     next_doc_id: &AtomicU64,
     state_dir: &Path,
 ) -> Result<PreparedOpencodeDatabase> {
+    crate::profiling::span!("opencode.hydrate");
     let mut spool = tempfile::Builder::new()
         .prefix(OPENCODE_SPOOL_PREFIX)
         .tempfile_in(state_dir)
@@ -624,10 +628,12 @@ pub fn ingest_if_stale(
     ttl_seconds: u64,
     lease: &IngestLease,
 ) -> Result<Option<IngestReport>> {
+    crate::profiling::span!("ingest.freshness");
     let cache_path = paths.state.join("scan_cache.json");
     let cache = ScanCache::load(&cache_path)?;
 
     if can_skip_fresh_scan(&cache, paths, index, options, ttl_seconds)? {
+        crate::profiling::count!("ingest.fresh_cache_hits", 1);
         // The transcript scan cache cannot detect edits in a Markdown memory
         // file. Refresh these small documents even when transcript discovery is
         // still within its TTL, under the same ingestion lease.
@@ -635,6 +641,7 @@ pub fn ingest_if_stale(
         return Ok(None);
     }
 
+    crate::profiling::count!("ingest.fresh_cache_misses", 1);
     let report = ingest_all(paths, index, options, lease)?;
     Ok(Some(report))
 }
@@ -773,6 +780,7 @@ fn ingest_selected(
     _lease: &IngestLease,
     dirty: Option<&HashSet<PathBuf>>,
 ) -> Result<DirtyIngestReport> {
+    crate::profiling::span!("ingest.all");
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let state_path = paths.state.join("ingest.json");
@@ -816,6 +824,8 @@ fn ingest_selected(
 
     // Index-time exclusion: matched transcripts never enter the index, and
     // records previously indexed from now-excluded paths are removed.
+    #[cfg(feature = "profiling")]
+    let discovery_profile = crate::profiling::Scope::enter("ingest.discovery");
     let excluder = build_path_excluder(options)?;
     let mut excluded_state_paths: Vec<String> = Vec::new();
     if full_scan {
@@ -1649,6 +1659,23 @@ fn ingest_selected(
     installed_opencode_states.extend(opencode_database_states.clone());
     let opencode_database_state_changed = installed_opencode_states != state.opencode_databases;
 
+    #[cfg(feature = "profiling")]
+    drop(discovery_profile);
+    crate::profiling::count!("ingest.files_scanned", files_scanned);
+    crate::profiling::count!("ingest.files_skipped", files_skipped);
+    crate::profiling::count!("ingest.parse_tasks", tasks.len());
+    crate::profiling::count!(
+        "opencode.legacy_deletes_scheduled",
+        opencode_legacy_paths_to_delete.len()
+    );
+    crate::profiling::count!(
+        "opencode.scope_deletes_scheduled",
+        opencode_scope_targets.len()
+    );
+    crate::profiling::count!(
+        "opencode.database_deletes_scheduled",
+        opencode_database_paths_to_delete.len()
+    );
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
     let analytics_db = analytics_path(&paths.state);
@@ -1679,6 +1706,7 @@ fn ingest_selected(
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
         }
+        crate::profiling::count!("ingest.noop_returns", 1);
         index.publish_generation_if_uninitialized()?;
         state.opencode_databases = installed_opencode_states;
         if recovering_pending_ingest || empty_index_rebuild {
@@ -1802,6 +1830,7 @@ fn ingest_selected(
     let parser_pool = parser_thread_pool()?;
     let parser_result = parser_pool.install(|| {
         tasks_arc.par_iter().try_for_each(|task| -> Result<()> {
+            crate::profiling::span!("ingest.parse_file");
             let result = match task.source {
                 SourceKind::Claude => parse_claude_file(
                     task,
@@ -1944,10 +1973,14 @@ fn ingest_selected(
     };
     // A failed writer may have already closed the channel. Joining below keeps that root cause.
     let _ = decision_tx.send(decision);
+    #[cfg(feature = "profiling")]
+    let writer_wait_profile = crate::profiling::Scope::enter("ingest.writer_wait");
     let writer_result = writer_handle.join().map_err(|_| {
         tail.finish_and_clear();
         anyhow!("writer thread panicked")
     })?;
+    #[cfg(feature = "profiling")]
+    drop(writer_wait_profile);
     progress.finish();
     tail.set_message("updating analytics…");
     let outcome = (|| -> Result<DirtyIngestReport> {
@@ -2011,6 +2044,7 @@ fn ingest_selected(
 }
 
 fn refresh_memories(paths: &Paths, options: &IngestOptions) -> Result<()> {
+    crate::profiling::span!("memory.refresh");
     let mut enabled_sources = HashSet::new();
     if !options.claude_sources.is_empty() {
         enabled_sources.insert(SourceKind::Claude);
@@ -2105,6 +2139,7 @@ fn can_skip_noop_index(
     index: &SearchIndex,
     options: &IngestOptions,
 ) -> Result<bool> {
+    crate::profiling::span!("vectors.compatibility");
     if !options.embeddings {
         return Ok(true);
     }
@@ -2127,6 +2162,7 @@ fn vector_index_covers_embeddable_records(
     index: &SearchIndex,
     vector_index: &crate::vector::VectorIndex,
 ) -> Result<bool> {
+    crate::profiling::span!("vectors.coverage_check");
     let mut covers_all = true;
     index.for_each_record(|record| {
         if record_needs_embedding(&record) && !vector_index.contains(record.doc_id) {
@@ -2162,6 +2198,7 @@ fn writer_loop(
     delete_paths: Vec<String>,
     ctx: WriterContext,
 ) -> Result<WriterOutcome> {
+    crate::profiling::span!("ingest.writer");
     let WriterContext {
         embeddings,
         do_backfill_embeddings,
@@ -2290,7 +2327,10 @@ fn writer_loop(
         analytics.delete_source_path(&path)?;
     }
     analytics.flush()?;
-    writer.commit()?;
+    {
+        crate::profiling::span!("lexical.commit");
+        writer.commit()?;
+    }
     index.maybe_compact_continuous_segments(&mut writer)?;
     let mut staged_vectors = None;
     if reconcile_vector_ids {
@@ -2336,11 +2376,16 @@ fn writer_loop(
     if let Some(handle) = embedder.take() {
         std::mem::forget(handle);
     }
-    writer.wait_merging_threads()?;
+    {
+        crate::profiling::span!("lexical.merge_wait");
+        writer.wait_merging_threads()?;
+    }
     index.publish_generation()?;
     if let Some(staged) = staged_vectors {
         staged.publish()?;
     }
+    crate::profiling::count!("ingest.records_added", count);
+    crate::profiling::count!("ingest.records_embedded", embedded_count);
     Ok(WriterOutcome::Published {
         records_added: count,
         records_embedded: embedded_count,
@@ -2353,6 +2398,7 @@ fn backfill_embeddings(
     vector_index: &mut crate::vector::VectorIndex,
     progress: &Arc<Progress>,
 ) -> Result<usize> {
+    crate::profiling::span!("vectors.backfill");
     use std::cell::Cell;
     let embedded_count = Cell::new(0usize);
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
