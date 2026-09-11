@@ -40,6 +40,7 @@ toml_edit = "0.22"
 walkdir = "2.5"
 globset = "0.4"
 notify = "8"
+gix = { version = "0.84", default-features = false, features = ["sha1", "sha256"] }
 indicatif = "0.17"
 ratatui = { version = "0.30", default-features = false, features = [
     "crossterm_0_29",

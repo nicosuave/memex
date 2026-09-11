@@ -17,6 +17,7 @@ mod native;
 pub mod profiling;
 pub mod progress;
 pub mod read_budget;
+mod repository;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;

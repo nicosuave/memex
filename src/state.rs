@@ -25,6 +25,8 @@ pub struct FileIdentity {
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +104,8 @@ pub struct FileState {
     /// migrated safely on their next ingest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_metadata_offsets: Option<Vec<u64>>,
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip

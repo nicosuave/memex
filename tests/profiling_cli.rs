@@ -158,3 +158,51 @@ fn failed_commands_still_finish_the_trace() {
             .any(|e| e["name"] == "cli.run")
     );
 }
+
+#[cfg(feature = "profiling")]
+#[test]
+fn no_op_and_checkpoint_only_refreshes_do_not_open_a_lexical_writer() {
+    use std::io::Write;
+    let temp = fixture();
+    let root = temp.path().join("index");
+    assert!(
+        run(temp.path(), &root, None, "privateneedle")
+            .status
+            .success()
+    );
+    let generation = fs::read(root.join("index/CURRENT")).unwrap();
+    for (name, append) in [("noop.json", false), ("checkpoint.json", true)] {
+        if append {
+            let source = temp
+                .path()
+                .join(".claude/projects/private-project/private-session.jsonl");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(source)
+                .unwrap()
+                .write_all(b"{\"type\":\"progress\",\"data\":{\"message\":\"unindexed update\"}}\n")
+                .unwrap();
+        }
+        let trace = temp.path().join(name);
+        let output = run(temp.path(), &root, Some(&trace), "privateneedle");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let profile: serde_json::Value = serde_json::from_slice(&fs::read(trace).unwrap()).unwrap();
+        for event in profile["traceEvents"].as_array().unwrap() {
+            assert!(
+                ![
+                    "lexical.stage",
+                    "lexical.writer_open",
+                    "lexical.commit",
+                    "lexical.publish"
+                ]
+                .iter()
+                .any(|name| event["name"] == *name)
+            );
+        }
+        assert_eq!(fs::read(root.join("index/CURRENT")).unwrap(), generation);
+    }
+}

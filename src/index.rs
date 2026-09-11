@@ -75,6 +75,7 @@ pub struct SearchIndex {
 const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
+const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MERGE_BATCH_SEGMENTS: usize = 128;
 const CONTINUOUS_MERGE_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
@@ -581,12 +582,25 @@ impl SearchIndex {
         }
     }
 
+    pub(crate) fn is_writable(&self) -> bool {
+        self.writable
+    }
+
     pub fn writer(&self) -> Result<IndexWriter> {
+        self.writer_for_ingest(None)
+    }
+
+    pub(crate) fn writer_for_ingest(&self, input_bytes: Option<u64>) -> Result<IndexWriter> {
         crate::profiling::span!("lexical.writer_open");
         if !self.writable {
             bail!("cannot create a writer for a sealed index generation");
         }
-        let writer = self.index.writer(256_000_000)?;
+        let writer = if input_bytes.is_some_and(|bytes| bytes <= SMALL_INGEST_MAX_BYTES) {
+            crate::profiling::count!("lexical.single_thread_batches", 1);
+            self.index.writer_with_num_threads(1, 64_000_000)?
+        } else {
+            self.index.writer(256_000_000)?
+        };
         if self.suppress_automatic_merges {
             writer.set_merge_policy(Box::new(NoMergePolicy));
         }
@@ -711,6 +725,30 @@ impl SearchIndex {
 
     pub fn doc_ids_by_source_scope(&self, scope: &SessionScope) -> Result<Vec<u64>> {
         self.doc_ids_matching_query(Box::new(source_scope_query(&self.fields, scope)))
+    }
+
+    pub(crate) fn source_paths_with_records(
+        &self,
+        candidates: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        crate::profiling::span!("lexical.source_presence");
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let mut present = HashSet::new();
+        for path in candidates {
+            let query = TermQuery::new(
+                Term::from_field_text(self.fields.source_path, path),
+                IndexRecordOption::Basic,
+            );
+            crate::profiling::count!("lexical.source_presence_queries", 1);
+            if searcher.search(&query, &Count)? > 0 {
+                present.insert(path.clone());
+            }
+        }
+        Ok(present)
     }
 
     pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
@@ -2002,25 +2040,45 @@ fn is_abandoned_generation_workdir(name: &std::ffi::OsStr) -> bool {
 
 fn clone_generation(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
-    for name in committed_generation_files(source)? {
-        let source_file = source.join(&name);
-        if !source_file.is_file() {
-            continue;
+    let files = committed_generation_files(source)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let copy = |files: &[PathBuf]| -> Result<()> {
+        for name in files {
+            let source_file = source.join(name);
+            if !source_file.is_file() {
+                continue;
+            }
+            let target = destination.join(name);
+            if should_copy_generation_file(&name.to_string_lossy())
+                || fs::hard_link(&source_file, &target).is_err()
+            {
+                fs::copy(&source_file, &target).with_context(|| {
+                    format!(
+                        "copy index generation file {} to {}",
+                        source_file.display(),
+                        target.display()
+                    )
+                })?;
+            }
         }
-        let target = destination.join(&name);
-        let name_text = name.to_string_lossy();
-        if should_copy_generation_file(&name_text) || fs::hard_link(&source_file, &target).is_err()
-        {
-            fs::copy(&source_file, &target).with_context(|| {
-                format!(
-                    "copy index generation file {} to {}",
-                    source_file.display(),
-                    target.display()
-                )
-            })?;
-        }
+        Ok(())
+    };
+    if files.len() < 32 {
+        return copy(&files);
     }
-    Ok(())
+    std::thread::scope(|scope| {
+        let workers = files
+            .chunks(files.len().div_ceil(4))
+            .map(|chunk| scope.spawn(move || copy(chunk)))
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow!("index staging worker panicked"))??;
+        }
+        Ok(())
+    })
 }
 
 fn committed_generation_files(source: &Path) -> Result<HashSet<PathBuf>> {
@@ -2570,6 +2628,22 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "session.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn small_ingest_produces_one_segment() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..32 {
+            index
+                .add_record(&mut writer, &test_record(id, "small update"))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.index.searchable_segment_metas().unwrap().len(), 1);
+        assert_eq!(index.doc_count().unwrap(), 32);
     }
 
     fn create_stale_schema_index(dir: &Path) {

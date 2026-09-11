@@ -1,3 +1,4 @@
+use crate::repository::{RepositoryResolution, RepositoryResolver};
 use crate::state::SessionScope;
 use crate::types::{
     Record, SourceFilter, SourceKind, jcode_text_is_subagent_directive,
@@ -8,12 +9,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 // Reconcile legacy catalogs that survived a rebuilt search index.
 const SCHEMA_VERSION: i64 = 7;
-const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
 const REPOSITORY_PROJECT_SQL: &str = "COALESCE(NULLIF(repo_project, ''), 'Unfiled')";
@@ -103,8 +103,9 @@ pub struct AnalyticsWriter {
     store: AnalyticsStore,
     sessions: HashMap<SessionKey, SessionAccumulator>,
     metadata_cache: HashMap<SessionKey, SessionMetadata>,
-    git_cache: HashMap<String, GitMetadata>,
+    repositories: Arc<RepositoryResolver>,
     cwd_overrides: HashMap<SessionKey, String>,
+    codex_checkpoints: HashMap<String, (u64, Vec<u64>)>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -297,30 +298,33 @@ impl AnalyticsStore {
         Ok(())
     }
 
+    pub(crate) fn source_paths(&self, candidates: &HashSet<String>) -> Result<HashSet<String>> {
+        crate::profiling::span!("analytics.source_inventory");
+        let candidates = candidates.iter().collect::<Vec<_>>();
+        let mut present = HashSet::new();
+        for batch in candidates.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT DISTINCT source_path FROM sessions WHERE source_path IN ({placeholders})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            crate::profiling::count!("analytics.source_inventory_scans", 1);
+            let rows = statement.query_map(params_from_iter(batch.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            present.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(present)
+    }
+
     pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
-        crate::profiling::span!("analytics.delete_path");
-        crate::profiling::count!("analytics.delete_path.calls", 1);
-        let _rows_deleted = self.conn.execute(
-            "DELETE FROM sessions WHERE source_path = ?1",
-            params![source_path],
-        )?;
-        crate::profiling::count!("analytics.delete_path.rows", _rows_deleted);
-        Ok(())
+        delete_path(&self.conn, source_path)
     }
 
     pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
-        crate::profiling::span!("analytics.delete_scope");
-        crate::profiling::count!("analytics.delete_scope.calls", 1);
-        let _rows_deleted = self.conn.execute(
-            "DELETE FROM sessions WHERE source = ?1 AND source_path = ?2 AND session_id = ?3",
-            params![
-                SourceKind::Opencode.storage_label(),
-                scope.source_path,
-                scope.session_id
-            ],
-        )?;
-        crate::profiling::count!("analytics.delete_scope.rows", _rows_deleted);
-        Ok(())
+        delete_scope(&self.conn, scope)
     }
 
     pub fn query_sessions(
@@ -955,12 +959,20 @@ impl AnalyticsStore {
 
 impl AnalyticsWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_repositories(path, Arc::new(RepositoryResolver::default()))
+    }
+
+    pub(crate) fn with_repositories(
+        path: impl AsRef<Path>,
+        repositories: Arc<RepositoryResolver>,
+    ) -> Result<Self> {
         Ok(Self {
             store: AnalyticsStore::open(path)?,
             sessions: HashMap::new(),
             metadata_cache: HashMap::new(),
-            git_cache: HashMap::new(),
+            repositories,
             cwd_overrides: HashMap::new(),
+            codex_checkpoints: HashMap::new(),
         })
     }
 
@@ -974,6 +986,16 @@ impl AnalyticsWriter {
 
     pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
         self.store.delete_session_scope(scope)
+    }
+
+    pub(crate) fn set_codex_metadata_checkpoint(
+        &mut self,
+        source_path: String,
+        offset: u64,
+        metadata_offsets: Vec<u64>,
+    ) {
+        self.codex_checkpoints
+            .insert(source_path, (offset, metadata_offsets));
     }
 
     pub fn set_session_cwd(
@@ -1047,22 +1069,143 @@ impl AnalyticsWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        crate::profiling::span!("analytics.flush");
-        if self.sessions.is_empty() {
-            return Ok(());
-        }
-        let pending_sessions: Vec<SessionAccumulator> = self.sessions.values().cloned().collect();
-        let sessions: Vec<(SessionAccumulator, SessionMetadata)> = pending_sessions
+        self.prepare().commit(&[], &[])
+    }
+
+    pub(crate) fn prepare(&mut self) -> PreparedAnalytics<'_> {
+        crate::profiling::span!("analytics.prepare");
+        let pending = self.sessions.values().cloned().collect::<Vec<_>>();
+        let mut opencode_cache = OpencodeLookupCache::default();
+        let rows = pending
             .into_iter()
             .map(|session| {
                 let metadata = self.resolve_metadata(&session.key);
-                (session, metadata)
+                let label = extract_session_label(
+                    session.key.source,
+                    &session.key.source_path,
+                    &session.key.session_id,
+                    session.first_user_text.as_deref(),
+                    metadata.cwd.as_deref(),
+                    &mut opencode_cache,
+                );
+                let conversation_kind = infer_session_kind(
+                    session.key.source,
+                    &session.key.source_path,
+                    &session.key.session_id,
+                    session.conversation_kind.as_deref(),
+                    metadata.cwd.as_deref(),
+                    session.first_user_text.as_deref(),
+                    &mut opencode_cache,
+                );
+                PreparedSession {
+                    session,
+                    metadata,
+                    label,
+                    conversation_kind,
+                }
             })
             .collect();
-        let tx = self.store.conn.transaction()?;
+        PreparedAnalytics { writer: self, rows }
+    }
+
+    fn resolve_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
+        crate::profiling::span!("analytics.resolve_metadata");
+        if let Some(cached) = self.metadata_cache.get(key) {
+            return cached.clone();
+        }
+        let metadata = self.resolve_uncached_metadata(key);
+        self.metadata_cache.insert(key.clone(), metadata.clone());
+        metadata
+    }
+
+    fn resolve_uncached_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
+        let cwd = self.cwd_overrides.get(key).cloned().or_else(|| {
+            if key.source == SourceKind::Codex
+                && let Some((offset, metadata_offsets)) =
+                    self.codex_checkpoints.get(&key.source_path)
+            {
+                crate::sources::codex::cwd_with_metadata_checkpoint(
+                    Path::new(&key.source_path),
+                    *offset,
+                    metadata_offsets,
+                )
+                .ok()
+                .flatten()
+                .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id)
+            }
+        });
+        let Some(cwd) = cwd else {
+            return SessionMetadata {
+                resolution_status: "no-cwd".to_string(),
+                ..SessionMetadata::default()
+            };
+        };
+        let git = GitMetadata::from(self.repositories.resolve(Path::new(&cwd)));
+        SessionMetadata {
+            cwd: Some(cwd),
+            git_root: git.git_root,
+            git_common_dir: git.git_common_dir,
+            repo_project: git.repo_project,
+            resolution_status: git.status,
+        }
+    }
+}
+
+fn delete_path(conn: &Connection, source_path: &str) -> Result<()> {
+    crate::profiling::span!("analytics.delete_path");
+    crate::profiling::count!("analytics.delete_path.calls", 1);
+    let _rows_deleted = conn.execute(
+        "DELETE FROM sessions WHERE source_path = ?1",
+        params![source_path],
+    )?;
+    crate::profiling::count!("analytics.delete_path.rows", _rows_deleted);
+    Ok(())
+}
+
+fn delete_scope(conn: &Connection, scope: &SessionScope) -> Result<()> {
+    crate::profiling::span!("analytics.delete_scope");
+    crate::profiling::count!("analytics.delete_scope.calls", 1);
+    let _rows_deleted = conn.execute(
+        "DELETE FROM sessions WHERE source = ?1 AND source_path = ?2 AND session_id = ?3",
+        params![
+            SourceKind::Opencode.storage_label(),
+            scope.source_path,
+            scope.session_id
+        ],
+    )?;
+    crate::profiling::count!("analytics.delete_scope.rows", _rows_deleted);
+    Ok(())
+}
+
+struct PreparedSession {
+    session: SessionAccumulator,
+    metadata: SessionMetadata,
+    label: Option<String>,
+    conversation_kind: Option<String>,
+}
+
+pub(crate) struct PreparedAnalytics<'a> {
+    writer: &'a mut AnalyticsWriter,
+    rows: Vec<PreparedSession>,
+}
+
+impl PreparedAnalytics<'_> {
+    pub(crate) fn commit(self, delete_paths: &[String], scopes: &[SessionScope]) -> Result<()> {
+        crate::profiling::span!("analytics.persist");
+        if self.rows.is_empty() && delete_paths.is_empty() && scopes.is_empty() {
+            return Ok(());
+        }
+        let tx = self.writer.store.conn.transaction()?;
+        for scope in scopes {
+            delete_scope(&tx, scope)?;
+        }
+        for path in delete_paths {
+            delete_path(&tx, path)?;
+        }
         {
-            let mut stmt = tx.prepare(
-                r#"
+            let mut stmt = tx.prepare(r#"
                 INSERT INTO sessions(
                     source, session_id, source_path, project, cwd, git_root, git_common_dir,
                     repo_project, started_at, last_at, message_count, resolution_status,
@@ -1085,30 +1228,14 @@ impl AnalyticsWriter {
                     -- which delete the row first (delete_first) and recompute.
                     label = COALESCE(sessions.label, excluded.label),
                     conversation_kind = COALESCE(sessions.conversation_kind, excluded.conversation_kind)
-                "#,
-            )?;
-            // OpenCode title/agent lookups hit the source SQLite database. Sessions
-            // from one database share the same file, so memoize per flush to
-            // avoid reopening it once per session during large index scans.
-            let mut opencode_cache = OpencodeLookupCache::default();
-            for (session, metadata) in sessions {
-                let label = extract_session_label(
-                    session.key.source,
-                    &session.key.source_path,
-                    &session.key.session_id,
-                    session.first_user_text.as_deref(),
-                    metadata.cwd.as_deref(),
-                    &mut opencode_cache,
-                );
-                let conversation_kind = infer_session_kind(
-                    session.key.source,
-                    &session.key.source_path,
-                    &session.key.session_id,
-                    session.conversation_kind.as_deref(),
-                    metadata.cwd.as_deref(),
-                    session.first_user_text.as_deref(),
-                    &mut opencode_cache,
-                );
+                "#)?;
+            for PreparedSession {
+                session,
+                metadata,
+                label,
+                conversation_kind,
+            } in self.rows
+            {
                 stmt.execute(params![
                     session.key.source.storage_label(),
                     session.key.session_id,
@@ -1128,42 +1255,8 @@ impl AnalyticsWriter {
             }
         }
         tx.commit()?;
-        self.sessions.clear();
+        self.writer.sessions.clear();
         Ok(())
-    }
-
-    fn resolve_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
-        crate::profiling::span!("analytics.resolve_metadata");
-        if let Some(cached) = self.metadata_cache.get(key) {
-            return cached.clone();
-        }
-        let metadata = self.resolve_uncached_metadata(key);
-        self.metadata_cache.insert(key.clone(), metadata.clone());
-        metadata
-    }
-
-    fn resolve_uncached_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
-        let cwd = self.cwd_overrides.get(key).cloned().or_else(|| {
-            resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id)
-        });
-        let Some(cwd) = cwd else {
-            return SessionMetadata {
-                resolution_status: "no-cwd".to_string(),
-                ..SessionMetadata::default()
-            };
-        };
-        let git = self
-            .git_cache
-            .entry(cwd.clone())
-            .or_insert_with(|| git_metadata_for_cwd(&cwd))
-            .clone();
-        SessionMetadata {
-            cwd: Some(cwd),
-            git_root: git.git_root,
-            git_common_dir: git.git_common_dir,
-            repo_project: git.repo_project,
-            resolution_status: git.status,
-        }
     }
 }
 
@@ -1175,135 +1268,47 @@ struct GitMetadata {
     status: String,
 }
 
+impl From<RepositoryResolution> for GitMetadata {
+    fn from(resolution: RepositoryResolution) -> Self {
+        let project = resolution.project().map(str::to_owned);
+        match resolution {
+            RepositoryResolution::Found(facts) => Self {
+                git_root: facts
+                    .worktree
+                    .map(|path| path.to_string_lossy().into_owned()),
+                git_common_dir: Some(facts.common_dir.to_string_lossy().into_owned()),
+                status: if project.is_some() {
+                    "ok"
+                } else {
+                    "git-partial"
+                }
+                .to_owned(),
+                repo_project: project,
+            },
+            _ => Self {
+                status: if project.is_some() {
+                    "path-fallback"
+                } else {
+                    "not-git"
+                }
+                .to_owned(),
+                repo_project: project,
+                ..Self::default()
+            },
+        }
+    }
+}
+
+#[cfg(test)]
 fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
-    crate::profiling::span!("git.metadata");
-    let deadline = Instant::now() + GIT_METADATA_TIMEOUT;
-    let root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"], deadline);
-    let common_dir = git_rev_parse(
-        cwd,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        deadline,
-    );
-    let path_repo_project =
-        claude_worktree_repo_project(cwd).or_else(|| codex_worktree_repo_project(cwd));
-    let repo_project = common_dir
-        .as_deref()
-        .and_then(common_dir_project_name)
-        .or_else(|| root.as_deref().and_then(path_file_name))
-        .or_else(|| path_repo_project.clone());
-
-    let status = if repo_project.is_some() && root.is_none() && common_dir.is_none() {
-        "path-fallback"
-    } else if repo_project.is_some() {
-        "ok"
-    } else if root.is_some() || common_dir.is_some() {
-        "git-partial"
-    } else {
-        "not-git"
-    }
-    .to_string();
-
-    GitMetadata {
-        git_root: root,
-        git_common_dir: common_dir,
-        repo_project,
-        status,
-    }
+    RepositoryResolver::default().resolve(Path::new(cwd)).into()
 }
 
 pub(crate) fn repository_project_for_cwd(cwd: &str) -> Option<String> {
-    git_metadata_for_cwd(cwd).repo_project
-}
-
-fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
-    for ancestor in Path::new(cwd).ancestors() {
-        if ancestor.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
-            continue;
-        }
-        let claude_dir = ancestor.parent()?;
-        if claude_dir.file_name().and_then(|n| n.to_str()) != Some(".claude") {
-            continue;
-        }
-        let repo_dir = claude_dir.parent()?;
-        return path_file_name(repo_dir.to_string_lossy().as_ref());
-    }
-    None
-}
-
-fn codex_worktree_repo_project(cwd: &str) -> Option<String> {
-    let cwd = Path::new(cwd);
-    for ancestor in cwd.ancestors() {
-        if ancestor.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
-            continue;
-        }
-        let codex_dir = ancestor.parent()?;
-        if codex_dir.file_name().and_then(|name| name.to_str()) != Some(".codex") {
-            continue;
-        }
-        let mut relative = cwd.strip_prefix(ancestor).ok()?.components();
-        relative.next()?;
-        return relative
-            .next()
-            .and_then(|component| component.as_os_str().to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string);
-    }
-    None
-}
-
-fn git_rev_parse(cwd: &str, args: &[&str], deadline: Instant) -> Option<String> {
-    if Instant::now() >= deadline {
-        return None;
-    }
-    let child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let output = child_output_before(child, deadline)?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
-}
-
-fn child_output_before(mut child: Child, deadline: Instant) -> Option<Output> {
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-}
-
-fn common_dir_project_name(path: &str) -> Option<String> {
-    let path = Path::new(path);
-    if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
-        return path
-            .parent()
-            .and_then(|p| path_file_name(p.to_string_lossy().as_ref()));
-    }
-    path_file_name(path.to_string_lossy().as_ref())
+    RepositoryResolver::default()
+        .resolve(Path::new(cwd))
+        .project()
+        .map(str::to_owned)
 }
 
 fn display_project_name(project: &str) -> String {
@@ -1380,14 +1385,6 @@ fn encoded_tail_display(tail: &[&str]) -> String {
         return tail[1..].join("-");
     }
     tail.join("-")
-}
-
-fn path_file_name(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|name| !name.is_empty())
-        .map(|name| name.to_string())
 }
 
 fn resolve_session_cwd_from_parts(
@@ -2180,7 +2177,15 @@ pub fn backfill_from_index(
     path: impl AsRef<Path>,
     index: &crate::index::SearchIndex,
 ) -> Result<()> {
-    let mut writer = AnalyticsWriter::open(path)?;
+    backfill_from_index_with_repositories(path, index, Arc::new(RepositoryResolver::default()))
+}
+
+pub(crate) fn backfill_from_index_with_repositories(
+    path: impl AsRef<Path>,
+    index: &crate::index::SearchIndex,
+    repositories: Arc<RepositoryResolver>,
+) -> Result<()> {
+    let mut writer = AnalyticsWriter::with_repositories(path, repositories)?;
     writer.clear()?;
     index
         .for_each_record(|record| {
@@ -2278,32 +2283,16 @@ fn session_selection_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn codex_worktree_repo_project(path: &str) -> Option<String> {
+        crate::repository::codex_worktree_repo_project(Path::new(path))
+    }
+    fn claude_worktree_repo_project(path: &str) -> Option<String> {
+        crate::repository::claude_worktree_repo_project(Path::new(path))
+    }
     use crate::test_support::env_lock;
     use crate::types::RecordLinks;
     use std::fs;
-
-    #[cfg(unix)]
-    #[test]
-    fn timed_out_child_is_killed_and_reaped() {
-        let _guard = env_lock();
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn child");
-        let pid = child.id();
-
-        assert!(child_output_before(child, Instant::now() + Duration::from_millis(20)).is_none());
-        assert!(
-            !Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stderr(Stdio::null())
-                .status()
-                .expect("check child")
-                .success()
-        );
-    }
+    use std::process::Command;
 
     #[test]
     fn writable_connections_use_durable_wal_commits() {
