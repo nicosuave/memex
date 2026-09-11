@@ -380,6 +380,17 @@ impl VectorIndex {
         self.doc_id_set.contains(&doc_id)
     }
 
+    pub(crate) fn embedding(&self, doc_id: u64) -> Result<Option<Vec<f32>>> {
+        if !self.contains(doc_id) {
+            return Ok(None);
+        }
+        let mut embedding = vec![0.0; self.dims];
+        if self.index.get(doc_id, &mut embedding)? != 1 {
+            return Err(anyhow!("missing or duplicate vector for doc_id {doc_id}"));
+        }
+        Ok(Some(embedding))
+    }
+
     pub fn len(&self) -> usize {
         self.index.size()
     }
