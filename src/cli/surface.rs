@@ -14,6 +14,12 @@ pub(super) enum IndexCommand {
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Merge segments below 5% of the corpus, excluding the three largest
+    #[command(hide = true)]
+    Compact {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Reclaim unreachable generations (requires stopped readers)
     Gc {
         #[arg(long)]
@@ -107,6 +113,7 @@ impl Commands {
                     dry_run,
                     offline,
                 },
+                IndexCommand::Compact { root } => Self::IndexCompact { root },
                 IndexCommand::Embed { model, root } => Self::Embed { model, root },
                 IndexCommand::Stats { root } => Self::Stats { root },
             },

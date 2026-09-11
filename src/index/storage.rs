@@ -42,6 +42,11 @@ struct Manifest {
     files: BTreeMap<String, String>,
 }
 
+/// Abandoned generations are removed without the store lock, and hold no published references.
+fn removed_concurrently(directory: &Path, error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound && !directory.exists()
+}
+
 impl Manifest {
     fn empty() -> Self {
         Self {
@@ -56,14 +61,23 @@ impl Manifest {
         if !marker.try_exists()? && !manifest.try_exists()? {
             return Ok(None);
         }
-        if fs::read_to_string(&marker).context("read shared-segment format")? != FORMAT_VERSION {
+        let format = match fs::read_to_string(&marker) {
+            Ok(format) => format,
+            Err(error) if removed_concurrently(directory, &error) => return Ok(None),
+            Err(error) => return Err(error).context("read shared-segment format"),
+        };
+        if format != FORMAT_VERSION {
             bail!(
                 "unsupported shared-segment format in {}",
                 directory.display()
             );
         }
-        let parsed: Self =
-            serde_json::from_slice(&fs::read(&manifest).context("read segment references")?)?;
+        let references = match fs::read(&manifest) {
+            Ok(references) => references,
+            Err(error) if removed_concurrently(directory, &error) => return Ok(None),
+            Err(error) => return Err(error).context("read segment references"),
+        };
+        let parsed: Self = serde_json::from_slice(&references)?;
         if parsed.version != 1 {
             bail!("unsupported segment-reference version {}", parsed.version);
         }
@@ -698,6 +712,22 @@ mod tests {
 
     fn bytes(directory: &SharedDirectory, path: &str) -> Vec<u8> {
         directory.atomic_read(Path::new(path)).unwrap()
+    }
+
+    #[test]
+    fn a_generation_removed_between_listing_and_read_contributes_no_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed = temp.path().join("generations/.pending.tmp");
+        assert!(Manifest::read(&removed).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_present_generation_missing_its_format_marker_still_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let generation = temp.path().join("generations/live");
+        fs::create_dir_all(&generation).unwrap();
+        fs::write(generation.join(MANIFEST), b"{\"version\":1,\"files\":{}}").unwrap();
+        assert!(Manifest::read(&generation).is_err());
     }
 
     #[test]
