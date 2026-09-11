@@ -3790,6 +3790,74 @@ mod tests {
         assert_eq!(search_text_count(&index, "rollback"), 0);
     }
 
+    #[test]
+    fn existing_default_tokenizer_is_preserved_until_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("index");
+        fs::create_dir(&dir).expect("index directory");
+        let mut schema =
+            serde_json::to_value(build_schema().expect("schema")).expect("serialize schema");
+        let fields = schema.as_array_mut().expect("schema fields");
+        let text = fields
+            .iter_mut()
+            .find(|field| field["name"] == "text")
+            .expect("text field");
+        text["options"]["indexing"]["tokenizer"] = "default".into();
+        let legacy_indexing = text["options"]["indexing"].clone();
+        for field in fields {
+            if field["name"] == "tool_input" || field["name"] == "tool_output" {
+                field["options"]["indexing"] = legacy_indexing.clone();
+            }
+        }
+        let schema: Schema = serde_json::from_value(schema).expect("legacy schema");
+        drop(Index::create_in_dir(&dir, schema).expect("create legacy index"));
+
+        let record = test_record(1, "ran the database migrations");
+        let legacy = SearchIndex::open_or_create(&dir).expect("open legacy index");
+        let mut writer = legacy.writer().expect("legacy writer");
+        legacy
+            .add_record(&mut writer, &record)
+            .expect("legacy record");
+        writer.commit().expect("commit legacy record");
+        writer.wait_merging_threads().expect("finish legacy writer");
+        drop(legacy);
+
+        let reopened = SearchIndex::open_or_create(&dir).expect("reopen legacy index");
+        assert_eq!(search_text_count(&reopened, "migrations"), 1);
+        assert_eq!(search_text_count(&reopened, "migration"), 0);
+        drop(reopened);
+
+        let incremental =
+            SearchIndex::open_or_create_for_ingest(&dir).expect("stage existing schema for ingest");
+        assert_eq!(search_text_count(&incremental, "migrations"), 1);
+        assert_eq!(search_text_count(&incremental, "migration"), 0);
+        incremental
+            .publish_generation()
+            .expect("publish existing schema");
+        drop(incremental);
+        let published = SearchIndex::open_or_create(&dir).expect("reopen published schema");
+        assert_eq!(search_text_count(&published, "migrations"), 1);
+        assert_eq!(search_text_count(&published, "migration"), 0);
+        drop(published);
+
+        // Explicit rebuild removes the derived index and reparses the source records.
+        fs::remove_dir_all(&dir).expect("reset index for rebuild");
+        let rebuilt = SearchIndex::open_or_create_for_ingest(&dir).expect("rebuild index");
+        let mut writer = rebuilt.writer().expect("rebuild writer");
+        rebuilt
+            .add_record(&mut writer, &record)
+            .expect("rebuild record");
+        writer.commit().expect("commit rebuilt record");
+        writer
+            .wait_merging_threads()
+            .expect("finish rebuild writer");
+        rebuilt.publish_generation().expect("publish rebuilt index");
+        drop(rebuilt);
+        let reopened = SearchIndex::open_or_create(&dir).expect("reopen rebuilt index");
+        assert_eq!(search_text_count(&reopened, "migrations"), 1);
+        assert_eq!(search_text_count(&reopened, "migration"), 1);
+    }
+
     fn search_text_count(index: &SearchIndex, query: &str) -> usize {
         index
             .search(&QueryOptions {
