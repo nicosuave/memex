@@ -284,6 +284,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         updatingRows = true
         defer { updatingRows = wasUpdating }
         var opened = Set<String>()
+        if records.first(where: { $0.id == hit.recordID })?.record.isRoutineTurnBoundary == true {
+            let id = "message:\(hit.recordID)"
+            if expanded.insert(id).inserted { opened.insert(id) }
+        }
         if let item = TranscriptItem.group(records).first(where: { $0.records.contains { $0.id == hit.recordID } }) {
             var disclosureIDs: [String] = []
             if item.isActivity || item.isInstructions {
@@ -447,11 +451,11 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                         ? .message($0.records[0]) : .activity($0, nested: true)
                 } : [group]
         }
-        // Searching injected text reveals the original mixed record once, so a
-        // source occurrence cannot be confused with a projected request segment.
+        // Explicit Find reveals hidden bookkeeping or the original mixed record,
+        // so every source occurrence has an exact, navigable display row.
         if !rawTranscript, let hit = findHit, !findQuery.isEmpty,
            let original = records.first(where: { $0.id == hit.recordID }),
-           TranscriptPresentation.project([original]) != [original] {
+           (original.record.isRoutineTurnBoundary || TranscriptPresentation.project([original]) != [original]) {
             let insertion = rows.firstIndex { $0.records.contains { $0.sourceID == hit.recordID } } ?? rows.count
             rows = rows.compactMap { row in
                 let remaining = row.records.filter { $0.sourceID != hit.recordID }

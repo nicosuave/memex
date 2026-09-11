@@ -36,11 +36,13 @@ import SwiftUI
         conversations.minimumThickness = 260
         conversations.maximumThickness = 450
         conversations.holdingPriority = .defaultHigh
+        conversations.canCollapse = true
         let reader = NSSplitViewItem(viewController: readerHost)
         reader.minimumThickness = 400
         addSplitViewItem(sidebar)
         addSplitViewItem(conversations)
         addSplitViewItem(reader)
+        conversations.isCollapsed = store.scope == .home
     }
     override func viewDidAppear() {
         super.viewDidAppear()
@@ -63,7 +65,9 @@ import SwiftUI
 }
 
 @MainActor final class BrowserToolbarController: NSObject, NSToolbarDelegate, NSSearchFieldDelegate, NSPopoverDelegate {
-    let toolbar = NSToolbar(identifier: "MemexBrowserColumns")
+    // AppKit synchronizes item changes between toolbars with the same identifier.
+    // Each window must switch between Home and the reader independently.
+    let toolbar = NSToolbar(identifier: "MemexBrowserColumns-\(UUID().uuidString)")
     let store: Store
     let splitView: NSSplitView
     private var actionItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
@@ -98,6 +102,7 @@ import SwiftUI
             _ = store.loadingSessions
             _ = store.query
             _ = store.filters
+            _ = store.scope
         } onChange: { [weak self] in
             // Observation fires before the mutation; read the completed state
             // on the next main-loop turn, then subscribe to subsequent changes.
@@ -109,7 +114,10 @@ import SwiftUI
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleSidebar, Self.sidebarBoundary, Self.title, .flexibleSpace, Self.filters,
+        if store.scope == .home {
+            return [.toggleSidebar, Self.sidebarBoundary, .flexibleSpace]
+        }
+        return [.toggleSidebar, Self.sidebarBoundary, Self.title, .flexibleSpace, Self.filters,
          Self.readerBoundary, Self.refresh, Self.find, Self.copyID, Self.reveal,
          .flexibleSpace, Self.resume, .flexibleSpace, Self.search]
     }
@@ -174,6 +182,20 @@ import SwiftUI
         return item
     }
     func update() {
+        if let columns = splitView.delegate as? NSSplitViewController, columns.splitViewItems.count == 3 {
+            let collapsed = store.scope == .home
+            if columns.splitViewItems[1].isCollapsed != collapsed {
+                columns.splitViewItems[1].isCollapsed = collapsed
+            }
+        }
+        let identifiers = toolbarDefaultItemIdentifiers(toolbar)
+        if toolbar.items.map(\.itemIdentifier) != identifiers {
+            filterPopover?.performClose(nil)
+            while !toolbar.items.isEmpty { toolbar.removeItem(at: toolbar.items.count - 1) }
+            for (index, identifier) in identifiers.enumerated() {
+                toolbar.insertItem(withItemIdentifier: identifier, at: index)
+            }
+        }
         if #available(macOS 26.0, *) {
             actionItems[Self.filters]?.style = filterPopover?.isShown == true || store.filters.isActive ? .prominent : .plain
         }
@@ -229,10 +251,12 @@ private struct ConversationToolbarTitle: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(store.scope.title).font(.headline).lineLimit(1)
-            Text(store.sessionCountLabel)
-                .font(.subheadline).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .help(store.sessionCountHelp)
+            if store.scope != .home {
+                Text(store.sessionCountLabel)
+                    .font(.subheadline).foregroundStyle(.secondary).monospacedDigit().lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .help(store.sessionCountHelp)
+            }
         }
         .frame(minWidth: 70, idealWidth: 190, maxWidth: 240, alignment: .leading)
     }

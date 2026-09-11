@@ -92,10 +92,50 @@ private struct FilterFixture {
     #expect(Set(store.sessions.map(\.sessionID)) == ["r5"])
     store.filters = .defaults
     await store.loadSessions()
-    #expect(Set(store.sessions.map(\.sessionID)) == ["r1", "r2", "r4", "r5"])
+    #expect(Set(store.sessions.map(\.sessionID)) == ["r2", "r5"])
     store.scope = .all
     await store.loadSessions()
-    #expect(store.sessions.count == 10)
+    #expect(store.sessions.count == 4)
+}
+
+@MainActor @Test func homeLoadsFilteredResultsWithoutOpeningATranscript() async throws {
+    let fixture = try FilterFixture()
+    defer { fixture.cleanUp() }
+    let store = Store(client: fixture.client)
+    store.homeProject = "memex"
+    store.filters.provider = .codex
+    await store.loadSessions()
+    #expect(store.scope == .home)
+    #expect(store.sessions.count == 1)
+    #expect(store.sessions.allSatisfy { $0.project == "memex" && $0.source == "codex" })
+    #expect(store.selectedID == nil)
+    let session = try #require(store.sessions.last)
+    store.openConversation(session)
+    #expect(store.scope == .project("memex"))
+    #expect(store.selectedID == session.id)
+    store.scope = .home
+    await store.loadSessions()
+    #expect(store.selectedID == nil)
+}
+
+@MainActor @Test func browsingSubagentsPreservesTheirTitlesWhenSearching() async throws {
+    let fixture = try FilterFixture()
+    defer { fixture.cleanUp() }
+    let store = Store(client: fixture.client)
+    store.homeProject = "memex"
+    store.filters.origin = .subagent
+    await store.loadSessions()
+    let titles = Dictionary(uniqueKeysWithValues: store.sessions.map { ($0.id, $0.title) })
+    #expect(titles.count == 2)
+    // A subsequent browse with the default filter must not erase known agents.
+    store.filters = .defaults
+    await store.loadSessions()
+    store.filters.origin = .subagent
+    store.query = "needle"
+    await store.loadSessions()
+    #expect(store.sessions.count == titles.count)
+    #expect(store.sessions.allSatisfy { $0.title == titles[$0.id] })
+    #expect(store.sessions.allSatisfy { $0.searchRecordID != nil && $0.snippet == "needle" })
 }
 
 @MainActor @Test func filterChangesResetPaginationAndIgnoreOldResults() async throws {
@@ -116,7 +156,7 @@ private struct FilterFixture {
     await store.loadSessions()
     try FileManager.default.removeItem(at: hold)
     await pending.value
-    #expect(store.sessions.count == 4)
+    #expect(store.sessions.count == 1)
     #expect(store.sessions.allSatisfy { $0.source == "codex" })
     #expect(!store.loadingSessions)
 }
@@ -134,7 +174,7 @@ private struct FilterFixture {
     #expect(Store(filterPreferences: preferences).filters == .defaults)
 }
 
-@MainActor @Test func permissionReviewsAreHiddenByDefaultForBrowsingAndSearch() async throws {
+@MainActor @Test func subagentsAndPermissionReviewsAreHiddenByDefaultForBrowsingAndSearch() async throws {
     let fixture = try FilterFixture()
     defer { fixture.cleanUp() }
     let store = Store(client: fixture.client)
@@ -142,6 +182,10 @@ private struct FilterFixture {
     for query in ["", "needle"] {
         store.query = query
         store.filters = .defaults
+        await store.loadSessions()
+        #expect(store.sessions.count == 4)
+        #expect(Set(store.sessions.map(\.sessionID)) == ["r2", "r5"])
+        store.filters.origin = .all
         await store.loadSessions()
         #expect(store.sessions.count == 10)
         #expect(!store.sessions.contains { $0.sessionID == "r6" })
@@ -156,8 +200,11 @@ private struct FilterFixture {
 
 @Test func conversationTypeAndPermissionReviewToggleKeepDistinctMeanings() throws {
     var filters = ConversationFilters.defaults
-    #expect(filters.conversationType == .all)
+    #expect(filters.conversationType == .interactive)
     #expect(!filters.showsPermissionReviews)
+    #expect(filters.summary.isEmpty)
+    filters.conversationType = .all
+    #expect(filters.summary == "Chats and subagents")
     filters.showsPermissionReviews = true
     #expect(filters.origin.argument == "all")
     #expect(filters.conversationType == .all)
@@ -171,7 +218,7 @@ private struct FilterFixture {
         filters.showsPermissionReviews = true
         #expect(filters.origin == type)
     }
-    filters.conversationType = .all
+    filters.conversationType = .interactive
     #expect(filters == .defaults)
     let saved = try JSONDecoder().decode(ConversationFilters.self,
         from: Data(#"{"timeframe":"all","provider":"all","origin":"includingReviews"}"#.utf8))

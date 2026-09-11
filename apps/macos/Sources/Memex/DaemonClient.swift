@@ -15,10 +15,13 @@ struct DaemonRequest: Encodable, Sendable {
     var sourcePath: String?
     var offset: Int?
     var maxChars: Int?
+    var metric: String?
+    var range: String?
+    var nowMS: UInt64?
 
     enum CodingKeys: String, CodingKey {
-        case op, machine, filters, query, project, source, since, origin, limit, offset
-        case sessionID = "session_id", sourcePath = "source_path", maxChars = "max_chars"
+        case op, machine, filters, query, project, source, since, origin, limit, offset, metric, range
+        case sessionID = "session_id", sourcePath = "source_path", maxChars = "max_chars", nowMS = "now_ms"
     }
 }
 

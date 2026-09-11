@@ -23,6 +23,7 @@ const MAX_CONNECTIONS: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const CAPABILITIES: &[&str] = &[
     "machines",
+    "activity",
     "projects",
     "sessions",
     "count",
@@ -36,6 +37,16 @@ const CAPABILITIES: &[&str] = &[
 pub(crate) enum Operation {
     Hello {},
     Machines {},
+    Activity {
+        machine: String,
+        metric: String,
+        range: String,
+        query: Option<String>,
+        project: Option<String>,
+        source: Option<String>,
+        origin: SessionOrigin,
+        now_ms: u64,
+    },
     Projects {
         machine: String,
     },
@@ -426,6 +437,52 @@ mod tests {
             json!({"id":"local","label":"This Mac"})
         );
         assert!(!root.path().join("index").exists());
+    }
+
+    #[test]
+    fn activity_returns_one_machine_raw_buckets_at_a_shared_clock() {
+        let root = root();
+        let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let day = 86_400_000;
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (id, timestamp) in [(1, day), (2, 2 * day + 1)] {
+            analytics
+                .record(&Record {
+                    source: SourceKind::Codex,
+                    doc_id: id,
+                    ts: timestamp,
+                    project: "memex".into(),
+                    session_id: format!("session-{id}"),
+                    turn_id: 1,
+                    role: "user".into(),
+                    text: "hello".into(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: RecordLinks::default(),
+                    source_path: format!("/{id}.jsonl"),
+                })
+                .unwrap();
+        }
+        analytics.flush().unwrap();
+        drop(analytics);
+        let server = spawn(Some(root.path().to_path_buf())).unwrap();
+        let mut stream = connect(&server);
+        let operation = json!({"op":"activity", "machine":"local", "metric":"sessions", "range":"24h",
+            "source":"codex", "project":"memex", "origin":"regular", "now_ms":3 * day});
+        let response = request(&mut stream, operation.clone());
+        assert_eq!(
+            response["result"]["points"],
+            json!([{"timestamp_ms":2 * day,"source":"codex","value":1}])
+        );
+        assert_eq!(response["result"]["partial"], false);
+        let mut invalid = operation;
+        invalid["metric"] = json!("wrong");
+        assert_eq!(
+            request(&mut stream, invalid)["error"]["code"],
+            "request_failed"
+        );
     }
 
     #[test]

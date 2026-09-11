@@ -63,7 +63,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -574,6 +574,36 @@ The input contains at most 32 requests; each page is limited to 500 records."
     /// List this machine and enabled configured peers (without connecting)
     Machines {
         /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Aggregate conversation or token activity over time
+    Activity {
+        #[arg(long, default_value = "sessions", value_parser = ["sessions", "tokens"])]
+        metric: String,
+        #[arg(long, default_value = "30d", value_parser = ["24h", "7d", "30d", "all"])]
+        range: String,
+        #[arg(long, default_value = "local")]
+        machine: String,
+        /// Return uncompressed time buckets for one machine
+        #[arg(long)]
+        raw: bool,
+        /// Emit advancing usage-cache progress on stderr
+        #[arg(long, hide = true)]
+        progress: bool,
+        /// Common clock for native requests across several machines
+        #[arg(long, hide = true, requires = "raw")]
+        now_ms: Option<u64>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+        origin: SessionOrigin,
         #[arg(long)]
         root: Option<PathBuf>,
         #[command(flatten)]
@@ -1691,6 +1721,63 @@ pub fn run() -> Result<()> {
             output
                 .resolve(OutputFormat::Jsonl, None, false)?
                 .print_values(crate::machine::configured_machine_summaries(&config)?)?;
+        }
+        Commands::Activity {
+            metric,
+            range,
+            machine,
+            query,
+            raw,
+            progress,
+            now_ms,
+            source,
+            project,
+            origin,
+            root,
+            output,
+        } => {
+            let paths = Paths::new(root)?;
+            let request = crate::web::ActivityRequest {
+                metric: if metric == "tokens" {
+                    crate::web::ActivityMetric::Tokens
+                } else {
+                    crate::web::ActivityMetric::Sessions
+                },
+                range: Some(crate::web::TimeRange::parse(&range)?),
+                query: query.unwrap_or_default().trim().to_owned(),
+                source,
+                project,
+                origin: origin.into(),
+                days: 30,
+            };
+            let collect = || -> Result<Value> {
+                Ok(if raw {
+                    let now = now_ms
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().max(0) as u64);
+                    serde_json::to_value(crate::web::single_machine_activity_payload(
+                        &paths, &request, &machine, now,
+                    )?)?
+                } else {
+                    serde_json::to_value(crate::web::machine_activity_payload(
+                        &paths, &request, &machine,
+                    )?)?
+                })
+            };
+            let payload = if progress {
+                crate::usage::with_usage_progress(collect, |progress| {
+                    writeln!(
+                        std::io::stderr(),
+                        "MEMEX_PROGRESS {}",
+                        serde_json::to_string(&progress)?
+                    )?;
+                    Ok(())
+                })??
+            } else {
+                collect()?
+            };
+            output
+                .resolve(OutputFormat::Json, None, false)?
+                .print_value(&payload)?;
         }
         Commands::Projects {
             source,
@@ -3000,6 +3087,34 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
         Operation::Machines {} => Ok(Value::Array(crate::machine::configured_machine_summaries(
             &config,
         )?)),
+        Operation::Activity {
+            machine,
+            metric,
+            range,
+            query,
+            project,
+            source,
+            origin,
+            now_ms,
+        } => {
+            let metric = match metric.as_str() {
+                "sessions" => crate::web::ActivityMetric::Sessions,
+                "tokens" => crate::web::ActivityMetric::Tokens,
+                _ => anyhow::bail!("unknown activity metric: {metric}"),
+            };
+            let request = crate::web::ActivityRequest {
+                metric,
+                range: Some(crate::web::TimeRange::parse(&range)?),
+                query: query.unwrap_or_default().trim().to_owned(),
+                project,
+                source: parse_source_filter(source)?,
+                origin: origin.into(),
+                days: 30,
+            };
+            Ok(serde_json::to_value(
+                crate::web::single_machine_activity_payload(paths, &request, &machine, now_ms)?,
+            )?)
+        }
         Operation::Projects { machine } => {
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
@@ -3085,7 +3200,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     unique_session: true,
                     fields: search_fields(
                         Some(
-                            "source,session_id,source_path,project,snippet,ts,machine,record_id"
+                            "source,session_id,source_path,project,snippet,ts,machine,record_id,conversation_kind"
                                 .into(),
                         ),
                         false,
@@ -7926,6 +8041,38 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn activity_cli_validates_ranges_metrics_and_filter_arguments() {
+        for range in ["24h", "7d", "30d", "all"] {
+            for metric in ["sessions", "tokens"] {
+                assert!(
+                    Cli::try_parse_from([
+                        "memex",
+                        "activity",
+                        "--range",
+                        range,
+                        "--metric",
+                        metric,
+                        "--machine",
+                        "all",
+                        "--query=--needle",
+                        "--project",
+                        "memex",
+                        "--source",
+                        "codex",
+                        "--origin",
+                        "regular",
+                        "--format",
+                        "json"
+                    ])
+                    .is_ok()
+                );
+            }
+        }
+        assert!(Cli::try_parse_from(["memex", "activity", "--range", "year"]).is_err());
+        assert!(Cli::try_parse_from(["memex", "activity", "--metric", "cost"]).is_err());
+    }
 
     #[test]
     fn session_count_query_requires_count_and_rejects_cwd() {

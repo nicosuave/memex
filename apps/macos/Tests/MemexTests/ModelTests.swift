@@ -2,6 +2,23 @@ import Foundation
 import Testing
 @testable import Memex
 
+@Test func subagentClassificationSurvivesBrowsingSearchAndMetadata() throws {
+    for kind in [nil, "main", "subagent", "sidechain", "guardian_review"] as [String?] {
+        var object: [String: String] = ["source": "codex", "session_id": "s", "source_path": "/s", "project": "p"]
+        object["conversation_kind"] = kind
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let session = try JSONDecoder().decode(Session.self, from: data)
+        let expected = kind == "subagent" || kind == "sidechain"
+        #expect(session.isSubagent == expected)
+        let hit = try JSONDecoder().decode(SearchHit.self, from: data)
+        #expect(hit.session(known: [:]).isSubagent == expected)
+        var oldMetadata = session
+        oldMetadata.conversationKind = nil
+        #expect(session.applyingMetadata(oldMetadata).isSubagent == expected)
+        #expect(hit.session(known: [oldMetadata.id: oldMetadata]).isSubagent == expected)
+    }
+}
+
 @Test func decodesCLIContracts() throws {
     let sessionJSON = #"[{"source":"codex","session_id":"session-1","source_path":"/tmp/one.jsonl","project":"memex","last_at":"2026-09-07T17:03:01Z","label":"Native app","resume_cmd":"codex resume session-1"}]"#
     let sessions = try JSONDecoder().decode([Session].self, from: Data(sessionJSON.utf8))

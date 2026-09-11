@@ -68,7 +68,10 @@ private struct BrowserReader: View {
     @Bindable var store: Store
 
     var body: some View {
-        ReaderView(store: store)
+        Group {
+            if store.scope == .home { HomeView(store: store) }
+            else { ReaderView(store: store) }
+        }
         .task(id: store.requestID) { await store.loadSessions() }
         .task(id: store.sessionCountRequestID) { await store.loadSessionCount() }
         .task(id: store.readerRequestID) { await store.loadRecords() }
@@ -117,6 +120,8 @@ private struct BrowserSidebar: View {
     private var sidebarList: some View {
         List(selection: $store.scope) {
             Section {
+                Label("Home", systemImage: "house")
+                    .tag(Store.Scope.home)
                 Label("All conversations", systemImage: "bubble.left.and.bubble.right")
                     .tag(Store.Scope.all)
             }

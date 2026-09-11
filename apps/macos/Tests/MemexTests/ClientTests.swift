@@ -28,6 +28,71 @@ import Testing
     }
 }
 
+private final class ScanProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var received: [ActivityScanProgress] = []
+    func append(_ value: ActivityScanProgress) { lock.lock(); defer { lock.unlock() }; received.append(value) }
+    var values: [ActivityScanProgress] { lock.lock(); defer { lock.unlock() }; return received }
+}
+
+@Test func advancingScanProgressKeepsColdBackfillAliveBeyondNormalReadTimeout() throws {
+    let recorder = ScanProgressRecorder()
+    let script = #"""
+    for done in 0 1 2 3 4 5; do
+      printf 'MEMEX_PROGRESS {"source":"codex","done":%s,"total":5}\n' "$done" >&2
+      sleep 0.15
+    done
+    printf 'complete'
+    """#
+    let start = ContinuousClock.now
+    let result = try CommandRun().execute(executable: URL(fileURLWithPath: "/bin/sh"),
+        arguments: ["-c", script], timeout: 0.5, progress: recorder.append)
+    #expect(start.duration(to: .now) > .milliseconds(500))
+    #expect(String(decoding: result, as: UTF8.self) == "complete")
+    #expect(recorder.values.map(\.done) == [0, 1, 2, 3, 4, 5])
+}
+
+@Test(arguments: ["1 1", "2 1", "0 0", "-1 9"])
+func stalledRegressingAndInvalidScanCountersStillTimeOut(counters: String) {
+    let script = #"""
+    while :; do
+      for done in $1; do
+        printf 'MEMEX_PROGRESS {"source":"codex","done":%s,"total":5}\n' "$done" >&2
+        sleep 0.05
+      done
+    done
+    """#
+    let start = ContinuousClock.now
+    #expect(throws: ClientError.self) {
+        try CommandRun().execute(executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script, "fixture", counters], timeout: 0.25, progress: { _ in })
+    }
+    #expect(start.duration(to: .now) < .seconds(2))
+}
+
+@Test func coldScanRemainsCancellableWhileProgressAdvances() async throws {
+    let command = CommandRun()
+    let recorder = ScanProgressRecorder()
+    let script = #"""
+    done=1
+    while [ "$done" -lt 1000 ]; do
+      printf 'MEMEX_PROGRESS {"source":"codex","done":%s,"total":1000}\n' "$done" >&2
+      done=$((done+1))
+      sleep 0.05
+    done
+    """#
+    let task = Task.detached {
+        try command.execute(executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script], timeout: 0.5, progress: recorder.append)
+    }
+    let deadline = Date().addingTimeInterval(3)
+    while recorder.values.isEmpty && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    #expect(!recorder.values.isEmpty)
+    command.cancel()
+    do { _ = try await task.value; Issue.record("Expected cancellation") }
+    catch is CancellationError {} catch { Issue.record("Unexpected error: \(error)") }
+}
+
 @Test func cancelledRunningRequestIsReaped() async throws {
     let command = CommandRun()
     let task = Task.detached {

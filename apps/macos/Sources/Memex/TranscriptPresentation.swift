@@ -217,6 +217,13 @@ enum TranscriptPresentation {
             work = []
         }
         for entry in records {
+            // Keep completion evidence and turn boundaries for grouping without
+            // presenting routine Codex bookkeeping as conversation messages.
+            if entry.record.isRoutineTurnBoundary {
+                flushWork()
+                flushOrdinary()
+                continue
+            }
             if isWork(entry) {
                 flushOrdinary()
                 if work.first?.record.sourceTurnID != entry.record.sourceTurnID { flushWork() }
