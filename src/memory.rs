@@ -5,6 +5,7 @@
 //! rather than synthetic sessions or turns.
 
 use crate::config::expand_exclude_patterns;
+use crate::repository::RepositoryResolver;
 use crate::types::SourceKind;
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -183,6 +184,22 @@ pub struct MemoryStore {
     snapshot_path: PathBuf,
 }
 
+pub(crate) struct PreparedMemoryRefresh<'a> {
+    store: &'a MemoryStore,
+    report: MemoryRefreshReport,
+    _lock: SnapshotWriteLock,
+}
+
+impl PreparedMemoryRefresh<'_> {
+    pub(crate) fn publish(self) -> Result<MemoryRefreshReport> {
+        crate::profiling::span!("memory.publish");
+        if self.report.changed {
+            atomic_write_snapshot(&self.store.snapshot_path, &self.report.snapshot)?;
+        }
+        Ok(self.report)
+    }
+}
+
 impl MemoryStore {
     /// `snapshot_path` is the file itself, normally `<Paths.root>/memory/documents.json`.
     pub fn new(snapshot_path: impl Into<PathBuf>) -> Self {
@@ -220,9 +237,25 @@ impl MemoryStore {
 
     /// Refresh changed files as whole documents and publish one atomic replacement snapshot.
     pub fn refresh(&self, options: &MemoryDiscoveryOptions) -> Result<MemoryRefreshReport> {
+        self.refresh_with_repositories(options, &RepositoryResolver::default())
+    }
+
+    pub(crate) fn refresh_with_repositories(
+        &self,
+        options: &MemoryDiscoveryOptions,
+        repositories: &RepositoryResolver,
+    ) -> Result<MemoryRefreshReport> {
+        self.prepare_refresh(options, repositories)?.publish()
+    }
+
+    pub(crate) fn prepare_refresh(
+        &self,
+        options: &MemoryDiscoveryOptions,
+        repositories: &RepositoryResolver,
+    ) -> Result<PreparedMemoryRefresh<'_>> {
         let parent = parent_directory(&self.snapshot_path)?;
         fs::create_dir_all(parent)?;
-        let _lock = SnapshotWriteLock::acquire(&self.snapshot_path, WRITE_LOCK_TIMEOUT)?;
+        let lock = SnapshotWriteLock::acquire(&self.snapshot_path, WRITE_LOCK_TIMEOUT)?;
 
         let snapshot_existed = self.snapshot_path.is_file();
         let previous = self.load()?;
@@ -255,7 +288,6 @@ impl MemoryStore {
             .map(|document| (document.stable_id.clone(), document))
             .collect::<HashMap<_, _>>();
         let mut documents = Vec::with_capacity(discovery.candidates.len());
-        let mut repository_projects = HashMap::new();
 
         for candidate in discovery.candidates {
             let stable_id = memory_stable_id(candidate.provider, &candidate.source_path);
@@ -271,7 +303,7 @@ impl MemoryStore {
                         document.scope = resolve_memory_scope(
                             &candidate,
                             &parse_source_metadata(&content),
-                            &mut repository_projects,
+                            repositories,
                         );
                         documents.push(document);
                         report.unchanged += 1;
@@ -280,7 +312,7 @@ impl MemoryStore {
                             &candidate,
                             content,
                             &metadata,
-                            &mut repository_projects,
+                            repositories,
                         )?);
                         report.parsed += 1;
                     }
@@ -351,11 +383,12 @@ impl MemoryStore {
             .filter(|document| matches!(document.freshness, MemoryFreshness::Stale { .. }))
             .count();
         report.changed = !snapshot_existed || next != previous;
-        if report.changed {
-            atomic_write_snapshot(&self.snapshot_path, &next)?;
-        }
         report.snapshot = next;
-        Ok(report)
+        Ok(PreparedMemoryRefresh {
+            store: self,
+            report,
+            _lock: lock,
+        })
     }
 }
 
@@ -424,7 +457,12 @@ pub fn discover_memory_documents(options: &MemoryDiscoveryOptions) -> Result<Mem
 
 pub fn parse_memory_document(candidate: &MemoryCandidate) -> Result<MemoryDocument> {
     let (content, metadata) = read_consistent(&candidate.source_path)?;
-    parse_memory_content(candidate, content, &metadata, &mut HashMap::new())
+    parse_memory_content(
+        candidate,
+        content,
+        &metadata,
+        &RepositoryResolver::default(),
+    )
 }
 
 /// Re-read a snapshot-known source without mutating either the source or memory snapshot.
@@ -448,14 +486,14 @@ fn parse_memory_content(
     candidate: &MemoryCandidate,
     content: String,
     metadata: &fs::Metadata,
-    repository_projects: &mut HashMap<PathBuf, Option<String>>,
+    repositories: &RepositoryResolver,
 ) -> Result<MemoryDocument> {
     let mtime_ms = modified_millis(metadata)?;
     let version_sha256 = sha256_hex(content.as_bytes());
     let stable_id = memory_stable_id(candidate.provider, &candidate.source_path);
     let (sections, title) = parse_sections(&content);
     let source_metadata = parse_source_metadata(&content);
-    let scope = resolve_memory_scope(candidate, &source_metadata, repository_projects);
+    let scope = resolve_memory_scope(candidate, &source_metadata, repositories);
 
     Ok(MemoryDocument {
         provider: candidate.provider,
@@ -483,7 +521,7 @@ fn parse_memory_content(
 fn resolve_memory_scope(
     candidate: &MemoryCandidate,
     source_metadata: &ParsedSourceMetadata,
-    repository_projects: &mut HashMap<PathBuf, Option<String>>,
+    repositories: &RepositoryResolver,
 ) -> MemoryScope {
     let mut scope = candidate.scope.clone();
     if candidate.provider == SourceKind::Codex && candidate.kind == MemoryDocumentKind::Summary {
@@ -498,13 +536,8 @@ fn resolve_memory_scope(
     }
     if let Some(cwd) = scope.cwd.as_mut() {
         *cwd = canonicalize_with_missing(cwd);
-        // Share the session repository resolver, but retain the exact checkout for cwd filters.
-        // One Git lookup per cwd per refresh avoids repeating it for every note in a project.
-        if let Some(project) = repository_projects
-            .entry(cwd.clone())
-            .or_insert_with(|| crate::analytics::repository_project_for_cwd(&cwd.to_string_lossy()))
-        {
-            scope.project = Some(project.clone());
+        if let Some(project) = repositories.resolve(cwd).project() {
+            scope.project = Some(project.to_owned());
         }
     }
     scope

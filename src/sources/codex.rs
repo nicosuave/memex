@@ -71,8 +71,10 @@ pub fn rollout_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn discover_rollouts() -> Vec<SourceFile> {
-    super::common::jsonl_files(rollout_roots())
+pub fn discover_rollouts(
+    walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> Vec<SourceFile> {
+    super::common::jsonl_files_with(rollout_roots(), walk)
         .into_iter()
         .map(|path| SourceFile {
             source: SourceKind::Codex,
@@ -374,51 +376,128 @@ fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionM
 }
 
 fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
-    let mut metadata = fallback_meta(path);
     if limit == 0 {
-        return Ok(metadata);
+        return Ok(fallback_meta(path));
     }
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let limit = (limit as usize).min(mmap.len());
-    let mut start = 0usize;
+    Ok(read_meta_prefix(path, &mmap[..limit], None).0)
+}
+
+fn read_meta_prefix(
+    path: &Path,
+    prefix: &[u8],
+    cached_offsets: Option<&[u64]>,
+) -> (SessionMeta, Vec<u64>) {
+    crate::profiling::span!("codex.metadata_recovery");
+    let mut metadata = fallback_meta(path);
+    let mut offsets = Vec::new();
     let mut buffer = Vec::new();
-    while start < limit {
-        let slice = &mmap[start..limit];
-        let relative = memchr(b'\n', slice).unwrap_or(slice.len());
-        let line = &slice[..relative];
-        start += relative + 1;
-        if line.is_empty() {
+    if let Some(cached) = cached_offsets {
+        for &offset in cached {
+            let Ok(start) = usize::try_from(offset) else {
+                return read_meta_prefix(path, prefix, None);
+            };
+            if start >= prefix.len()
+                || (start > 0 && prefix[start - 1] != b'\n')
+                || offsets.last().is_some_and(|last| *last >= offset)
+            {
+                return read_meta_prefix(path, prefix, None);
+            }
+            let slice = &prefix[start..];
+            let length = memchr(b'\n', slice).unwrap_or(slice.len());
+            buffer.clear();
+            buffer.extend_from_slice(&slice[..length]);
+            if !apply_meta_line(&mut buffer, &mut metadata) {
+                return read_meta_prefix(path, prefix, None);
+            }
+            offsets.push(offset);
+        }
+        return (metadata, offsets);
+    }
+    crate::profiling::count!("codex.metadata_prefix_scanned_bytes", prefix.len());
+    offsets = scan_meta_lines(prefix, &mut metadata);
+    (metadata, offsets)
+}
+
+const META_LINE_MARKERS: [&[u8]; 6] = [
+    b"session_meta",
+    b"turn_context",
+    b"task_started",
+    b"task_complete",
+    b"turn_aborted",
+    b"\\u",
+];
+
+fn scan_meta_lines(bytes: &[u8], metadata: &mut SessionMeta) -> Vec<u64> {
+    let mut buffer = Vec::new();
+    let mut offsets = Vec::new();
+    let mut start = 0;
+    while start < bytes.len() {
+        let line_start = start;
+        let slice = &bytes[start..];
+        let length = memchr(b'\n', slice).unwrap_or(slice.len());
+        let line = &slice[..length];
+        start += length + 1;
+        if META_LINE_MARKERS
+            .iter()
+            .all(|marker| memmem::find(line, marker).is_none())
+        {
             continue;
         }
         buffer.clear();
         buffer.extend_from_slice(line);
-        if let Ok(value) = simd_json::to_borrowed_value(&mut buffer)
-            && let Some(payload) = value.get("payload").and_then(|value| value.as_object())
-        {
-            match value.get("type").and_then(|value| value.as_str()) {
-                Some("session_meta") => apply_meta(payload, &mut metadata),
-                Some("turn_context") => {
-                    metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
-                }
-                Some("event_msg")
-                    if payload.get("type").and_then(|v| v.as_str()) == Some("task_started") =>
-                {
-                    metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
-                }
-                Some("event_msg")
-                    if matches!(
-                        payload.get("type").and_then(|v| v.as_str()),
-                        Some("task_complete" | "turn_aborted")
-                    ) =>
-                {
-                    metadata.source_turn_id = None;
-                }
-                _ => {}
-            }
+        if apply_meta_line(&mut buffer, metadata) {
+            offsets.push(line_start as u64);
         }
     }
-    Ok(metadata)
+    offsets
+}
+
+pub(crate) fn cwd_with_metadata_checkpoint(
+    path: &Path,
+    offset: u64,
+    metadata_offsets: &[u64],
+) -> Result<Option<PathBuf>> {
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length < offset || length == 0 {
+        return Ok(read_meta_until(path, length)?.cwd);
+    }
+    let mmap = unsafe { Mmap::map(&file)? };
+    let boundary = (offset as usize).min(mmap.len());
+    let (mut metadata, _) = read_meta_prefix(path, &mmap[..boundary], Some(metadata_offsets));
+    crate::profiling::count!("codex.metadata_tail_scanned_bytes", mmap.len() - boundary);
+    scan_meta_lines(&mmap[boundary..], &mut metadata);
+    Ok(metadata.cwd)
+}
+
+/// Applies a line that changes session metadata and reports whether it did, so its offset
+/// can be replayed on the next incremental parse instead of rescanning the prefix.
+fn apply_meta_line(line: &mut [u8], metadata: &mut SessionMeta) -> bool {
+    crate::profiling::count!("codex.metadata_candidates_decoded", 1);
+    let Ok(value) = simd_json::to_borrowed_value(line) else {
+        return false;
+    };
+    let Some(payload) = value.get("payload").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("session_meta") => apply_meta(payload, metadata),
+        Some("turn_context") => {
+            metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
+        }
+        Some("event_msg") => match payload.get("type").and_then(|value| value.as_str()) {
+            Some("task_started") => {
+                metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
+            }
+            Some("task_complete" | "turn_aborted") => metadata.source_turn_id = None,
+            _ => return false,
+        },
+        _ => return false,
+    }
+    true
 }
 
 pub fn probe(path: &Path) -> Result<SourceMetadata> {
@@ -444,13 +523,33 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
     include_reasoning: bool,
     next_doc_id: &AtomicU64,
-    mut emit: impl FnMut(Record) -> Result<()>,
+    emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    parse_index_records_with_metadata_offsets(
+        path,
+        state,
+        include_reasoning,
+        next_doc_id,
+        None,
+        emit,
+    )
+    .map(|(output, _)| output)
+}
+
+pub(crate) fn parse_index_records_with_metadata_offsets(
+    path: &Path,
+    state: IndexParseState,
+    include_reasoning: bool,
+    next_doc_id: &AtomicU64,
+    cached_offsets: Option<&[u64]>,
+    mut emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, Vec<u64>)> {
     let mut legacy_turn_id = state.legacy_ordinal()?;
     let mut emit = |mut record: Record| {
         if record.links.source_record_offset.is_none() {
@@ -461,20 +560,28 @@ pub(crate) fn parse_index_records(
     };
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
     let mut pending_tool_calls = state.pending_tool_calls;
     let source_path = path.to_string_lossy().to_string();
-    let mut metadata = read_meta_until(path, state.offset)?;
+    let prefix_len = start;
+    let (mut metadata, mut metadata_offsets) = read_meta_prefix(
+        path,
+        &mmap[..prefix_len],
+        cached_offsets.filter(|_| state.offset > 0),
+    );
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
 
     while start < mmap.len() {
         let source_record_offset = start as u64;
+        let line_start = start;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
-        start += relative + 1;
+        start += relative + usize::from(relative < slice.len());
         if line.is_empty() {
             continue;
         }
@@ -483,6 +590,11 @@ pub(crate) fn parse_index_records(
         let value = match simd_json::to_borrowed_value(&mut buffer) {
             Ok(value) => value,
             Err(_) => {
+                if relative == slice.len() {
+                    start = line_start;
+                    break;
+                }
+
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -503,6 +615,7 @@ pub(crate) fn parse_index_records(
         if entry_type == "session_meta" {
             if let Some(payload) = object.get("payload").and_then(|value| value.as_object()) {
                 apply_meta(payload, &mut metadata);
+                metadata_offsets.push(line_start as u64);
             }
             continue;
         }
@@ -511,6 +624,7 @@ pub(crate) fn parse_index_records(
                 .get("payload")
                 .and_then(|v| v.as_object())
                 .and_then(|payload| super::common::borrowed_string(payload, "turn_id"));
+            metadata_offsets.push(line_start as u64);
             continue;
         }
         if entry_type == "event_msg" {
@@ -528,6 +642,7 @@ pub(crate) fn parse_index_records(
                 if event_type == "task_started" {
                     metadata.source_turn_id = super::common::borrowed_string(payload, "turn_id");
                 }
+                metadata_offsets.push(line_start as u64);
                 let mut links = metadata.links.record_links();
                 links.source_turn_id = super::common::borrowed_string(payload, "turn_id")
                     .or_else(|| metadata.source_turn_id.clone());
@@ -955,14 +1070,17 @@ pub(crate) fn parse_index_records(
         }
     }
 
-    Ok(IndexParseOutput {
-        offset: mmap.len() as u64,
-        turn_id,
-        legacy_turn_id: Some(legacy_turn_id),
-        pending_tool_calls,
-        session_id: Some(metadata.session_id),
-        diagnostics,
-    })
+    Ok((
+        IndexParseOutput {
+            offset: start as u64,
+            turn_id,
+            legacy_turn_id: Some(legacy_turn_id),
+            pending_tool_calls,
+            session_id: Some(metadata.session_id),
+            diagnostics,
+        },
+        metadata_offsets,
+    ))
 }
 
 pub(crate) fn parse_history_records(
@@ -974,15 +1092,18 @@ pub(crate) fn parse_history_records(
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
-        start += relative + 1;
+        start += relative + usize::from(relative < slice.len());
         if line.is_empty() {
             continue;
         }
@@ -990,6 +1111,10 @@ pub(crate) fn parse_history_records(
         buffer.extend_from_slice(line);
         let Ok(value): Result<BorrowedValue<'_>, _> = simd_json::to_borrowed_value(&mut buffer)
         else {
+            if relative == slice.len() {
+                start = line_start;
+                break;
+            }
             continue;
         };
         let Some(object) = value.as_object() else {
@@ -1037,7 +1162,7 @@ pub(crate) fn parse_history_records(
     }
     Ok(IndexParseOutput {
         legacy_turn_id: Some(turn_id),
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls: state.pending_tool_calls,
         session_id: None,
@@ -2157,6 +2282,121 @@ mod tests {
             records[0].links.lifecycle_event.as_deref(),
             Some("turn_aborted")
         );
+    }
+
+    #[test]
+    fn metadata_offsets_recover_partial_headers_and_reject_invalid_checkpoints() {
+        let path = Path::new("rollout.jsonl");
+        let first = br#"{"type":"session_meta","payload":{"id":"first","cwd":"/first"}}
+"#;
+        let other = br#"{"type":"response_item","payload":{"text":"ignored"}}
+"#;
+        let last = br#"{"type":"session_meta","payload":{"id":"last","forked_from_id":"parent"}}
+"#;
+        let bytes = [first.as_slice(), other.as_slice(), last.as_slice()].concat();
+        let (full, offsets) = read_meta_prefix(path, &bytes, None);
+        assert_eq!(offsets, vec![0, (first.len() + other.len()) as u64]);
+        let (cached, reused) = read_meta_prefix(path, &bytes, Some(&offsets));
+        assert_eq!(reused, offsets);
+        assert_eq!(cached.session_id, full.session_id);
+        assert_eq!(cached.cwd, full.cwd);
+        assert_eq!(cached.cwd.as_deref(), Some(Path::new("/first")));
+        assert_eq!(cached.links.parent_session_id, full.links.parent_session_id);
+        for invalid in [
+            vec![u64::MAX],
+            vec![1],
+            vec![first.len() as u64],
+            vec![0, 0],
+        ] {
+            let (recovered, positions) = read_meta_prefix(path, &bytes, Some(&invalid));
+            assert_eq!(recovered.session_id, full.session_id);
+            assert_eq!(positions, offsets);
+        }
+    }
+
+    #[test]
+    fn incremental_metadata_offsets_include_new_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        let first = r#"{"type":"session_meta","payload":{"id":"first","cwd":"/first"}}
+"#;
+        std::fs::write(&path, first).unwrap();
+        let ids = AtomicU64::new(1);
+        let (parsed, offsets) = parse_index_records_with_metadata_offsets(
+            &path,
+            IndexParseState::default(),
+            false,
+            &ids,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let appended = r#"{"type":"session_meta","payload":{"id":"first","cwd":"/last"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"new text"}}
+"#;
+        std::fs::write(&path, format!("{first}{appended}")).unwrap();
+        let mut records = Vec::new();
+        let (_, updated) = parse_index_records_with_metadata_offsets(
+            &path,
+            IndexParseState {
+                offset: parsed.offset,
+                turn_id: parsed.turn_id,
+                legacy_turn_id: parsed.legacy_turn_id,
+                pending_tool_calls: parsed.pending_tool_calls,
+            },
+            false,
+            &ids,
+            Some(&offsets),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(updated, vec![0, first.len() as u64]);
+        assert_eq!(records.len(), 1);
+        // One rollout file owns one session identity, so a later header updates the
+        // working directory without reassigning the session.
+        assert_eq!(records[0].session_id, "first");
+        assert_eq!(records[0].project, "last");
+        assert_eq!(
+            cwd_with_metadata_checkpoint(&path, first.len() as u64, &offsets)
+                .unwrap()
+                .as_deref(),
+            Some(Path::new("/last"))
+        );
+    }
+
+    #[test]
+    fn metadata_prefilter_preserves_escaped_types_and_later_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        let initial = r#"{"type":"session_meta","payload":{"id":"first","cwd":"/first"}}
+{"type":"response_item","payload":{"text":"session_meta is ordinary content"}}
+{"type":"response_item","payload":{"text":"escaped \u0073ession_meta content"}}
+not json
+"#;
+        let later = r#"{"type":"ses\u0073ion_meta","payload":{"id":"first","cwd":"/last","forked_from_id":"parent"}}
+"#;
+        std::fs::write(&path, format!("{initial}{later}")).unwrap();
+        let early = read_meta_until(&path, initial.len() as u64).unwrap();
+        assert_eq!(early.session_id, "first");
+        assert_eq!(early.cwd.as_deref(), Some(Path::new("/first")));
+        let latest = read_meta_until(&path, u64::MAX).unwrap();
+        assert_eq!(latest.session_id, "first");
+        assert_eq!(latest.cwd.as_deref(), Some(Path::new("/last")));
+        assert_eq!(latest.links.parent_session_id.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn metadata_prefilter_handles_fully_escaped_type_and_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        std::fs::write(&path, r#"{"\u0074ype":"\u0073\u0065\u0073\u0073\u0069\u006f\u006e\u005f\u006d\u0065\u0074\u0061","payload":{"id":"escaped","cwd":"/escaped"}}
+"#).unwrap();
+        let metadata = read_meta_until(&path, u64::MAX).unwrap();
+        assert_eq!(metadata.session_id, "escaped");
+        assert_eq!(metadata.cwd.as_deref(), Some(Path::new("/escaped")));
     }
 
     #[test]

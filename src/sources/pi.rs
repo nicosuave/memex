@@ -57,8 +57,8 @@ fn configured_session_root(agent: &Path) -> Option<PathBuf> {
     })
 }
 
-pub fn discover() -> Vec<SourceFile> {
-    super::common::jsonl_files([sessions_root()])
+pub fn discover(walk: Option<&mut crate::ingest::directories::StampedWalk>) -> Vec<SourceFile> {
+    super::common::jsonl_files_with([sessions_root()], walk)
         .into_iter()
         .map(|path| SourceFile {
             source: SourceKind::Pi,
@@ -242,7 +242,9 @@ pub(crate) fn parse_index_records_for(
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
 
     let source_path = path.to_string_lossy().to_string();
@@ -275,6 +277,7 @@ pub(crate) fn parse_index_records_for(
         }
     }
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let rel = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..rel];
@@ -287,6 +290,11 @@ pub(crate) fn parse_index_records_for(
         let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
             Ok(v) => v,
             Err(_) => {
+                if rel == slice.len() {
+                    start = line_start;
+                    break;
+                }
+
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -685,7 +693,7 @@ pub(crate) fn parse_index_records_for(
 
     Ok(IndexParseOutput {
         legacy_turn_id: None,
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),

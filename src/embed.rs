@@ -574,6 +574,7 @@ impl EmbedderHandle {
         choice: ModelChoice,
         runtime: &EmbedRuntimeConfig,
     ) -> Result<Self> {
+        crate::profiling::span!("embeddings.model_init");
         if let Some((model_type, dims)) = choice.fastembed_config() {
             let requested_provider = runtime.execution_provider;
             let effective_provider = requested_provider.effective();
@@ -610,6 +611,7 @@ impl EmbedderHandle {
     }
 
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        crate::profiling::span!("embeddings.batch");
         if texts.is_empty() {
             return Ok(Vec::new());
         }

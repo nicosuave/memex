@@ -1,7 +1,9 @@
+pub(crate) mod checkpoint;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +27,8 @@ pub struct FileIdentity {
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,7 +87,7 @@ pub struct PendingToolCall {
     pub source_tool_assistant_uuid: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileState {
     pub size: u64,
     pub mtime: i64,
@@ -102,6 +106,8 @@ pub struct FileState {
     /// migrated safely on their next ingest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_metadata_offsets: Option<Vec<u64>>,
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip
@@ -117,18 +123,51 @@ pub struct ScanCache {
 }
 
 impl ScanCache {
+    const MAX_JSON_BYTES: u64 = 80 * 1024 * 1024;
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.scan_cache.load");
+        let reader = checkpoint::CheckpointReader::open(&path.with_file_name("ingest.json"))?;
+        if reader.is_v2() {
+            return Ok(reader
+                .export_scan_cache_json()?
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default());
+        }
         if !path.exists() {
             return Ok(Self::default());
         }
-        let data = fs::read_to_string(path)?;
-        let cache = serde_json::from_str(&data).unwrap_or_default();
+        let mut data = Vec::new();
+        fs::File::open(path)?
+            .take(Self::MAX_JSON_BYTES + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > Self::MAX_JSON_BYTES {
+            return Ok(Self::default());
+        }
+        let cache = serde_json::from_slice(&data).unwrap_or_default();
         Ok(cache)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.scan_cache.save");
         let data = serde_json::to_string(self)?;
-        atomic_write(path, data.as_bytes())
+        checkpoint::save_sidecar(path, Some(data.as_bytes()))
+    }
+
+    pub fn save_with_lease(
+        &self,
+        path: &Path,
+        lease: &crate::lease::IngestLease,
+    ) -> anyhow::Result<()> {
+        if checkpoint::sidecar_reader(path)?.is_none() {
+            return self.save(path);
+        }
+        checkpoint::CheckpointWriter::open(&path.with_file_name("ingest.json"), lease, false)?
+            .commit_delta(&checkpoint::CheckpointDelta {
+                scan_cache: Some(self.clone()),
+                ..Default::default()
+            })?;
+        Ok(())
     }
 
     /// Check if the cache is still valid (within TTL seconds)
@@ -138,6 +177,15 @@ impl ScanCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         now.saturating_sub(self.last_scan_ts) < ttl_seconds
+    }
+
+    /// Re-arm freshness after a refresh that covered the interval but counted only part of
+    /// the corpus, so the last full scan's totals stand.
+    pub fn touch(&mut self) {
+        self.last_scan_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
     }
 
     /// Update cache with current scan results
@@ -210,41 +258,79 @@ impl Default for IngestState {
 
 impl IngestState {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let data = fs::read_to_string(path)?;
-        let state = serde_json::from_str(&data)?;
-        Ok(state)
+        crate::profiling::span!("state.ingest.load");
+        checkpoint::CheckpointReader::open(path)?.snapshot()
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let data = serde_json::to_string_pretty(self)?;
-        atomic_write(path, data.as_bytes())
+        crate::profiling::span!("state.ingest.save");
+        checkpoint::save_legacy(self, path)
+    }
+
+    pub fn save_with_lease(
+        &self,
+        path: &Path,
+        lease: &crate::lease::IngestLease,
+    ) -> anyhow::Result<()> {
+        checkpoint::CheckpointWriter::open(path, lease, true)?.replace_snapshot(self)
     }
 }
 
 impl PendingIngest {
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        crate::profiling::span!("state.pending.load");
+        let reader = checkpoint::CheckpointReader::open(&path.with_file_name("ingest.json"))?;
+        if reader.is_v2() {
+            return reader
+                .export_pending_json()?
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(Into::into);
+        }
         if !path.exists() {
             return Ok(None);
         }
-        let data = fs::read_to_string(path)?;
-        Ok(Some(serde_json::from_str(&data)?))
+        let data = fs::read(path)?;
+        let value: serde_json::Value = serde_json::from_slice(&data)?;
+        anyhow::ensure!(
+            value.is_object(),
+            "pending ingest checkpoint must be an object"
+        );
+        Ok(Some(serde_json::from_value(value)?))
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.pending.save");
         let data = serde_json::to_string_pretty(self)?;
-        atomic_write(path, data.as_bytes())
+        checkpoint::save_sidecar(path, Some(data.as_bytes()))
+    }
+
+    pub fn save_with_lease(
+        &self,
+        path: &Path,
+        lease: &crate::lease::IngestLease,
+    ) -> anyhow::Result<()> {
+        if checkpoint::sidecar_reader(path)?.is_none() {
+            return self.save(path);
+        }
+        checkpoint::CheckpointWriter::open(&path.with_file_name("ingest.json"), lease, false)?
+            .commit_intent(self)
+    }
+
+    pub fn clear_with_lease(path: &Path, lease: &crate::lease::IngestLease) -> anyhow::Result<()> {
+        if checkpoint::sidecar_reader(path)?.is_none() {
+            return Self::clear(path);
+        }
+        checkpoint::CheckpointWriter::open(&path.with_file_name("ingest.json"), lease, false)?
+            .commit_delta(&checkpoint::CheckpointDelta {
+                pending: checkpoint::PendingChange::Clear,
+                ..Default::default()
+            })?;
+        Ok(())
     }
 
     pub fn clear(path: &Path) -> anyhow::Result<()> {
-        let parent = parent_directory(path)?;
-        match fs::remove_file(path) {
-            Ok(()) => sync_directory(parent),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        checkpoint::save_sidecar(path, None)
     }
 }
 
@@ -304,7 +390,11 @@ mod tests {
         assert!(
             fs::read_dir(temp.path())
                 .expect("read tempdir")
-                .all(|entry| entry.expect("directory entry").path() == path)
+                .all(|entry| {
+                    let path = entry.expect("directory entry").path();
+                    path.file_name() == Some(std::ffi::OsStr::new("ingest.json"))
+                        || path.file_name() == Some(std::ffi::OsStr::new(".checkpoints.lock"))
+                })
         );
     }
 
@@ -332,6 +422,17 @@ mod tests {
 
         let cache = ScanCache::load(&path).expect("load malformed cache");
 
+        assert_eq!(cache.last_scan_ts, 0);
+        assert_eq!(cache.file_count, 0);
+        assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn optional_scan_cache_invalid_utf8_loads_as_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scan_cache.json");
+        fs::write(&path, b"\xff").unwrap();
+        let cache = ScanCache::load(&path).expect("invalid optional cache must expire");
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);

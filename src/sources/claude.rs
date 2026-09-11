@@ -14,7 +14,6 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
@@ -97,20 +96,22 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
     custom_title.or(ai_title).or(agent_name)
 }
 
-pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
+pub fn discover(
+    root: &Path,
+    _include_agents: bool,
+    walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> Result<Vec<SourceFile>> {
     // `_include_agents` is a retired opt-in kept only for CLI compatibility:
     // agent transcripts are always indexed now, matching every other source.
     // Consumers hide them from default views via `conversation_kind`.
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-        {
+    for path in super::common::files_under(root, walk) {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
             continue;
         }
-        let name = entry.file_name().to_string_lossy();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let is_agent = name.starts_with("agent-");
-        let under_subagents = entry.path().ancestors().any(|ancestor| {
+        let under_subagents = path.ancestors().any(|ancestor| {
             ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents")
         });
         if under_subagents && !is_agent {
@@ -121,8 +122,7 @@ pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
         // (`<project>/<session>.jsonl`); only agent transcripts nest
         // deeper, under a `subagents/` directory (see `is_subagent_path`).
         // Anything deeper outside `subagents/` is not a session file.
-        let relative_depth = entry
-            .path()
+        let relative_depth = path
             .strip_prefix(root)
             .map(|path| path.components().count())
             .unwrap_or(0);
@@ -131,7 +131,7 @@ pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
         }
         files.push(SourceFile {
             source: SourceKind::Claude,
-            path: entry.path().to_path_buf(),
+            path,
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -939,8 +939,8 @@ mod tests {
         fs::write(temp.path().join("main.jsonl"), "{}\n").unwrap();
         fs::write(temp.path().join("agent-child.jsonl"), "{}\n").unwrap();
         // The retired opt-in flag no longer gates anything.
-        assert_eq!(discover(temp.path(), false).unwrap().len(), 2);
-        assert_eq!(discover(temp.path(), true).unwrap().len(), 2);
+        assert_eq!(discover(temp.path(), false, None).unwrap().len(), 2);
+        assert_eq!(discover(temp.path(), true, None).unwrap().len(), 2);
     }
 
     #[test]
@@ -951,7 +951,7 @@ mod tests {
         fs::write(subagents.join("agent-child.jsonl"), "{}\n").unwrap();
         fs::write(subagents.join("journal.jsonl"), "{}\n").unwrap();
 
-        let files = discover(temp.path(), false).unwrap();
+        let files = discover(temp.path(), false, None).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].path.file_name().and_then(|name| name.to_str()),

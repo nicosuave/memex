@@ -321,7 +321,17 @@ fn search_defaults_to_compact_match_centered_references_and_full_is_explicit() {
         ],
     );
     assert_eq!(projected[0].as_object().unwrap().len(), 2);
-    assert_eq!(projected[0]["text"], records[1].text);
+    let text = projected[0]["text"].as_str().unwrap();
+    assert!(
+        text.chars().count() <= memex::machine::SEARCH_TEXT_BUDGET + 2,
+        "{}",
+        text.chars().count()
+    );
+    assert!(records[1].text.chars().count() > memex::machine::SEARCH_TEXT_BUDGET);
+    assert!(
+        text.starts_with('…') && text.contains("late_needle"),
+        "{text}"
+    );
 }
 
 #[test]

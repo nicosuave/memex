@@ -14,6 +14,7 @@ pub mod cursor;
 pub mod grok;
 pub mod hermes;
 pub mod jcode;
+mod jsonl;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;

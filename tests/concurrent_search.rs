@@ -64,7 +64,18 @@ fn concurrent_searches_coalesce_stale_auto_indexing() {
         );
     }
     transcript_file.flush().expect("flush appended transcript");
-    fs::remove_file(root.join("state").join("scan_cache.json")).expect("expire scan cache");
+    {
+        let paths = memex::config::Paths::new(Some(root.clone())).expect("test paths");
+        let lease = memex::lease::IngestLease::acquire(
+            &paths,
+            "expire test scan cache",
+            std::time::Duration::from_secs(30),
+        )
+        .expect("checkpoint lease");
+        memex::state::ScanCache::default()
+            .save_with_lease(&paths.state.join("scan_cache.json"), &lease)
+            .expect("expire scan cache");
+    }
 
     let barrier = Arc::new(Barrier::new(CONCURRENT_SEARCHES));
     let handles = (0..CONCURRENT_SEARCHES)
