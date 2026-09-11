@@ -22,7 +22,7 @@ use tantivy::merge_policy::NoMergePolicy;
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
-    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
+    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions,
 };
 use tantivy::store::StoreReader;
@@ -2266,8 +2266,11 @@ fn build_schema_with_options(
     builder.add_text_field("role", STRING | STORED);
     builder.add_text_field("source", session_identity_options.clone());
 
+    // `en_stem` lowercases and applies the English Snowball stemmer, so a query for
+    // "migration" also matches "migrations" and "migrated". Existing indexes keep the
+    // tokenizer recorded in their on-disk schema until `memex index rebuild`.
     let text_indexing = TextFieldIndexing::default()
-        .set_tokenizer("default")
+        .set_tokenizer("en_stem")
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let text_options = TextOptions::default()
         .set_indexing_options(text_indexing)
@@ -2275,8 +2278,11 @@ fn build_schema_with_options(
     builder.add_text_field("text", text_options);
 
     builder.add_text_field("tool_name", STRING | STORED);
-    builder.add_text_field("tool_input", TEXT | STORED);
-    builder.add_text_field("tool_output", TEXT | STORED);
+    // Queries only parse against `text`, which already carries a tool result's content;
+    // indexing these too roughly doubled each segment's vocabulary. Existing indexes keep
+    // their on-disk schema until `memex index rebuild`.
+    builder.add_text_field("tool_input", STORED);
+    builder.add_text_field("tool_output", STORED);
     builder.add_text_field("event_id", STRING | STORED);
     builder.add_text_field("parent_event_id", STRING | STORED);
     builder.add_text_field("logical_parent_event_id", STRING | STORED);
@@ -2532,6 +2538,21 @@ fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_payload_fields_are_stored_without_indexing() {
+        let schema = build_schema().unwrap();
+        for name in ["tool_input", "tool_output"] {
+            let field = schema.get_field(name).unwrap();
+            let entry = schema.get_field_entry(field);
+            assert!(entry.is_stored(), "{name} must remain retrievable");
+            assert!(
+                !entry.is_indexed(),
+                "{name} must not duplicate the text vocabulary"
+            );
+        }
+    }
+    use tantivy::schema::TEXT;
 
     fn test_record(doc_id: u64, text: &str) -> Record {
         Record {
@@ -3535,6 +3556,22 @@ mod tests {
         let new_reader = SearchIndex::open_or_create(tmp.path()).expect("new reader");
         assert_eq!(search_text_count(&new_reader, "beforeupdate"), 0);
         assert_eq!(search_text_count(&new_reader, "afterupdate"), 1);
+    }
+
+    #[test]
+    fn text_search_matches_inflected_forms_through_stemming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(1, "ran the database migrations"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "migration"), 1);
+        assert_eq!(search_text_count(&index, "migrated"), 1);
+        assert_eq!(search_text_count(&index, "Databases"), 1);
+        assert_eq!(search_text_count(&index, "rollback"), 0);
     }
 
     fn search_text_count(index: &SearchIndex, query: &str) -> usize {
