@@ -363,11 +363,10 @@ pub(crate) fn parse_index_records_with_background(
         emit(record)
     };
     use memchr::memchr;
-    use memmap2::Mmap;
     use simd_json::prelude::*;
 
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     // Discovery captured this boundary before parsing began. Never consume
     // bytes appended after it: they need a fresh metadata probe so a late
     // `sessionKind: "bg"` marker can reclassify the whole transcript.
@@ -389,6 +388,7 @@ pub(crate) fn parse_index_records_with_background(
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
+    let mut session_cwd: Option<String> = None;
 
     while start < mmap.len() {
         let source_record_offset = start as u64;
@@ -431,6 +431,12 @@ pub(crate) fn parse_index_records_with_background(
             diagnostics.non_object_json_lines += 1;
             continue;
         };
+        if session_cwd.is_none()
+            && let Some(cwd) = object.get("cwd").and_then(|value| value.as_str())
+            && !cwd.is_empty()
+        {
+            session_cwd = Some(cwd.to_string());
+        }
         let entry_type = object
             .get("type")
             .and_then(|value| value.as_str())
@@ -728,6 +734,7 @@ pub(crate) fn parse_index_records_with_background(
             pending_tool_calls,
             session_id: Some(session_id),
             diagnostics,
+            session_cwd,
         },
         is_background,
     ))

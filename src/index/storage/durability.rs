@@ -75,9 +75,23 @@ impl StagingDurability {
         if !lease.is_file() || lease.dev() != expected.dev() || lease.ino() != expected.ino() {
             return Err(io::Error::other("staging durability lease changed"));
         }
-        // F_FULLFSYNC drains earlier fsyncs on this device before the generation is reachable.
-        crate::profiling::span!("lexical.publication_fullsync");
-        self.synchronize(&self.lease, true)
+        // The barrier orders every earlier write on this device before the generation rename;
+        // the full flush after `CURRENT` makes all of it durable at once.
+        crate::profiling::span!("lexical.publication_barrier");
+        self.synchronize_barrier(&self.lease)
+    }
+
+    fn synchronize_barrier(&self, file: &File) -> io::Result<()> {
+        self.check_file(file)?;
+        #[cfg(test)]
+        {
+            self.calls.lock().unwrap().push(true);
+            if *self.fail.lock().unwrap() == Some(true) {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+        crate::profiling::count!("lexical.barrier_syncs", 1);
+        finish_probe(file, barrier_sync(file)).map(drop)
     }
 
     fn synchronize(&self, file: &File, full: bool) -> io::Result<()> {
@@ -198,6 +212,12 @@ fn finish_probe(file: &File, result: io::Result<()>) -> io::Result<bool> {
 
 fn full_sync(file: &File) -> io::Result<()> {
     retry_sync(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) })
+}
+
+/// `F_BARRIERFSYNC`: earlier writes reach the media before later ones, without waiting for
+/// the drive cache. About 40k/s against 46/s for `F_FULLFSYNC` on Apple hardware.
+fn barrier_sync(file: &File) -> io::Result<()> {
+    retry_sync(|| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) })
 }
 
 fn retry_sync(mut call: impl FnMut() -> libc::c_int) -> io::Result<()> {

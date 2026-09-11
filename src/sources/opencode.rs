@@ -699,6 +699,7 @@ pub(crate) fn parse_index_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id),
         diagnostics: Default::default(),
+        session_cwd: None,
     })
 }
 
@@ -746,6 +747,7 @@ pub(crate) fn parse_session_records(
             pending_tool_calls: state.pending_tool_calls,
             session_id: Some(session_id.to_string()),
             diagnostics: Default::default(),
+            session_cwd: None,
         });
     };
     // Parent linkage is the only subagent signal: the `agent` column records
@@ -872,6 +874,7 @@ pub(crate) fn parse_session_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id.to_string()),
         diagnostics,
+        session_cwd: None,
     })
 }
 

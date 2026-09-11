@@ -171,6 +171,7 @@ pub(crate) fn parse_index_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id),
         diagnostics,
+        session_cwd: None,
     })
 }
 

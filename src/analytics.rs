@@ -205,7 +205,8 @@ impl AnalyticsStore {
         }
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
-             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);",
+             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
+             CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);",
         )?;
         let previous_schema_version: Option<i64> = self
             .conn
@@ -1544,62 +1545,7 @@ pub fn sanitize_label(raw: &str) -> String {
     // goes straight to the single-allocation finish pass. This keeps the
     // per-record emptiness check in `record` cheap during index scans.
     if raw.contains('<') {
-        let mut current = raw.to_string();
-        const DROP_TAGS: &[&str] = &[
-            "system-reminder",
-            "command-message",
-            "command-name",
-            "local-command-stdout",
-            "local-command-caveat",
-            "local-command-output",
-            "instructions",
-            "system_instruction",
-            "system_instructions",
-            "environment_context",
-            "cwd",
-            "approval_policy",
-            "shell",
-            "user_instructions",
-            "recommended_plugins",
-            "skill",
-            "user_action",
-            "context",
-            "task-notification",
-            "task-id",
-            "tool-use-id",
-            "subagent_notification",
-            "turn_aborted",
-            "current_date",
-            "timezone",
-            "epoch",
-            "collaboration_mode",
-            "apps_instructions",
-            "permissions",
-            "total_tokens",
-        ];
-        for tag in DROP_TAGS {
-            let open = format!("<{tag}");
-            let close = format!("</{tag}>");
-            loop {
-                let Some(start) = find_ascii_ci(&current, &open) else {
-                    break;
-                };
-                let open_end = match current[start..].find('>') {
-                    Some(p) => start + p + 1,
-                    None => {
-                        current.truncate(start);
-                        break;
-                    }
-                };
-                if let Some(end_offset) = find_ascii_ci(&current[open_end..], &close) {
-                    let abs_end = open_end + end_offset + close.len();
-                    current.replace_range(start..abs_end, " ");
-                } else {
-                    current.truncate(start);
-                    break;
-                }
-            }
-        }
+        let mut current = strip_drop_tags(raw);
         // Generic unwrap: remove any remaining <...> tags but keep inner text.
         let mut search_start = 0;
         loop {
@@ -1719,6 +1665,67 @@ fn finish_label(text: &str) -> String {
 /// offsets (e.g. U+0130 folds 2 bytes into 3), which would make `replace_range`
 /// or `truncate` panic on a non-char-boundary. Every match starts at a `<`
 /// byte, which is always a char boundary in UTF-8.
+const DROP_TAGS: &[&str] = &[
+    "system-reminder",
+    "command-message",
+    "command-name",
+    "local-command-stdout",
+    "local-command-caveat",
+    "local-command-output",
+    "instructions",
+    "environment_context",
+    "cwd",
+    "approval_policy",
+    "shell",
+    "user_instructions",
+    "recommended_plugins",
+    "skill",
+    "user_action",
+    "context",
+    "task-notification",
+    "task-id",
+    "tool-use-id",
+    "subagent_notification",
+    "turn_aborted",
+    "current_date",
+    "timezone",
+    "epoch",
+    "collaboration_mode",
+    "apps_instructions",
+    "permissions",
+    "total_tokens",
+];
+
+/// Removes every `<tag ...>...</tag>` block for the tags above, case-insensitively, in one
+/// pass over the text. A block without its closing tag truncates the text at its start, as
+/// the tag-by-tag stripper did. Tool results are `user` records and routinely run to hundreds
+/// of kilobytes, so this runs per record during indexing.
+fn strip_drop_tags(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(4096));
+    let mut rest = raw;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(tag) = DROP_TAGS.iter().find(|tag| starts_ascii_ci(after, tag)) else {
+            out.push('<');
+            rest = after;
+            continue;
+        };
+        let Some(open_end) = after.find('>') else {
+            return out;
+        };
+        let body = &after[open_end + 1..];
+        let close = format!("</{tag}>");
+        let Some(close_at) = find_ascii_ci(body, &close) else {
+            return out;
+        };
+        out.push(' ');
+        rest = &body[close_at + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
     let hay = haystack.as_bytes();
     let ndl = needle.as_bytes();

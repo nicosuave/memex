@@ -1339,6 +1339,8 @@ mod tests {
             },
             kind: MemoryDocumentKind::Note,
             mtime_ms,
+            size: 0,
+            changed_ns: None,
             event_dates: Vec::new(),
             title: Some(format!("{project} notes")),
             content,

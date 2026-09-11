@@ -212,6 +212,8 @@ fn finish_parsed_source(
         state.claude_background = background_session;
     }
     tx_update.send(FileUpdate {
+        source,
+        session_cwd: parsed.session_cwd,
         path: source_path,
         state,
         session_id: parsed.session_id,
@@ -796,7 +798,8 @@ impl ParserContext<'_> {
         if tasks.len() <= 1 {
             tasks.iter().try_for_each(parse)
         } else {
-            self.pool.install(|| tasks.par_iter().try_for_each(parse))
+            self.pool
+                .install(|| tasks.par_iter().with_max_len(1).try_for_each(parse))
         }
     }
 }
@@ -1070,7 +1073,7 @@ pub(super) fn execute_refresh(
         recovering_pending_ingest,
         empty_index_rebuild,
         next_doc_id,
-        tasks,
+        mut tasks,
         files_scanned,
         files_skipped,
         total_bytes,
@@ -1270,6 +1273,8 @@ pub(super) fn execute_refresh(
         session_ids: &session_ids,
         opencode_links: &opencode_session_links,
     };
+    // Largest remaining inputs first: one big transcript must not become the parse tail.
+    tasks.sort_by_key(|task| std::cmp::Reverse(task.size.saturating_sub(task.offset)));
     let parser_result = parser.parse(&tasks, &parse_skipped);
     let parser_result = parser_result.and_then(|_| {
         for database in &mut opencode_ready_databases {
@@ -1310,8 +1315,22 @@ pub(super) fn execute_refresh(
     } else {
         None
     };
+    // Parsers have finished and dropped their sender, so this drains completely.
+    let updates = rx_update.iter().collect::<Vec<_>>();
     let decision = if parser_result.is_ok() && pending_update_error.is_none() {
-        WriterDecision::Commit
+        WriterDecision::Commit {
+            session_cwds: updates
+                .iter()
+                .filter_map(|update| {
+                    Some(SessionCwd {
+                        source: update.source,
+                        source_path: update.path.clone(),
+                        session_id: update.session_id.clone()?,
+                        cwd: update.session_cwd.clone()?,
+                    })
+                })
+                .collect(),
+        }
     } else {
         WriterDecision::Cancel
     };
@@ -1359,10 +1378,9 @@ pub(super) fn execute_refresh(
 
         let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
         let mut updated_files = HashMap::new();
-        while let Ok(update) = rx_update.recv() {
+        for update in updates {
             updated_files.insert(update.path.clone(), update.state.clone());
             diagnostics.merge(update.diagnostics);
-            let _ = update.session_id;
         }
 
         for (path, update) in updated_files {

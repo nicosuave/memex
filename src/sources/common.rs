@@ -7,6 +7,28 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// Maps a transcript for one sequential pass and tells the kernel so, which widens its
+/// read-ahead window beyond what it does around an ordinary fault. A rebuild reads gigabytes
+/// of transcripts, so the difference is measurable there.
+///
+/// Only `MADV_SEQUENTIAL`, which both Linux and Darwin record on the mapping and consult on
+/// every fault. `MADV_WILLNEED` is a one-shot request to page the whole mapping in now, which
+/// contradicts asking for a sliding window and, on a transcript larger than the free page
+/// cache, evicts pages the rest of the refresh still wants.
+///
+/// The advice is only a hint: `madvise` can refuse it without the mapping becoming any less
+/// valid, so a refusal must not fail the parse. It is counted instead, because silently
+/// losing it would show up as a slow rebuild and nothing else.
+pub(crate) fn map_sequential(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+    let mmap = unsafe { memmap2::Mmap::map(file)? };
+    if mmap.advise(memmap2::Advice::Sequential).is_ok() {
+        crate::profiling::count!("sources.mmap_advice_accepted", 1);
+    } else {
+        crate::profiling::count!("sources.mmap_advice_refused", 1);
+    }
+    Ok(mmap)
+}
+
 pub fn home() -> PathBuf {
     BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())

@@ -33,7 +33,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
 simd-json = { version = "0.13", features = ["serde"] }
-tantivy = "0.22"
+tantivy = { version = "0.22", features = ["quickwit"] }
 usearch = "2"
 toml = "0.8"
 toml_edit = "0.22"
