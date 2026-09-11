@@ -2,7 +2,7 @@
 
 ## Two-phase checkpoint state: 154.0651 to 135.0057 ms including v2 adoption
 
-2026-09-10. Moving pending intent and scan-cache persistence into the checkpoint database lowers adoption-inclusive aggregate elapsed time by 12.3710% against freshly measured checkpoint-v1. Both variants are memex 0.18.1. The [checkpoint storage contract](checkpoint-storage.md) defines authority, upgrade, transactional publication, and recovery; this comparison does not weaken its durability barriers.
+2026-09-10. Moving pending intent and scan-cache persistence into the checkpoint database lowers adoption-inclusive aggregate elapsed time by 12.3710% against freshly measured checkpoint-v1. Both variants are memex 0.18.1. The [checkpoint storage contract](../../docs/checkpoint-storage.md) defines authority, upgrade, transactional publication, and recovery; this comparison does not weaken its durability barriers.
 
 | Repeat | Variant | 260 appends + queries, including first use | Terminal index/SQLite maintenance + final query | Total charged wall time |
 |---|---|---:|---:|---:|
@@ -77,7 +77,7 @@ No installation, live-root migration, commit or push occurred in this experiment
 
 ## Per-file checkpoints: 158.96 to 148.77 ms including adoption
 
-2026-09-09. Per-file checkpoint persistence lowers adoption-inclusive aggregate elapsed time by 6.41% against the preserved cleanup candidate. Both are 0.18.1 builds; the baseline is the uncommitted cleanup build, not the older globally installed executable. The [checkpoint storage contract](checkpoint-storage.md) defines the schema, migration, lifecycle protection, compatibility, and retained recovery boundaries.
+2026-09-09. Per-file checkpoint persistence lowers adoption-inclusive aggregate elapsed time by 6.41% against the preserved cleanup candidate. Both are 0.18.1 builds; the baseline is the uncommitted cleanup build, not the older globally installed executable. The [checkpoint storage contract](../../docs/checkpoint-storage.md) defines the schema, migration, lifecycle protection, compatibility, and retained recovery boundaries.
 
 | Repeat | Variant | 260 appends + queries, including first use | Terminal index/SQLite maintenance + final query | Total charged wall time |
 |---|---|---:|---:|---:|
@@ -134,7 +134,7 @@ The exact benchmarked checkpoint-v1 candidate was subsequently installed globall
 
 ## Unchanged cleanup: 167.26 to 160.88 ms per update
 
-2026-09-09. Skipping trailing cleanup-directory synchronization when no removal was attempted lowers charged aggregate elapsed time by 3.81% against installed `231dee2` (0.18.1). Both variants use corrected blocking waits. All data-protection barriers remain governed by the [storage contract](index-storage.md#readers-and-collection).
+2026-09-09. Skipping trailing cleanup-directory synchronization when no removal was attempted lowers charged aggregate elapsed time by 3.81% against installed `231dee2` (0.18.1). Both variants use corrected blocking waits. All data-protection barriers remain governed by the [storage contract](../../docs/index-storage.md#readers-and-collection).
 
 | Repeat | Variant | 260 appends + queries | Terminal maintenance + final query | Total charged wall time |
 |---|---|---:|---:|---:|
@@ -206,7 +206,7 @@ Each repeat starts from the same complete shared-format seed: 740,555 live docum
 
 All 2,088 charged subprocess calls reconcile with launch/exit-observation timestamps and per-case native binaries/helpers. Each variant pays its own terminal compaction. All four endpoints have 745,755 live documents, the same three retained partitions, and one deletion-free 42,939-document remainder in four segments. Full stored-document fingerprint: `f735004bd1cee1b617d5acf5e81f6fd673006e4ae25cc613c3c1c6c9c61ccdf8`. Query identities, checkpoint progression, and paired state checks match. Five seed/endpoint fingerprints run after all timing; the owned source is restored afterward.
 
-Baseline production SHA-256: `2b0d5171b3c5badf20248ae390e4a26625506c6c271b76f7ceec0f6363b15532`. Candidate production SHA-256: `a1be4e54db342d730c331738c49294ad7149e6b2c69ef1ce1bafaeaa2cd04d2a`. The [storage contract](index-storage.md#macos-staging-durability) defines the retained recovery barriers. After measurement, this exact candidate was installed at `/Users/srnnkls/.cargo/bin/memex` as version 0.18.1; `installation.json` records the verified replacement and preserved previous executable. No live-index migration was run. Later sections describe historical installations.
+Baseline production SHA-256: `2b0d5171b3c5badf20248ae390e4a26625506c6c271b76f7ceec0f6363b15532`. Candidate production SHA-256: `a1be4e54db342d730c331738c49294ad7149e6b2c69ef1ce1bafaeaa2cd04d2a`. The [storage contract](../../docs/index-storage.md#macos-staging-durability) defines the retained recovery barriers. After measurement, this exact candidate was installed at `/Users/srnnkls/.cargo/bin/memex` as version 0.18.1; `installation.json` records the verified replacement and preserved previous executable. No live-index migration was run. Later sections describe historical installations.
 
 ### Paired trace and CPU explanation
 
@@ -270,7 +270,7 @@ Both variants start from the same shared-format seed: 740,555 live documents in 
 
 Per-variant native terminal helpers preserve the same three large segments and compact the remainder. All four endpoints match exactly: 745,755 live documents in four segments, unchanged retained partitions, and a deletion-free 42,939-document remainder. Full stored-document fingerprint: `0167bea1da08c3a97b9bd8d38c942916f6496f3045d5a1f643402772ac2bb9ad`. Five seed/endpoint fingerprints run only after every timed operation. Exact query records, checkpoint progression, and paired state hashes also match.
 
-The [storage durability contract](index-storage.md#macos-staging-durability) defines eligible layouts and publication ordering. Failure-injection tests verify ordering and retry; physical power-loss testing was not performed. The advisor's approximately 85 ms projection is not an observed result.
+The [storage durability contract](../../docs/index-storage.md#macos-staging-durability) defines eligible layouts and publication ordering. Failure-injection tests verify ordering and retry; physical power-loss testing was not performed. The advisor's approximately 85 ms projection is not an observed result.
 
 ### Paired traces and CPU flamegraphs
 
@@ -387,7 +387,7 @@ The observed reduction applies to this corpus, append size, and query cadence wi
 
 2026-09-09. The accepted `minlayer1` candidate reduces total charged production wall time from 85.25710 to 77.21606 seconds in repeat 0 and from 84.37620 to 78.29550 seconds in repeat 1: 9.43% and 7.21% lower. These totals include every append, following query, terminal maintenance, and final query. Across both repeats, 169.63329 seconds becomes 155.51156 seconds, an 8.32% reduction on this workload.
 
-The current source uses Tantivy's size-tiered automatic merging for incremental indexing, not the rejected manual 128-segment batch. The routing contract is in [refresh.md](refresh.md#cost-contracts). The accepted production build is now installed at `/Users/srnnkls/.cargo/bin/memex` (version 0.17.5, SHA-256 `86d4eb09784b40b603b087d0165aa4c5de02512d8368b9d704d2a626988cd32e`), with verification recorded in `/Users/srnnkls/Library/Caches/memex-tiered-aggregate-20260909/installation.json`; installation did not migrate the live index.
+The current source uses Tantivy's size-tiered automatic merging for incremental indexing, not the rejected manual 128-segment batch. The routing contract is in [refresh.md](../../docs/refresh.md#cost-contracts). The accepted production build is now installed at `/Users/srnnkls/.cargo/bin/memex` (version 0.17.5, SHA-256 `86d4eb09784b40b603b087d0165aa4c5de02512d8368b9d704d2a626988cd32e`), with verification recorded in `/Users/srnnkls/Library/Caches/memex-tiered-aggregate-20260909/installation.json`; installation did not migrate the live index.
 
 ### Production accounting and common endpoint
 
@@ -607,7 +607,7 @@ The rejected continuous policy used a 128-segment threshold and a 256 MiB input 
 
 ## Implementation verification
 
-This historical verification concerns the rejected bounded policy, not the accepted incremental tiers. Ordinary CLI `index` then selected the existing bounded constructor; `index rebuild` / `reindex` kept the bulk constructor. The redundant CLI `continuous` flag was removed. Compaction thresholds and recovery ordering were unchanged in that comparison; the safety-limit error named `memex index rebuild`. The current canonical routing contract is in [refresh.md](refresh.md#cost-contracts).
+This historical verification concerns the rejected bounded policy, not the accepted incremental tiers. Ordinary CLI `index` then selected the existing bounded constructor; `index rebuild` / `reindex` kept the bulk constructor. The redundant CLI `continuous` flag was removed. Compaction thresholds and recovery ordering were unchanged in that comparison; the safety-limit error named `memex index rebuild`. The current canonical routing contract is in [refresh.md](../../docs/refresh.md#cost-contracts).
 
 This comparison uses the shared-storage build on both sides, differing in CLI routing. Both run the same explicit-index command against copies of the candidate's frozen pre-merge fixture and consume the same 3,640-byte append. No provider checkpoints are cleared in this comparison. All thirty calls retrieved the twenty new records and retained 741,395 live documents. Every candidate call retained all twelve original segment IDs and added one; baseline calls merged down to six.
 

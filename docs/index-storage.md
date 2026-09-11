@@ -52,4 +52,4 @@ Old flat and full-directory indexes remain readable. Their committed files are a
 
 Older binaries cannot read the shared-reference layout. Upgrade every process using an index before migrating it. Do not roll back to an older binary against a migrated index; restore a pre-migration snapshot or rebuild using the older version.
 
-See [shared-segment measurements](shared-segments-benchmark.md) for migration-excluded latency and paired trace/flamegraph results.
+See [shared-segment measurements](../benches/reports/shared-segments-benchmark.md) for migration-excluded latency and paired trace/flamegraph results.
