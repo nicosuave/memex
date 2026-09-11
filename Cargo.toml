@@ -64,4 +64,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+
+[[bench]]
+name = "index"
+harness = false
