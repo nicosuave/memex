@@ -322,7 +322,14 @@ fn index_db_file(
                     continue;
                 };
                 let (action, summary) = tool_action_summary(&args);
-                let text = summary.clone().or(action).unwrap_or_else(|| args.clone());
+                // Arguments are stored but not indexed, so a summary-only `text` would put
+                // them out of reach of search. Lead with the summary for display and carry
+                // the arguments after it.
+                let text = match summary.clone().or(action) {
+                    Some(label) if label == args => label,
+                    Some(label) => format!("{label}\n{args}"),
+                    None => args.clone(),
+                };
                 let mut links = RecordLinks::default();
                 if let Some(ref id) = message_id {
                     links.event_id = Some(id.clone());
