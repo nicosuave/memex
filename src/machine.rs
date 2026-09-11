@@ -2781,6 +2781,14 @@ fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
 
 fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<IngestReport> {
     crate::profiling::span!("index.local");
+    let options = local_ingest_options(config, stale_only)?;
+    // The journal stream must be registered before this process writes anything: a write in
+    // the milliseconds before registration makes fseventsd hold the replay for ~160 ms.
+    let journal = stale_only.then(|| {
+        let journal = crate::ingest::discovery::start_journal_replay(paths, &options);
+        journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);
+        journal
+    });
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
     let index = if stale_only {
@@ -2791,7 +2799,29 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
     } else {
         SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
     };
-    let options = IngestOptions {
+    if stale_only {
+        Ok(ingest_if_stale(
+            paths,
+            &index,
+            &options,
+            config.scan_cache_ttl(),
+            &lease,
+            journal,
+        )?
+        .unwrap_or(IngestReport {
+            records_added: 0,
+            records_embedded: 0,
+            files_scanned: 0,
+            files_skipped: 0,
+            diagnostics: Default::default(),
+        }))
+    } else {
+        ingest_all(paths, &index, &options, &lease)
+    }
+}
+
+fn local_ingest_options(config: &UserConfig, stale_only: bool) -> Result<IngestOptions> {
+    Ok(IngestOptions {
         claude_sources: default_claude_sources(),
         include_agents: false,
         include_reasoning: config.include_reasoning_default(),
@@ -2813,22 +2843,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
         defer_merges: stale_only,
-    };
-    if stale_only {
-        Ok(
-            ingest_if_stale(paths, &index, &options, config.scan_cache_ttl(), &lease)?.unwrap_or(
-                IngestReport {
-                    records_added: 0,
-                    records_embedded: 0,
-                    files_scanned: 0,
-                    files_skipped: 0,
-                    diagnostics: Default::default(),
-                },
-            ),
-        )
-    } else {
-        ingest_all(paths, &index, &options, &lease)
-    }
+    })
 }
 
 fn records_for_session(

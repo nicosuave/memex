@@ -179,6 +179,15 @@ impl ScanCache {
         now.saturating_sub(self.last_scan_ts) < ttl_seconds
     }
 
+    /// Re-arm freshness after a refresh that covered the interval but counted only part of
+    /// the corpus, so the last full scan's totals stand.
+    pub fn touch(&mut self) {
+        self.last_scan_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+
     /// Update cache with current scan results
     pub fn update(&mut self, file_count: usize, total_bytes: u64) {
         self.last_scan_ts = SystemTime::now()

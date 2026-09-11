@@ -60,6 +60,8 @@ pub(crate) struct CheckpointDelta {
     pub opencode_databases: Option<HashMap<String, OpencodeDatabaseState>>,
     pub pending: PendingChange,
     pub scan_cache: Option<ScanCache>,
+    pub directory_stamps: Option<crate::ingest::directories::DirectoryStampUpdate>,
+    pub journal_cursor: Option<crate::ingest::journal::JournalCursorUpdate>,
 }
 
 pub(crate) struct CheckpointReader {
@@ -240,6 +242,70 @@ impl CheckpointReader {
         }
     }
 
+    pub(crate) fn load_directory_stamps(
+        &self,
+        fingerprint: &str,
+    ) -> Result<HashMap<PathBuf, crate::ingest::directories::DirectoryStamp>> {
+        crate::profiling::span!("state.checkpoint.load_directories");
+        let Backend::Sqlite { connection, .. } = &self.backend else {
+            return Ok(HashMap::new());
+        };
+        let present: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='directories')",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            return Ok(HashMap::new());
+        }
+        let mut statement = connection.prepare_cached(
+            "SELECT path, device, inode, mtime_secs, mtime_nanos, ctime_secs, ctime_nanos FROM directories WHERE fingerprint=?1",
+        )?;
+        let rows = statement.query_map([fingerprint], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                crate::ingest::directories::DirectoryStamp {
+                    device: row.get::<_, i64>(1)? as u64,
+                    inode: row.get::<_, i64>(2)? as u64,
+                    mtime_secs: row.get(3)?,
+                    mtime_nanos: row.get(4)?,
+                    ctime_secs: row.get(5)?,
+                    ctime_nanos: row.get(6)?,
+                },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .context("read directory stamps")
+    }
+
+    pub(crate) fn load_journal_cursor(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<crate::ingest::journal::JournalCursor>> {
+        let Backend::Sqlite { connection, .. } = &self.backend else {
+            return Ok(None);
+        };
+        let present: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal')",
+            [],
+            |row| row.get(0),
+        )?;
+        if present == 0 {
+            return Ok(None);
+        }
+        let mut statement = connection
+            .prepare_cached("SELECT device_uuid, event_id FROM journal WHERE fingerprint=?1")?;
+        statement
+            .query_row([fingerprint], |row| {
+                Ok(crate::ingest::journal::JournalCursor {
+                    device_uuid: row.get(0)?,
+                    event_id: row.get::<_, i64>(1)? as u64,
+                })
+            })
+            .optional()
+            .context("read journal cursor")
+    }
+
     pub(crate) fn file_keys(&self) -> Result<Vec<String>> {
         crate::profiling::count!("state.checkpoint.key_scans", 1);
         match &self.backend {
@@ -399,6 +465,11 @@ impl CheckpointWriter {
             && delta.opencode_databases.is_none()
             && matches!(delta.pending, PendingChange::Keep)
             && delta.scan_cache.is_none()
+            && delta
+                .directory_stamps
+                .as_ref()
+                .is_none_or(|stamps| stamps.upserts.is_empty() && stamps.deletes.is_empty())
+            && delta.journal_cursor.is_none()
         {
             return Ok(false);
         }
@@ -446,6 +517,46 @@ impl CheckpointWriter {
             )?;
         }
         replace_pending(&transaction, &delta.pending)?;
+        if let Some(stamps) = &delta.directory_stamps {
+            transaction.execute(
+                "DELETE FROM directories WHERE fingerprint<>?1",
+                [&stamps.fingerprint],
+            )?;
+            let mut delete = transaction.prepare_cached("DELETE FROM directories WHERE path=?1")?;
+            for path in &stamps.deletes {
+                delete.execute([path.to_string_lossy().as_ref()])?;
+            }
+            let mut upsert = transaction.prepare_cached(
+                "INSERT INTO directories(path,fingerprint,device,inode,mtime_secs,mtime_nanos,ctime_secs,ctime_nanos) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(path) DO UPDATE SET fingerprint=excluded.fingerprint, device=excluded.device, inode=excluded.inode, mtime_secs=excluded.mtime_secs, mtime_nanos=excluded.mtime_nanos, ctime_secs=excluded.ctime_secs, ctime_nanos=excluded.ctime_nanos",
+            )?;
+            for (path, stamp) in &stamps.upserts {
+                upsert.execute(params![
+                    path.to_string_lossy().as_ref(),
+                    stamps.fingerprint,
+                    stamp.device as i64,
+                    stamp.inode as i64,
+                    stamp.mtime_secs,
+                    stamp.mtime_nanos,
+                    stamp.ctime_secs,
+                    stamp.ctime_nanos,
+                ])?;
+            }
+            crate::profiling::count!(
+                "state.checkpoint.directories_upserted",
+                stamps.upserts.len()
+            );
+        }
+        if let Some(journal) = &delta.journal_cursor {
+            transaction.execute("DELETE FROM journal", [])?;
+            transaction.execute(
+                "INSERT INTO journal(fingerprint,device_uuid,event_id) VALUES(?1,?2,?3)",
+                params![
+                    journal.fingerprint,
+                    journal.cursor.device_uuid,
+                    journal.cursor.event_id as i64
+                ],
+            )?;
+        }
         if let Some(cache) = &delta.scan_cache {
             let old: Option<String> = transaction.query_row(
                 "SELECT CASE WHEN length(CAST(scancache_json AS BLOB)) <= ?1 THEN scancache_json END FROM metadata WHERE singleton=1",

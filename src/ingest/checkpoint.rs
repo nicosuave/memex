@@ -1,6 +1,7 @@
 use super::*;
 use crate::state::OpencodeDatabaseState;
 use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter, PendingChange};
+use std::path::PathBuf;
 
 pub(super) struct CheckpointSession {
     writer: CheckpointWriter,
@@ -12,6 +13,8 @@ pub(super) struct CheckpointSession {
     pub opencode_databases: HashMap<String, OpencodeDatabaseState>,
     pub pending: Option<PendingIngest>,
     pub scan_cache: ScanCache,
+    pub directory_stamps: Option<super::directories::DirectoryStampUpdate>,
+    pub journal_cursor: Option<super::journal::JournalCursorUpdate>,
 }
 
 impl CheckpointSession {
@@ -36,7 +39,32 @@ impl CheckpointSession {
             opencode_databases: header.opencode_databases,
             pending: header.pending,
             scan_cache: header.scan_cache,
+            directory_stamps: None,
+            journal_cursor: None,
         })
+    }
+
+    /// Paths tracked by the last committed checkpoint, ignoring this session's pending changes.
+    pub fn persisted_file_keys(&self) -> Result<Vec<String>> {
+        self.writer.reader().file_keys()
+    }
+
+    pub fn clears_files(&self) -> bool {
+        self.delta.clear_files
+    }
+
+    pub fn load_directory_stamps(
+        &self,
+        fingerprint: &str,
+    ) -> Result<HashMap<PathBuf, super::directories::DirectoryStamp>> {
+        self.writer.reader().load_directory_stamps(fingerprint)
+    }
+
+    /// Paths the refresh must stat whatever the event stream said, at or after `since`
+    /// (Unix seconds): the watch daemon's sweep candidates, resolved the same way.
+    pub fn sweep_candidate_keys(&self, since: i64) -> Result<Vec<String>> {
+        let (files, databases) = crate::watch::sweep_candidates(self.writer.reader(), since)?;
+        Ok(files.into_keys().chain(databases).collect())
     }
 
     pub fn preload(&mut self, paths: &[String]) -> Result<()> {
@@ -143,6 +171,8 @@ impl CheckpointSession {
         crate::profiling::span!("state.checkpoint.commit_final");
         self.delta.scan_cache = cache;
         self.delta.pending = pending;
+        self.delta.directory_stamps = self.directory_stamps.take();
+        self.delta.journal_cursor = self.journal_cursor.take();
         self.delta.next_doc_id =
             (self.next_doc_id != self.original_next_doc_id).then_some(self.next_doc_id);
         self.delta.opencode_databases = (self.opencode_databases

@@ -17,6 +17,7 @@ pub(super) fn discover_transcripts(
     state: &mut CheckpointSession,
     pool: &rayon::ThreadPool,
     selected: Option<&[crate::sources::SourceFile]>,
+    mut walk: Option<&mut directories::StampedWalk>,
 ) -> Result<TranscriptDiscovery> {
     let full_scan = selected.is_none();
     let mut files = selected.unwrap_or_default().to_vec();
@@ -25,11 +26,14 @@ pub(super) fn discover_transcripts(
             files.extend(crate::sources::claude::discover(
                 root,
                 options.include_agents,
+                walk.as_deref_mut(),
             )?);
         }
     }
     if options.include_codex && full_scan {
-        files.extend(crate::sources::codex::discover_rollouts());
+        files.extend(crate::sources::codex::discover_rollouts(
+            walk.as_deref_mut(),
+        ));
         files.extend(
             crate::sources::codex::history_paths()
                 .into_iter()
@@ -43,10 +47,10 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::cursor::discover_transcripts());
     }
     if options.include_pi && full_scan {
-        files.extend(crate::sources::pi::discover());
+        files.extend(crate::sources::pi::discover(walk.as_deref_mut()));
     }
     if options.include_omp && full_scan {
-        files.extend(crate::sources::omp::discover());
+        files.extend(crate::sources::omp::discover(walk.as_deref_mut()));
     }
     if options.include_openclaw && full_scan {
         files.extend(crate::sources::openclaw::discover());
@@ -61,7 +65,7 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::jcode::discover());
     }
     if options.include_muse && full_scan {
-        files.extend(crate::sources::muse::discover());
+        files.extend(crate::sources::muse::discover(walk));
     }
     if options.include_antigravity && full_scan {
         files.extend(crate::sources::antigravity::discover());
@@ -166,6 +170,121 @@ pub(super) fn discover_transcripts(
         }
     }
     Ok(result)
+}
+
+/// Directory stamps are only reusable while the roots and filters that produced them hold.
+fn discovery_fingerprint(options: &IngestOptions) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memex-directory-stamps-v2");
+    let mut feed = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    for root in &options.claude_sources {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    for root in crate::sources::codex::rollout_roots() {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    feed(
+        crate::sources::pi::sessions_root()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    for root in crate::sources::omp::session_roots() {
+        feed(root.as_os_str().as_encoded_bytes());
+    }
+    feed(
+        crate::sources::muse::sessions_root()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    for flag in [
+        options.include_agents,
+        options.include_codex,
+        options.include_pi,
+        options.include_omp,
+        options.include_muse,
+    ] {
+        feed(&[u8::from(flag)]);
+    }
+    for pattern in &options.exclude_patterns {
+        feed(pattern.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// Start replaying the file-system event journal from the cursor persisted by the last
+/// committed refresh, on its own thread, before the checkpoint is opened.
+pub(crate) fn start_journal_replay(
+    paths: &Paths,
+    options: &IngestOptions,
+) -> journal::ReplayHandle {
+    let roots = crate::watch::watch_roots(options)
+        .into_iter()
+        .filter(|root| root.exists())
+        .collect::<Vec<_>>();
+    let fingerprint = journal_fingerprint(options, &roots);
+    let state_path = paths.state.join("ingest.json");
+    journal::ReplayHandle::spawn(roots, fingerprint, move |fingerprint| {
+        CheckpointReader::open(&state_path)
+            .and_then(|reader| reader.load_journal_cursor(fingerprint))
+            .ok()
+            .flatten()
+    })
+}
+
+/// Collect the replay. Returns the cursor to persist with this refresh and, when the journal
+/// was complete within budget, the paths that may have changed. `None` hints mean the caller
+/// must walk.
+fn journal_hints(
+    journal: journal::ReplayHandle,
+    state: &CheckpointSession,
+) -> Result<(
+    Option<journal::JournalCursorUpdate>,
+    Option<HashSet<PathBuf>>,
+)> {
+    let (fingerprint, replay) = journal.wait(journal::REPLAY_BUDGET);
+    let cursor = replay.next.map(|cursor| journal::JournalCursorUpdate {
+        fingerprint,
+        cursor,
+    });
+    let hints = match replay.outcome {
+        journal::Replay::Changed(mut paths) => {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(crate::watch::HOT_WINDOW.as_secs()) as i64;
+            paths.extend(
+                state
+                    .sweep_candidate_keys(since)?
+                    .into_iter()
+                    .map(PathBuf::from),
+            );
+            crate::profiling::count!("journal.hints", paths.len());
+            Some(paths)
+        }
+        journal::Replay::Unusable(_) => {
+            crate::profiling::count!("journal.fallbacks", 1);
+            None
+        }
+    };
+    Ok((cursor, hints))
+}
+
+/// A cursor is only meaningful for the roots that existed when it was captured: a root that
+/// appears later was never watched and needs a walk.
+fn journal_fingerprint(options: &IngestOptions, roots: &[PathBuf]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"memex-journal-v1");
+    hash.update(discovery_fingerprint(options).as_bytes());
+    for root in roots.iter().filter(|root| root.exists()) {
+        let bytes = root.as_os_str().as_encoded_bytes();
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    format!("{:x}", hash.finalize())
 }
 
 pub(super) fn modified_ns(metadata: &std::fs::Metadata) -> Option<i64> {
@@ -855,15 +974,28 @@ pub(super) struct PreparedRefresh {
     pub identities_changed: bool,
 }
 
+/// How a refresh limits discovery: to event hints from a watcher, to a journal replay started
+/// before the checkpoint was opened, or not at all.
+pub(super) enum Narrowing<'a> {
+    Dirty(&'a HashSet<PathBuf>),
+    Journal(journal::ReplayHandle),
+    None,
+}
+
 pub(super) fn prepare_refresh(
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
     pool: &rayon::ThreadPool,
     recovered: publication::RecoveredCheckpoint,
-    dirty: Option<&HashSet<PathBuf>>,
+    narrowing: Narrowing<'_>,
     mut scan_cache: Option<ScanCache>,
 ) -> Result<PreparedRefresh> {
+    let (dirty, journal) = match narrowing {
+        Narrowing::Dirty(dirty) => (Some(dirty), None),
+        Narrowing::Journal(journal) => (None, Some(journal)),
+        Narrowing::None => (None, None),
+    };
     let publication::RecoveredCheckpoint {
         mut state,
         pending_recovery,
@@ -883,7 +1015,42 @@ pub(super) fn prepare_refresh(
     } else {
         None
     };
+    let mut journal_cursor = state.journal_cursor.take();
+    let mut journal_narrowed = false;
+    let selected = match (selected, journal) {
+        (None, Some(journal))
+            if dirty.is_none()
+                && !recovering_pending_ingest
+                && !empty_index_rebuild
+                && state_path.exists()
+                && !state.clears_files() =>
+        {
+            let (cursor, hints) = journal_hints(journal, &state)?;
+            journal_cursor = cursor;
+            match hints {
+                Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
+                    selection::DirtySelection::Paths { files, databases } => {
+                        crate::profiling::count!("journal.narrowed_refreshes", 1);
+                        journal_narrowed = true;
+                        Some((files, databases))
+                    }
+                    selection::DirtySelection::Resync => None,
+                },
+                None => None,
+            }
+        }
+        (selected, Some(journal)) => {
+            // The hints cannot be used here, but the cursor was captured before anything was
+            // read, so it still describes what this refresh is about to cover. Dropping it
+            // would make the next refresh replay an interval this scan already handled.
+            let (cursor, _) = journal_hints(journal, &state)?;
+            journal_cursor = cursor;
+            selected
+        }
+        (selected, None) => selected,
+    };
     let full_scan = selected.is_none();
+    state.journal_cursor = journal_cursor;
 
     // Index-time exclusion: matched transcripts never enter the index, and
     // records previously indexed from now-excluded paths are removed.
@@ -906,18 +1073,49 @@ pub(super) fn prepare_refresh(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
-    if !full_scan {
+    // A dirty-set refresh sees only what it was handed; the others cover the whole interval
+    // and may re-arm the scan-cache TTL.
+    if !(full_scan || journal_narrowed) {
         scan_cache = None;
     } else if scan_cache.is_none() {
         scan_cache = Some(std::mem::take(&mut state.scan_cache));
     }
+    // Reuse reconstructs an unchanged directory from the rows the last successful refresh
+    // persisted. Session-level deletes (pending-intent recovery) and clears must not hide files
+    // that are still on disk, so they never feed the walk.
+    let mut walk = if full_scan {
+        let fingerprint = discovery_fingerprint(options);
+        let (previous, known) = if state.clears_files() {
+            (HashMap::new(), Vec::new())
+        } else {
+            (
+                state.load_directory_stamps(&fingerprint)?,
+                state.persisted_file_keys()?,
+            )
+        };
+        Some((
+            directories::StampedWalk::new(previous, known.into_iter().map(PathBuf::from)),
+            fingerprint,
+        ))
+    } else {
+        None
+    };
     let transcripts = discovery::discover_transcripts(
         options,
         &excluder,
         &mut state,
         pool,
         selected.as_ref().map(|(files, _)| files.as_slice()),
+        walk.as_mut().map(|(walk, _)| walk),
     )?;
+    if let Some((walk, fingerprint)) = walk {
+        crate::profiling::count!("discovery.directories_reused", walk.counters().reused);
+        crate::profiling::count!(
+            "discovery.directories_enumerated",
+            walk.counters().enumerated
+        );
+        state.directory_stamps = Some(walk.finish(fingerprint));
+    }
     tasks.extend(transcripts.tasks);
     unchanged_identities.extend(transcripts.unchanged_identities);
     files_scanned += transcripts.files_scanned;
@@ -945,7 +1143,7 @@ pub(super) fn prepare_refresh(
                 pending_recovery,
                 empty_index_rebuild,
             },
-            None,
+            Narrowing::None,
             scan_cache,
         );
     };

@@ -4,12 +4,14 @@ Ingest checkpoints bind source offsets, parser state, OpenCode ownership, the do
 
 ## Schema and access
 
-`state/checkpoints.sqlite` has two tables:
+`state/checkpoints.sqlite` has four tables:
 
 | Table | Columns |
 | --- | --- |
 | `metadata` | Singleton key `singleton=1`; `format_version=2`; opaque `store_id`; migration/bootstrap `origin`; canonical unsigned decimal TEXT `next_doc_id`; complete JSON object TEXT `opencode_databases` and `legacy_extras`; nullable JSON object TEXT `pending_json` and `scancache_json`. |
 | `files` | Exact, unnormalized TEXT primary key `path`; complete JSON TEXT `payload`; validated, generated, stored signed INTEGER `mtime`, indexed by `files_mtime`. |
+| `directories` | TEXT primary key `path`; TEXT `fingerprint` of the discovery roots, provider flags, and exclude patterns; INTEGER `device`, `inode`, `mtime_secs`, `mtime_nanos` of the directory when it was last enumerated. Rows under a different fingerprint are dropped on the next stamp write. |
+| `journal` | TEXT primary key `fingerprint` of the discovery fingerprint and existing watch roots; TEXT `device_uuid` of the volume; INTEGER `event_id`, the file-system event journal position captured by the last committed refresh. One row at a time; a write under a new fingerprint replaces it. |
 
 Unsigned payload values remain JSON integers, including `u64::MAX`. Only `mtime` is extracted into SQLite INTEGER. Private codecs preserve unknown top-level, file, identity, pending-tool-call, OpenCode database, pending-intent, and scan-cache fields. Pending scope extensions follow `(source_path, session_id)`, never array position. Updates replace known fields without restoring removed optional fields; deleting an entity deletes its extensions. Conflicting extensions for duplicate scope identities fail rather than silently discard data.
 

@@ -1135,7 +1135,7 @@ pub(super) fn execute_refresh(
         crate::profiling::count!("ingest.noop_returns", 1);
         index.publish_generation_if_uninitialized()?;
         state.opencode_databases = installed_opencode_states;
-        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes);
+        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes, full_scan);
         let pending = if recovering_pending_ingest {
             finalized_pending_ingest(&deferred_pending_scopes, state.next_doc_id)
         } else {
@@ -1370,7 +1370,7 @@ pub(super) fn execute_refresh(
         }
         state.opencode_databases = installed_opencode_states;
         state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
-        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes);
+        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes, full_scan);
         let pending = finalized_pending_ingest(&deferred_pending_scopes, state.next_doc_id);
         state.commit_final(cache, pending)?;
 

@@ -1146,14 +1146,6 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(IndexUpdate::Started);
             let result = (|| -> Result<Option<crate::ingest::IngestReport>> {
-                let lease = match IngestLease::try_acquire(&paths, "TUI auto-index")? {
-                    LeaseAttempt::Acquired(lease) => lease,
-                    LeaseAttempt::Busy(_) => return Ok(None),
-                };
-                let index = match SearchIndex::open_or_create(&paths.index) {
-                    Ok(index) if !index.is_writable() => index,
-                    _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
-                };
                 let embeddings_default = config.embeddings_default();
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
@@ -1180,7 +1172,24 @@ impl App {
                     tool_content_limits,
                     defer_merges: true,
                 };
-                ingest_if_stale(&paths, &index, &opts, config.scan_cache_ttl(), &lease)
+                let journal = crate::ingest::discovery::start_journal_replay(&paths, &opts);
+                journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);
+                let lease = match IngestLease::try_acquire(&paths, "TUI auto-index")? {
+                    LeaseAttempt::Acquired(lease) => lease,
+                    LeaseAttempt::Busy(_) => return Ok(None),
+                };
+                let index = match SearchIndex::open_or_create(&paths.index) {
+                    Ok(index) if !index.is_writable() => index,
+                    _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+                };
+                ingest_if_stale(
+                    &paths,
+                    &index,
+                    &opts,
+                    config.scan_cache_ttl(),
+                    &lease,
+                    Some(journal),
+                )
             })();
             match result {
                 Ok(Some(report)) => {

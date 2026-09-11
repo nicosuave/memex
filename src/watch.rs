@@ -378,6 +378,21 @@ fn enqueue_event(
 pub(crate) const HOT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// Files whose ingested mtime is older than this are not sweep candidates;
 /// events and periodic resync discover resumed cold sessions.
+/// Everything a refresh must stat regardless of what the event stream reported: transcripts the
+/// checkpoint saw modified since `cutoff`, and every tracked database. A writer can commit
+/// exclusively to the WAL for a whole session, leaving the main file's mtime cold, so databases
+/// are returned separately rather than stat-compared like ordinary transcripts.
+pub(crate) fn sweep_candidates(
+    reader: &CheckpointReader,
+    cutoff: i64,
+) -> Result<(HashMap<String, crate::state::FileState>, HashSet<String>)> {
+    let mut snapshot = reader.hot_files_since(cutoff)?;
+    let mut databases: HashSet<String> = reader.header()?.opencode_databases.into_keys().collect();
+    databases.extend(reader.sqlite_backed_paths()?);
+    snapshot.retain(|key, file| file.identity.sqlite_wal.is_none() && !databases.contains(key));
+    Ok((snapshot, databases))
+}
+
 pub(crate) const HOT_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 impl WatchService {
@@ -684,16 +699,7 @@ impl WatchService {
             .saturating_sub(window.as_secs()) as i64;
         let (snapshot, databases) = {
             let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
-            let mut snapshot = reader.hot_files_since(cutoff)?;
-            // A writer can commit exclusively to the WAL for a whole session, leaving the
-            // main file's mtime cold, so these are watched as databases rather than
-            // stat-compared like ordinary transcripts.
-            let mut databases: HashSet<String> =
-                reader.header()?.opencode_databases.into_keys().collect();
-            databases.extend(reader.sqlite_backed_paths()?);
-            snapshot
-                .retain(|key, file| file.identity.sqlite_wal.is_none() && !databases.contains(key));
-            (snapshot, databases)
+            sweep_candidates(&reader, cutoff)?
         };
         self.hot_databases
             .retain(|path, _| databases.contains(path.to_string_lossy().as_ref()));
@@ -1470,6 +1476,44 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn sweep_candidates_keep_cold_databases_and_drop_their_wal_backed_transcripts() {
+        use crate::state::checkpoint::CheckpointReader;
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let hot = temp.path().join("hot.jsonl");
+        std::fs::write(&hot, "{}\n").unwrap();
+        let key = hot.to_string_lossy().into_owned();
+        let mut backed = file_state_for(&hot);
+        backed.identity.sqlite_wal = Some(crate::state::SqliteWalIdentity {
+            exists: true,
+            size: 1,
+            modified_ns: None,
+        });
+        backed.mtime = 1_000_000;
+        let database = "/tmp/sessions/other.db".to_string();
+        write_ingest_state(
+            &paths.root,
+            HashMap::from([
+                (key.clone(), file_state_for(&hot)),
+                (database.clone(), backed),
+            ]),
+        );
+
+        let reader = CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (files, databases) = sweep_candidates(&reader, cutoff).unwrap();
+
+        // Cold by mtime, so only its WAL backing makes it a candidate.
+        assert!(databases.contains(&database));
+        assert!(!files.contains_key(&database));
     }
 
     #[test]

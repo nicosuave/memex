@@ -3208,6 +3208,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "fastembed",
+ "fsevent-sys",
  "getrandom 0.3.4",
  "gix",
  "globset",

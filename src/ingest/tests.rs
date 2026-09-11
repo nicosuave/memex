@@ -1,6 +1,6 @@
 use super::discovery::{
-    FILE_IDENTITY_PREFIX_BYTES, changed_ns, discovered_metadata, file_identity, modified_ns,
-    prepare_refresh, unchanged_file_metadata,
+    FILE_IDENTITY_PREFIX_BYTES, Narrowing, changed_ns, discovered_metadata, file_identity,
+    modified_ns, prepare_refresh, unchanged_file_metadata,
 };
 use super::execution::{
     RecordSender, build_parser_thread_pool, execute_refresh, finish_file_task, parse_claude_file,
@@ -233,7 +233,7 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     fs::write(&memory, "# Decisions\n\nRevised middle paragraph.\n").unwrap();
     assert!(can_skip_fresh_scan(&paths, &published, &options, 3600).unwrap());
     assert!(
-        ingest_if_stale(&paths, &published, &options, 3600, &lease)
+        ingest_if_stale(&paths, &published, &options, 3600, &lease, None)
             .unwrap()
             .is_none()
     );
@@ -245,7 +245,7 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     assert_eq!(published.doc_count().unwrap(), 1);
 
     fs::remove_file(memory).unwrap();
-    ingest_if_stale(&paths, &published, &options, 3600, &lease).unwrap();
+    ingest_if_stale(&paths, &published, &options, 3600, &lease, None).unwrap();
     assert!(store.load().unwrap().documents.is_empty());
 }
 
@@ -2847,7 +2847,7 @@ fn updating_scan_cache_replaces_malformed_cache() {
     let lease = ingest_lease(&paths);
     let mut state =
         CheckpointSession::open(&paths.state.join("ingest.json"), &lease, true, None).unwrap();
-    let cache = updated_scan_cache(Some(std::mem::take(&mut state.scan_cache)), 7, 42);
+    let cache = updated_scan_cache(Some(std::mem::take(&mut state.scan_cache)), 7, 42, true);
     state
         .commit_final(cache, PendingChange::Keep)
         .expect("update scan cache");
@@ -4652,7 +4652,16 @@ fn full_single_source_reads_and_writes_only_discovered_checkpoint() {
     let recovered = recover_checkpoint(&paths, &index, &lease, None).unwrap();
     assert!(recovered.state.loaded.is_empty());
     let pool = parser_thread_pool().unwrap();
-    let prepared = prepare_refresh(&paths, &index, &options, &pool, recovered, None, None).unwrap();
+    let prepared = prepare_refresh(
+        &paths,
+        &index,
+        &options,
+        &pool,
+        recovered,
+        Narrowing::None,
+        None,
+    )
+    .unwrap();
     assert_eq!(prepared.state.loaded.len(), 1);
     assert!(prepared.state.loaded.contains_key(&key));
     let report = execute_refresh(
@@ -4816,8 +4825,16 @@ fn early_intent_failure_cancels_publication_without_flushing_recovery_changes() 
     assert_eq!(recovered.state.next_doc_id, 100);
     assert!(!recovered.state.contains_file(&key).unwrap());
     let pool = parser_thread_pool().unwrap();
-    let mut prepared =
-        prepare_refresh(&paths, &index, &options, &pool, recovered, None, None).unwrap();
+    let mut prepared = prepare_refresh(
+        &paths,
+        &index,
+        &options,
+        &pool,
+        recovered,
+        Narrowing::None,
+        None,
+    )
+    .unwrap();
     prepared
         .state
         .upsert_file("unpublished".to_string(), before.files[&key].clone());
@@ -4919,4 +4936,110 @@ fn can_skip_fresh_scan(
 ) -> Result<bool> {
     let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
     super::can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("claude-projects");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let line =
+        |text: &str| format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{text}\"}}}}\n");
+    fs::write(project.join("first.jsonl"), line("alpha")).unwrap();
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Gemma);
+    options.claude_sources = vec![root.clone()];
+    let settle = || std::thread::sleep(Duration::from_millis(150));
+    let refresh = || {
+        let journal = discovery::start_journal_replay(&paths, &options);
+        journal.wait_until_streaming(journal::REPLAY_BUDGET);
+        let index = open_search_index(&paths);
+        ingest_selected(&paths, &index, &options, &lease, None, None, Some(journal)).unwrap()
+    };
+    let indexed = || {
+        let index = open_search_index(&paths);
+        let mut texts = Vec::new();
+        index
+            .for_each_record(|record| {
+                texts.push(record.text.clone());
+                Ok(())
+            })
+            .unwrap();
+        texts.sort();
+        texts
+    };
+
+    let first = refresh();
+    assert!(first.full_scan, "the first refresh has no cursor and walks");
+    assert_eq!(first.report.records_added, 1);
+    settle();
+
+    let mut appended = fs::OpenOptions::new()
+        .append(true)
+        .open(project.join("first.jsonl"))
+        .unwrap();
+    appended.write_all(line("beta").as_bytes()).unwrap();
+    drop(appended);
+    fs::write(project.join("second.jsonl"), line("gamma")).unwrap();
+    settle();
+    // fseventsd occasionally holds a replay past the budget, which legitimately falls back
+    // to a walk; a narrowed refresh must arrive within a few attempts.
+    let mut added = 0;
+    let mut narrowed = false;
+    for _ in 0..5 {
+        let refreshed = refresh();
+        added += refreshed.report.records_added;
+        narrowed = !refreshed.full_scan;
+        settle();
+        if narrowed {
+            break;
+        }
+    }
+    assert!(narrowed, "a journaled interval narrows the refresh");
+    assert_eq!(added, 2);
+    assert_eq!(indexed(), vec!["alpha", "beta", "gamma"]);
+
+    fs::rename(&project, root.join("renamed")).unwrap();
+    settle();
+    let fourth = refresh();
+    assert!(fourth.full_scan, "a renamed directory forces a walk");
+    assert_eq!(fourth.report.files_scanned, 2);
+    assert_eq!(fourth.report.records_added, 3);
+}
+
+#[test]
+fn full_scan_preserves_the_cursor_captured_before_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = open_search_index(&paths);
+    let options = ingest_options(false, ModelChoice::Gemma);
+    let mut recovered = recover_checkpoint(&paths, &index, &lease, None).unwrap();
+    let cursor = journal::JournalCursorUpdate {
+        fingerprint: "captured-before-fallback".into(),
+        cursor: journal::JournalCursor {
+            device_uuid: "test-volume".into(),
+            event_id: 42,
+        },
+    };
+    recovered.state.journal_cursor = Some(cursor.clone());
+    let prepared = prepare_refresh(
+        &paths,
+        &index,
+        &options,
+        &parser_thread_pool().unwrap(),
+        recovered,
+        Narrowing::None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(prepared.state.journal_cursor, Some(cursor));
 }

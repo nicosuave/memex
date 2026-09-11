@@ -57,8 +57,8 @@ fn configured_session_root(agent: &Path) -> Option<PathBuf> {
     })
 }
 
-pub fn discover() -> Vec<SourceFile> {
-    super::common::jsonl_files([sessions_root()])
+pub fn discover(walk: Option<&mut crate::ingest::directories::StampedWalk>) -> Vec<SourceFile> {
+    super::common::jsonl_files_with([sessions_root()], walk)
         .into_iter()
         .map(|path| SourceFile {
             source: SourceKind::Pi,
