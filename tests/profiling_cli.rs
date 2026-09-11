@@ -42,6 +42,130 @@ fn fixture() -> tempfile::TempDir {
     temp
 }
 
+fn run_index(home: &Path, root: &Path, rebuild: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .args(["--no-update-check", "--non-interactive", "index"]);
+    if rebuild {
+        command.arg("rebuild");
+    }
+    command
+        .args([
+            "--only-source",
+            "claude",
+            "--no-embeddings",
+            "--claude-path",
+        ])
+        .arg(home.join(".claude/projects"))
+        .arg("--root")
+        .arg(root)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn explicit_incremental_indexing_preserves_segments_until_bulk_rebuild() {
+    use memex::index::SearchIndex;
+    use std::collections::BTreeSet;
+    use std::io::Write;
+
+    let temp = fixture();
+    let root = temp.path().join("index");
+    let source = temp
+        .path()
+        .join(".claude/projects/private-project/private-session.jsonl");
+    let mut expected = BTreeSet::from(["privateneedle".to_owned()]);
+    {
+        let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        for seed in 1..128 {
+            let text = format!("privateneedle seed-{seed}");
+            let record = serde_json::json!({
+                "type": "user",
+                "uuid": format!("private-seed-{seed}"),
+                "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"role": "user", "content": text},
+            });
+            writeln!(file, "{record}").unwrap();
+            expected.insert(text);
+        }
+    }
+    let mut seed_segments = Vec::new();
+    let mut previous_segments = Vec::new();
+    let mut compacted_peers = false;
+    for append in 0..=10 {
+        if append > 0 {
+            let text = format!("privateneedle update-{append}");
+            let record = serde_json::json!({
+                "type": "user",
+                "uuid": format!("private-event-{append}"),
+                "timestamp": "2026-09-01T00:00:00Z",
+                "message": {"role": "user", "content": text},
+            });
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&source).unwrap(),
+                "{record}"
+            )
+            .unwrap();
+            expected.insert(text);
+        }
+        let output = run_index(temp.path(), &root, false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let index = SearchIndex::open_or_create(&root.join("index")).unwrap();
+        let segments = index.index.searchable_segment_ids().unwrap();
+        if append == 0 {
+            assert_eq!(segments.len(), 1);
+            seed_segments = segments.clone();
+        } else {
+            assert!(seed_segments.iter().all(|id| segments.contains(id)));
+            compacted_peers |= segments.len() < previous_segments.len() + 1
+                && previous_segments.iter().any(|id| !segments.contains(id));
+        }
+        assert_eq!(index.doc_count().unwrap(), expected.len());
+        assert_eq!(
+            index
+                .recent_records(expected.len())
+                .unwrap()
+                .into_iter()
+                .map(|record| record.text)
+                .collect::<BTreeSet<_>>(),
+            expected
+        );
+        previous_segments = segments;
+    }
+    assert!(compacted_peers, "tiny peer segments were never compacted");
+    let current = fs::read(root.join("index/CURRENT")).unwrap();
+    assert!(run_index(temp.path(), &root, false).status.success());
+    assert_eq!(fs::read(root.join("index/CURRENT")).unwrap(), current);
+
+    let output = run_index(temp.path(), &root, true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rebuilt = SearchIndex::open_or_create(&root.join("index")).unwrap();
+    let segments = rebuilt.index.searchable_segment_ids().unwrap();
+    assert_eq!(segments.len(), 1);
+    assert!(segments.iter().all(|id| !previous_segments.contains(id)));
+    assert_eq!(rebuilt.doc_count().unwrap(), expected.len());
+    assert_eq!(
+        rebuilt
+            .recent_records(expected.len())
+            .unwrap()
+            .into_iter()
+            .map(|record| record.text)
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+}
+
 #[cfg(not(feature = "profiling"))]
 #[test]
 fn default_build_ignores_trace_environment_entirely() {
