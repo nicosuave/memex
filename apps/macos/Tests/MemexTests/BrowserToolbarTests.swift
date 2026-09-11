@@ -8,6 +8,7 @@ struct BrowserToolbarTests {
     @Test func nativeRootKeepsToolbarAndFullHeightSidebarAcrossHostedUpdates() async throws {
         _ = NSApplication.shared
         let store = Store()
+        store.scope = .all
         let controller = BrowserColumnsController(store: store, sidebar: Text("Sidebar"),
             conversations: Text("Conversations"), reader: Text("Reader"))
         let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1380, height: 700),
@@ -216,7 +217,9 @@ struct BrowserToolbarTests {
         for _ in 0..<3 { split.addArrangedSubview(NSView()) }
         window.contentView = split
         split.adjustSubviews()
-        let controller = BrowserToolbarController(store: Store(), splitView: split)
+        let store = Store()
+        store.scope = .all
+        let controller = BrowserToolbarController(store: store, splitView: split)
         window.toolbar = controller.toolbar
         window.toolbarStyle = .unified
         window.titleVisibility = .hidden

@@ -1980,13 +1980,15 @@ impl SessionTitleLookup {
         explicit
             .as_deref()
             .and_then(nonempty_label)
-            .or_else(|| opening.and_then(nonempty_label))
-            .or_else(|| codex.and_then(|metadata| metadata.first_user_message.clone()))
+            // Forked agents inherit the parent's opening prompt. Their own task
+            // path is a better label when Codex has not assigned an explicit title.
             .or_else(|| {
                 codex
                     .and_then(|metadata| metadata.agent_path.as_deref())
                     .and_then(human_agent_title)
             })
+            .or_else(|| opening.and_then(nonempty_label))
+            .or_else(|| codex.and_then(|metadata| metadata.first_user_message.clone()))
             .or_else(|| {
                 (source == SourceKind::Codex)
                     .then(|| codex_assignment_title(source_path))
@@ -3106,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn title_precedence_preserves_requests_and_humanizes_only_agent_identifiers() {
+    fn title_precedence_prefers_agent_tasks_over_inherited_requests() {
         use crate::sources::codex::SessionTitleMetadata;
         let mut titles = SessionTitleLookup {
             codex: HashMap::from([(
@@ -3128,10 +3130,8 @@ mod tests {
         titles.codex.get_mut("s").unwrap().title = None;
         assert_eq!(
             resolve(&titles, Some("Opening prompt")).as_deref(),
-            Some("Opening prompt")
+            Some("Cache invalidation")
         );
-        assert_eq!(resolve(&titles, None).as_deref(), Some("Original request"));
-        titles.codex.get_mut("s").unwrap().first_user_message = None;
         assert_eq!(
             resolve(&titles, None).as_deref(),
             Some("Cache invalidation")
@@ -3140,6 +3140,14 @@ mod tests {
             titles.codex["s"].agent_path.as_deref(),
             Some("/root/cache_invalidation")
         );
+        titles.codex.get_mut("s").unwrap().agent_path = None;
+        assert_eq!(
+            resolve(&titles, Some("Opening prompt")).as_deref(),
+            Some("Opening prompt")
+        );
+        assert_eq!(resolve(&titles, None).as_deref(), Some("Original request"));
+        titles.codex.get_mut("s").unwrap().first_user_message = None;
+        assert_eq!(resolve(&titles, None), None);
         assert_eq!(
             human_agent_title("/root/research/cache_invalidation").as_deref(),
             Some("Research / cache invalidation")

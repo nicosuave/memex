@@ -204,6 +204,13 @@ pub struct UsageActivityPoint {
 /// points instead of deep-cloning full events out of the memoized assembly. The boolean is
 /// true when any scanner reported a warning, i.e. the totals may be partial.
 pub fn scan_usage_activity(query: &UsageQuery) -> Result<(Vec<UsageActivityPoint>, bool)> {
+    let (points, warnings) = scan_usage_activity_with_warnings(query)?;
+    Ok((points, !warnings.is_empty()))
+}
+
+pub(crate) fn scan_usage_activity_with_warnings(
+    query: &UsageQuery,
+) -> Result<(Vec<UsageActivityPoint>, Vec<String>)> {
     let _scan_guard = USAGE_SCAN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -215,7 +222,7 @@ pub fn scan_usage_activity(query: &UsageQuery) -> Result<(Vec<UsageActivityPoint
             total_tokens: event.tokens.total(),
         })
         .collect();
-    Ok((points, !warnings.is_empty()))
+    Ok((points, warnings.as_ref().clone()))
 }
 
 /// Assembled events are already sorted; filtering preserves that order.
@@ -632,7 +639,7 @@ static USAGE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 /// Parse-phase progress of the usage scan currently holding `USAGE_SCAN_LOCK`. Cache hits
 /// are not counted: progress is only published while files are being (re)parsed, which is
 /// the phase that can take minutes on a cold cache.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct UsageScanProgress {
     pub source: &'static str,
     pub done: usize,
@@ -647,10 +654,45 @@ pub fn usage_scan_progress() -> Option<UsageScanProgress> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Forward advancing cold-cache counters without imposing a total scan lifetime.
+/// Callers retain their own cancellation and inactivity watchdogs.
+pub(crate) fn with_usage_progress<T: Send>(
+    action: impl FnOnce() -> T + Send,
+    mut publish: impl FnMut(UsageScanProgress) -> Result<()>,
+) -> Result<T> {
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        scope.spawn(move || {
+            let _ = sender.send(action());
+        });
+        let mut previous = None;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(result) => return Ok(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("activity worker stopped without a result"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(progress) = usage_scan_progress()
+                        && Some(progress) != previous
+                    {
+                        publish(progress)?;
+                        previous = Some(progress);
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn publish_scan_progress(progress: Option<UsageScanProgress>) {
     *USAGE_SCAN_PROGRESS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = progress;
+}
+
+pub(crate) fn publish_remote_scan_progress(progress: UsageScanProgress) {
+    publish_scan_progress(Some(progress));
 }
 
 fn bump_scan_progress() {
@@ -1655,6 +1697,37 @@ fn claude_rates(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn activity_reports_progress_before_the_scan_completes() {
+        let _scan_guard = super::USAGE_SCAN_LOCK.lock().unwrap();
+        let (acknowledge, received) = std::sync::mpsc::channel();
+        let mut updates = Vec::new();
+        let value = super::with_usage_progress(
+            move || {
+                for done in [0, 1] {
+                    super::publish_scan_progress(Some(super::UsageScanProgress {
+                        source: "codex",
+                        done,
+                        total: 2,
+                    }));
+                    received
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                }
+                super::publish_scan_progress(None);
+                42
+            },
+            |progress| {
+                updates.push(progress.done);
+                acknowledge.send(()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(updates, vec![0, 1]);
+    }
+
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};

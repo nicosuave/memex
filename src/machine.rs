@@ -366,12 +366,18 @@ enum RpcOperation {
     SessionActivity {
         spec: SessionActivitySpec,
     },
+    HomeActivity {
+        request: crate::web::ActivityRequest,
+        now: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RpcRequest {
     protocol: u32,
     request: RpcOperation,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    usage_progress: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -437,6 +443,9 @@ enum RpcPayload {
     },
     SessionActivity {
         points: Vec<SessionActivityPointWire>,
+    },
+    HomeActivity {
+        activity: crate::web::RawActivityPayload,
     },
     Error {
         message: String,
@@ -1857,6 +1866,95 @@ pub(crate) fn remote_session_count(
     }
 }
 
+pub(crate) fn remote_activity(
+    config: &UserConfig,
+    id: &str,
+    request: crate::web::ActivityRequest,
+    now: u64,
+) -> Result<crate::web::RawActivityPayload> {
+    remote_activity_with(&request, now, |operation| {
+        metadata_rpc(config, id, operation, "activity")
+    })
+}
+
+fn remote_activity_with(
+    request: &crate::web::ActivityRequest,
+    now: u64,
+    mut call: impl FnMut(RpcOperation) -> Result<RpcPayload>,
+) -> Result<crate::web::RawActivityPayload> {
+    match call(RpcOperation::HomeActivity {
+        request: request.clone(),
+        now,
+    }) {
+        Ok(RpcPayload::HomeActivity { activity }) => return Ok(activity),
+        Err(error)
+            if error
+                .to_string()
+                .contains("unknown variant `home_activity`") => {}
+        Err(error) => return Err(error),
+        _ => bail!("unexpected activity response"),
+    }
+    if !request.query.is_empty() {
+        bail!("This machine needs a newer Memex build for activity filtered by search.");
+    }
+    let since_ms = request
+        .range
+        .map(|range| range.since_ms(now))
+        .unwrap_or_else(|| Some(now.saturating_sub(request.days as u64 * 86_400_000)));
+    let operation = match request.metric {
+        crate::web::ActivityMetric::Sessions => RpcOperation::SessionActivity {
+            spec: SessionActivitySpec {
+                source: request.source,
+                project: request.project.clone(),
+                project_grouping: ProjectGrouping::Flat,
+                since_ms,
+                until_ms: None,
+                kind: Some(request.origin),
+            },
+        },
+        crate::web::ActivityMetric::Tokens => RpcOperation::UsageActivity {
+            spec: UsageSpec {
+                source: request.source,
+                project: request.project.clone(),
+                project_grouping: ProjectGrouping::Flat,
+                session_keys: None,
+                machine_session_keys: None,
+                since_ms,
+                until_ms: None,
+                cost_mode: CostMode::Source,
+                include_events: false,
+                memo_ttl_ms: 60_000,
+                kind: Some(request.origin),
+            },
+        },
+    };
+    match call(operation)? {
+        RpcPayload::SessionActivity { points }
+            if matches!(request.metric, crate::web::ActivityMetric::Sessions) =>
+        {
+            Ok(crate::web::RawActivityPayload::from_remote_points(
+                points
+                    .into_iter()
+                    .map(|point| (point.timestamp_ms, point.source, 1)),
+                request,
+                false,
+            ))
+        }
+        RpcPayload::UsageActivity { points, partial }
+            if matches!(request.metric, crate::web::ActivityMetric::Tokens) =>
+        {
+            Ok(crate::web::RawActivityPayload::from_remote_points(
+                points
+                    .into_iter()
+                    .map(|point| (point.timestamp_ms, point.source, point.total_tokens)),
+                request,
+                partial,
+            ))
+        }
+        _ => bail!("unexpected legacy activity response"),
+    }
+}
+
 fn metadata_rpc(
     config: &UserConfig,
     id: &str,
@@ -1916,7 +2014,24 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
             ),
         }
     } else {
-        match handle_rpc(&paths, &config, request.request) {
+        let report_progress = request.usage_progress
+            && matches!(&request.request,
+            RpcOperation::HomeActivity { request, .. } if request.metric == crate::web::ActivityMetric::Tokens);
+        let action = || handle_rpc(&paths, &config, request.request);
+        let result = if report_progress {
+            crate::usage::with_usage_progress(action, |progress| {
+                writeln!(
+                    std::io::stderr(),
+                    "MEMEX_PROGRESS {}",
+                    serde_json::to_string(&progress)?
+                )?;
+                Ok(())
+            })
+            .and_then(|result| result)
+        } else {
+            action()
+        };
+        match result {
             Ok(response) => response,
             Err(err) => RpcPayload::Error {
                 message: err.to_string(),
@@ -2090,6 +2205,9 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }
         RpcOperation::SessionActivity { spec } => Ok(RpcPayload::SessionActivity {
             points: session_activity_local(paths, &spec)?,
+        }),
+        RpcOperation::HomeActivity { request, now } => Ok(RpcPayload::HomeActivity {
+            activity: crate::web::raw_activity_payload(paths, &request, now)?,
         }),
     }
 }
@@ -2688,9 +2806,12 @@ fn rpc(machine: &MachineConfig, operation: RpcOperation, timeout: Duration) -> R
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to start SSH for '{}'", machine.id))?;
+    let usage_progress = matches!(&operation,
+        RpcOperation::HomeActivity { request, .. } if request.metric == crate::web::ActivityMetric::Tokens);
     let request = serde_json::to_vec(&RpcRequest {
         protocol: RPC_PROTOCOL,
         request: operation,
+        usage_progress,
     })?;
     child
         .stdin
@@ -2698,45 +2819,13 @@ fn rpc(machine: &MachineConfig, operation: RpcOperation, timeout: Duration) -> R
         .ok_or_else(|| anyhow!("missing SSH stdin"))?
         .write_all(&request)?;
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("missing SSH stdout"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("missing SSH stderr"))?;
-    let stdout_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "SSH request to '{}' timed out after {}s",
-                machine.id,
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let stdout = stdout_thread
-        .join()
-        .map_err(|_| anyhow!("SSH stdout reader panicked"))??;
-    let stderr = stderr_thread
-        .join()
-        .map_err(|_| anyhow!("SSH stderr reader panicked"))??;
+    let (status, stdout, stderr) = wait_rpc_child(
+        &mut child,
+        &machine.id,
+        timeout,
+        usage_progress,
+        crate::usage::publish_remote_scan_progress,
+    )?;
     if !status.success() {
         let message = String::from_utf8_lossy(&stderr).trim().to_string();
         bail!(
@@ -2759,6 +2848,118 @@ fn rpc(machine: &MachineConfig, operation: RpcOperation, timeout: Duration) -> R
         );
     }
     Ok(response.response)
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcUsageProgress {
+    source: String,
+    done: usize,
+    total: usize,
+}
+
+fn wait_rpc_child(
+    child: &mut std::process::Child,
+    machine_id: &str,
+    timeout: Duration,
+    usage_progress: bool,
+    mut publish: impl FnMut(crate::usage::UsageScanProgress),
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing SSH stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing SSH stderr"))?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let (progress_sender, progress_receiver) = std::sync::mpsc::sync_channel(64);
+    let stderr_thread = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut line = Vec::new();
+        let mut discard_line = false;
+        let mut buffer = [0; 8192];
+        loop {
+            let count = stderr.read(&mut buffer)?;
+            if count == 0 {
+                return Ok(bytes);
+            }
+            if !usage_progress {
+                bytes.extend_from_slice(&buffer[..count]);
+                continue;
+            }
+            // Keep the final diagnostic even after a long stream of progress.
+            let excess = (bytes.len() + count).saturating_sub(65_536);
+            bytes.drain(..excess);
+            bytes.extend_from_slice(&buffer[..count]);
+            for &byte in &buffer[..count] {
+                if byte == b'\n' {
+                    if !discard_line
+                        && let Some(json) = line.strip_prefix(b"MEMEX_PROGRESS ")
+                        && let Ok(progress) = serde_json::from_slice::<RpcUsageProgress>(json)
+                    {
+                        let _ = progress_sender.try_send((Instant::now(), progress));
+                    }
+                    line.clear();
+                    discard_line = false;
+                } else if !discard_line {
+                    if line.len() == 65_536 {
+                        line.clear();
+                        discard_line = true;
+                    } else {
+                        line.push(byte);
+                    }
+                }
+            }
+        }
+    });
+
+    let mut deadline = Instant::now() + timeout;
+    let mut completed = HashMap::new();
+    let status = loop {
+        for (received_at, progress) in progress_receiver.try_iter() {
+            let Some(source) = crate::types::SourceKind::from_label(&progress.source) else {
+                continue;
+            };
+            if progress.total == 0 || progress.done == 0 || progress.done > progress.total {
+                continue;
+            }
+            let previous = completed.entry(source.label()).or_insert(0);
+            if progress.done <= *previous {
+                continue;
+            }
+            *previous = progress.done;
+            deadline = received_at + timeout;
+            publish(crate::usage::UsageScanProgress {
+                source: source.label(),
+                done: progress.done,
+                total: progress.total,
+            });
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "SSH request to '{}' timed out after {}s",
+                machine_id,
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow!("SSH stdout reader panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow!("SSH stderr reader panicked"))??;
+    Ok((status, stdout, stderr))
 }
 
 fn validate_machine(machine: &MachineConfig) -> Result<()> {
@@ -2842,6 +3043,278 @@ mod tests {
     use crate::types::{RecordLinks, SourceKind};
     use tempfile::TempDir;
 
+    fn activity_progress_child(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn activity_rpc_progress_extends_idle_deadline_and_preserves_output() {
+        let mut child = activity_progress_child(
+            r#"
+            for done in 1 2 3 4 5; do
+                printf 'MEMEX_PROGRESS {"source":"codex","done":%s,"total":5}\n' "$done" >&2
+                sleep 0.1
+            done
+            printf 'complete'
+            printf 'diagnostic\n' >&2
+        "#,
+        );
+        let started = Instant::now();
+        let mut updates = Vec::new();
+        let (status, output, stderr) = wait_rpc_child(
+            &mut child,
+            "fixture",
+            Duration::from_millis(250),
+            true,
+            |progress| updates.push(progress.done),
+        )
+        .unwrap();
+        assert!(status.success());
+        assert!(started.elapsed() > Duration::from_millis(250));
+        assert_eq!(output, b"complete");
+        assert!(String::from_utf8(stderr).unwrap().contains("diagnostic"));
+        assert_eq!(updates, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn activity_rpc_nonadvancing_or_unrequested_progress_times_out_and_reaps_child() {
+        for (progress, enabled) in [
+            (r#"{"source":"codex","done":0,"total":5}"#, true),
+            (r#"{"source":"codex","done":1,"total":5}"#, true),
+            (r#"{"source":"codex","done":4,"total":3}"#, true),
+            (r#"{"source":"codex","done":-1,"total":3}"#, true),
+            (r#"{"source":"codex","done":1,"total":0}"#, true),
+            (r#"{"source":"unknown","done":1,"total":3}"#, true),
+            ("invalid JSON", true),
+            (r#"{"source":"codex","done":2,"total":5}"#, false),
+        ] {
+            let script = format!(
+                "while :; do printf '%s\\n' 'MEMEX_PROGRESS {progress}' >&2; sleep 0.05; done"
+            );
+            let mut child = activity_progress_child(&script);
+            let started = Instant::now();
+            let result = wait_rpc_child(
+                &mut child,
+                "fixture",
+                Duration::from_millis(200),
+                enabled,
+                |_| {},
+            );
+            assert!(result.unwrap_err().to_string().contains("timed out"));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(child.try_wait().unwrap().is_some());
+        }
+        let mut child = activity_progress_child(
+            r#"
+            printf 'MEMEX_PROGRESS {"source":"codex","done":3,"total":5}\n' >&2
+            sleep 0.1
+            while :; do printf 'MEMEX_PROGRESS {"source":"codex","done":2,"total":5}\n' >&2; sleep 0.05; done
+        "#,
+        );
+        assert!(
+            wait_rpc_child(
+                &mut child,
+                "fixture",
+                Duration::from_millis(200),
+                true,
+                |_| {}
+            )
+            .is_err()
+        );
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn activity_rpc_progress_discards_overlong_lines_and_bounds_diagnostics() {
+        let mut child = activity_progress_child(
+            r#"
+            awk 'BEGIN { for (i=0; i<70000; i++) printf "x"; print "" }' >&2
+            printf 'MEMEX_PROGRESS {"source":"codex","done":1,"total":1}\n' >&2
+            sleep 0.1
+            printf 'complete'
+            printf 'final SSH failure detail\n' >&2
+        "#,
+        );
+        let mut updates = Vec::new();
+        let (_, output, stderr) = wait_rpc_child(
+            &mut child,
+            "fixture",
+            Duration::from_secs(2),
+            true,
+            |progress| updates.push(progress.done),
+        )
+        .unwrap();
+        assert_eq!(output, b"complete");
+        assert_eq!(stderr.len(), 65_536);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .ends_with("final SSH failure detail\n")
+        );
+        assert_eq!(updates, [1]);
+    }
+
+    #[test]
+    fn activity_rpc_progress_is_optional_for_existing_requests() {
+        let request: RpcRequest =
+            serde_json::from_value(serde_json::json!({"protocol": 1, "request": {"op": "ping"}}))
+                .unwrap();
+        assert!(!request.usage_progress);
+        assert!(
+            serde_json::to_value(request)
+                .unwrap()
+                .get("usage_progress")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_home_activity_preserves_every_nonquery_filter() {
+        use crate::web::{ActivityMetric, ActivityRequest, TimeRange};
+        let now = 200 * 86_400_000;
+        for metric in [ActivityMetric::Sessions, ActivityMetric::Tokens] {
+            for origin in [
+                SessionKindFilter::All,
+                SessionKindFilter::Regular,
+                SessionKindFilter::Primary,
+                SessionKindFilter::Subagent,
+            ] {
+                for range in [
+                    None,
+                    Some(TimeRange::Day),
+                    Some(TimeRange::Week),
+                    Some(TimeRange::Month),
+                    Some(TimeRange::All),
+                ] {
+                    for filtered in [false, true] {
+                        let request = ActivityRequest {
+                            metric,
+                            query: String::new(),
+                            source: filtered.then_some(SourceFilter::Codex),
+                            project: filtered.then(|| "memex".to_string()),
+                            days: 10,
+                            range,
+                            origin,
+                        };
+                        let mut calls = 0;
+                        let payload = remote_activity_with(&request, now, |operation| {
+                            calls += 1;
+                            match operation {
+                                RpcOperation::HomeActivity { .. } => {
+                                    Err(anyhow!("unknown variant `home_activity`"))
+                                }
+                                RpcOperation::SessionActivity { spec } => {
+                                    assert!(matches!(metric, ActivityMetric::Sessions));
+                                    assert_eq!(spec.source, request.source);
+                                    assert_eq!(spec.project, request.project);
+                                    assert_eq!(spec.kind, Some(origin));
+                                    assert_eq!(spec.project_grouping, ProjectGrouping::Flat);
+                                    assert_eq!(spec.until_ms, None);
+                                    assert_eq!(
+                                        spec.since_ms,
+                                        range
+                                            .map(|value| value.since_ms(now))
+                                            .unwrap_or(Some(now - 10 * 86_400_000))
+                                    );
+                                    Ok(RpcPayload::SessionActivity {
+                                        points: vec![SessionActivityPointWire {
+                                            machine: "peer".into(),
+                                            source: "codex".into(),
+                                            timestamp_ms: now,
+                                        }],
+                                    })
+                                }
+                                RpcOperation::UsageActivity { spec } => {
+                                    assert!(matches!(metric, ActivityMetric::Tokens));
+                                    assert_eq!(spec.source, request.source);
+                                    assert_eq!(spec.project, request.project);
+                                    assert_eq!(spec.kind, Some(origin));
+                                    assert_eq!(spec.project_grouping, ProjectGrouping::Flat);
+                                    assert_eq!(spec.until_ms, None);
+                                    assert_eq!(
+                                        spec.since_ms,
+                                        range
+                                            .map(|value| value.since_ms(now))
+                                            .unwrap_or(Some(now - 10 * 86_400_000))
+                                    );
+                                    assert!(spec.session_keys.is_none());
+                                    assert!(!spec.include_events);
+                                    Ok(RpcPayload::UsageActivity {
+                                        points: vec![UsageActivityPointWire {
+                                            machine: "peer".into(),
+                                            source: "codex".into(),
+                                            timestamp_ms: now,
+                                            total_tokens: 42,
+                                        }],
+                                        partial: true,
+                                    })
+                                }
+                                _ => panic!("unexpected legacy operation"),
+                            }
+                        })
+                        .unwrap();
+                        assert_eq!(calls, 2);
+                        let json = serde_json::to_value(payload).unwrap();
+                        assert_eq!(
+                            json["points"][0]["value"],
+                            if matches!(metric, ActivityMetric::Tokens) {
+                                42
+                            } else {
+                                1
+                            }
+                        );
+                        assert_eq!(json["partial"], matches!(metric, ActivityMetric::Tokens));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_home_activity_never_ignores_query_or_other_errors() {
+        use crate::web::{ActivityMetric, ActivityRequest, TimeRange};
+        for metric in [ActivityMetric::Sessions, ActivityMetric::Tokens] {
+            let mut request = ActivityRequest {
+                metric,
+                query: "exact search".into(),
+                source: None,
+                project: None,
+                days: 30,
+                range: Some(TimeRange::All),
+                origin: SessionKindFilter::All,
+            };
+            let mut calls = 0;
+            let error = remote_activity_with(&request, 100, |_| {
+                calls += 1;
+                Err(anyhow!("unknown variant `home_activity`"))
+            })
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(error.to_string().contains("activity filtered by search"));
+            request.query.clear();
+            for message in [
+                "connection timed out",
+                "invalid activity data",
+                "unknown variant `another_operation`",
+                "unsupported RPC protocol",
+            ] {
+                let mut calls = 0;
+                let error = remote_activity_with(&request, 100, |_| {
+                    calls += 1;
+                    Err(anyhow!(message.to_string()))
+                })
+                .unwrap_err();
+                assert_eq!(calls, 1);
+                assert_eq!(error.to_string(), message);
+            }
+        }
+    }
+
     fn machine(id: &str) -> MachineConfig {
         MachineConfig {
             id: id.to_string(),
@@ -2921,6 +3394,7 @@ mod tests {
         let request = serde_json::to_vec(&RpcRequest {
             protocol: RPC_PROTOCOL,
             request: operation,
+            usage_progress: false,
         })
         .unwrap();
         let request: RpcRequest = serde_json::from_slice(&request).unwrap();
@@ -3760,6 +4234,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn home_activity_rpc_round_trips_filtered_complete_history() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut writer = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for id in 1..=240 {
+            let mut row = test_record(id, &format!("session-{id}"), &format!("/{id}.jsonl"), 1);
+            row.source = SourceKind::Codex;
+            row.project = if id % 2 == 0 { "memex" } else { "other" }.into();
+            writer.record(&row).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        let response = rpc_handler_round_trip(
+            &paths,
+            &UserConfig::default(),
+            RpcOperation::HomeActivity {
+                request: crate::web::ActivityRequest {
+                    metric: crate::web::ActivityMetric::Sessions,
+                    query: String::new(),
+                    source: Some(SourceFilter::Codex),
+                    project: Some("memex".into()),
+                    days: 30,
+                    range: Some(crate::web::TimeRange::All),
+                    origin: SessionKindFilter::Regular,
+                },
+                now: 2_000_000_000_000,
+            },
+        );
+        let RpcPayload::HomeActivity { activity } = response else {
+            panic!("expected home activity");
+        };
+        let json = serde_json::to_value(activity).unwrap();
+        let total = json["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["value"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(total, 120);
+        assert_eq!(json["partial"], false);
     }
 
     #[test]

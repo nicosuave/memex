@@ -161,15 +161,23 @@ import Testing
         #expect(reader.selectedFindRange != nil)
     }
 
-    @Test func lifecycleLabelsRequireRecordedEvents() {
+    @Test func routineLifecycleRowsAreHiddenButInterruptionsAndRawEventsRemain() throws {
         var completed = record("complete", "lifecycle", "Turn completed").record
         completed.lifecycleEvent = "task_complete"
         var aborted = record("abort", "lifecycle", "Turn interrupted").record
         aborted.lifecycleEvent = "turn_aborted"
-        let reader = controller([TranscriptRecord(recordID: "complete", record: completed), TranscriptRecord(recordID: "abort", record: aborted)])
-        #expect(reader.measurement(at: 0).title == "Completed")
-        #expect(reader.measurement(at: 1).title == "Interrupted")
-        #expect(reader.measurement(at: 1).hasFailure)
+        let records = [TranscriptRecord(recordID: "complete", record: completed), TranscriptRecord(recordID: "abort", record: aborted)]
+        let reader = controller(records)
+        #expect(reader.rows.count == 1)
+        #expect(reader.measurement(at: 0).title == "Interrupted")
+        #expect(reader.measurement(at: 0).hasFailure)
+        let hit = try #require(ConversationMatcher.matches(records, query: "Turn completed").first)
+        reader.update(sessionID: "reader", records: records, provider: "codex", findQuery: "Turn completed", findHit: hit, findGeneration: 1)
+        #expect(reader.rows.count == 2)
+        #expect(reader.selectedFindRange != nil)
+        reader.update(sessionID: "reader", records: records, provider: "codex", rawTranscript: true)
+        #expect(reader.rows.count == 2)
+        #expect(reader.measurement(at: 0).body.contains("task_complete"))
     }
 
     @Test func returningToLongExpandedRawMessageRestoresDisplayStateAndOffset() {

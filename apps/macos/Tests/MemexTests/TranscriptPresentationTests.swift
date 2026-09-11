@@ -53,7 +53,7 @@ private func presentationRecord(_ id: String, _ role: String, _ text: String, tu
     #expect(items[0].records.map(\.id) == ["c", "tool"])
     #expect(!items[1].isCompletedWork)
     #expect(items[1].records[0].id == "f")
-    #expect(items.flatMap(\.records).map(\.id) == ["c", "tool", "f", "done"])
+    #expect(items.flatMap(\.records).map(\.id) == ["c", "tool", "f"])
     for incomplete in [[commentary, tool, final], [commentary, tool, completion],
                        [commentary, tool, final, presentationRecord("x", "lifecycle", "", turn: "other", lifecycle: "task_complete")],
                        [commentary, tool, final, completion, presentationRecord("a", "lifecycle", "", turn: "t", lifecycle: "turn_aborted")]] {
@@ -71,7 +71,19 @@ private func presentationRecord(_ id: String, _ role: String, _ text: String, tu
     #expect(items[0].isCompletedWork)
     #expect(!items[1].isCompletedWork)
     #expect(items[2].isCompletedWork)
-    #expect(items.flatMap(\.records).map(\.id) == records.map(\.id))
+    #expect(items.flatMap(\.records).map(\.id) == ["a", "u", "b", "f"])
+}
+
+@Test func routineTurnEventsAreHiddenWithoutHidingMessagesOrJoiningTurns() {
+    let records = [presentationRecord("a", "tool_use", "first turn"),
+                   presentationRecord("done", "lifecycle", "Turn completed", lifecycle: "task_complete"),
+                   presentationRecord("start", "lifecycle", "Turn started", lifecycle: "task_started"),
+                   presentationRecord("b", "tool_use", "second turn"),
+                   presentationRecord("user", "user", "Turn completed"),
+                   presentationRecord("abort", "lifecycle", "Turn interrupted", lifecycle: "turn_aborted")]
+    let items = TranscriptItem.group(records)
+    #expect(items.map { $0.records.map(\.id) } == [["a"], ["b"], ["user"], ["abort"]])
+    #expect(TranscriptPresentation.project(records) == records)
 }
 
 @Test func rawTranscriptRetainsUnknownFieldsAndOriginalMixedRecord() throws {

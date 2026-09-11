@@ -14,6 +14,8 @@ final class Store {
     private var projectGeneration = UUID()
     private var projectLoadScope = ""
     private var sessionMachineScope = ""
+    private var sessionBatchesCriteria: String?
+    private var sessionBatches: [String: [Session]] = [:]
     private var sortTask: Task<Void, Never>?
     private var projectSortWasSelected = false
     let projectCatalog: ProjectCatalog
@@ -25,7 +27,13 @@ final class Store {
     var selectedID: String?
     var records: [TranscriptRecord] = []
     var query = ""
-    var scope: Scope = .all
+    var homeProject: String?
+    var scope: Scope = .home {
+        didSet {
+            if scope == .home { selectedID = nil }
+            else if oldValue == .home && selectedID == nil { selectedID = sessions.first?.id }
+        }
+    }
     var filters = ConversationFilters.defaults {
         didSet {
             guard filters != oldValue else { return }
@@ -43,6 +51,13 @@ final class Store {
     private var filterReferenceDate = Date()
     private var activeSessionCriteria = ""
     var loadingSessions = false
+    var loadingHomeActivity = false
+    var homeActivityMetric = HomeActivityMetric.sessions
+    var homeActivityCache: HomeActivityCache?
+    var homeActivityGeneration = UUID()
+    private var refreshingHome = false
+    private var lastHomeRefresh = Date()
+    private var lastSessionsLoadedAt = Date()
     var loadingRecords = false
     var listError: String?
     var readerError: String?
@@ -69,6 +84,7 @@ final class Store {
     private var countResultKey: String?
     private var countValue: Int?
     private var countRefresh = 0
+    private var activityRefresh = 0
     private var listGeneration = UUID()
     private var readerGeneration = UUID()
     let client: MemexClient
@@ -82,9 +98,9 @@ final class Store {
     }
 
     enum Scope: Hashable {
-        case all, project(String)
+        case home, all, project(String)
         var title: String {
-            switch self { case .all: "All conversations"; case .project(let value): value }
+            switch self { case .home: "Home"; case .all: "All conversations"; case .project(let value): value }
         }
         var project: String? { if case .project(let value) = self { value } else { nil } }
     }
@@ -97,9 +113,12 @@ final class Store {
         }
     }
     var machineRequestID: String { "\(machineSelection)|\(selectedMachineIDs.joined(separator: "|"))" }
-    private var sessionCriteriaID: String { "\(machineRequestID)|\(scope)|\(filters)|\(query)" }
+    var selectedProject: String? { scope == .home ? homeProject : scope.project }
+    private var sessionCriteriaID: String { "\(machineRequestID)|\(selectedProject ?? "")|\(filters)|\(query)" }
     var requestID: String { "\(sessionCriteriaID)|\(sessionLimit)" }
     var sessionCountRequestID: String { "\(sessionCriteriaID)|\(countRefresh)" }
+    var homeActivityCriteriaID: String { sessionCriteriaID }
+    var homeActivityRequestID: String { "\(sessionCriteriaID)|\(activityRefresh)" }
     var sessionTotal: Int? {
         guard countResultKey == sessionCountRequestID, let countValue,
               countValue >= sessions.count else { return nil }
@@ -122,6 +141,11 @@ final class Store {
         [selectedID ?? "", query.nilIfBlank ?? "", readerAnchorID ?? ""].map { "\($0.utf8.count):\($0)" }.joined()
     }
     var readerRequestID: String { readerPositionKey }
+
+    func openConversation(_ session: Session) {
+        if scope == .home { scope = homeProject.map(Scope.project) ?? .all }
+        selectedID = session.id
+    }
 
     func loadMachines() async {
         guard !loadingMachines else { return }
@@ -188,15 +212,27 @@ final class Store {
         projectsError = snapshot.cacheWarning
     }
 
-    func refresh() async {
+    func refresh(refreshActivity: Bool = true) async {
         filterReferenceDate = Date()
         countRefresh += 1
+        if refreshActivity { activityRefresh += 1 }
         async let sessions: Void = loadSessions()
         async let projects: Void = loadProjects()
         async let machines: Void = loadMachines()
         async let count: Void = loadSessionCount()
         _ = await (sessions, projects, machines, count)
         await loadSelectedSessionMetadata()
+    }
+
+    func refreshHomeIfStale(isVisible: Bool, now: Date = Date()) async {
+        guard isVisible, scope == .home, !refreshingHome,
+              !loadingSessions, !loadingProjects, !loadingMachines,
+              now.timeIntervalSince(lastHomeRefresh) >= 60,
+              now.timeIntervalSince(lastSessionsLoadedAt) >= 60 else { return }
+        refreshingHome = true
+        lastHomeRefresh = now
+        defer { refreshingHome = false }
+        await refresh(refreshActivity: !loadingHomeActivity)
     }
 
     func loadMoreSessionsIfNeeded(visibleID: String) {
@@ -230,7 +266,7 @@ final class Store {
         }
         let ids = selectedMachineIDs
         let query = query.nilIfBlank
-        let project = scope.project
+        let project = selectedProject
         let source = filters.provider.argument
         let since = filters.timeframe.since(relativeTo: filterReferenceDate)
         let origin = filters.origin
@@ -262,6 +298,11 @@ final class Store {
     func loadSessions() async {
         prepareSessionCriteria()
         let criteria = sessionCriteriaID
+        if sessionBatchesCriteria != criteria {
+            sessionBatchesCriteria = criteria
+            sessionBatches = [:]
+        }
+        let previousBatches = sessionBatches
         let generation = UUID()
         listGeneration = generation
         loadingSessions = true
@@ -270,10 +311,15 @@ final class Store {
             sessionMachineScope = machineRequestID
             sessions = []; catalog = []; selectedID = nil
         }
-        defer { if listGeneration == generation { loadingSessions = false } }
+        defer {
+            if listGeneration == generation {
+                loadingSessions = false
+                if !Task.isCancelled { lastSessionsLoadedAt = Date() }
+            }
+        }
         let ids = selectedMachineIDs
         let query = query.nilIfBlank
-        let project = scope.project
+        let project = selectedProject
         let source = filters.provider.argument
         let origin = filters.origin
         let since = filters.timeframe.since(relativeTo: filterReferenceDate)
@@ -290,21 +336,31 @@ final class Store {
                         project: project, source: source, since: since, origin: origin, limit: limit, known: known)
                 }
             }
-            var batches: [String: [Session]] = [:]
+            // Keep each peer's previous page until its replacement arrives.
+            // Otherwise a fast peer temporarily removes the rows being scrolled
+            // on a slower peer, losing the native list's visible-row anchor.
+            var batches = previousBatches
             var errors: [String: String] = [:]
             for await batch in group {
                 guard listGeneration == generation, sessionCriteriaID == criteria, !Task.isCancelled else { group.cancelAll(); return }
                 if let error = batch.error { errors[batch.machine] = "\(batch.machine): \(error)" }
                 else { batches[batch.machine] = batch.rows }
+                sessionBatches = batches
                 let rows = await mergeMachineSessions(batches: ids.compactMap { batches[$0] }, limit: limit, ranked: query != nil)
                 guard listGeneration == generation, sessionCriteriaID == criteria, !Task.isCancelled else { group.cancelAll(); return }
                 if query != nil {
                     let metadata = Dictionary(catalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                     sessions = rows.map { row in metadata[row.id].map { row.applyingMetadata($0) } ?? row }
                 } else { sessions = rows }
-                if scope == .all && query == nil && !filters.isActive { catalog = rows }
+                if query == nil {
+                    // Search results need metadata from every previously browsed
+                    // filter, including subagents explicitly shown by the user.
+                    let refreshedIDs = Set(rows.map(\.id))
+                    catalog.removeAll { refreshedIDs.contains($0.id) }
+                    catalog.append(contentsOf: rows)
+                }
                 hasMoreSessions = rows.count >= limit
-                if !rows.contains(where: { $0.id == selectedID }) { selectedID = rows.first?.id }
+                if scope != .home && !rows.contains(where: { $0.id == selectedID }) { selectedID = rows.first?.id }
                 listError = errors.keys.sorted().compactMap { errors[$0] }.joined(separator: "\n").nilIfBlank
             }
         }

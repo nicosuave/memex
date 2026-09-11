@@ -21,7 +21,7 @@ struct NativeConversationList: NSViewControllerRepresentable {
         let title: String
         let preview: String
         let date: String
-        let machine: String?
+        let metadata: String?
         init(_ session: Session) {
             self.session = session
             id = session.id
@@ -29,7 +29,9 @@ struct NativeConversationList: NSViewControllerRepresentable {
             title = session.title
             preview = session.snippet?.nilIfBlank ?? session.source
             date = session.date?.formatted(.dateTime.month(.abbreviated).day()) ?? ""
-            machine = session.machineID == "local" ? nil : session.machineID
+            metadata = [session.machineID == "local" ? nil : "▣ \(session.machineID)",
+                        session.isSubagent ? "Subagent" : nil]
+                .compactMap { $0 }.joined(separator: " · ").nilIfBlank
         }
     }
 
@@ -109,7 +111,7 @@ struct NativeConversationList: NSViewControllerRepresentable {
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { rows[row].machine == nil ? 68 : 84 }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { rows[row].metadata == nil ? 68 : 84 }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let identifier = NSUserInterfaceItemIdentifier("conversation-cell")
         let cell = tableView.makeView(withIdentifier: identifier, owner: self) as? ConversationCell ?? ConversationCell()
@@ -135,11 +137,11 @@ struct NativeConversationList: NSViewControllerRepresentable {
     private let date = NSTextField(labelWithString: "")
     private let title = NSTextField(wrappingLabelWithString: "")
     private let preview = NSTextField(wrappingLabelWithString: "")
-    private let machine = NSTextField(labelWithString: "")
+    private let metadata = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        for field in [project, date, title, preview, machine] {
+        for field in [project, date, title, preview, metadata] {
             field.font = .systemFont(ofSize: 11)
             field.textColor = .secondaryLabelColor
             field.lineBreakMode = .byTruncatingTail
@@ -167,9 +169,9 @@ struct NativeConversationList: NSViewControllerRepresentable {
         date.stringValue = row.date
         title.stringValue = row.title
         preview.stringValue = row.preview
-        machine.stringValue = row.machine.map { "▣ \($0)" } ?? ""
-        machine.isHidden = row.machine == nil
-        setAccessibilityLabel([row.project, row.date, row.title, row.preview, row.machine].compactMap { $0 }.joined(separator: ", "))
+        metadata.stringValue = row.metadata ?? ""
+        metadata.isHidden = row.metadata == nil
+        setAccessibilityLabel([row.project, row.date, row.title, row.preview, row.metadata].compactMap { $0 }.joined(separator: ", "))
         needsLayout = true
     }
     override func layout() {
@@ -180,6 +182,6 @@ struct NativeConversationList: NSViewControllerRepresentable {
         date.frame = NSRect(x: 8 + width - dateWidth, y: 8, width: dateWidth, height: 15)
         title.frame = NSRect(x: 8, y: 25, width: width, height: 17)
         preview.frame = NSRect(x: 8, y: 43, width: width, height: 16)
-        machine.frame = NSRect(x: 8, y: 88, width: width, height: 15)
+        metadata.frame = NSRect(x: 8, y: 61, width: width, height: 15)
     }
 }

@@ -3,7 +3,7 @@ import Foundation
 struct ConversationFilters: Codable, Equatable, Sendable {
     var timeframe = ConversationTimeframe.all
     var provider = ConversationProvider.all
-    var origin = ConversationOrigin.all
+    var origin = ConversationOrigin.interactive
 
     static let defaults = ConversationFilters()
     var conversationType: ConversationOrigin {
@@ -21,7 +21,7 @@ struct ConversationFilters: Codable, Equatable, Sendable {
     var summary: String {
         [timeframe == .all ? nil : timeframe.title,
          provider == .all ? nil : provider.title,
-         origin == .all ? nil : origin.title].compactMap { $0 }.joined(separator: " · ")
+         origin == Self.defaults.origin ? nil : origin.title].compactMap { $0 }.joined(separator: " · ")
     }
 }
 

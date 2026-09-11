@@ -2,12 +2,12 @@ use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analy
 use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey, TimestampOrder};
 use crate::types::SourceFilter;
-use crate::usage::{CostMode, UsageQuery, scan_usage, scan_usage_activity};
+use crate::usage::{CostMode, UsageQuery, scan_usage, scan_usage_activity_with_warnings};
 use crate::web_auth::WebAuth;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -361,14 +361,14 @@ struct SessionTokenPayload<'a> {
     token: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActivityMetric {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ActivityMetric {
     Sessions,
     Tokens,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TimeRange {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TimeRange {
     Day,
     Week,
     Month,
@@ -376,7 +376,7 @@ enum TimeRange {
 }
 
 impl TimeRange {
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "24h" => Ok(Self::Day),
             "7d" => Ok(Self::Week),
@@ -397,7 +397,7 @@ impl TimeRange {
         }
     }
 
-    fn since_ms(self, now: u64) -> Option<u64> {
+    pub(crate) fn since_ms(self, now: u64) -> Option<u64> {
         let days = match self {
             Self::Day => 1,
             Self::Week => 7,
@@ -408,15 +408,15 @@ impl TimeRange {
     }
 }
 
-#[derive(Debug)]
-struct ActivityRequest {
-    metric: ActivityMetric,
-    query: String,
-    source: Option<SourceFilter>,
-    project: Option<String>,
-    days: i64,
-    range: Option<TimeRange>,
-    origin: SessionKindFilter,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ActivityRequest {
+    pub(crate) metric: ActivityMetric,
+    pub(crate) query: String,
+    pub(crate) source: Option<SourceFilter>,
+    pub(crate) project: Option<String>,
+    pub(crate) days: i64,
+    pub(crate) range: Option<TimeRange>,
+    pub(crate) origin: SessionKindFilter,
 }
 
 impl ActivityRequest {
@@ -495,7 +495,7 @@ fn activity_matching_session_scopes(
 }
 
 #[derive(Serialize)]
-struct ActivityPayload {
+pub(crate) struct ActivityPayload {
     metric: &'static str,
     days: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -504,6 +504,8 @@ struct ActivityPayload {
     token_usage_enabled: bool,
     partial: bool,
     points: Vec<ActivityPoint>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -544,10 +546,64 @@ impl AllowedUsageScopes {
     }
 }
 
-fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityPayload> {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RawActivityPayload {
+    points: Vec<RawActivityPoint>,
+    token_usage_enabled: bool,
+    partial: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RawActivityPoint {
+    timestamp_ms: u64,
+    source: String,
+    value: u64,
+}
+
+impl RawActivityPayload {
+    pub(crate) fn from_remote_points(
+        points: impl IntoIterator<Item = (u64, String, u64)>,
+        request: &ActivityRequest,
+        partial: bool,
+    ) -> Self {
+        let bucket_ms = if request.range == Some(TimeRange::Day) {
+            3_600_000
+        } else {
+            86_400_000
+        };
+        let mut buckets = BTreeMap::new();
+        for (timestamp, source, value) in points {
+            add_activity_value(&mut buckets, timestamp, &source, value, bucket_ms);
+        }
+        Self {
+            points: buckets
+                .into_iter()
+                .map(|((timestamp_ms, source), value)| RawActivityPoint {
+                    timestamp_ms,
+                    source,
+                    value,
+                })
+                .collect(),
+            token_usage_enabled: true,
+            partial,
+            warnings: if partial {
+                vec!["The peer reported incomplete token usage data".to_string()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
+pub(crate) fn raw_activity_payload(
+    paths: &Paths,
+    params: &ActivityRequest,
+    now: u64,
+) -> Result<RawActivityPayload> {
     let config = UserConfig::load(paths)?;
     let token_usage_enabled = config.token_usage_enabled();
-    let now = Utc::now().timestamp_millis().max(0) as u64;
     let since_ms = params
         .range
         .map(|range| range.since_ms(now))
@@ -560,6 +616,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
     let mut buckets: BTreeMap<(u64, String), u64> = BTreeMap::new();
     let matching_scopes = activity_matching_session_scopes(paths, params, since_ms)?;
 
+    let mut warnings = Vec::new();
     let partial = match (params.metric, matching_scopes.as_ref()) {
         (ActivityMetric::Sessions, matching_scopes) => {
             let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
@@ -633,6 +690,7 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 };
                 let report = scan_usage(&query)?;
                 let partial = !report.warnings.is_empty();
+                warnings.extend(report.warnings.iter().cloned());
                 for event in report.details {
                     let Some(session_id) = event.session_id else {
                         continue;
@@ -698,7 +756,9 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                 cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                 memo_ttl_ms: 60_000,
             };
-            let (points, partial) = scan_usage_activity(&query)?;
+            let (points, scan_warnings) = scan_usage_activity_with_warnings(&query)?;
+            let partial = !scan_warnings.is_empty();
+            warnings.extend(scan_warnings);
             for point in points {
                 add_activity_value(
                     &mut buckets,
@@ -712,6 +772,50 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
         }
     };
 
+    Ok(RawActivityPayload {
+        points: buckets
+            .into_iter()
+            .map(|((timestamp_ms, source), value)| RawActivityPoint {
+                timestamp_ms,
+                source,
+                value,
+            })
+            .collect(),
+        token_usage_enabled,
+        partial,
+        warnings,
+    })
+}
+
+fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityPayload> {
+    let now = Utc::now().timestamp_millis().max(0) as u64;
+    finish_activity_payload(raw_activity_payload(paths, params, now)?, params, now)
+}
+
+fn finish_activity_payload(
+    raw: RawActivityPayload,
+    params: &ActivityRequest,
+    now: u64,
+) -> Result<ActivityPayload> {
+    let since_ms = params
+        .range
+        .map(|range| range.since_ms(now))
+        .unwrap_or_else(|| Some(now.saturating_sub(params.days as u64 * 86_400_000)));
+    let bucket_ms = if params.range == Some(TimeRange::Day) {
+        3_600_000
+    } else {
+        86_400_000
+    };
+    let buckets = raw
+        .points
+        .into_iter()
+        .fold(BTreeMap::new(), |mut buckets, point| {
+            let total = buckets
+                .entry((point.timestamp_ms, point.source))
+                .or_insert(0_u64);
+            *total = total.saturating_add(point.value);
+            buckets
+        });
     let (bucket_keys, points, days) = activity_buckets(buckets, since_ms, now, bucket_ms);
     Ok(ActivityPayload {
         metric: match params.metric {
@@ -727,10 +831,107 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
         },
         range: params.range.map(TimeRange::label),
         bucket_keys,
-        token_usage_enabled,
-        partial,
+        token_usage_enabled: raw.token_usage_enabled,
+        partial: raw.partial,
         points,
+        warnings: raw.warnings,
     })
+}
+
+/// A native request reads one machine so a slow peer cannot hold completed data.
+pub(crate) fn single_machine_activity_payload(
+    paths: &Paths,
+    params: &ActivityRequest,
+    machine: &str,
+    now: u64,
+) -> Result<RawActivityPayload> {
+    let config = UserConfig::load(paths)?;
+    crate::machine::selected_machine_ids(&config, &[machine.to_owned()])?;
+    if machine == crate::machine::LOCAL_MACHINE_ID {
+        raw_activity_payload(paths, params, now)
+    } else {
+        crate::machine::remote_activity(&config, machine, params.clone(), now)
+    }
+}
+
+/// Collect raw time buckets concurrently, then choose one common bucket grid.
+/// Combining already compressed per-machine charts would misalign all-time data.
+pub(crate) fn machine_activity_payload(
+    paths: &Paths,
+    params: &ActivityRequest,
+    machine: &str,
+) -> Result<ActivityPayload> {
+    let config = UserConfig::load(paths)?;
+    let requested = if machine == "all" {
+        crate::machine::configured_machine_summaries(&config)?
+            .into_iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect()
+    } else {
+        vec![machine.to_owned()]
+    };
+    let ids = crate::machine::selected_machine_ids(&config, &requested)?;
+    let now = Utc::now().timestamp_millis().max(0) as u64;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let sender = sender.clone();
+            let config = &config;
+            scope.spawn(move || {
+                let result = if id == crate::machine::LOCAL_MACHINE_ID {
+                    raw_activity_payload(paths, params, now)
+                } else {
+                    crate::machine::remote_activity(config, id, params.clone(), now)
+                };
+                let _ = sender.send((id.clone(), result));
+            });
+        }
+        drop(sender);
+    });
+    finish_activity_payload(
+        merge_activity_results(receiver, params.metric)?,
+        params,
+        now,
+    )
+}
+
+fn merge_activity_results(
+    results: impl IntoIterator<Item = (String, Result<RawActivityPayload>)>,
+    metric: ActivityMetric,
+) -> Result<RawActivityPayload> {
+    let mut merged = RawActivityPayload {
+        points: Vec::new(),
+        token_usage_enabled: false,
+        partial: false,
+        warnings: Vec::new(),
+    };
+    let mut successes = 0;
+    let mut errors = Vec::new();
+    for (id, result) in results {
+        match result {
+            Ok(raw) => {
+                successes += 1;
+                merged.points.extend(raw.points);
+                merged.token_usage_enabled |= raw.token_usage_enabled;
+                merged.partial |= raw.partial;
+                merged.warnings.extend(
+                    raw.warnings
+                        .into_iter()
+                        .map(|warning| format!("{id}: {warning}")),
+                );
+                // A disabled peer contributes no token usage; keep that absence explicit.
+                if metric == ActivityMetric::Tokens && !raw.token_usage_enabled {
+                    merged.partial = true;
+                }
+            }
+            Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    if successes == 0 {
+        return Err(anyhow!("Activity unavailable: {}", errors.join("; ")));
+    }
+    merged.partial |= !errors.is_empty();
+    Ok(merged)
 }
 
 fn add_activity_value(
@@ -740,6 +941,10 @@ fn add_activity_value(
     value: u64,
     bucket_ms: u64,
 ) {
+    // Missing source timestamps are encoded as zero, not activity in 1970.
+    if timestamp_ms == 0 || timestamp_ms > i64::MAX as u64 {
+        return;
+    }
     let Some(timestamp) = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_ms as i64)
     else {
         return;
@@ -2337,6 +2542,171 @@ mod tests {
         for selector in [format!("before={}", total + 1), format!("offset={}", total)] {
             let error = session_payload(&paths, &request(&selector)).unwrap_err();
             assert!(error.downcast_ref::<InvalidSessionOffset>().is_some());
+        }
+    }
+
+    #[test]
+    fn native_activity_uses_web_filters_and_complete_history() {
+        use crate::analytics::AnalyticsWriter;
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut rows = Vec::new();
+        for index in 1..=240 {
+            let mut row = record(
+                index,
+                &format!("session-{index}"),
+                &format!("/{index}.jsonl"),
+                if index % 2 == 0 {
+                    "needle"
+                } else {
+                    "unrelated"
+                }
+                .into(),
+            );
+            if index % 3 == 0 {
+                row.project = "other".into();
+            }
+            rows.push(row);
+        }
+        let mut writer = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for row in &rows {
+            writer.record(row).unwrap();
+        }
+        writer.flush().unwrap();
+        drop(writer);
+        publish_records(&paths, rows);
+        for (filters, expected) in [
+            ("", 240),
+            ("&q=needle&project=memex&source=claude", 80),
+            ("&source=codex", 0),
+        ] {
+            let request = ActivityRequest::from_url(
+                &parse_url(&format!("/api/activity?range=all&origin=regular{filters}")).unwrap(),
+            )
+            .unwrap();
+            let web = activity_payload(&paths, &request).unwrap();
+            for machine in ["local", "all"] {
+                let native = machine_activity_payload(&paths, &request, machine).unwrap();
+                assert_eq!(native.points.iter().map(|p| p.value).sum::<u64>(), expected);
+                assert_eq!(
+                    serde_json::to_value(&native).unwrap(),
+                    serde_json::to_value(&web).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_activity_preserves_successful_peers_and_reports_failures() {
+        let good = RawActivityPayload {
+            points: vec![RawActivityPoint {
+                timestamp_ms: 0,
+                source: "codex".into(),
+                value: 10,
+            }],
+            token_usage_enabled: true,
+            partial: false,
+            warnings: Vec::new(),
+        };
+        let merged = merge_activity_results(
+            [
+                ("local".into(), Ok(good)),
+                (
+                    "older-peer".into(),
+                    Err(anyhow!("unknown variant home_activity")),
+                ),
+            ],
+            ActivityMetric::Sessions,
+        )
+        .unwrap();
+        assert!(merged.partial);
+        assert_eq!(merged.points[0].value, 10);
+        let failed = merge_activity_results(
+            [(
+                "older-peer".into(),
+                Err(anyhow!("unknown variant home_activity")),
+            )],
+            ActivityMetric::Sessions,
+        )
+        .unwrap_err();
+        assert!(
+            failed
+                .to_string()
+                .contains("older-peer: unknown variant home_activity")
+        );
+    }
+
+    #[test]
+    fn native_activity_merges_raw_buckets_on_one_all_time_grid() {
+        let day = 86_400_000;
+        let request =
+            ActivityRequest::from_url(&parse_url("/api/activity?range=all").unwrap()).unwrap();
+        let raw = RawActivityPayload {
+            points: vec![
+                RawActivityPoint {
+                    timestamp_ms: day,
+                    source: "Claude".into(),
+                    value: 2,
+                },
+                RawActivityPoint {
+                    timestamp_ms: day,
+                    source: "Claude".into(),
+                    value: 3,
+                },
+                RawActivityPoint {
+                    timestamp_ms: 150 * day,
+                    source: "Codex".into(),
+                    value: 7,
+                },
+            ],
+            token_usage_enabled: true,
+            partial: true,
+            warnings: Vec::new(),
+        };
+        let payload = finish_activity_payload(raw, &request, 200 * day).unwrap();
+        assert!(payload.bucket_keys.len() <= 60);
+        assert!(
+            payload
+                .points
+                .iter()
+                .all(|p| payload.bucket_keys.contains(&p.date))
+        );
+        assert_eq!(payload.points.iter().map(|p| p.value).sum::<u64>(), 12);
+        assert_eq!(
+            payload
+                .points
+                .iter()
+                .find(|p| p.source == "Claude")
+                .unwrap()
+                .value,
+            5
+        );
+        assert!(payload.partial);
+    }
+
+    #[test]
+    fn activity_excludes_missing_and_invalid_timestamps_for_both_metrics() {
+        let now = 1_789_000_000_000;
+        for metric in ["sessions", "tokens"] {
+            let request = ActivityRequest::from_url(
+                &parse_url(&format!("/api/activity?range=all&metric={metric}")).unwrap(),
+            )
+            .unwrap();
+            let raw = RawActivityPayload::from_remote_points(
+                [
+                    (0, "cursor".into(), 19_955_038),
+                    (u64::MAX, "cursor".into(), 7),
+                    (now, "cursor".into(), 3),
+                ],
+                &request,
+                false,
+            );
+            let result = finish_activity_payload(raw, &request, now).unwrap();
+            assert_eq!(result.bucket_keys.len(), 1);
+            assert_eq!(result.points.len(), 1);
+            assert_eq!(result.points[0].value, 3);
+            assert!(!result.bucket_keys[0].starts_with("1970"));
         }
     }
 

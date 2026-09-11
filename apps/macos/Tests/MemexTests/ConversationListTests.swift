@@ -3,6 +3,33 @@ import Testing
 @testable import Memex
 
 @MainActor @Suite(.serialized) struct ConversationListTests {
+    @Test func nativeCellsShowSubagentsAndKeepMetadataInsideTheRow() throws {
+        let controller = ConversationListController()
+        let cell = ConversationCell()
+        for (machine, kind, expected) in [
+            ("local", "subagent", "Subagent"),
+            ("nicbook-atm", "subagent", "▣ nicbook-atm · Subagent"),
+            ("nicbook-atm", "main", "▣ nicbook-atm"),
+            ("local", "main", "")
+        ] {
+            let session = Session(source: "codex", sessionID: "s", sourcePath: "/s", project: "memex",
+                                  machine: machine, conversationKind: kind)
+            controller.update(sessions: [session], selectedID: nil, select: { _ in }, loadMore: { _ in })
+            let height = controller.tableView(controller.table, heightOfRow: 0)
+            cell.frame = NSRect(x: 0, y: 0, width: 300, height: height)
+            cell.configure(controller.rows[0])
+            cell.layoutSubtreeIfNeeded()
+            let visibleLabels = cell.subviews.compactMap { $0 as? NSTextField }.filter { !$0.isHidden }
+            #expect(visibleLabels.allSatisfy { $0.frame.maxY <= height })
+            if expected.isEmpty {
+                #expect(!visibleLabels.contains { $0.stringValue.contains("nicbook-atm") || $0.stringValue.contains("Subagent") })
+            } else {
+                #expect(visibleLabels.contains { $0.stringValue == expected })
+            }
+            #expect(cell.accessibilityLabel()?.contains("Subagent") == (kind == "subagent"))
+        }
+    }
+
     func sessions(_ count: Int) -> [Session] {
         (0..<count).map { Session(source: "codex", sessionID: "s\($0)", sourcePath: "/s\($0)", project: "memex", label: "Conversation \($0) with enough text to wrap onto another line", lastAt: "2026-09-07T12:00:00Z", snippet: "A two-line preview of this conversation.") }
     }

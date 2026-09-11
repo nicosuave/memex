@@ -31,8 +31,8 @@ if [[ ! -f "$CLI" || ! -x "$CLI" ]]; then
 fi
 CLI=$(cd "$(dirname "$CLI")" && pwd)/$(basename "$CLI")
 "$CLI" --version
-if ! "$CLI" projects --help >/dev/null 2>&1 || ! "$CLI" machines --help >/dev/null 2>&1; then
-  echo "This app requires a Memex CLI with projects and machines commands. Build this checkout's CLI and set MEMEX_CLI to it." >&2
+if ! "$CLI" projects --help >/dev/null 2>&1 || ! "$CLI" machines --help >/dev/null 2>&1 || ! "$CLI" activity --help >/dev/null 2>&1; then
+  echo "This app requires a Memex CLI with projects, machines, and activity commands. Build this checkout's CLI and set MEMEX_CLI to it." >&2
   exit 1
 fi
 swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --product Memex --force-resolved-versions

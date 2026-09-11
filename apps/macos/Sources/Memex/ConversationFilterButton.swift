@@ -2,12 +2,24 @@ import SwiftUI
 
 struct ConversationFilterControls: View {
     @Bindable var store: Store
+    var includesProject = false
     let done: () -> Void
+
+    private var filtersAreActive: Bool { store.filters.isActive || (includesProject && store.homeProject != nil) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Filters").font(.headline)
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+                if includesProject {
+                    GridRow {
+                        Text("Project").foregroundStyle(.secondary)
+                        Picker("Project", selection: $store.homeProject) {
+                            Text("All projects").tag(String?.none)
+                            ForEach(store.projects) { Text($0.project).tag(Optional($0.project)) }
+                        }.labelsHidden()
+                    }
+                }
                 GridRow {
                     Text("Timeframe").foregroundStyle(.secondary)
                     Picker("Timeframe", selection: $store.filters.timeframe) {
@@ -36,8 +48,11 @@ struct ConversationFilterControls: View {
                 .help("Include approval logs when showing chats and subagents")
             Divider()
             HStack {
-                Button("Reset Filters") { store.filters = .defaults }
-                    .disabled(!store.filters.isActive)
+                Button("Reset Filters") {
+                    store.filters = .defaults
+                    if includesProject { store.homeProject = nil }
+                }
+                    .disabled(!filtersAreActive)
                 Spacer()
                 Button("Done", action: done)
                     .keyboardShortcut(.defaultAction)
