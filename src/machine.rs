@@ -1414,7 +1414,7 @@ fn validate_content_page(record: &Record, content: &ContentPage) -> Result<usize
     if content.returned_chars > content.total_chars {
         bail!("bounded response returned_chars exceeds total_chars");
     }
-    if content.truncated != !content.continuations.is_empty() {
+    if content.truncated == content.continuations.is_empty() {
         bail!("bounded response has inconsistent truncation metadata");
     }
     let mut fields = Vec::new();
