@@ -27,7 +27,7 @@ The existing ingestion lease is retained across observation and execution. Check
 - Metadata enrichment performs no subprocess calls. SQL persistence performs no source or repository discovery.
 - Source-ID presence checks reuse one reader; analytics inventory returns only candidate paths.
 - Record delivery remains bounded. Parsed whole-corpus records are never accumulated in a vector.
-- Small known-size batches use a single writer; explicit indexing retains its normal merge policy, and automatic refresh uses bounded compaction.
+- Small known-size batches use a single writer. Ordinary CLI indexing, daemon indexing, and automatic search refresh use tiered automatic merging with Tantivy's `LogMergePolicy` minimum layer size set to one document; ordinary initial indexing uses this policy too. `memex index rebuild` retains the default bulk merge policy. Incremental tiers group small peers without clipping them into the default 10,000-document floor; they are not a byte or latency bound.
 - Publication intent is written once after parsing has determined the final document-ID checkpoint and before shared record mutations. Existing pending recovery is retained on cancellation.
 
-See [profiling.md](profiling.md) for traces, counters, and per-thread wall-time flamegraphs. Initial creation, recovery, ordinary append updates, and no-op calls must be measured separately.
+See [index-merge-cost-model.md](index-merge-cost-model.md) for the sustained aggregate comparison, including queries and terminal maintenance. See [profiling.md](profiling.md) for traces, counters, and per-thread wall-time flamegraphs. Initial creation, recovery, ordinary append updates, and no-op calls must be measured separately.

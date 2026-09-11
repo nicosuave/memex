@@ -2669,7 +2669,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
             _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
         }
     } else {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
     };
     let options = IngestOptions {
         claude_sources: default_claude_sources(),

@@ -180,7 +180,6 @@ pub(super) fn writer_loop(
         crate::profiling::span!("lexical.commit");
         writer.commit()?;
     }
-    index.maybe_compact_continuous_segments(&mut writer)?;
     let mut staged_vectors = None;
     if reconcile_vector_ids {
         let mut live_doc_ids = HashSet::new();
@@ -229,6 +228,7 @@ pub(super) fn writer_loop(
         crate::profiling::span!("lexical.merge_wait");
         writer.wait_merging_threads()?;
     }
+    index.check_continuous_segment_limit()?;
     index.publish_generation()?;
     if let Some(staged) = staged_vectors {
         staged.publish()?;
