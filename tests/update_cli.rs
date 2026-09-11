@@ -86,6 +86,10 @@ if [ "$1" = "--version" ]; then
   printf 'memex 99.0.0\n'
   exit 0
 fi
+if [ "$1" = "--no-update-check" ]; then
+  [ "$MEMEX_TEST_FAIL" = "daemon" ] && exit 20
+  exit 0
+fi
 if [ "$MEMEX_TEST_FAIL" = "skill" ]; then exit 19; fi
 mkdir -p "$HOME/.agents/skills/memex-search"
 printf 'updated by installed binary\n' > "$HOME/.agents/skills/memex-search/SKILL.md"
@@ -120,6 +124,91 @@ printf 'updated by installed binary\n' > "$HOME/.agents/skills/memex-search/SKIL
             command.env_remove(name);
         }
         command
+    }
+
+    fn standalone() -> Self {
+        let mut fixture = Self::new();
+        let standalone = fixture.bin.join("memex");
+        std::fs::hard_link(env!("CARGO_BIN_EXE_memex"), &standalone).unwrap();
+        fixture.cellar_memex = standalone;
+        // The already-current case runs the real reconciler. Keep both platform
+        // registration locations inside this fixture, regardless of host config.
+        std::fs::write(
+            fixture.home.join(".memex/config.toml"),
+            format!(
+                "auto_index_on_search = false\nindex_service_plist = {:?}\nindex_service_systemd_dir = {:?}\n",
+                fixture.home.join("daemon.plist"),
+                fixture.home.join("systemd"),
+            ),
+        )
+        .unwrap();
+
+        let release = fixture._temp.path().join("release");
+        std::fs::create_dir_all(&release).unwrap();
+        write_script(
+            &release.join("memex"),
+            r#"#!/bin/sh
+printf 'release-binary %s\n' "$*" >> "$MEMEX_TEST_LOG"
+case "$*" in
+  --version)
+    [ "$MEMEX_TEST_FAIL" = version ] && exit 18
+    if [ "$MEMEX_TEST_FAIL" = wrong-version ]; then
+      printf 'memex 98.0.0\n'
+    else
+      printf 'memex 99.0.0\n'
+    fi
+    ;;
+  '--no-update-check daemon reconcile') exit 0 ;;
+  'skill update --target all')
+    mkdir -p "$HOME/.agents/skills/memex-search"
+    printf 'updated by release binary\n' > "$HOME/.agents/skills/memex-search/SKILL.md"
+    ;;
+  *) exit 96 ;;
+esac
+"#,
+        );
+        let archive = fixture.bin.join("release.tar.gz");
+        let archived = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&release)
+            .arg("memex")
+            .output()
+            .unwrap();
+        assert!(
+            archived.status.success(),
+            "{}",
+            String::from_utf8_lossy(&archived.stderr)
+        );
+        write_script(
+            &fixture.bin.join("curl"),
+            r#"#!/bin/sh
+destination=
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) shift; destination=$1 ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+case "$url" in
+  https://api.github.com/repos/nicosuave/memex/releases/latest)
+    printf 'release latest\n' >> "$MEMEX_TEST_LOG"
+    printf '{"tag_name":"v%s"}\n' "${MEMEX_TEST_LATEST:-99.0.0}"
+    ;;
+  https://github.com/nicosuave/memex/releases/download/v99.0.0/memex-99.0.0-*.tar.gz)
+    printf 'release download\n' >> "$MEMEX_TEST_LOG"
+    [ "$MEMEX_TEST_FAIL" = download ] && exit 17
+    [ -n "$destination" ] || exit 95
+    cp "$(dirname "$0")/release.tar.gz" "$destination"
+    ;;
+  *) exit 97 ;;
+esac
+"#,
+        );
+        fixture
     }
 
     fn cache_update(&self) {
@@ -286,7 +375,7 @@ fn bare_human_startup_accepts_cached_update_before_tui() {
     assert!(!output.output.contains("\u{1b}[?1049h"));
     assert_eq!(
         fixture.log(),
-        "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled skill update --target all\n"
+        "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled --no-update-check daemon reconcile\ninstalled skill update --target all\n"
     );
     assert_eq!(
         std::fs::read_to_string(fixture.home.join(".agents/skills/memex-search/SKILL.md")).unwrap(),
@@ -382,7 +471,7 @@ fn update_requires_yes_without_a_tty_and_yes_runs_installed_binary_chain() {
     );
     assert_eq!(
         fixture.log(),
-        "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled skill update --target all\n"
+        "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled --no-update-check daemon reconcile\ninstalled skill update --target all\n"
     );
 }
 
@@ -406,8 +495,13 @@ fn homebrew_failures_stop_the_update_at_the_failing_step() {
             "installed memex version check failed",
         ),
         (
+            "daemon",
+            "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled --no-update-check daemon reconcile\n",
+            "daemon activation failed",
+        ),
+        (
             "skill",
-            "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled skill update --target all\n",
+            "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled --no-update-check daemon reconcile\ninstalled skill update --target all\n",
             "refreshing its skills failed",
         ),
     ];
@@ -431,6 +525,88 @@ fn homebrew_failures_stop_the_update_at_the_failing_step() {
             );
         }
     }
+}
+
+#[test]
+fn standalone_update_verifies_release_then_activates_and_refreshes_skills() {
+    let fixture = Fixture::standalone();
+    let output = run(fixture
+        .command()
+        .args(["--no-update-check", "update", "--yes"]));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.log(),
+        "release latest\nrelease download\nrelease-binary --version\nrelease-binary --no-update-check daemon reconcile\nrelease-binary skill update --target all\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.home.join(".agents/skills/memex-search/SKILL.md")).unwrap(),
+        "updated by release binary\n"
+    );
+    let installed = run(fixture.command().arg("--version"));
+    assert!(installed.status.success());
+    assert_eq!(installed.stdout, b"memex 99.0.0\n");
+}
+
+#[test]
+fn standalone_download_and_verification_failures_preserve_original_binary() {
+    use std::os::unix::fs::MetadataExt;
+
+    for failure in ["download", "version", "wrong-version"] {
+        let fixture = Fixture::standalone();
+        let original = std::fs::metadata(&fixture.cellar_memex).unwrap();
+        let output = run(fixture.command().env("MEMEX_TEST_FAIL", failure).args([
+            "--no-update-check",
+            "update",
+            "--yes",
+        ]));
+        assert!(!output.status.success(), "{failure} unexpectedly succeeded");
+        let expected = if failure == "download" {
+            "release latest\nrelease download\n"
+        } else {
+            "release latest\nrelease download\nrelease-binary --version\n"
+        };
+        assert_eq!(fixture.log(), expected, "failure at {failure}");
+        let unchanged = std::fs::metadata(&fixture.cellar_memex).unwrap();
+        assert_eq!(original.ino(), unchanged.ino(), "failure at {failure}");
+        assert_eq!(original.len(), unchanged.len(), "failure at {failure}");
+        let installed = run(fixture.command().arg("--version"));
+        assert!(installed.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&installed.stdout),
+            format!("memex {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+}
+
+#[test]
+fn standalone_already_current_still_reconciles_and_refreshes_skills() {
+    let fixture = Fixture::standalone();
+    let skill = fixture.home.join(".agents/skills/memex-search/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill, "outdated skill\n").unwrap();
+    let output = run(fixture
+        .command()
+        .env("MEMEX_TEST_LATEST", env!("CARGO_PKG_VERSION"))
+        .args(["--no-update-check", "update", "--yes"]));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.log(), "release latest\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("already up to date"), "{stdout}");
+    assert!(
+        stdout.contains("daemon: no Memex-owned registration; unchanged"),
+        "{stdout}"
+    );
+    let updated = std::fs::read_to_string(&skill).unwrap();
+    assert_ne!(updated, "outdated skill\n");
+    assert!(updated.contains("memex-search"));
 }
 
 #[test]

@@ -85,7 +85,9 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
       {
         programs.memex = {
           enable = true;
+          daemon.enable = true;
           settings = {
+            index_service_mode = "continuous";
             embeddings = true;
             include_reasoning = false;
             model = "minilm";
@@ -123,6 +125,42 @@ available. Press Enter to update Memex and refresh its installed skill copies, o
 choose no to continue into the TUI. Homebrew installs run `brew update` followed by
 `brew upgrade nicosuave/tap/memex`; skills are refreshed by the newly installed binary.
 After updating, run `memex` again to start that version.
+
+Enabled daemons follow binary upgrades automatically between indexing passes.
+Homebrew registrations use `opt/memex/bin/memex`, so direct `brew upgrade
+nicosuave/tap/memex` works without a second service manager. Cargo/manual installs
+follow replacement at their registered executable path; replace binaries atomically.
+Nix profile registrations follow the profile link. A running indexing pass finishes
+before handoff; Web UI and MCP connections reconnect when the process reloads.
+
+**One-time migration:** daemons installed before this behavior need
+`memex daemon restart` from the newly installed binary. Use `--root <path>` for
+each custom data root. This also replaces old version-specific Homebrew service
+paths. After migration, interval services use the new binary on their next run;
+continuous daemons detect a replacement within a few seconds when idle.
+
+`memex update` also runs `memex daemon reconcile` using the installed binary.
+Reconciliation updates an existing enabled, loaded Memex registration and checks
+continuous-daemon readiness; absent, stopped, disabled, and Nix-owned registrations
+stay unchanged. It preserves the registered arguments, environment and schedule.
+Use `memex daemon reconcile --root <path>` for a custom root. `memex daemon status`
+shows the running version, PID, executable, readiness and whether its file identity
+matches the installed executable, including same-version rebuilds. Older daemons
+without runtime reporting show their running build as unavailable.
+
+For Nix-managed services, update the flake input and activate with
+`home-manager switch` or `nixos-rebuild switch`. Home Manager's
+`programs.memex.daemon.enable` owns the native Linux/macOS service; Linux automatic
+activation requires `systemd.user.startServices = "sd-switch"` (or `true`).
+An explicit `false`/`"suggest"` setting leaves service activation manual.
+The NixOS module restarts active owned services on switch, preserves stopped
+services, and handles interval/continuous transitions. Disable
+`services.memex.enable` and switch before removing the module import.
+Disable a CLI-owned registration before enabling a declarative service; choose
+one owner. `memex update` refuses to overwrite immutable Nix store binaries.
+For a standalone Nix profile, upgrade the selected profile package; an already
+migrated daemon follows its stable profile link, or run `memex daemon reconcile`
+through that profile to activate an existing registration explicitly.
 
 Agents and scripts still receive update notices but never a startup prompt. Memex
 recognizes CI, Codex, and Claude Code environment markers; use `--non-interactive`
