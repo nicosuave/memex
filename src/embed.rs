@@ -16,20 +16,20 @@ const MEMEX_CUDNN_LIBRARY_PATHS_ENV: &str = "MEMEX_CUDNN_LIBRARY_PATHS";
 
 #[cfg(all(feature = "cuda", windows))]
 const CUDA_DYLIBS: &[&str] = &[
-    "cublasLt64_12.dll",
-    "cublas64_12.dll",
-    "cufft64_11.dll",
-    "cudart64_12.dll",
+    "cublasLt64_13.dll",
+    "cublas64_13.dll",
+    "cufft64_12.dll",
+    "cudart64_13.dll",
 ];
 
 #[cfg(all(feature = "cuda", not(windows)))]
 const CUDA_DYLIBS: &[&str] = &[
-    "libcublasLt.so.12",
-    "libcublas.so.12",
-    "libnvrtc.so.12",
+    "libcublasLt.so.13",
+    "libcublas.so.13",
+    "libnvrtc.so.13",
     "libcurand.so.10",
-    "libcufft.so.11",
-    "libcudart.so.12",
+    "libcufft.so.12",
+    "libcudart.so.13",
 ];
 
 #[cfg(all(feature = "cuda", windows))]
@@ -374,27 +374,58 @@ fn candidate_cudnn_library_dirs(explicit_paths: &[PathBuf]) -> Vec<PathBuf> {
 
 #[cfg(feature = "cuda")]
 fn append_common_cuda_dirs(dirs: &mut Vec<PathBuf>) {
-    for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
-        if let Some(root) = std::env::var_os(var).map(PathBuf::from) {
-            dirs.push(root.clone());
-            dirs.push(root.join("lib64"));
-            dirs.push(root.join("lib"));
-            dirs.push(root.join("targets/x86_64-linux/lib"));
-            dirs.push(root.join("bin"));
-        }
+    for root in cuda_roots() {
+        append_cuda_root_dirs(dirs, &root);
     }
 
     #[cfg(target_os = "linux")]
     dirs.extend([
-        PathBuf::from("/usr/local/cuda/lib64"),
-        PathBuf::from("/usr/local/cuda/lib"),
-        PathBuf::from("/usr/local/cuda/targets/x86_64-linux/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
         PathBuf::from("/usr/lib64"),
         PathBuf::from("/usr/lib"),
         PathBuf::from("/lib/x86_64-linux-gnu"),
         PathBuf::from("/lib64"),
     ]);
+}
+
+/// Toolkit roots to probe: those named by the environment first, then the
+/// conventional install prefixes (`/usr/local/cuda` on NVIDIA's runfile and
+/// Debian packages, `/opt/cuda` on Arch and Gentoo).
+#[cfg(feature = "cuda")]
+fn cuda_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"]
+        .iter()
+        .filter_map(|var| std::env::var_os(var).map(PathBuf::from))
+        .collect();
+
+    #[cfg(target_os = "linux")]
+    roots.extend([PathBuf::from("/usr/local/cuda"), PathBuf::from("/opt/cuda")]);
+
+    roots
+}
+
+#[cfg(feature = "cuda")]
+fn append_cuda_root_dirs(dirs: &mut Vec<PathBuf>, root: &Path) {
+    dirs.push(root.to_path_buf());
+    dirs.push(root.join("lib64"));
+    dirs.push(root.join("lib"));
+    dirs.extend(cuda_target_lib_dirs(root));
+    dirs.push(root.join("bin"));
+}
+
+/// A toolkit keeps its per-architecture libraries under `targets/<triple>/lib`,
+/// where the triple names the target the libraries are built for (for example
+/// `x86_64-linux`, or `sbsa-linux` and `aarch64-linux` on Arm hosts). Enumerate
+/// the directory rather than naming a triple, so every host resolves.
+#[cfg(feature = "cuda")]
+fn cuda_target_lib_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root.join("targets")) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().join("lib"))
+        .collect()
 }
 
 #[cfg(feature = "cuda")]
@@ -406,6 +437,12 @@ fn append_common_cudnn_dirs(dirs: &mut Vec<PathBuf>) {
             dirs.push(root.join("lib"));
             dirs.push(root.join("bin"));
         }
+    }
+
+    // Some distributions install cuDNN into the CUDA toolkit prefix rather than
+    // a standalone one.
+    for root in cuda_roots() {
+        append_cuda_root_dirs(dirs, &root);
     }
 
     #[cfg(target_os = "linux")]
@@ -493,19 +530,19 @@ fn init_options_with_coreml(
     opts: InitOptions,
     runtime: &EmbedRuntimeConfig,
 ) -> Result<InitOptions> {
-    use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
+    use ort::ep::coreml::{ComputeUnits, CoreML};
 
     let compute_units = runtime
         .compute_units
         .as_deref()
         .map(|v| match v.to_lowercase().as_str() {
-            "ane" | "neural" | "neuralengine" => CoreMLComputeUnits::CPUAndNeuralEngine,
-            "gpu" => CoreMLComputeUnits::CPUAndGPU,
-            "cpu" => CoreMLComputeUnits::CPUOnly,
-            _ => CoreMLComputeUnits::All,
+            "ane" | "neural" | "neuralengine" => ComputeUnits::CPUAndNeuralEngine,
+            "gpu" => ComputeUnits::CPUAndGPU,
+            "cpu" => ComputeUnits::CPUOnly,
+            _ => ComputeUnits::All,
         })
-        .unwrap_or(CoreMLComputeUnits::All);
-    let provider = CoreMLExecutionProvider::default()
+        .unwrap_or(ComputeUnits::All);
+    let provider = CoreML::default()
         .with_subgraphs(true)
         .with_compute_units(compute_units);
     let dispatch = if matches!(runtime.execution_provider, ExecutionProviderChoice::CoreML) {
@@ -528,10 +565,10 @@ fn init_options_with_coreml(
 
 #[cfg(feature = "cuda")]
 fn init_options_with_cuda(opts: InitOptions, runtime: &EmbedRuntimeConfig) -> Result<InitOptions> {
-    use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
+    use ort::ep::{CUDA, ExecutionProvider};
 
     preload_cuda_dependencies(runtime)?;
-    let mut provider = CUDAExecutionProvider::default();
+    let mut provider = CUDA::default();
     if let Some(device_id) = runtime.cuda_device_id {
         provider = provider.with_device_id(device_id);
     }
