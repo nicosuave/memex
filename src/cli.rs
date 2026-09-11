@@ -2327,15 +2327,16 @@ fn run_index_selection(
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex {
+        ensure_rebuild_space(&paths)?;
         reset_reindex_artifacts(&paths, &lease)?;
     }
     paths.ensure_dirs()?;
     let index = if reindex {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
         match SearchIndex::open_or_create(&paths.index) {
             Ok(index) if !index.is_writable() => index,
-            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
+            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
         }
     };
 
@@ -2365,7 +2366,56 @@ fn run_index_selection(
             serde_json::to_string_pretty(&report.diagnostics)?
         );
     }
+    drop(lease);
+    if report.records_added > 0 {
+        crate::machine::schedule_compaction_if_fragmented(&paths)?;
+    }
     Ok(full_scan)
+}
+
+/// A rebuild removes the current index before writing the new one, so running out of space
+/// half-way leaves nothing to search. The new index is at most about the size of the old one.
+fn ensure_rebuild_space(paths: &Paths) -> Result<()> {
+    let needed = unique_file_bytes(&paths.index)?;
+    let available = available_bytes(&paths.root)?;
+    if available < needed {
+        anyhow::bail!(
+            "rebuild needs about {} MiB free on {} but only {} MiB is available; free space \
+             before rebuilding, the current index is untouched",
+            needed >> 20,
+            paths.root.display(),
+            available >> 20
+        );
+    }
+    Ok(())
+}
+
+/// Bytes on disk below `dir`, counting each inode once so hard-linked segment files are not
+/// multiplied by their link count.
+fn unique_file_bytes(dir: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
+fn available_bytes(path: &Path) -> Result<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .context("data directory path contains a NUL byte")?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("statvfs data directory");
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u128 * stat.f_frsize as u128) as u64)
 }
 
 fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
@@ -9953,5 +10003,24 @@ arguments = {
         };
         let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
         assert!(error.to_string().contains("Failed to connect to bus"));
+    }
+}
+
+#[cfg(test)]
+mod rebuild_space_tests {
+    use super::*;
+
+    #[test]
+    fn unique_file_bytes_counts_hard_linked_files_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("index");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/segment"), vec![7u8; 4096]).unwrap();
+        std::fs::hard_link(root.join("a/segment"), root.join("b/segment")).unwrap();
+        std::fs::write(root.join("b/other"), vec![1u8; 100]).unwrap();
+        assert_eq!(unique_file_bytes(&root).unwrap(), 4196);
+        assert_eq!(unique_file_bytes(&root.join("missing")).unwrap(), 0);
+        assert!(available_bytes(temp.path()).unwrap() > 0);
     }
 }

@@ -3,7 +3,6 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use memchr::memchr;
-use memmap2::Mmap;
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::fs::File;
@@ -65,7 +64,7 @@ pub fn cwd_from_muse_session(path: &Path) -> Option<PathBuf> {
     let Ok(file) = File::open(path) else {
         return None;
     };
-    let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
+    let Ok(mmap) = super::common::map_sequential(&file) else {
         return None;
     };
     let mut start = 0;
@@ -173,7 +172,7 @@ pub(crate) fn parse_index_records(
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
         simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
     });
@@ -516,6 +515,7 @@ pub(crate) fn parse_index_records(
         pending_tool_calls,
         session_id: Some(session_id),
         diagnostics,
+        session_cwd: None,
     })
 }
 
@@ -525,7 +525,7 @@ pub fn usage_files() -> Vec<PathBuf> {
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut session_id = session_id_from_path(path);
     let mut project = SourceKind::Muse.label().to_string();

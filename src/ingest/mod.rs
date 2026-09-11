@@ -130,6 +130,18 @@ struct FileUpdate {
     state: FileState,
     session_id: Option<String>,
     diagnostics: crate::sources::ParseDiagnostics,
+    source: SourceKind,
+    session_cwd: Option<String>,
+}
+
+/// A session's working directory as its transcript recorded it, handed to analytics so it
+/// never re-reads the transcript to find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionCwd {
+    source: SourceKind,
+    source_path: String,
+    session_id: String,
+    cwd: String,
 }
 
 #[derive(Debug, Clone)]
@@ -176,9 +188,9 @@ struct WriterContext {
     defer_merges: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WriterDecision {
-    Commit,
+    Commit { session_cwds: Vec<SessionCwd> },
     Cancel,
 }
 

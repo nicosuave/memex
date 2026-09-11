@@ -999,7 +999,11 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
     let (records, rx) = unbounded();
     drop(records);
     let (decision, decisions) = bounded(1);
-    decision.send(WriterDecision::Commit).unwrap();
+    decision
+        .send(WriterDecision::Commit {
+            session_cwds: Vec::new(),
+        })
+        .unwrap();
     let outcome = writer_loop(
         index,
         rx,
@@ -3530,7 +3534,11 @@ fn writer_loop_accepts_copilot_source_progress() {
 
     let writer = index.writer().expect("open writer");
     let (decision_tx, decision_rx) = bounded(1);
-    decision_tx.send(WriterDecision::Commit).expect("commit");
+    decision_tx
+        .send(WriterDecision::Commit {
+            session_cwds: Vec::new(),
+        })
+        .expect("commit");
     let outcome = run_writer_fixture(index, writer, rx_record, decision_rx, Vec::new(), ctx)
         .expect("write copilot record");
     let WriterOutcome::Published {

@@ -3,7 +3,6 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use memchr::memchr;
-use memmap2::Mmap;
 use rusqlite::{Connection, OpenFlags};
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
@@ -113,7 +112,7 @@ pub(crate) fn parse_index_records(
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
         simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
     });
@@ -305,6 +304,7 @@ pub(crate) fn parse_index_records(
         pending_tool_calls,
         session_id: Some(session_id),
         diagnostics: Default::default(),
+        session_cwd: None,
     })
 }
 

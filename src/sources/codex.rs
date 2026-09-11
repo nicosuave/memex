@@ -7,7 +7,6 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use memchr::{memchr, memmem};
-use memmap2::Mmap;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -380,7 +379,7 @@ fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
         return Ok(fallback_meta(path));
     }
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let limit = (limit as usize).min(mmap.len());
     Ok(read_meta_prefix(path, &mmap[..limit], None).0)
 }
@@ -465,7 +464,7 @@ pub(crate) fn cwd_with_metadata_checkpoint(
     if length < offset || length == 0 {
         return Ok(read_meta_until(path, length)?.cwd);
     }
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let boundary = (offset as usize).min(mmap.len());
     let (mut metadata, _) = read_meta_prefix(path, &mmap[..boundary], Some(metadata_offsets));
     crate::profiling::count!("codex.metadata_tail_scanned_bytes", mmap.len() - boundary);
@@ -559,7 +558,7 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
         emit(record)
     };
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
         simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
     });
@@ -1078,6 +1077,7 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
             pending_tool_calls,
             session_id: Some(metadata.session_id),
             diagnostics,
+            session_cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
         },
         metadata_offsets,
     ))
@@ -1091,7 +1091,7 @@ pub(crate) fn parse_history_records(
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
         simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
     });
@@ -1167,6 +1167,7 @@ pub(crate) fn parse_history_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: None,
         diagnostics: Default::default(),
+        session_cwd: None,
     })
 }
 
@@ -1511,7 +1512,7 @@ fn total_usage_snapshots(path: &Path) -> Result<Vec<(u64, UsageTokens)>> {
     static TOKEN_COUNT_NEEDLE: Lazy<memmem::Finder<'static>> =
         Lazy::new(|| memmem::Finder::new(b"token_count"));
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let mut start = 0usize;
     let mut buffer = Vec::new();
     let mut snapshots = Vec::new();
@@ -1572,7 +1573,7 @@ pub(crate) fn parse_usage_file(
     let mut unresolved_fork_baseline_seen = false;
     let mut events = Vec::new();
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let mut start = 0usize;
     let mut line_index = 0u64;
     let mut buffer = Vec::new();

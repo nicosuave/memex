@@ -78,6 +78,7 @@ pub struct SearchIndex {
     _generation_lease: Option<Arc<GenerationLease>>,
     incremental_merge_policy: bool,
     defer_merges: bool,
+    bulk_rebuild: bool,
     shared_reader: Arc<OnceLock<IndexReader>>,
 }
 
@@ -85,6 +86,8 @@ const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
+/// Rebuild arena across tantivy's indexing threads; bigger arenas flush fewer, larger segments.
+const REBUILD_MEMORY_BUDGET_BYTES: usize = 1 << 30;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
 /// Small-segment count above which a search-triggered refresh schedules background compaction.
 pub const SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS: usize = 8;
@@ -568,6 +571,15 @@ impl SearchIndex {
         Ok(index)
     }
 
+    /// A rebuild writes with no merges and a large arena; the segments it publishes are folded
+    /// afterwards by the detached compaction, never in the foreground.
+    pub fn open_or_create_for_rebuild(dir: &Path) -> Result<Self> {
+        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, false)?;
+        index.defer_merges = true;
+        index.bulk_rebuild = true;
+        Ok(index)
+    }
+
     pub fn segment_count(&self) -> Result<usize> {
         Ok(self.index.searchable_segment_metas()?.len())
     }
@@ -658,6 +670,7 @@ impl SearchIndex {
             if schema_is_current(&existing.schema())
                 && existing.schema().get_field("reader_metadata").is_ok()
             {
+                check_term_dictionary_format(&existing, &load_fields(existing.schema())?, dir)?;
                 existing
             } else {
                 drop(existing);
@@ -676,6 +689,7 @@ impl SearchIndex {
             _generation_lease: None,
             incremental_merge_policy,
             defer_merges: false,
+            bulk_rebuild: false,
             shared_reader: Arc::new(OnceLock::new()),
         })
     }
@@ -698,6 +712,7 @@ impl SearchIndex {
                 _generation_lease: None,
                 incremental_merge_policy: false,
                 defer_merges: false,
+                bulk_rebuild: false,
                 shared_reader: Arc::new(OnceLock::new()),
             })
         } else {
@@ -726,6 +741,8 @@ impl SearchIndex {
         let writer = if input_bytes.is_some_and(|bytes| bytes <= SMALL_INGEST_MAX_BYTES) {
             crate::profiling::count!("lexical.single_thread_batches", 1);
             self.index.writer_with_num_threads(1, 64_000_000)?
+        } else if self.bulk_rebuild {
+            self.index.writer(REBUILD_MEMORY_BUDGET_BYTES)?
         } else {
             self.index.writer(256_000_000)?
         };
@@ -907,28 +924,34 @@ impl SearchIndex {
     }
 
     pub fn add_record(&self, writer: &mut IndexWriter, record: &Record) -> Result<()> {
+        self.add_record_owned(writer, record.clone())
+    }
+
+    /// Moves the record's strings into the document instead of copying them; the ingest
+    /// writer feeds hundreds of thousands of records through here per rebuild.
+    pub fn add_record_owned(&self, writer: &mut IndexWriter, record: Record) -> Result<()> {
         let mut doc = TantivyDocument::default();
         if let Some(field) = self.fields.canonical_record_id {
-            doc.add_text(field, crate::retrieval::canonical_record_id(record));
+            doc.add_text(field, crate::retrieval::canonical_record_id(&record));
         }
         doc.add_u64(self.fields.doc_id, record.doc_id);
         doc.add_u64(self.fields.ts, record.ts);
-        doc.add_text(self.fields.project, &record.project);
-        doc.add_text(self.fields.session_id, &record.session_id);
         doc.add_u64(self.fields.turn_id, record.turn_id as u64);
-        doc.add_text(self.fields.role, &record.role);
-        doc.add_text(self.fields.text, &record.text);
         if let Some(field) = self.fields.source {
             doc.add_text(field, record.source.storage_label());
         }
-        if let Some(tool_name) = &record.tool_name {
-            doc.add_text(self.fields.tool_name, tool_name);
+        doc.add_field_value(self.fields.project, record.project);
+        doc.add_field_value(self.fields.session_id, record.session_id);
+        doc.add_field_value(self.fields.role, record.role);
+        doc.add_field_value(self.fields.text, record.text);
+        if let Some(tool_name) = record.tool_name {
+            doc.add_field_value(self.fields.tool_name, tool_name);
         }
-        if let Some(tool_input) = &record.tool_input {
-            doc.add_text(self.fields.tool_input, tool_input);
+        if let Some(tool_input) = record.tool_input {
+            doc.add_field_value(self.fields.tool_input, tool_input);
         }
-        if let Some(tool_output) = &record.tool_output {
-            doc.add_text(self.fields.tool_output, tool_output);
+        if let Some(tool_output) = record.tool_output {
+            doc.add_field_value(self.fields.tool_output, tool_output);
         }
         add_optional_text(&mut doc, self.fields.event_id, &record.links.event_id);
         add_optional_text(
@@ -2044,6 +2067,24 @@ fn stale_schema_error(dir: &Path) -> anyhow::Error {
     )
 }
 
+/// Term dictionaries are SSTables; an index written with tantivy's FST dictionaries fails
+/// only when a segment is first searched, from a worker thread, with an opaque message.
+/// Probing one segment's dictionary at open time turns that into a rebuild instruction.
+fn check_term_dictionary_format(index: &Index, fields: &IndexFields, dir: &Path) -> Result<()> {
+    let Some(segment) = index.searchable_segment_metas()?.into_iter().next() else {
+        return Ok(());
+    };
+    let reader = tantivy::SegmentReader::open(&index.segment(segment))?;
+    match reader.inverted_index(fields.text) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("dictionary type") => Err(anyhow!(
+            "index at {} uses term dictionaries this build cannot read; run `memex index rebuild`",
+            dir.display()
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
     let schema = build_schema()?;
     let index = Index::create_in_dir(dir, schema.clone())?;
@@ -2057,6 +2098,7 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         _generation_lease: None,
         incremental_merge_policy: false,
         defer_merges: false,
+        bulk_rebuild: false,
         shared_reader: Arc::new(OnceLock::new()),
     })
 }
@@ -2079,6 +2121,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         return Err(stale_schema_error(dir));
     }
     let fields = load_fields(index.schema())?;
+    check_term_dictionary_format(&index, &fields, dir)?;
     Ok(SearchIndex {
         index,
         fields,
@@ -2088,6 +2131,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         _generation_lease: Some(generation_lease),
         incremental_merge_policy: false,
         defer_merges: false,
+        bulk_rebuild: false,
         shared_reader: Arc::new(OnceLock::new()),
     })
 }

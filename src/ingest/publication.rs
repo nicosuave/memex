@@ -30,7 +30,7 @@ pub(super) fn writer_loop(
         && !ctx.reconcile_vector_ids
     {
         return match decision_rx.recv() {
-            Ok(WriterDecision::Commit) => {
+            Ok(WriterDecision::Commit { .. }) => {
                 index.publish_generation_if_uninitialized()?;
                 crate::profiling::count!("ingest.checkpoint_only_returns", 1);
                 Ok(WriterOutcome::CheckpointsOnly)
@@ -122,29 +122,44 @@ pub(super) fn writer_loop(
         vindex.remove_doc_ids(&scoped_doc_ids)?;
     }
 
+    #[cfg(feature = "profiling")]
+    let mut last_stamp = std::time::Instant::now();
+    #[cfg(feature = "profiling")]
+    let stamp = |name: &'static str, last: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
+        crate::profiling::record_count(name, now.duration_since(*last).as_micros() as u64);
+        *last = now;
+    };
     for mut record in first.into_iter().chain(rx.iter()) {
+        #[cfg(feature = "profiling")]
+        stamp("writer.recv_us", &mut last_stamp);
         // Parsers apply the limit before queueing; enforce it here as a defensive boundary too.
         let _ = limit_record_tool_content(&mut record, tool_content_limits);
         analytics.record(&record)?;
-        index.add_record(&mut writer, &record)?;
-        let source_idx = record.source.idx();
-        index_pending[source_idx] += 1;
-        if index_pending[source_idx] >= INDEX_PROGRESS_BATCH {
-            progress.add_indexed(record.source, index_pending[source_idx]);
-            index_pending[source_idx] = 0;
-        }
-        if embeddings
+        #[cfg(feature = "profiling")]
+        stamp("writer.analytics_us", &mut last_stamp);
+        let embed_text = (embeddings
             && !reset_vector_store
             && is_embedding_role(&record.role)
-            && !record.text.is_empty()
-        {
-            let text = truncate_for_embedding(std::mem::take(&mut record.text));
+            && !record.text.is_empty())
+        .then(|| truncate_for_embedding(record.text.clone()));
+        let (doc_id, source) = (record.doc_id, record.source);
+        index.add_record_owned(&mut writer, record)?;
+        #[cfg(feature = "profiling")]
+        stamp("writer.add_us", &mut last_stamp);
+        let source_idx = source.idx();
+        index_pending[source_idx] += 1;
+        if index_pending[source_idx] >= INDEX_PROGRESS_BATCH {
+            progress.add_indexed(source, index_pending[source_idx]);
+            index_pending[source_idx] = 0;
+        }
+        if let Some(text) = embed_text {
             if let Some(vindex) = vector_index.as_ref()
-                && !vindex.contains(record.doc_id)
+                && !vindex.contains(doc_id)
             {
-                progress.add_embed_total(record.source, 1);
-                progress.add_embed_pending(record.source, 1);
-                embed_buffer.push((record.doc_id, text, record.source));
+                progress.add_embed_total(source, 1);
+                progress.add_embed_pending(source, 1);
+                embed_buffer.push((doc_id, text, source));
             }
             if let Some(emb) = embedder.as_mut()
                 && embed_buffer.len() >= EMBED_BATCH_SIZE
@@ -170,7 +185,16 @@ pub(super) fn writer_loop(
     }
 
     match decision_rx.recv() {
-        Ok(WriterDecision::Commit) => {}
+        Ok(WriterDecision::Commit { session_cwds }) => {
+            for session in &session_cwds {
+                analytics.set_session_cwd(
+                    session.source,
+                    &session.source_path,
+                    &session.session_id,
+                    &session.cwd,
+                );
+            }
+        }
         Ok(WriterDecision::Cancel) | Err(_) => {
             writer.rollback()?;
             return Ok(WriterOutcome::Cancelled);

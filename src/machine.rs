@@ -2743,7 +2743,7 @@ fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
 /// `memex index compact` process folds the small ones into one segment and exits. The spawn
 /// is skipped while an ingest holds the lease, and the child takes a compaction lock, so a
 /// second child started in the gap exits instead of merging the same segments again.
-fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
+pub(crate) fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     let small = SearchIndex::open_or_create(&paths.index)?
         .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
     if small <= crate::index::SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS {
@@ -2781,7 +2781,7 @@ fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
 
 fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<IngestReport> {
     crate::profiling::span!("index.local");
-    let options = local_ingest_options(config, stale_only)?;
+    let options = local_ingest_options(config)?;
     // The journal stream must be registered before this process writes anything: a write in
     // the milliseconds before registration makes fseventsd hold the replay for ~160 ms.
     let journal = stale_only.then(|| {
@@ -2791,13 +2791,9 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
     });
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
-    let index = if stale_only {
-        match SearchIndex::open_or_create(&paths.index) {
-            Ok(index) if !index.is_writable() => index,
-            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
-        }
-    } else {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+    let index = match SearchIndex::open_or_create(&paths.index) {
+        Ok(index) if !index.is_writable() => index,
+        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
     };
     if stale_only {
         Ok(ingest_if_stale(
@@ -2816,11 +2812,16 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
             diagnostics: Default::default(),
         }))
     } else {
-        ingest_all(paths, &index, &options, &lease)
+        let report = ingest_all(paths, &index, &options, &lease)?;
+        drop(lease);
+        if report.records_added > 0 {
+            schedule_compaction_if_fragmented(paths)?;
+        }
+        Ok(report)
     }
 }
 
-fn local_ingest_options(config: &UserConfig, stale_only: bool) -> Result<IngestOptions> {
+fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
     Ok(IngestOptions {
         claude_sources: default_claude_sources(),
         include_agents: false,
@@ -2842,7 +2843,7 @@ fn local_ingest_options(config: &UserConfig, stale_only: bool) -> Result<IngestO
         model: config.resolve_model(None)?,
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
-        defer_merges: stale_only,
+        defer_merges: true,
     })
 }
 
