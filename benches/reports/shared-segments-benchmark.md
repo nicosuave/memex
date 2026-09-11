@@ -1,6 +1,6 @@
 # Shared-segment refresh measurements
 
-2026-09-08, Apple M1 Pro. Baseline: `64f6472`; candidate: `perf/shared-segments`. Storage semantics and compatibility are defined in [index-storage.md](index-storage.md).
+2026-09-08, Apple M1 Pro. Baseline: `64f6472`; candidate: `perf/shared-segments`. Storage semantics and compatibility are defined in [index-storage.md](../../docs/index-storage.md).
 
 ## Workload
 
