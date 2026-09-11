@@ -1,6 +1,8 @@
 mod checkpoint;
-mod discovery;
+pub mod directories;
+pub(crate) mod discovery;
 mod execution;
+pub mod journal;
 mod plan;
 mod publication;
 mod selection;
@@ -204,6 +206,7 @@ pub fn ingest_if_stale(
     options: &IngestOptions,
     ttl_seconds: u64,
     lease: &IngestLease,
+    journal: Option<journal::ReplayHandle>,
 ) -> Result<Option<IngestReport>> {
     crate::profiling::span!("ingest.freshness");
     let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
@@ -221,7 +224,7 @@ pub fn ingest_if_stale(
     }
 
     crate::profiling::count!("ingest.fresh_cache_misses", 1);
-    let report = ingest_selected(paths, index, options, lease, None, Some(header))?.report;
+    let report = ingest_selected(paths, index, options, lease, None, Some(header), journal)?.report;
     Ok(Some(report))
 }
 
@@ -231,7 +234,7 @@ pub fn ingest_all(
     options: &IngestOptions,
     lease: &IngestLease,
 ) -> Result<IngestReport> {
-    ingest_selected(paths, index, options, lease, None, None).map(|result| result.report)
+    ingest_selected(paths, index, options, lease, None, None, None).map(|result| result.report)
 }
 
 pub(crate) fn ingest_dirty(
@@ -241,7 +244,7 @@ pub(crate) fn ingest_dirty(
     lease: &IngestLease,
     dirty: &HashSet<PathBuf>,
 ) -> Result<DirtyIngestReport> {
-    ingest_selected(paths, index, options, lease, Some(dirty), None)
+    ingest_selected(paths, index, options, lease, Some(dirty), None, None)
 }
 
 fn ingest_selected(
@@ -251,15 +254,24 @@ fn ingest_selected(
     lease: &IngestLease,
     dirty: Option<&HashSet<PathBuf>>,
     checkpoint_header: Option<CheckpointHeader>,
+    journal: Option<journal::ReplayHandle>,
 ) -> Result<DirtyIngestReport> {
     crate::profiling::span!("ingest.all");
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
+    let narrowing = match (dirty, journal) {
+        (Some(dirty), _) => discovery::Narrowing::Dirty(dirty),
+        (None, Some(journal)) => discovery::Narrowing::Journal(journal),
+        (None, None) => discovery::Narrowing::None,
+    };
     let pool = parser_thread_pool()?;
     let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
+    if dirty.is_none() {
+        refresh_memories(paths, options, &repositories)?;
+    }
     let prepared =
-        discovery::prepare_refresh(paths, index, options, &pool, recovered, dirty, None)?;
+        discovery::prepare_refresh(paths, index, options, &pool, recovered, narrowing, None)?;
     let full_scan = prepared.full_scan;
-    if full_scan {
+    if full_scan && dirty.is_some() {
         refresh_memories(paths, options, &repositories)?;
     }
     let report = execution::execute_refresh(prepared, paths, index, options, repositories, &pool)?;

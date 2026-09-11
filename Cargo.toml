@@ -66,6 +66,7 @@ url = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 # ort >= rc.13 gates each execution provider behind its own feature.
 ort = { version = "2.0.0-rc.13", features = ["coreml"] }
+fsevent-sys = "4"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

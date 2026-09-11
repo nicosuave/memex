@@ -768,8 +768,8 @@ mod tests {
         .unwrap() else {
             panic!("regular source files should resolve directly")
         };
-        let mut discovered = sources::claude::discover(&claude, false).unwrap();
-        discovered.extend(sources::codex::discover_rollouts());
+        let mut discovered = sources::claude::discover(&claude, false, None).unwrap();
+        discovered.extend(sources::codex::discover_rollouts(None));
         discovered.extend(
             sources::codex::history_paths()
                 .into_iter()
@@ -778,7 +778,7 @@ mod tests {
                     path,
                 }),
         );
-        discovered.extend(sources::pi::discover());
+        discovered.extend(sources::pi::discover(None));
         discovered.sort_by(|left, right| left.path.cmp(&right.path));
         assert_eq!(files, discovered);
         assert_eq!(databases, sources::opencode::discover_databases().unwrap());
@@ -806,7 +806,7 @@ mod tests {
         .unwrap() else {
             panic!("fallback Codex root should resolve directly")
         };
-        assert_eq!(files, sources::codex::discover_rollouts());
+        assert_eq!(files, sources::codex::discover_rollouts(None));
         assert!(databases.is_empty());
     }
 

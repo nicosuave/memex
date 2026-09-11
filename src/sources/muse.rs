@@ -10,7 +10,6 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
@@ -37,21 +36,17 @@ pub fn sessions_root() -> PathBuf {
         .unwrap_or_else(|| super::common::home().join(".local/share/muse/sessions"))
 }
 
-pub fn discover() -> Vec<SourceFile> {
+pub fn discover(walk: Option<&mut crate::ingest::directories::StampedWalk>) -> Vec<SourceFile> {
     let root = sessions_root();
     if !root.exists() {
         return Vec::new();
     }
-    let mut files = WalkDir::new(root)
+    let mut files = super::common::files_under(&root, walk)
         .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry.path().file_name().and_then(|n| n.to_str()) == Some("session.jsonl")
-        })
-        .map(|entry| SourceFile {
+        .filter(|path| path.file_name().and_then(|n| n.to_str()) == Some("session.jsonl"))
+        .map(|path| SourceFile {
             source: SourceKind::Muse,
-            path: entry.path().to_path_buf(),
+            path,
         })
         .collect::<Vec<_>>();
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -525,7 +520,7 @@ pub(crate) fn parse_index_records(
 }
 
 pub fn usage_files() -> Vec<PathBuf> {
-    discover().into_iter().map(|f| f.path).collect()
+    discover(None).into_iter().map(|f| f.path).collect()
 }
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {

@@ -25,6 +25,31 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
 ";
 
+/// Added after format version 2 shipped; every writer creates it on open so existing
+/// databases gain it without a format bump. Readers treat its absence as no stamps.
+const DIRECTORIES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS directories (
+    path TEXT PRIMARY KEY NOT NULL,
+    fingerprint TEXT NOT NULL,
+    device INTEGER NOT NULL,
+    inode INTEGER NOT NULL,
+    mtime_secs INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL,
+    ctime_secs INTEGER NOT NULL,
+    ctime_nanos INTEGER NOT NULL
+);
+";
+
+/// One row per discovery fingerprint: the file-system event journal position captured by the
+/// last committed refresh. Readers treat a missing table as no cursor.
+const JOURNAL_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS journal (
+    fingerprint TEXT PRIMARY KEY NOT NULL,
+    device_uuid TEXT NOT NULL,
+    event_id INTEGER NOT NULL
+);
+";
+
 pub(super) enum MigrationFailure {
     None,
     #[cfg(test)]
@@ -179,7 +204,27 @@ fn open_connection(state_path: &Path, writable: bool, create: bool) -> Result<Co
     Ok(connection)
 }
 
+fn drop_outdated_directories(connection: &Connection) -> Result<()> {
+    let columns: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('directories') WHERE name='ctime_secs'",
+        [],
+        |row| row.get(0),
+    )?;
+    let table: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='directories')",
+        [],
+        |row| row.get(0),
+    )?;
+    if table == 1 && columns == 0 {
+        connection.execute_batch("DROP TABLE directories;")?;
+    }
+    Ok(())
+}
+
 fn configure_writer(connection: &Connection) -> Result<()> {
+    drop_outdated_directories(connection)?;
+    connection.execute_batch(DIRECTORIES_SCHEMA)?;
+    connection.execute_batch(JOURNAL_SCHEMA)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "fullfsync", false)?;

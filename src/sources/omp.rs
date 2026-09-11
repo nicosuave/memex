@@ -109,8 +109,8 @@ pub(crate) fn session_roots() -> Vec<PathBuf> {
     roots
 }
 
-pub fn discover() -> Vec<SourceFile> {
-    super::common::jsonl_files(session_roots())
+pub fn discover(walk: Option<&mut crate::ingest::directories::StampedWalk>) -> Vec<SourceFile> {
+    super::common::jsonl_files_with(session_roots(), walk)
         .into_iter()
         .map(|path| SourceFile {
             source: SourceKind::Omp,
@@ -216,7 +216,7 @@ mod tests {
         let _env = EnvVarGuard::set_os(&[("PI_CODING_AGENT_DIR", Some(temp.path().as_os_str()))]);
 
         assert_eq!(
-            discover(),
+            discover(None),
             vec![SourceFile {
                 source: SourceKind::Omp,
                 path: transcript

@@ -32,7 +32,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     push(SourceKind::Claude, super::claude::usage_files());
     push(
         SourceKind::Codex,
-        super::codex::discover_rollouts()
+        super::codex::discover_rollouts(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -54,7 +54,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     );
     push(
         SourceKind::Pi,
-        super::pi::discover()
+        super::pi::discover(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -96,7 +96,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     );
     push(
         SourceKind::Muse,
-        super::muse::discover()
+        super::muse::discover(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),
@@ -111,7 +111,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
 
     push(
         SourceKind::Omp,
-        super::omp::discover()
+        super::omp::discover(None)
             .into_iter()
             .map(|file| file.path)
             .collect(),

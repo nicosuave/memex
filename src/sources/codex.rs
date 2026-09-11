@@ -71,8 +71,10 @@ pub fn rollout_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn discover_rollouts() -> Vec<SourceFile> {
-    super::common::jsonl_files(rollout_roots())
+pub fn discover_rollouts(
+    walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> Vec<SourceFile> {
+    super::common::jsonl_files_with(rollout_roots(), walk)
         .into_iter()
         .map(|path| SourceFile {
             source: SourceKind::Codex,
