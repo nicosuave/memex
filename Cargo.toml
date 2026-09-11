@@ -9,6 +9,7 @@ repository = "https://github.com/nicosuave/memex"
 
 [features]
 default = []
+profiling = []
 cuda = ["ort/cuda", "dep:libloading"]
 
 [dependencies]

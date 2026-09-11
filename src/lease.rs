@@ -44,6 +44,7 @@ impl IngestLease {
     }
 
     pub fn acquire(paths: &Paths, operation: impl Into<String>, timeout: Duration) -> Result<Self> {
+        crate::profiling::span!("ingest.lease_wait");
         let path = lease_path(paths);
         let operation = operation.into();
         let started = Instant::now();

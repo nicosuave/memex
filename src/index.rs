@@ -22,7 +22,7 @@ use tantivy::merge_policy::NoMergePolicy;
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
-    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
+    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
     TextFieldIndexing, TextOptions,
 };
 use tantivy::store::StoreReader;
@@ -514,6 +514,7 @@ impl SearchIndex {
         dir: &Path,
         suppress_automatic_merges: bool,
     ) -> Result<Self> {
+        crate::profiling::span!("lexical.stage");
         fs::create_dir_all(dir)?;
         let generations = dir.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;
@@ -581,6 +582,7 @@ impl SearchIndex {
     }
 
     pub fn writer(&self) -> Result<IndexWriter> {
+        crate::profiling::span!("lexical.writer_open");
         if !self.writable {
             bail!("cannot create a writer for a sealed index generation");
         }
@@ -592,11 +594,14 @@ impl SearchIndex {
     }
 
     pub fn reader(&self) -> Result<IndexReader> {
-        Ok(self
+        crate::profiling::span!("lexical.reader_open");
+        let reader: IndexReader = self
             .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
-            .try_into()?)
+            .try_into()?;
+        crate::profiling::count!("lexical.readers_opened", 1);
+        Ok(reader)
     }
 
     /// Open-time snapshot identity. It remains stable for this instance; writable callers must
@@ -658,6 +663,7 @@ impl SearchIndex {
     }
 
     pub(crate) fn publish_generation(&self) -> Result<()> {
+        crate::profiling::span!("lexical.publish");
         let Some(pending) = &self.pending_generation else {
             return Ok(());
         };
@@ -716,6 +722,7 @@ impl SearchIndex {
     }
 
     fn doc_ids_matching_query(&self, query: Box<dyn Query>) -> Result<Vec<u64>> {
+        crate::profiling::span!("lexical.source_ids");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let limit = (searcher.num_docs() as usize).max(1);
@@ -731,6 +738,8 @@ impl SearchIndex {
             }
         }
         doc_ids.sort_unstable();
+        crate::profiling::count!("lexical.source_id_queries", 1);
+        crate::profiling::count!("lexical.source_ids_found", doc_ids.len());
         Ok(doc_ids)
     }
 
@@ -951,6 +960,7 @@ impl SearchIndex {
     }
 
     pub fn search(&self, options: &QueryOptions) -> Result<Vec<(f32, Record)>> {
+        crate::profiling::span!("lexical.search");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let query = build_query(&self.fields, options, &self.index)?;
@@ -1586,6 +1596,7 @@ impl SearchIndex {
     where
         F: FnMut(Record) -> Result<()>,
     {
+        crate::profiling::span!("lexical.walk_records");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         for segment_reader in searcher.segment_readers() {
@@ -1593,6 +1604,7 @@ impl SearchIndex {
             for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
                 let doc = doc?;
                 let record = record_from_doc(&self.fields, &doc);
+                crate::profiling::count!("lexical.records_walked", 1);
                 f(record)?;
             }
         }
@@ -2254,8 +2266,11 @@ fn build_schema_with_options(
     builder.add_text_field("role", STRING | STORED);
     builder.add_text_field("source", session_identity_options.clone());
 
+    // `en_stem` lowercases and applies the English Snowball stemmer, so a query for
+    // "migration" also matches "migrations" and "migrated". Existing indexes keep the
+    // tokenizer recorded in their on-disk schema until `memex index rebuild`.
     let text_indexing = TextFieldIndexing::default()
-        .set_tokenizer("default")
+        .set_tokenizer("en_stem")
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let text_options = TextOptions::default()
         .set_indexing_options(text_indexing)
@@ -2263,8 +2278,11 @@ fn build_schema_with_options(
     builder.add_text_field("text", text_options);
 
     builder.add_text_field("tool_name", STRING | STORED);
-    builder.add_text_field("tool_input", TEXT | STORED);
-    builder.add_text_field("tool_output", TEXT | STORED);
+    // Queries only parse against `text`, which already carries a tool result's content;
+    // indexing these too roughly doubled each segment's vocabulary. Existing indexes keep
+    // their on-disk schema until `memex index rebuild`.
+    builder.add_text_field("tool_input", STORED);
+    builder.add_text_field("tool_output", STORED);
     builder.add_text_field("event_id", STRING | STORED);
     builder.add_text_field("parent_event_id", STRING | STORED);
     builder.add_text_field("logical_parent_event_id", STRING | STORED);
@@ -2520,6 +2538,21 @@ fn add_optional_text(doc: &mut TantivyDocument, field: Field, value: &Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_payload_fields_are_stored_without_indexing() {
+        let schema = build_schema().unwrap();
+        for name in ["tool_input", "tool_output"] {
+            let field = schema.get_field(name).unwrap();
+            let entry = schema.get_field_entry(field);
+            assert!(entry.is_stored(), "{name} must remain retrievable");
+            assert!(
+                !entry.is_indexed(),
+                "{name} must not duplicate the text vocabulary"
+            );
+        }
+    }
+    use tantivy::schema::TEXT;
 
     fn test_record(doc_id: u64, text: &str) -> Record {
         Record {
@@ -3523,6 +3556,90 @@ mod tests {
         let new_reader = SearchIndex::open_or_create(tmp.path()).expect("new reader");
         assert_eq!(search_text_count(&new_reader, "beforeupdate"), 0);
         assert_eq!(search_text_count(&new_reader, "afterupdate"), 1);
+    }
+
+    #[test]
+    fn text_search_matches_inflected_forms_through_stemming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(1, "ran the database migrations"))
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "migration"), 1);
+        assert_eq!(search_text_count(&index, "migrated"), 1);
+        assert_eq!(search_text_count(&index, "Databases"), 1);
+        assert_eq!(search_text_count(&index, "rollback"), 0);
+    }
+
+    #[test]
+    fn existing_default_tokenizer_is_preserved_until_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("index");
+        fs::create_dir(&dir).expect("index directory");
+        let mut schema =
+            serde_json::to_value(build_schema().expect("schema")).expect("serialize schema");
+        let fields = schema.as_array_mut().expect("schema fields");
+        let text = fields
+            .iter_mut()
+            .find(|field| field["name"] == "text")
+            .expect("text field");
+        text["options"]["indexing"]["tokenizer"] = "default".into();
+        let legacy_indexing = text["options"]["indexing"].clone();
+        for field in fields {
+            if field["name"] == "tool_input" || field["name"] == "tool_output" {
+                field["options"]["indexing"] = legacy_indexing.clone();
+            }
+        }
+        let schema: Schema = serde_json::from_value(schema).expect("legacy schema");
+        drop(Index::create_in_dir(&dir, schema).expect("create legacy index"));
+
+        let record = test_record(1, "ran the database migrations");
+        let legacy = SearchIndex::open_or_create(&dir).expect("open legacy index");
+        let mut writer = legacy.writer().expect("legacy writer");
+        legacy
+            .add_record(&mut writer, &record)
+            .expect("legacy record");
+        writer.commit().expect("commit legacy record");
+        writer.wait_merging_threads().expect("finish legacy writer");
+        drop(legacy);
+
+        let reopened = SearchIndex::open_or_create(&dir).expect("reopen legacy index");
+        assert_eq!(search_text_count(&reopened, "migrations"), 1);
+        assert_eq!(search_text_count(&reopened, "migration"), 0);
+        drop(reopened);
+
+        let incremental =
+            SearchIndex::open_or_create_for_ingest(&dir).expect("stage existing schema for ingest");
+        assert_eq!(search_text_count(&incremental, "migrations"), 1);
+        assert_eq!(search_text_count(&incremental, "migration"), 0);
+        incremental
+            .publish_generation()
+            .expect("publish existing schema");
+        drop(incremental);
+        let published = SearchIndex::open_or_create(&dir).expect("reopen published schema");
+        assert_eq!(search_text_count(&published, "migrations"), 1);
+        assert_eq!(search_text_count(&published, "migration"), 0);
+        drop(published);
+
+        // Explicit rebuild removes the derived index and reparses the source records.
+        fs::remove_dir_all(&dir).expect("reset index for rebuild");
+        let rebuilt = SearchIndex::open_or_create_for_ingest(&dir).expect("rebuild index");
+        let mut writer = rebuilt.writer().expect("rebuild writer");
+        rebuilt
+            .add_record(&mut writer, &record)
+            .expect("rebuild record");
+        writer.commit().expect("commit rebuilt record");
+        writer
+            .wait_merging_threads()
+            .expect("finish rebuild writer");
+        rebuilt.publish_generation().expect("publish rebuilt index");
+        drop(rebuilt);
+        let reopened = SearchIndex::open_or_create(&dir).expect("reopen rebuilt index");
+        assert_eq!(search_text_count(&reopened, "migrations"), 1);
+        assert_eq!(search_text_count(&reopened, "migration"), 1);
     }
 
     fn search_text_count(index: &SearchIndex, query: &str) -> usize {
