@@ -3,7 +3,6 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use memchr::memchr;
-use memmap2::Mmap;
 use rusqlite::{Connection, OpenFlags};
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
@@ -113,8 +112,10 @@ pub(crate) fn parse_index_records(
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mmap = super::common::map_sequential(&file)?;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = initial_turn_id(path, state.turn_id);
     let mut pending_tool_calls = state.pending_tool_calls;
     let source_path = path.to_string_lossy().to_string();
@@ -123,6 +124,7 @@ pub(crate) fn parse_index_records(
     let timestamp = mtime.max(0) as u64 * 1000;
     let mut buffer = Vec::new();
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let relative = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..relative];
@@ -133,6 +135,10 @@ pub(crate) fn parse_index_records(
         buffer.clear();
         buffer.extend_from_slice(line);
         let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
+            if relative == slice.len() {
+                start = line_start;
+                break;
+            }
             continue;
         };
         let Some(object) = value.as_object() else {
@@ -293,11 +299,12 @@ pub(crate) fn parse_index_records(
     }
     Ok(IndexParseOutput {
         legacy_turn_id: None,
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
         diagnostics: Default::default(),
+        session_cwd: None,
     })
 }
 

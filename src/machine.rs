@@ -44,6 +44,9 @@ pub enum SearchMode {
     Hybrid,
 }
 
+/// Must exceed every preview window callers render, so a capped record centres the same match.
+pub const SEARCH_TEXT_BUDGET: usize = 2_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSpec {
     pub query: String,
@@ -65,9 +68,29 @@ pub struct SearchSpec {
     pub recency_half_life_days: f32,
     pub min_score: Option<f32>,
     pub project_grouping: Option<ProjectGrouping>,
+    /// Cap on the characters of `text`, `tool_input`, and `tool_output` returned per record.
+    /// Callers that render excerpts avoid shipping whole tool transcripts; the kept window
+    /// starts at the first query term when that lies beyond the cap.
+    #[serde(default)]
+    pub text_limit: Option<usize>,
 }
 
 impl SearchSpec {
+    fn abbreviate(&self, records: &mut [(f32, Record)]) {
+        let Some(limit) = self.text_limit else {
+            return;
+        };
+        let terms = crate::cli::query_literals(&self.query);
+        for (_, record) in records {
+            abbreviate_field(&mut record.text, limit, &terms);
+            if let Some(input) = record.tool_input.as_mut() {
+                abbreviate_field(input, limit, &terms);
+            }
+            if let Some(output) = record.tool_output.as_mut() {
+                abbreviate_field(output, limit, &terms);
+            }
+        }
+    }
     fn query_options(&self) -> QueryOptions {
         QueryOptions {
             query: self.query.clone(),
@@ -512,7 +535,12 @@ pub fn federated_search(
                 let paths = paths.clone();
                 let config = config.clone();
                 scope.spawn(move || {
-                    let result = search_local(&paths, &config, &spec, auto_index_local);
+                    let result = search_local(&paths, &config, &spec, auto_index_local).map(
+                        |mut records| {
+                            spec.abbreviate(&mut records);
+                            records
+                        },
+                    );
                     let _ = tx.send((LOCAL_MACHINE_ID.to_string(), result));
                 });
             } else {
@@ -2082,9 +2110,11 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         RpcOperation::MemoryRead { request } => Ok(RpcPayload::MemoryDocument {
             document: Box::new(read_memory(paths, config, LOCAL_MACHINE_ID, &request)?),
         }),
-        RpcOperation::Search { spec } => Ok(RpcPayload::Records {
-            records: search_local(paths, config, &spec, true)?,
-        }),
+        RpcOperation::Search { spec } => {
+            let mut records = search_local(paths, config, &spec, true)?;
+            spec.abbreviate(&mut records);
+            Ok(RpcPayload::Records { records })
+        }
         RpcOperation::Recent {
             limit,
             project_grouping,
@@ -2450,6 +2480,7 @@ fn search_local(
     spec: &SearchSpec,
     auto_index: bool,
 ) -> Result<Vec<(f32, Record)>> {
+    crate::profiling::span!("search.local");
     if auto_index {
         ensure_local_index(paths, config)?;
     }
@@ -2651,18 +2682,147 @@ fn apply_project_grouping(
     }
 }
 
+/// Lowercasing can change a character's byte length, so an offset into the lowercased string
+/// does not index the original.
+fn chars_before_lowercase(field: &str, lower_byte: usize) -> usize {
+    let mut lowered = 0;
+    for (index, character) in field.chars().enumerate() {
+        if lowered >= lower_byte {
+            return index;
+        }
+        lowered += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    field.chars().count()
+}
+
+/// Keep `limit` characters of `field`: from the start, or from the first occurrence of a query
+/// term when every term lies beyond the first `limit` characters.
+fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
+    if field.chars().count() <= limit {
+        return;
+    }
+    let lower = field.to_lowercase();
+    let first_hit = terms
+        .iter()
+        .filter(|term| !term.is_empty())
+        .filter_map(|term| lower.find(term.as_str()))
+        .min();
+    let start_byte = match first_hit.map(|byte| (byte, chars_before_lowercase(field, byte))) {
+        Some((_, chars_before)) if chars_before >= limit => {
+            let skip = chars_before.saturating_sub(limit / 4);
+            field.char_indices().nth(skip).map_or(0, |(index, _)| index)
+        }
+        _ => 0,
+    };
+    let kept = field[start_byte..]
+        .char_indices()
+        .nth(limit)
+        .map_or(field.len(), |(index, _)| start_byte + index);
+    let mut abbreviated = String::with_capacity(kept - start_byte + 2);
+    if start_byte > 0 {
+        abbreviated.push('…');
+    }
+    abbreviated.push_str(&field[start_byte..kept]);
+    if kept < field.len() {
+        abbreviated.push('…');
+    }
+    *field = abbreviated;
+}
+
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
     if config.auto_index_on_search_default() {
-        let _ = index_local(paths, config, true)?;
+        let report = index_local(paths, config, true)?;
+        if report.records_added > 0 {
+            schedule_compaction_if_fragmented(paths)?;
+        }
     }
     Ok(())
 }
 
+/// Search refreshes append without merging; once segments accumulate, one detached
+/// `memex index compact` process folds the small ones into one segment and exits. The spawn
+/// is skipped while an ingest holds the lease, and the child takes a compaction lock, so a
+/// second child started in the gap exits instead of merging the same segments again.
+pub(crate) fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
+    let small = SearchIndex::open_or_create(&paths.index)?
+        .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
+    if small <= crate::index::SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS {
+        return Ok(());
+    }
+    if !matches!(
+        IngestLease::try_acquire(paths, "compaction-check")?,
+        crate::lease::LeaseAttempt::Acquired(_)
+    ) {
+        return Ok(());
+    }
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--no-update-check",
+            "--non-interactive",
+            "index",
+            "compact",
+            "--root",
+        ])
+        .arg(&paths.root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .spawn()
+        .context("spawn background index compaction")?;
+    Ok(())
+}
+
 fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<IngestReport> {
+    crate::profiling::span!("index.local");
+    let options = local_ingest_options(config)?;
+    // The journal stream must be registered before this process writes anything: a write in
+    // the milliseconds before registration makes fseventsd hold the replay for ~160 ms.
+    let journal = stale_only.then(|| {
+        let journal = crate::ingest::discovery::start_journal_replay(paths, &options);
+        journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);
+        journal
+    });
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
-    let index = SearchIndex::open_or_create_for_ingest(&paths.index)?;
-    let options = IngestOptions {
+    let index = match SearchIndex::open_or_create(&paths.index) {
+        Ok(index) if !index.is_writable() => index,
+        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+    };
+    if stale_only {
+        Ok(ingest_if_stale(
+            paths,
+            &index,
+            &options,
+            config.scan_cache_ttl(),
+            &lease,
+            journal,
+        )?
+        .unwrap_or(IngestReport {
+            records_added: 0,
+            records_embedded: 0,
+            files_scanned: 0,
+            files_skipped: 0,
+            diagnostics: Default::default(),
+        }))
+    } else {
+        let report = ingest_all(paths, &index, &options, &lease)?;
+        drop(lease);
+        if report.records_added > 0 {
+            schedule_compaction_if_fragmented(paths)?;
+        }
+        Ok(report)
+    }
+}
+
+fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
+    Ok(IngestOptions {
         claude_sources: default_claude_sources(),
         include_agents: false,
         include_reasoning: config.include_reasoning_default(),
@@ -2683,22 +2843,8 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         model: config.resolve_model(None)?,
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
-    };
-    if stale_only {
-        Ok(
-            ingest_if_stale(paths, &index, &options, config.scan_cache_ttl(), &lease)?.unwrap_or(
-                IngestReport {
-                    records_added: 0,
-                    records_embedded: 0,
-                    files_scanned: 0,
-                    files_skipped: 0,
-                    diagnostics: Default::default(),
-                },
-            ),
-        )
-    } else {
-        ingest_all(paths, &index, &options, &lease)
-    }
+        defer_merges: true,
+    })
 }
 
 fn records_for_session(
@@ -3036,6 +3182,61 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod abbreviate_tests {
+    use super::abbreviate_field;
+
+    #[test]
+    fn query_syntax_keeps_the_positive_text_window() {
+        for query in ["\"needle\"", "text:needle AND NOT text:padding"] {
+            let mut field = format!("padding {} needle evidence", "x".repeat(200));
+            abbreviate_field(&mut field, 40, &crate::cli::query_literals(query));
+            assert!(field.contains("needle"));
+            assert!(!field.contains("padding"));
+        }
+    }
+
+    #[test]
+    fn short_fields_are_untouched_and_long_ones_keep_the_query_window() {
+        let terms = vec!["needle".to_string()];
+        let mut short = "a needle in here".to_string();
+        abbreviate_field(&mut short, 100, &terms);
+        assert_eq!(short, "a needle in here");
+        let mut long = format!("{}needle tail", "x".repeat(500));
+        abbreviate_field(&mut long, 40, &terms);
+        assert!(long.starts_with('…') && long.contains("needle"), "{long}");
+        assert!(long.chars().count() <= 42);
+        let mut early = format!("needle {}", "y".repeat(500));
+        abbreviate_field(&mut early, 40, &terms);
+        assert!(early.starts_with("needle") && early.ends_with('…'));
+        let mut unicode = "é".repeat(50);
+        abbreviate_field(&mut unicode, 10, &[]);
+        assert_eq!(unicode, format!("{}…", "é".repeat(10)));
+    }
+
+    #[test]
+    fn a_prefix_that_grows_when_lowercased_still_keeps_the_query_window() {
+        let terms = vec!["needle".to_string()];
+
+        // `İ` lowercases to two characters, so the hit's offset in the lowercased string
+        // overshoots the original.
+        let mut turkish = format!("{}needle tail", "İ".repeat(100));
+        abbreviate_field(&mut turkish, 40, &terms);
+        assert!(turkish.contains("needle"), "{turkish}");
+        assert!(turkish.starts_with('…'));
+        assert!(turkish.chars().count() <= 42, "{}", turkish.chars().count());
+
+        // Final sigma lowercases to a different character of the same width.
+        let mut greek = format!("{}needle tail", "Σ".repeat(100));
+        abbreviate_field(&mut greek, 40, &terms);
+        assert!(greek.contains("needle"), "{greek}");
+
+        let mut mixed = format!("{}needle", "İa".repeat(60));
+        abbreviate_field(&mut mixed, 30, &terms);
+        assert!(mixed.contains("needle"), "{mixed}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analytics::AnalyticsWriter;
@@ -3353,6 +3554,7 @@ mod tests {
             recency_half_life_days: 30.0,
             min_score: None,
             project_grouping: None,
+            text_limit: None,
         }
     }
 

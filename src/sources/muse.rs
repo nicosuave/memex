@@ -3,14 +3,12 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use memchr::memchr;
-use memmap2::Mmap;
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
@@ -37,21 +35,17 @@ pub fn sessions_root() -> PathBuf {
         .unwrap_or_else(|| super::common::home().join(".local/share/muse/sessions"))
 }
 
-pub fn discover() -> Vec<SourceFile> {
+pub fn discover(walk: Option<&mut crate::ingest::directories::StampedWalk>) -> Vec<SourceFile> {
     let root = sessions_root();
     if !root.exists() {
         return Vec::new();
     }
-    let mut files = WalkDir::new(root)
+    let mut files = super::common::files_under(&root, walk)
         .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry.path().file_name().and_then(|n| n.to_str()) == Some("session.jsonl")
-        })
-        .map(|entry| SourceFile {
+        .filter(|path| path.file_name().and_then(|n| n.to_str()) == Some("session.jsonl"))
+        .map(|path| SourceFile {
             source: SourceKind::Muse,
-            path: entry.path().to_path_buf(),
+            path,
         })
         .collect::<Vec<_>>();
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -70,7 +64,7 @@ pub fn cwd_from_muse_session(path: &Path) -> Option<PathBuf> {
     let Ok(file) = File::open(path) else {
         return None;
     };
-    let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
+    let Ok(mmap) = super::common::map_sequential(&file) else {
         return None;
     };
     let mut start = 0;
@@ -178,8 +172,10 @@ pub(crate) fn parse_index_records(
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mmap = super::common::map_sequential(&file)?;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
     let mut pending_tool_calls = state.pending_tool_calls;
     let mut diagnostics = ParseDiagnostics::default();
@@ -240,6 +236,7 @@ pub(crate) fn parse_index_records(
         buf.clear();
     }
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let rel = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..rel];
@@ -252,6 +249,11 @@ pub(crate) fn parse_index_records(
         let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
             Ok(v) => v,
             Err(_) => {
+                if rel == slice.len() {
+                    start = line_start;
+                    break;
+                }
+
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -508,21 +510,22 @@ pub(crate) fn parse_index_records(
 
     Ok(IndexParseOutput {
         legacy_turn_id: None,
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
         diagnostics,
+        session_cwd: None,
     })
 }
 
 pub fn usage_files() -> Vec<PathBuf> {
-    discover().into_iter().map(|f| f.path).collect()
+    discover(None).into_iter().map(|f| f.path).collect()
 }
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut session_id = session_id_from_path(path);
     let mut project = SourceKind::Muse.label().to_string();

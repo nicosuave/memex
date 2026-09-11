@@ -1,9 +1,9 @@
 //! Resolve event hints without walking transcript trees. Root aliases are
 //! translated back to discovery spelling so state and index keys stay stable.
 
+use super::CheckpointSession;
 use super::{IngestOptions, PathExcluder, build_path_excluder};
 use crate::sources::{self, SourceFile};
-use crate::state::IngestState;
 use crate::types::SourceKind;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -131,7 +131,7 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
 pub(super) fn resolve_dirty(
     options: &IngestOptions,
     dirty: &HashSet<PathBuf>,
-    state: &IngestState,
+    state: &CheckpointSession,
 ) -> Result<DirtySelection> {
     let excluder = build_path_excluder(options)?;
     resolve(&roots(options), dirty, state, &excluder)
@@ -240,7 +240,7 @@ fn classify(root: &Root, path: &Path) -> Match {
 fn resolve(
     roots: &[Root],
     dirty: &HashSet<PathBuf>,
-    state: &IngestState,
+    state: &CheckpointSession,
     excluder: &PathExcluder,
 ) -> Result<DirtySelection> {
     let mut files = Vec::new();
@@ -288,12 +288,12 @@ fn resolve(
                 // A deleted lock/cache file is noise. A vanished directory
                 // containing indexed keys still requires tombstone recovery.
                 let key = path.to_string_lossy();
-                known_unmatched |= state.files.contains_key(key.as_ref())
+                known_unmatched |= state.contains_file(key.as_ref())?
                     || state.opencode_databases.contains_key(key.as_ref());
                 if metadata.is_err() {
                     known_unmatched |= state
-                        .files
-                        .keys()
+                        .file_keys()?
+                        .iter()
                         .chain(state.opencode_databases.keys())
                         .any(|key| Path::new(key).starts_with(&path));
                 }
@@ -363,23 +363,23 @@ fn resolve(
 /// batch. No transcript discovery or per-file stats are needed here.
 pub(super) fn codex_session_ids(
     options: &IngestOptions,
-    state: &IngestState,
+    state: &CheckpointSession,
     files: &[SourceFile],
-) -> HashSet<String> {
+) -> Result<HashSet<String>> {
     if !options.include_codex {
-        return HashSet::new();
+        return Ok(HashSet::new());
     }
     let Ok(excluder) = build_path_excluder(options) else {
         // The caller validates these same patterns before resolving a batch.
-        return HashSet::new();
+        return Ok(HashSet::new());
     };
     let rollout_roots = sources::codex::rollout_roots()
         .into_iter()
         .map(|root| Root::new(root, Shape::Jsonl(SourceKind::Codex)))
         .collect::<Vec<_>>();
-    state
-        .files
-        .keys()
+    Ok(state
+        .file_keys()?
+        .iter()
         .map(Path::new)
         .chain(
             files
@@ -399,14 +399,24 @@ pub(super) fn codex_session_ids(
             })
         })
         .filter_map(sources::codex::session_id_from_path)
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{IndexedToolContentLimits, UserConfig};
-    use crate::state::FileState;
+    use crate::state::{FileState, IngestState};
+
+    fn checkpoint(temp: &tempfile::TempDir, state: &IngestState) -> CheckpointSession {
+        let paths = crate::config::Paths::new(Some(temp.path().join("checkpoint"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease =
+            crate::lease::IngestLease::acquire(&paths, "test", std::time::Duration::ZERO).unwrap();
+        let path = paths.state.join("ingest.json");
+        state.save_with_lease(&path, &lease).unwrap();
+        CheckpointSession::open(&path, &lease, false, None).unwrap()
+    }
     use crate::test_support::{EnvVarGuard, env_lock};
 
     fn options() -> IngestOptions {
@@ -431,6 +441,7 @@ mod tests {
             model: Default::default(),
             embed_runtime: UserConfig::default().resolve_embed_runtime().unwrap(),
             tool_content_limits: IndexedToolContentLimits::default(),
+            defer_merges: false,
         }
     }
 
@@ -440,10 +451,11 @@ mod tests {
     }
 
     fn select(roots: &[Root], path: &Path) -> DirtySelection {
+        let temp = tempfile::tempdir().unwrap();
         resolve(
             roots,
             &HashSet::from([path.to_path_buf()]),
-            &IngestState::default(),
+            &checkpoint(&temp, &IngestState::default()),
             &PathExcluder::build(&[]).unwrap(),
         )
         .unwrap()
@@ -637,7 +649,7 @@ mod tests {
         let exclusions =
             PathExcluder::build(&[alias.join("**").to_string_lossy().into_owned()]).unwrap();
         assert!(matches!(resolve(&roots, &HashSet::from([canonical_hint]),
-            &IngestState::default(), &exclusions).unwrap(), DirtySelection::Paths { files, databases }
+            &checkpoint(&temp, &IngestState::default()), &exclusions).unwrap(), DirtySelection::Paths { files, databases }
             if files.is_empty() && databases.is_empty()));
     }
 
@@ -677,10 +689,12 @@ mod tests {
                 legacy_turn_id: None,
                 parser_version: 0,
                 pending_tool_calls: Default::default(),
+                codex_metadata_offsets: None,
                 identity: Default::default(),
                 claude_background: None,
             },
         );
+        let state = checkpoint(&temp, &state);
         let DirtySelection::Paths { files, databases } = resolve_dirty(
             &options,
             &HashSet::from([history.clone(), new.clone(), pi.clone()]),
@@ -696,12 +710,12 @@ mod tests {
             path: pi
         }));
         assert_eq!(
-            codex_session_ids(&options, &state, &files),
+            codex_session_ids(&options, &state, &files).unwrap(),
             HashSet::from([known_id.to_string(), new_id.to_string()])
         );
         options.exclude_patterns = vec![known.to_string_lossy().into_owned()];
         assert_eq!(
-            codex_session_ids(&options, &state, &files),
+            codex_session_ids(&options, &state, &files).unwrap(),
             HashSet::from([new_id.to_string()])
         );
     }
@@ -746,13 +760,16 @@ mod tests {
         options.include_codex = true;
         options.include_pi = true;
         options.include_opencode = true;
-        let DirtySelection::Paths { files, databases } =
-            resolve_dirty(&options, &dirty, &IngestState::default()).unwrap()
-        else {
+        let DirtySelection::Paths { files, databases } = resolve_dirty(
+            &options,
+            &dirty,
+            &checkpoint(&temp, &IngestState::default()),
+        )
+        .unwrap() else {
             panic!("regular source files should resolve directly")
         };
-        let mut discovered = sources::claude::discover(&claude, false).unwrap();
-        discovered.extend(sources::codex::discover_rollouts());
+        let mut discovered = sources::claude::discover(&claude, false, None).unwrap();
+        discovered.extend(sources::codex::discover_rollouts(None));
         discovered.extend(
             sources::codex::history_paths()
                 .into_iter()
@@ -761,7 +778,7 @@ mod tests {
                     path,
                 }),
         );
-        discovered.extend(sources::pi::discover());
+        discovered.extend(sources::pi::discover(None));
         discovered.sort_by(|left, right| left.path.cmp(&right.path));
         assert_eq!(files, discovered);
         assert_eq!(databases, sources::opencode::discover_databases().unwrap());
@@ -781,12 +798,15 @@ mod tests {
         }
         let mut options = options();
         options.include_codex = true;
-        let DirtySelection::Paths { files, databases } =
-            resolve_dirty(&options, &dirty, &IngestState::default()).unwrap()
-        else {
+        let DirtySelection::Paths { files, databases } = resolve_dirty(
+            &options,
+            &dirty,
+            &checkpoint(&temp, &IngestState::default()),
+        )
+        .unwrap() else {
             panic!("fallback Codex root should resolve directly")
         };
-        assert_eq!(files, sources::codex::discover_rollouts());
+        assert_eq!(files, sources::codex::discover_rollouts(None));
         assert!(databases.is_empty());
     }
 
@@ -804,6 +824,7 @@ mod tests {
             .opencode_databases
             .insert(noise.to_string_lossy().into_owned(), Default::default());
         let root = Root::new(temp.path().to_path_buf(), Shape::CodexHome);
+        let state = checkpoint(&temp, &state);
         assert!(matches!(
             resolve(
                 &[root],
@@ -814,5 +835,39 @@ mod tests {
             .unwrap(),
             DirtySelection::Resync
         ));
+    }
+
+    #[test]
+    fn vanished_directory_queries_preserve_path_components_and_exact_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed = temp.path().join("removed");
+        let sibling = temp.path().join("removed-neighbor/session.jsonl");
+        let nested = removed.join("./nested/session.jsonl");
+        let file: FileState = serde_json::from_value(serde_json::json!({
+            "size": 1, "mtime": 0, "offset": 1, "turn_id": 1
+        }))
+        .unwrap();
+        let mut original = IngestState::default();
+        original
+            .files
+            .insert(sibling.to_string_lossy().into_owned(), file.clone());
+        let roots = [Root::new(temp.path().to_path_buf(), Shape::CodexHome)];
+        let excluder = PathExcluder::build(&[]).unwrap();
+        let state = checkpoint(&temp, &original);
+        assert!(
+            matches!(resolve(&roots, &HashSet::from([removed.clone()]), &state, &excluder).unwrap(),
+            DirtySelection::Paths { files, databases } if files.is_empty() && databases.is_empty())
+        );
+        assert!(state.loaded.is_empty());
+        drop(state);
+        let nested_key = nested.to_string_lossy().into_owned();
+        original.files.insert(nested_key.clone(), file);
+        let state = checkpoint(&temp, &original);
+        assert!(matches!(
+            resolve(&roots, &HashSet::from([removed]), &state, &excluder).unwrap(),
+            DirtySelection::Resync
+        ));
+        assert!(state.loaded.is_empty());
+        assert!(state.file_keys().unwrap().contains(&nested_key));
     }
 }

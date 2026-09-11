@@ -241,6 +241,13 @@ EXAMPLES:
         #[command(flatten)]
         index: IndexArgs,
     },
+    /// Merge segments below 5% of the corpus, excluding the three largest
+    #[command(hide = true)]
+    IndexCompact {
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Reclaim unreachable immutable index generations without rebuilding
     #[command(hide = true)]
     IndexGc {
@@ -1282,6 +1289,7 @@ enum IndexServiceCommand {
 }
 
 pub fn run() -> Result<()> {
+    crate::profiling::span!("cli.run");
     let cli = Cli::parse();
     let interactive = interaction_allowed(
         cli.non_interactive,
@@ -1365,11 +1373,14 @@ pub fn run() -> Result<()> {
             } else if web_ui || web_listen.is_some() || mcp || no_mcp || mcp_listen.is_some() {
                 return Err(anyhow!("server options require `memex daemon run`"));
             } else {
-                run_index_args(&index, false, false)?;
+                run_index_args(&index, false)?;
             }
         }
         Commands::Reindex { index } => {
-            run_index_args(&index, true, false)?;
+            run_index_args(&index, true)?;
+        }
+        Commands::IndexCompact { root } => {
+            run_index_compact(root)?;
         }
         Commands::IndexGc {
             root,
@@ -2058,7 +2069,7 @@ fn run_poll_loop(
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || run_index_args(index, false),
         || {
             web_listen
                 .as_deref()
@@ -2082,7 +2093,7 @@ fn run_poll_loop(
                 std::thread::sleep(remaining);
             }
         }
-        run_index_args(index, false, true)?;
+        run_index_args(index, false)?;
         std::io::stdout().flush().ok();
     }
 }
@@ -2135,7 +2146,7 @@ fn run_event_loop(
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
         .transpose()?;
     let _web_thread = initialize_index_loop(
-        || run_index_args(index, false, true),
+        || run_index_args(index, false),
         || {
             web_listen
                 .as_deref()
@@ -2154,7 +2165,7 @@ fn run_event_loop(
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
                     eprintln!("watch: root refresh failed: {error:#}");
                 }
-                match run_index_args(index, false, true) {
+                match run_index_args(index, false) {
                     Ok(()) => {
                         service.mark_complete(FireCause::Resync);
                         log_watch_stats(&service);
@@ -2166,7 +2177,7 @@ fn run_event_loop(
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
                     Ok(false) => service.mark_skipped(),
-                    Ok(true) => match run_index_selection(index, false, true, Some(&dirty)) {
+                    Ok(true) => match run_index_selection(index, false, Some(&dirty)) {
                         Ok(full_scan) => {
                             if full_scan
                                 && let Err(error) = refresh_watch_roots(&mut service, index)
@@ -2186,7 +2197,7 @@ fn run_event_loop(
                     },
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
-                        if run_index_args(index, false, true).is_ok() {
+                        if run_index_args(index, false).is_ok() {
                             service.mark_complete(FireCause::Resync);
                             log_watch_stats(&service);
                         }
@@ -2242,8 +2253,8 @@ fn log_watch_stats(service: &WatchService) {
         stats.hot_hits,
     );
 }
-fn run_index_args(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index(index, reindex, continuous)
+fn run_index_args(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index(index, reindex)
 }
 
 /// Resolve the ingest projection from CLI flags plus config. Shared by the
@@ -2294,11 +2305,12 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         model: model_choice,
         embed_runtime,
         tool_content_limits,
+        defer_merges: false,
     })
 }
 
-fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
-    run_index_selection(index, reindex, continuous, None).map(|_| ())
+fn run_index(index: &IndexArgs, reindex: bool) -> Result<()> {
+    run_index_selection(index, reindex, None).map(|_| ())
 }
 
 /// Return whether discovery covered all sources, so only reconciliation
@@ -2306,7 +2318,6 @@ fn run_index(index: &IndexArgs, reindex: bool, continuous: bool) -> Result<()> {
 fn run_index_selection(
     index: &IndexArgs,
     reindex: bool,
-    continuous: bool,
     dirty: Option<&HashSet<PathBuf>>,
 ) -> Result<bool> {
     let paths = Paths::new(index.root.clone())?;
@@ -2316,13 +2327,17 @@ fn run_index_selection(
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex {
-        reset_reindex_artifacts(&paths)?;
+        ensure_rebuild_space(&paths)?;
+        reset_reindex_artifacts(&paths, &lease)?;
     }
     paths.ensure_dirs()?;
-    let index = if continuous {
-        SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?
+    let index = if reindex {
+        SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
-        SearchIndex::open_or_create_for_ingest(&paths.index)?
+        match SearchIndex::open_or_create(&paths.index) {
+            Ok(index) if !index.is_writable() => index,
+            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+        }
     };
 
     let (report, full_scan) = if let Some(dirty) = dirty {
@@ -2351,18 +2366,65 @@ fn run_index_selection(
             serde_json::to_string_pretty(&report.diagnostics)?
         );
     }
+    drop(lease);
+    if report.records_added > 0 {
+        crate::machine::schedule_compaction_if_fragmented(&paths)?;
+    }
     Ok(full_scan)
 }
 
-fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
+/// A rebuild removes the current index before writing the new one, so running out of space
+/// half-way leaves nothing to search. The new index is at most about the size of the old one.
+fn ensure_rebuild_space(paths: &Paths) -> Result<()> {
+    let needed = unique_file_bytes(&paths.index)?;
+    let available = available_bytes(&paths.root)?;
+    if available < needed {
+        anyhow::bail!(
+            "rebuild needs about {} MiB free on {} but only {} MiB is available; free space \
+             before rebuilding, the current index is untouched",
+            needed >> 20,
+            paths.root.display(),
+            available >> 20
+        );
+    }
+    Ok(())
+}
+
+/// Bytes on disk below `dir`, counting each inode once so hard-linked segment files are not
+/// multiplied by their link count.
+fn unique_file_bytes(dir: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
+fn available_bytes(path: &Path) -> Result<u64> {
+    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .context("data directory path contains a NUL byte")?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("statvfs data directory");
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u128 * stat.f_frsize as u128) as u64)
+}
+
+fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
+    crate::state::checkpoint::reset(&paths.state.join("ingest.json"), lease)?;
     remove_generated_path(&paths.index)?;
     remove_generated_path(&paths.vectors)?;
     remove_generated_path(&paths.root.join("memory"))?;
 
     for name in [
-        "ingest.json",
-        "ingest.pending.json",
-        "scan_cache.json",
         "analytics.sqlite",
         "analytics.sqlite-wal",
         "analytics.sqlite-shm",
@@ -2399,6 +2461,49 @@ fn remove_generated_path(path: &Path) -> Result<()> {
     result.with_context(|| format!("remove reindex artifact {}", path.display()))
 }
 
+/// Search refreshes append without merging; this folds the accumulated small segments into
+/// one while leaving the largest untouched, so a compaction costs the small segments' size,
+/// not the corpus's.
+///
+/// The ingest lease is held only to stage from the current generation and to publish; the
+/// merge itself runs unleased so search refreshes never wait on it. Publication is skipped
+/// when another writer published in between, leaving the next compaction to fold again.
+fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
+    let paths = Paths::new(root)?;
+    if !SearchIndex::exists(&paths.index) {
+        println!("no index to compact");
+        return Ok(());
+    }
+    let Some(_compaction) = crate::lease::CompactionLock::try_acquire(&paths)? else {
+        println!("compaction already running");
+        return Ok(());
+    };
+    let (index, base) = {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let base = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        (SearchIndex::open_or_create_for_ingest(&paths.index)?, base)
+    };
+    let merged = index.compact_small_segments(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
+    if merged > 0 {
+        let _lease = IngestLease::acquire(&paths, "compaction", INGEST_LEASE_TIMEOUT)?;
+        let current = SearchIndex::open_or_create(&paths.index)?
+            .snapshot_version()
+            .to_string();
+        if current != base {
+            println!("compaction skipped: the index moved while merging");
+            return Ok(());
+        }
+        index.publish_generation()?;
+    }
+    println!(
+        "compacted {merged} segments; {} remain",
+        SearchIndex::open_or_create(&paths.index)?.segment_count()?
+    );
+    Ok(())
+}
+
 fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<()> {
     if !dry_run && !offline {
         return Err(anyhow!(
@@ -2412,18 +2517,20 @@ fn run_index_gc(root: Option<PathBuf>, dry_run: bool, offline: bool) -> Result<(
     let memory_generations = gc_memory_vectors(&paths, dry_run)?;
     if report.dry_run {
         println!(
-            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; no rebuild required",
+            "would remove {} unreachable generations, {} abandoned generation work directories, {} legacy index files, {} unreferenced shared segment files, and {} obsolete memory vector generations; no rebuild required",
             report.generations_removed,
             report.abandoned_workdirs_removed,
             report.legacy_files_removed,
+            report.shared_files_removed,
             memory_generations
         );
     } else {
         println!(
-            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
+            "removed {} unreachable generations, {} abandoned generation work directories, {} legacy index files, {} unreferenced shared segment files, and {} obsolete memory vector generations; retained the committed indexes without rebuilding",
             report.generations_removed,
             report.abandoned_workdirs_removed,
             report.legacy_files_removed,
+            report.shared_files_removed,
             memory_generations
         );
     }
@@ -2573,6 +2680,7 @@ fn run_search(
     machines: Vec<String>,
     trace: bool,
 ) -> Result<()> {
+    crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
         SearchFormat::Json
     } else {
@@ -3358,6 +3466,8 @@ fn collect_search_with_auto_index(
         top_n_per_session
     };
     let kind_filter: crate::analytics::SessionKindFilter = origin.into();
+    // `--full` clears the field set and asks for whole records; everything else renders excerpts.
+    let text_limit = fields.as_ref().map(|_| crate::machine::SEARCH_TEXT_BUDGET);
     let render = RenderOptions {
         verbose,
         pretty: false,
@@ -3415,6 +3525,7 @@ fn collect_search_with_auto_index(
                 recency_half_life_days,
                 min_score,
                 project_grouping: None,
+                text_limit,
             };
             let federated = federated_search(
                 &paths,
@@ -7512,7 +7623,7 @@ fn format_ts(ts: u64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+pub(crate) fn query_literals(query: &str) -> Vec<String> {
     use tantivy::query_grammar::{Occur, UserInputAst, UserInputLeaf};
     fn literals(ast: &UserInputAst, terms: &mut Vec<String>) {
         match ast {
@@ -7551,13 +7662,20 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         if term.is_empty() || !seen.insert(term.clone()) {
             continue;
         }
-        out.push(
-            RegexBuilder::new(&regex::escape(&term))
-                .case_insensitive(true)
-                .build()?,
-        );
+        out.push(term);
     }
-    Ok(out)
+    out
+}
+
+pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
+    query_literals(query)
+        .into_iter()
+        .map(|term| {
+            Ok(RegexBuilder::new(&regex::escape(&term))
+                .case_insensitive(true)
+                .build()?)
+        })
+        .collect()
 }
 
 // Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
@@ -8924,7 +9042,8 @@ arguments = {
             std::fs::write(paths.state.join(name), "derived").unwrap();
         }
 
-        reset_reindex_artifacts(&paths).unwrap();
+        let lease = IngestLease::acquire(&paths, "rebuild test", INGEST_LEASE_TIMEOUT).unwrap();
+        reset_reindex_artifacts(&paths, &lease).unwrap();
 
         assert!(!paths.index.exists());
         assert!(!paths.vectors.exists());
@@ -9884,5 +10003,24 @@ arguments = {
         };
         let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
         assert!(error.to_string().contains("Failed to connect to bus"));
+    }
+}
+
+#[cfg(test)]
+mod rebuild_space_tests {
+    use super::*;
+
+    #[test]
+    fn unique_file_bytes_counts_hard_linked_files_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("index");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("a/segment"), vec![7u8; 4096]).unwrap();
+        std::fs::hard_link(root.join("a/segment"), root.join("b/segment")).unwrap();
+        std::fs::write(root.join("b/other"), vec![1u8; 100]).unwrap();
+        assert_eq!(unique_file_bytes(&root).unwrap(), 4196);
+        assert_eq!(unique_file_bytes(&root.join("missing")).unwrap(), 0);
+        assert!(available_bytes(temp.path()).unwrap() > 0);
     }
 }

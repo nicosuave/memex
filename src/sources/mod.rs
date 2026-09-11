@@ -14,6 +14,7 @@ pub mod cursor;
 pub mod grok;
 pub mod hermes;
 pub mod jcode;
+mod jsonl;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
@@ -106,6 +107,9 @@ pub(crate) struct IndexParseOutput {
     pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     pub session_id: Option<String>,
     pub diagnostics: ParseDiagnostics,
+    /// Working directory the transcript records for its session, when the format carries one.
+    /// Analytics resolves repositories from it instead of re-reading the transcript.
+    pub session_cwd: Option<String>,
 }
 
 impl IndexParseState {

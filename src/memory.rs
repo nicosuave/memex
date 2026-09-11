@@ -5,6 +5,7 @@
 //! rather than synthetic sessions or turns.
 
 use crate::config::expand_exclude_patterns;
+use crate::repository::RepositoryResolver;
 use crate::types::SourceKind;
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -126,6 +127,14 @@ pub struct MemoryDocument {
     pub scope: MemoryScope,
     pub kind: MemoryDocumentKind,
     pub mtime_ms: u64,
+    /// Byte length when last read; with `mtime_ms` it lets a refresh keep an unchanged
+    /// document without reading it. Snapshots written before this field carry zero.
+    #[serde(default)]
+    pub size: u64,
+    /// Inode change time in nanoseconds when last read; unlike mtime it cannot be restored
+    /// after an edit, so it guards the unchanged fast path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_ns: Option<i64>,
     pub event_dates: Vec<MemoryEventDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -183,6 +192,22 @@ pub struct MemoryStore {
     snapshot_path: PathBuf,
 }
 
+pub(crate) struct PreparedMemoryRefresh<'a> {
+    store: &'a MemoryStore,
+    report: MemoryRefreshReport,
+    _lock: SnapshotWriteLock,
+}
+
+impl PreparedMemoryRefresh<'_> {
+    pub(crate) fn publish(self) -> Result<MemoryRefreshReport> {
+        crate::profiling::span!("memory.publish");
+        if self.report.changed {
+            atomic_write_snapshot(&self.store.snapshot_path, &self.report.snapshot)?;
+        }
+        Ok(self.report)
+    }
+}
+
 impl MemoryStore {
     /// `snapshot_path` is the file itself, normally `<Paths.root>/memory/documents.json`.
     pub fn new(snapshot_path: impl Into<PathBuf>) -> Self {
@@ -220,9 +245,25 @@ impl MemoryStore {
 
     /// Refresh changed files as whole documents and publish one atomic replacement snapshot.
     pub fn refresh(&self, options: &MemoryDiscoveryOptions) -> Result<MemoryRefreshReport> {
+        self.refresh_with_repositories(options, &RepositoryResolver::default())
+    }
+
+    pub(crate) fn refresh_with_repositories(
+        &self,
+        options: &MemoryDiscoveryOptions,
+        repositories: &RepositoryResolver,
+    ) -> Result<MemoryRefreshReport> {
+        self.prepare_refresh(options, repositories)?.publish()
+    }
+
+    pub(crate) fn prepare_refresh(
+        &self,
+        options: &MemoryDiscoveryOptions,
+        repositories: &RepositoryResolver,
+    ) -> Result<PreparedMemoryRefresh<'_>> {
         let parent = parent_directory(&self.snapshot_path)?;
         fs::create_dir_all(parent)?;
-        let _lock = SnapshotWriteLock::acquire(&self.snapshot_path, WRITE_LOCK_TIMEOUT)?;
+        let lock = SnapshotWriteLock::acquire(&self.snapshot_path, WRITE_LOCK_TIMEOUT)?;
 
         let snapshot_existed = self.snapshot_path.is_file();
         let previous = self.load()?;
@@ -255,11 +296,31 @@ impl MemoryStore {
             .map(|document| (document.stable_id.clone(), document))
             .collect::<HashMap<_, _>>();
         let mut documents = Vec::with_capacity(discovery.candidates.len());
-        let mut repository_projects = HashMap::new();
 
         for candidate in discovery.candidates {
             let stable_id = memory_stable_id(candidate.provider, &candidate.source_path);
             let prior = previous_by_id.remove(&stable_id);
+            if let Some(document) = prior
+                .as_ref()
+                .filter(|document| unchanged_on_disk(document, &candidate.source_path))
+            {
+                // The bytes are identical, so the source metadata that produced this scope
+                // is too. Re-resolve from the stored working directory rather than reading
+                // the file again, so a snapshot written by an older resolver is still
+                // repaired without reparsing anything.
+                let mut document = document.clone();
+                document.scope = resolve_memory_scope(
+                    &candidate,
+                    &ParsedSourceMetadata {
+                        cwd: document.scope.cwd.clone(),
+                        ..ParsedSourceMetadata::default()
+                    },
+                    repositories,
+                );
+                documents.push(document);
+                report.unchanged += 1;
+                continue;
+            }
             match read_consistent(&candidate.source_path) {
                 Ok((content, metadata)) => {
                     let version = sha256_hex(content.as_bytes());
@@ -268,10 +329,12 @@ impl MemoryStore {
                             && document.version_sha256 == version
                     }) {
                         document.mtime_ms = modified_millis(&metadata)?;
+                        document.size = metadata.len();
+                        document.changed_ns = changed_nanos(&metadata);
                         document.scope = resolve_memory_scope(
                             &candidate,
                             &parse_source_metadata(&content),
-                            &mut repository_projects,
+                            repositories,
                         );
                         documents.push(document);
                         report.unchanged += 1;
@@ -280,7 +343,7 @@ impl MemoryStore {
                             &candidate,
                             content,
                             &metadata,
-                            &mut repository_projects,
+                            repositories,
                         )?);
                         report.parsed += 1;
                     }
@@ -351,11 +414,12 @@ impl MemoryStore {
             .filter(|document| matches!(document.freshness, MemoryFreshness::Stale { .. }))
             .count();
         report.changed = !snapshot_existed || next != previous;
-        if report.changed {
-            atomic_write_snapshot(&self.snapshot_path, &next)?;
-        }
         report.snapshot = next;
-        Ok(report)
+        Ok(PreparedMemoryRefresh {
+            store: self,
+            report,
+            _lock: lock,
+        })
     }
 }
 
@@ -424,7 +488,12 @@ pub fn discover_memory_documents(options: &MemoryDiscoveryOptions) -> Result<Mem
 
 pub fn parse_memory_document(candidate: &MemoryCandidate) -> Result<MemoryDocument> {
     let (content, metadata) = read_consistent(&candidate.source_path)?;
-    parse_memory_content(candidate, content, &metadata, &mut HashMap::new())
+    parse_memory_content(
+        candidate,
+        content,
+        &metadata,
+        &RepositoryResolver::default(),
+    )
 }
 
 /// Re-read a snapshot-known source without mutating either the source or memory snapshot.
@@ -448,14 +517,16 @@ fn parse_memory_content(
     candidate: &MemoryCandidate,
     content: String,
     metadata: &fs::Metadata,
-    repository_projects: &mut HashMap<PathBuf, Option<String>>,
+    repositories: &RepositoryResolver,
 ) -> Result<MemoryDocument> {
     let mtime_ms = modified_millis(metadata)?;
+    let size = metadata.len();
+    let changed_ns = changed_nanos(metadata);
     let version_sha256 = sha256_hex(content.as_bytes());
     let stable_id = memory_stable_id(candidate.provider, &candidate.source_path);
     let (sections, title) = parse_sections(&content);
     let source_metadata = parse_source_metadata(&content);
-    let scope = resolve_memory_scope(candidate, &source_metadata, repository_projects);
+    let scope = resolve_memory_scope(candidate, &source_metadata, repositories);
 
     Ok(MemoryDocument {
         provider: candidate.provider,
@@ -465,6 +536,8 @@ fn parse_memory_content(
         scope,
         kind: candidate.kind,
         mtime_ms,
+        size,
+        changed_ns,
         event_dates: parse_explicit_dates(&content),
         title: title.or_else(|| {
             candidate
@@ -483,7 +556,7 @@ fn parse_memory_content(
 fn resolve_memory_scope(
     candidate: &MemoryCandidate,
     source_metadata: &ParsedSourceMetadata,
-    repository_projects: &mut HashMap<PathBuf, Option<String>>,
+    repositories: &RepositoryResolver,
 ) -> MemoryScope {
     let mut scope = candidate.scope.clone();
     if candidate.provider == SourceKind::Codex && candidate.kind == MemoryDocumentKind::Summary {
@@ -498,13 +571,8 @@ fn resolve_memory_scope(
     }
     if let Some(cwd) = scope.cwd.as_mut() {
         *cwd = canonicalize_with_missing(cwd);
-        // Share the session repository resolver, but retain the exact checkout for cwd filters.
-        // One Git lookup per cwd per refresh avoids repeating it for every note in a project.
-        if let Some(project) = repository_projects
-            .entry(cwd.clone())
-            .or_insert_with(|| crate::analytics::repository_project_for_cwd(&cwd.to_string_lossy()))
-        {
-            scope.project = Some(project.clone());
+        if let Some(project) = repositories.resolve(cwd).project() {
+            scope.project = Some(project.to_owned());
         }
     }
     scope
@@ -886,6 +954,35 @@ fn canonicalize_with_missing(path: &Path) -> PathBuf {
         };
         cursor = parent;
     }
+}
+
+/// A fresh document whose file still has the recorded size and mtime is kept as is. The
+/// repository scope stays as last resolved; it is re-resolved when the content changes.
+fn unchanged_on_disk(document: &MemoryDocument, path: &Path) -> bool {
+    if !matches!(document.freshness, MemoryFreshness::Fresh)
+        || document.size == 0
+        || document.changed_ns.is_none()
+    {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && metadata.len() == document.size
+        && modified_millis(&metadata).ok() == Some(document.mtime_ms)
+        && changed_nanos(&metadata) == document.changed_ns
+}
+
+#[cfg(unix)]
+fn changed_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn changed_nanos(_metadata: &fs::Metadata) -> Option<i64> {
+    None
 }
 
 fn read_consistent(path: &Path) -> Result<(String, fs::Metadata)> {
@@ -1899,6 +1996,31 @@ mod tests {
         let deleted = store.refresh(&options).expect("delete refresh");
         assert_eq!(deleted.deleted, 1);
         assert!(store.load().expect("empty snapshot").documents.is_empty());
+    }
+
+    #[test]
+    fn an_untouched_document_is_kept_from_its_file_identity_without_a_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let claude = temp.path().join("claude-projects");
+        let source = claude.join("project/memory/note.md");
+        write(&source, "alpha\n");
+        let store = MemoryStore::new(temp.path().join("store/documents.json"));
+        let options = options(claude, temp.path().join("codex"));
+        let first = store.refresh(&options).expect("initial refresh");
+        let document = &first.snapshot.documents[0];
+        assert_eq!(document.size, 6);
+        assert!(document.changed_ns.is_some());
+        assert!(unchanged_on_disk(document, &source));
+
+        let second = store.refresh(&options).expect("second refresh");
+        assert_eq!((second.parsed, second.unchanged), (0, 1));
+        assert_eq!(second.snapshot.documents[0].content, "alpha\n");
+
+        // A snapshot written before the identity fields existed must fall back to reading.
+        let mut legacy = document.clone();
+        legacy.size = 0;
+        legacy.changed_ns = None;
+        assert!(!unchanged_on_disk(&legacy, &source));
     }
 
     #[test]

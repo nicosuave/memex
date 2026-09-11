@@ -22,7 +22,9 @@ use std::fs;
 use std::path::PathBuf;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, Query, QueryParser};
-use tantivy::schema::{INDEXED, STORED, Schema, TEXT, Value};
+use tantivy::schema::{
+    INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value,
+};
 use tantivy::{Index, ReloadPolicy, TantivyDocument};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -810,9 +812,14 @@ impl LexicalMemoryIndex {
     fn build(snapshot: &MemorySnapshot, candidates: &[SectionCandidate]) -> Result<Self> {
         let mut schema = Schema::builder();
         let key = schema.add_u64_field("key", INDEXED | STORED);
-        let text = schema.add_text_field("text", TEXT);
-        let heading = schema.add_text_field("heading", TEXT);
-        let title = schema.add_text_field("title", TEXT);
+        let stemmed = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("en_stem")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        let text = schema.add_text_field("text", stemmed.clone());
+        let heading = schema.add_text_field("heading", stemmed.clone());
+        let title = schema.add_text_field("title", stemmed);
         let index = Index::create_in_ram(schema.build());
         let mut writer = index.writer(15_000_000)?;
         for candidate in candidates {
@@ -1254,6 +1261,8 @@ mod tests {
             },
             kind: MemoryDocumentKind::Note,
             mtime_ms,
+            size: 0,
+            changed_ns: None,
             event_dates: Vec::new(),
             title: Some(format!("{project} notes")),
             content,
@@ -1381,6 +1390,35 @@ mod tests {
         assert_eq!(hits[0].memory_id, "two");
         assert_ne!(hits[0].memory_id, hits[1].memory_id);
         assert!(hits.iter().all(|hit| !hit.changed_since_search));
+    }
+
+    #[test]
+    fn lexical_search_matches_inflected_forms_through_stemming() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        write_snapshot(
+            &paths,
+            vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "Deploy notes",
+                100,
+                &[("a", "the schema migrations were applied by hand")],
+            )],
+        );
+        let search = |query: &str| {
+            search_memory(
+                &paths,
+                &MemorySearchOptions {
+                    query: query.to_string(),
+                    ..MemorySearchOptions::default()
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(search("migration").len(), 1);
+        assert_eq!(search("deploying").len(), 1);
+        assert_eq!(search("rollback").len(), 0);
     }
 
     #[test]

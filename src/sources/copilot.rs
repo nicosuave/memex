@@ -3,7 +3,6 @@ use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use memchr::memchr;
-use memmap2::Mmap;
 use simd_json::BorrowedValue;
 use simd_json::prelude::*;
 use std::collections::HashSet;
@@ -97,8 +96,10 @@ pub(crate) fn parse_index_records(
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mmap = super::common::map_sequential(&file)?;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        serde_json::from_slice::<serde_json::Value>(line).is_ok()
+    });
     let mut turn_id = state.turn_id;
 
     let source_path = path.to_string_lossy().to_string();
@@ -109,6 +110,7 @@ pub(crate) fn parse_index_records(
     let mut pending_tool_calls = state.pending_tool_calls;
 
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let rel = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..rel];
@@ -118,7 +120,13 @@ pub(crate) fn parse_index_records(
         }
         let value: serde_json::Value = match serde_json::from_slice(line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                if rel == slice.len() {
+                    start = line_start;
+                    break;
+                }
+                continue;
+            }
         };
         let Some(obj) = value.as_object() else {
             continue;
@@ -338,11 +346,12 @@ pub(crate) fn parse_index_records(
 
     Ok(IndexParseOutput {
         legacy_turn_id: None,
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
         diagnostics: Default::default(),
+        session_cwd: None,
     })
 }
 
@@ -587,7 +596,7 @@ fn copilot_tool_output(data: &serde_json::Value) -> Option<String> {
 
 pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
     let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
+    let mmap = super::common::map_sequential(&file)?;
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut start = 0usize;
     let mut index = 0u64;

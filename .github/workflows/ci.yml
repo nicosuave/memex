@@ -77,6 +77,14 @@ jobs:
         timeout-minutes: 10
         run: cargo test --verbose -- --test-threads=1
 
+      - name: Test profiling feature
+        timeout-minutes: 10
+        run: cargo test --features profiling --verbose -- --test-threads=1
+
+      - name: Smoke test Criterion benchmarks
+        timeout-minutes: 10
+        run: cargo bench --bench index --profile dev -- --test
+
   clippy:
     runs-on: ubuntu-latest
     steps:

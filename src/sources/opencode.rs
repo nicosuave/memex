@@ -75,6 +75,7 @@ fn parts_root_for_session(session_dir: &Path) -> PathBuf {
 }
 
 pub fn discover_sessions() -> anyhow::Result<Vec<SourceFile>> {
+    crate::profiling::span!("opencode.discover_legacy");
     discover_sessions_from_roots(&data_roots())
 }
 
@@ -116,6 +117,7 @@ pub fn discover_sessions_from_root(root: &Path) -> anyhow::Result<Vec<SourceFile
 /// OpenCode's data directory may be configured as a comma-separated list, so discovery is
 /// deliberately performed against every configured root and sorted globally for stable output.
 pub fn discover_databases() -> anyhow::Result<Vec<SourceFile>> {
+    crate::profiling::span!("opencode.discover_databases");
     discover_databases_from_roots(&data_roots())
 }
 
@@ -389,6 +391,7 @@ pub fn scan_database(
     path: &Path,
     previous: Option<&OpencodeDatabaseState>,
 ) -> Result<DatabaseScan> {
+    crate::profiling::span!("opencode.plan");
     let connection = open_read_only_database(path)?;
     connection
         .execute_batch("BEGIN")
@@ -696,6 +699,7 @@ pub(crate) fn parse_index_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id),
         diagnostics: Default::default(),
+        session_cwd: None,
     })
 }
 
@@ -714,11 +718,28 @@ pub(crate) fn parse_database_records(
     session_id: &str,
     state: IndexParseState,
     next_doc_id: &AtomicU64,
-    mut emit: impl FnMut(Record) -> Result<()>,
+    emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    let connection = open_database_for_sessions(path)?;
+    parse_session_records(&connection, path, session_id, state, next_doc_id, emit)
+}
+
+/// Open once for a batch of `parse_session_records` calls against the same database.
+pub(crate) fn open_database_for_sessions(path: &Path) -> Result<Connection> {
     let connection = open_read_only_database(path)?;
     require_modern_schema(&connection, path)?;
-    let Some(session) = enumerate_session_from_connection(&connection, path, session_id)? else {
+    Ok(connection)
+}
+
+pub(crate) fn parse_session_records(
+    connection: &Connection,
+    path: &Path,
+    session_id: &str,
+    state: IndexParseState,
+    next_doc_id: &AtomicU64,
+    mut emit: impl FnMut(Record) -> Result<()>,
+) -> Result<IndexParseOutput> {
+    let Some(session) = enumerate_session_from_connection(connection, path, session_id)? else {
         return Ok(IndexParseOutput {
             legacy_turn_id: None,
             offset: 0,
@@ -726,6 +747,7 @@ pub(crate) fn parse_database_records(
             pending_tool_calls: state.pending_tool_calls,
             session_id: Some(session_id.to_string()),
             diagnostics: Default::default(),
+            session_cwd: None,
         });
     };
     // Parent linkage is the only subagent signal: the `agent` column records
@@ -852,6 +874,7 @@ pub(crate) fn parse_database_records(
         pending_tool_calls: state.pending_tool_calls,
         session_id: Some(session_id.to_string()),
         diagnostics,
+        session_cwd: None,
     })
 }
 

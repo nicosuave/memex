@@ -7,6 +7,28 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// Maps a transcript for one sequential pass and tells the kernel so, which widens its
+/// read-ahead window beyond what it does around an ordinary fault. A rebuild reads gigabytes
+/// of transcripts, so the difference is measurable there.
+///
+/// Only `MADV_SEQUENTIAL`, which both Linux and Darwin record on the mapping and consult on
+/// every fault. `MADV_WILLNEED` is a one-shot request to page the whole mapping in now, which
+/// contradicts asking for a sliding window and, on a transcript larger than the free page
+/// cache, evicts pages the rest of the refresh still wants.
+///
+/// The advice is only a hint: `madvise` can refuse it without the mapping becoming any less
+/// valid, so a refusal must not fail the parse. It is counted instead, because silently
+/// losing it would show up as a slow rebuild and nothing else.
+pub(crate) fn map_sequential(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+    let mmap = unsafe { memmap2::Mmap::map(file)? };
+    if mmap.advise(memmap2::Advice::Sequential).is_ok() {
+        crate::profiling::count!("sources.mmap_advice_accepted", 1);
+    } else {
+        crate::profiling::count!("sources.mmap_advice_refused", 1);
+    }
+    Ok(mmap)
+}
+
 pub fn home() -> PathBuf {
     BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
@@ -28,24 +50,44 @@ pub fn timestamp_millis(value: &Value) -> u64 {
 }
 
 pub fn jsonl_files(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut files = roots
-        .into_iter()
-        .filter(|root| root.exists())
-        .flat_map(|root| {
-            WalkDir::new(root)
+    jsonl_files_with(roots, None)
+}
+
+/// `.jsonl` files below `roots`, reusing directory stamps from `walk` when one is supplied.
+pub(crate) fn jsonl_files_with(
+    roots: impl IntoIterator<Item = PathBuf>,
+    mut walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        files.extend(
+            files_under(&root, walk.as_deref_mut())
                 .into_iter()
-                .flatten()
-                .filter(|entry| {
-                    entry.file_type().is_file()
-                        && entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-                })
-                .map(|entry| entry.path().to_path_buf())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")),
+        );
+    }
     files.sort();
     files.dedup();
     files
+}
+
+/// Every regular file below `root`, without following symlinks below it.
+pub(crate) fn files_under(
+    root: &Path,
+    walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> Vec<PathBuf> {
+    match walk {
+        Some(walk) => walk.files(root),
+        None => WalkDir::new(root)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.path().to_path_buf())
+            .collect(),
+    }
 }
 
 pub fn project_from_path(path: &str) -> String {
