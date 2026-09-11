@@ -19,7 +19,7 @@
 
 use crate::config::Paths;
 use crate::ingest::{IngestOptions, PathExcluder, build_path_excluder};
-use crate::state::IngestState;
+use crate::state::checkpoint::{CheckpointReader, is_checkpoint_artifact_name};
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -187,10 +187,6 @@ fn ignorable_file_name(name: &str) -> bool {
         || name.ends_with("-shm")
         || name.ends_with("-journal")
         || name.starts_with(".memex-opencode-spool-")
-        || matches!(
-            name,
-            "ingest.json" | "ingest.pending.json" | "scan_cache.json"
-        )
 }
 
 /// Classify one watcher event. Returns the paths worth tracking, and whether
@@ -201,6 +197,9 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
     }
     let mut paths = Vec::with_capacity(event.paths.len());
     for path in &event.paths {
+        if path.file_name().is_some_and(is_checkpoint_artifact_name) {
+            continue;
+        }
         // SQLite commits can live entirely in the WAL until checkpoint.
         // Route the hint to the database that ingestion knows how to read.
         if let Some(name) = path
@@ -269,10 +268,17 @@ pub(crate) fn dirty_needs_ingest(paths: &Paths, dirty: &HashSet<PathBuf>) -> Res
     if dirty.is_empty() {
         return Ok(false);
     }
-    let state = IngestState::load(&paths.state.join("ingest.json"))?;
+    let keys = dirty
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let states = {
+        let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
+        reader.load_files(&keys)?
+    };
     for path in dirty {
         let key = path.to_string_lossy().into_owned();
-        let Some(previous) = state.files.get(&key) else {
+        let Some(previous) = states.get(&key).and_then(Option::as_ref) else {
             return Ok(true);
         };
         if let Some(wal) = &previous.identity.sqlite_wal
@@ -324,13 +330,10 @@ pub(crate) struct WatchService {
     excluder: PathExcluder,
     config: WatchConfig,
     stats: WatchStats,
-    hot_snapshot: Option<HashMap<String, StateSnapshot>>,
-    hot_state_mtime: Option<SystemTime>,
     hot_databases: HashMap<PathBuf, Option<DatabaseSnapshot>>,
 }
 
-/// Compact copy of the ingest state needed to spot changed files without
-/// re-reading `ingest.json` on every sweep.
+/// Filesystem observation for an OpenCode database or its WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StateSnapshot {
     size: u64,
@@ -410,8 +413,6 @@ impl WatchService {
             excluder,
             config,
             stats: WatchStats::default(),
-            hot_snapshot: None,
-            hot_state_mtime: None,
             hot_databases: HashMap::new(),
         };
         service.sort_pending();
@@ -681,72 +682,42 @@ impl WatchService {
             .unwrap_or_default()
             .as_secs()
             .saturating_sub(window.as_secs()) as i64;
-        let state_path = paths.state.join("ingest.json");
-        let state_mtime = std::fs::metadata(&state_path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
-        if self.hot_snapshot.is_none() || state_mtime != self.hot_state_mtime {
-            let state = IngestState::load(&state_path)?;
-            self.hot_snapshot = Some(
-                state
-                    .files
-                    .iter()
-                    .filter(|(_, file)| file.mtime >= cutoff && file.identity.sqlite_wal.is_none())
-                    .map(|(key, file)| {
-                        (
-                            key.clone(),
-                            StateSnapshot {
-                                size: file.size,
-                                mtime: file.mtime,
-                                modified_ns: file.identity.modified_ns,
-                            },
-                        )
-                    })
-                    .collect(),
-            );
-            // Keep databases even when their main-file mtime is old: active
-            // writers may commit exclusively to the WAL for the whole session.
-            let databases = state
-                .opencode_databases
-                .keys()
-                .chain(
-                    state
-                        .files
-                        .iter()
-                        .filter(|(_, file)| file.identity.sqlite_wal.is_some())
-                        .map(|(key, _)| key),
-                )
-                .map(PathBuf::from)
-                .collect::<HashSet<_>>();
-            self.hot_databases
-                .retain(|path, _| databases.contains(path));
-            for path in databases {
-                self.hot_databases.entry(path).or_insert(None);
-            }
-            self.hot_state_mtime = state_mtime;
+        let (snapshot, databases) = {
+            let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
+            let mut snapshot = reader.hot_files_since(cutoff)?;
+            // A writer can commit exclusively to the WAL for a whole session, leaving the
+            // main file's mtime cold, so these are watched as databases rather than
+            // stat-compared like ordinary transcripts.
+            let mut databases: HashSet<String> =
+                reader.header()?.opencode_databases.into_keys().collect();
+            databases.extend(reader.sqlite_backed_paths()?);
+            snapshot
+                .retain(|key, file| file.identity.sqlite_wal.is_none() && !databases.contains(key));
+            (snapshot, databases)
+        };
+        self.hot_databases
+            .retain(|path, _| databases.contains(path.to_string_lossy().as_ref()));
+        for key in databases {
+            self.hot_databases.entry(PathBuf::from(key)).or_insert(None);
         }
         let mut changed = Vec::new();
-        if let Some(snapshot) = &mut self.hot_snapshot {
-            // Expire candidates even when the ingest state has not changed.
-            snapshot.retain(|_, previous| previous.mtime >= cutoff);
-            for (key, previous) in snapshot {
-                let path = Path::new(key);
-                let metadata = match std::fs::metadata(path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        changed.push(PathBuf::from(key));
-                        continue;
-                    }
-                    Err(_) => continue,
-                };
-                if stat_differs(
-                    &metadata,
-                    previous.size,
-                    previous.mtime,
-                    previous.modified_ns,
-                ) {
+        for (key, previous) in &snapshot {
+            let path = Path::new(key);
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     changed.push(PathBuf::from(key));
+                    continue;
                 }
+                Err(_) => continue,
+            };
+            if stat_differs(
+                &metadata,
+                previous.size,
+                previous.mtime,
+                previous.identity.modified_ns,
+            ) {
+                changed.push(PathBuf::from(key));
             }
         }
         for (path, previous) in &mut self.hot_databases {
@@ -770,7 +741,7 @@ impl WatchService {
 mod tests {
     use super::*;
     use crate::config::UserConfig;
-    use crate::state::{FileIdentity, FileState};
+    use crate::state::{FileIdentity, FileState, IngestState};
     use crate::test_support::{EnvVarGuard, env_lock};
     use crossbeam_channel::unbounded;
     use std::collections::{HashMap, HashSet};
@@ -801,6 +772,7 @@ mod tests {
                 .resolve_embed_runtime()
                 .expect("default embed runtime"),
             tool_content_limits: crate::config::IndexedToolContentLimits::default(),
+            defer_merges: false,
         }
     }
 
@@ -1472,6 +1444,93 @@ mod tests {
             );
         }
         std::fs::write(&hot, "{}\n{}\n").unwrap();
+        assert_eq!(
+            service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+            vec![hot]
+        );
+    }
+
+    #[test]
+    fn checkpoint_artifacts_never_become_database_event_hints() {
+        let excluder = PathExcluder::build(&[]).unwrap();
+        for name in [
+            "checkpoints.sqlite",
+            "checkpoints.sqlite-wal",
+            "checkpoints.sqlite-shm",
+            "checkpoints.sqlite-journal",
+            ".checkpoints.lock",
+        ] {
+            let event = Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![PathBuf::from("/state").join(name)],
+                attrs: Default::default(),
+            };
+            assert!(
+                interesting_event_paths(&event, &excluder).0.is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_sweep_reads_committed_checkpoint_wal_without_file_mtime_changes() {
+        use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
+        use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter};
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let hot = temp.path().join("hot.jsonl");
+        std::fs::write(&hot, "{}\n").unwrap();
+        let key = hot.to_string_lossy().into_owned();
+        let mut files = HashMap::from([(key.clone(), file_state_for(&hot))]);
+        for number in 0..256 {
+            let mut cold = file_state_for(&hot);
+            cold.mtime = 1_000_000;
+            files.insert(format!("/cold/{number}.jsonl"), cold);
+        }
+        write_ingest_state(&paths.root, files);
+        let lease =
+            IngestLease::acquire(&paths, "watch checkpoint test", INGEST_LEASE_TIMEOUT).unwrap();
+        let state_path = paths.state.join("ingest.json");
+        let mut writer = CheckpointWriter::open(&state_path, &lease, false).unwrap();
+        let mut service = test_service();
+        assert!(
+            service
+                .hot_sweep_dirty(&paths, HOT_WINDOW)
+                .unwrap()
+                .is_empty()
+        );
+        let database_mtime = std::fs::metadata(paths.state.join("checkpoints.sqlite"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let marker_mtime = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        std::fs::write(&hot, "{}\n{}\n").unwrap();
+        writer
+            .commit_delta(&CheckpointDelta {
+                upserts: HashMap::from([(key, file_state_for(&hot))]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(paths.state.join("checkpoints.sqlite"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            database_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            marker_mtime
+        );
+        assert!(
+            service
+                .hot_sweep_dirty(&paths, HOT_WINDOW)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&hot, "{}\n{}\n{}\n").unwrap();
         assert_eq!(
             service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
             vec![hot]

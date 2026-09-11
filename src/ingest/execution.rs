@@ -902,15 +902,18 @@ pub(super) fn prehydrate_opencode_database(
         .tempfile_in(state_dir)
         .with_context(|| format!("create OpenCode hydration spool in {}", state_dir.display()))?;
     let mut diagnostics = crate::sources::ParseDiagnostics::default();
+    let connection = crate::sources::opencode::open_database_for_sessions(path)?;
+    let mut writer = std::io::BufWriter::new(spool.as_file_mut());
     for session_id in session_ids {
-        let output = crate::sources::opencode::parse_database_records(
+        let output = crate::sources::opencode::parse_session_records(
+            &connection,
             path,
             session_id,
             crate::sources::IndexParseState::default(),
             next_doc_id,
             |record| {
-                serde_json::to_writer(spool.as_file_mut(), &record)?;
-                spool.as_file_mut().write_all(b"\n")?;
+                serde_json::to_writer(&mut writer, &record)?;
+                writer.write_all(b"\n")?;
                 Ok(())
             },
         )
@@ -922,7 +925,8 @@ pub(super) fn prehydrate_opencode_database(
         })?;
         diagnostics.merge(output.diagnostics);
     }
-    spool.as_file_mut().flush()?;
+    writer.flush()?;
+    drop(writer);
     Ok(PreparedOpencodeDatabase {
         path: path.to_path_buf(),
         scan: scan.clone(),
@@ -1062,7 +1066,6 @@ pub(super) fn execute_refresh(
     let discovery::PreparedRefresh {
         full_scan,
         scan_cache,
-        state_path,
         mut state,
         recovering_pending_ingest,
         empty_index_rebuild,
@@ -1132,22 +1135,13 @@ pub(super) fn execute_refresh(
         crate::profiling::count!("ingest.noop_returns", 1);
         index.publish_generation_if_uninitialized()?;
         state.opencode_databases = installed_opencode_states;
-        if recovering_pending_ingest || empty_index_rebuild || identities_changed {
-            state.save(&state_path)?;
-        }
-        if opencode_database_state_changed {
-            state.save(&state_path)?;
-        }
-        if let Some(scan_cache) = scan_cache {
-            update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
-        }
-        if recovering_pending_ingest {
-            finalize_pending_ingest(
-                &pending_ingest_path(paths),
-                &deferred_pending_scopes,
-                state.next_doc_id,
-            )?;
-        }
+        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes);
+        let pending = if recovering_pending_ingest {
+            finalized_pending_ingest(&deferred_pending_scopes, state.next_doc_id)
+        } else {
+            PendingChange::Keep
+        };
+        state.commit_final(cache, pending)?;
         return Ok(IngestReport {
             records_added: 0,
             records_embedded: 0,
@@ -1207,7 +1201,6 @@ pub(super) fn execute_refresh(
         vector_publication,
         embedding_publication: Some(embeddings),
     };
-    let pending_path = pending_ingest_path(paths);
     let existing_records_change = !delete_paths.is_empty() || !opencode_scope_targets.is_empty();
 
     let input_bytes = if tasks.iter().any(|task| task.source == SourceKind::Opencode) {
@@ -1225,6 +1218,7 @@ pub(super) fn execute_refresh(
     let writer_ctx = WriterContext {
         index_root: paths.index.clone(),
         input_bytes,
+        defer_merges: options.defer_merges,
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild
@@ -1309,9 +1303,9 @@ pub(super) fn execute_refresh(
         || reconcile_pending_vector_ids
         || next_doc_id.load(Ordering::SeqCst) != state.next_doc_id;
     let pending_update_error = if needs_publication {
-        pending_ingest
-            .save(&pending_path)
-            .with_context(|| format!("prepare ingest publication at {}", pending_path.display()))
+        state
+            .commit_intent(&pending_ingest)
+            .context("prepare ingest publication intent")
             .err()
     } else {
         None
@@ -1372,16 +1366,13 @@ pub(super) fn execute_refresh(
         }
 
         for (path, update) in updated_files {
-            state.files.insert(path, update);
+            state.upsert_file(path, update);
         }
         state.opencode_databases = installed_opencode_states;
         state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
-        state.save(&state_path)?;
-
-        if let Some(scan_cache) = scan_cache {
-            update_scan_cache(paths, files_scanned, total_bytes, scan_cache)?;
-        }
-        finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
+        let cache = updated_scan_cache(scan_cache, files_scanned, total_bytes);
+        let pending = finalized_pending_ingest(&deferred_pending_scopes, state.next_doc_id);
+        state.commit_final(cache, pending)?;
 
         Ok(IngestReport {
             records_added,

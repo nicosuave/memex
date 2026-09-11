@@ -67,20 +67,6 @@ pub fn discover() -> Vec<SourceFile> {
         .collect()
 }
 
-pub(crate) fn discover_with_inventory(
-    inventory: &mut crate::directory_inventory::DiscoveryInventory,
-) -> Result<Vec<SourceFile>> {
-    Ok(
-        super::common::jsonl_files_with_inventory([sessions_root()], inventory)?
-            .into_iter()
-            .map(|path| SourceFile {
-                source: SourceKind::Pi,
-                path,
-            })
-            .collect(),
-    )
-}
-
 pub fn session_id_from_path(path: &Path) -> String {
     crate::sources::codex::session_id_from_path(path)
         .unwrap_or_else(|| path.to_string_lossy().into_owned())

@@ -40,6 +40,8 @@ pub(super) fn writer_loop(
     }
     let index = if index.is_writable() {
         index
+    } else if ctx.defer_merges {
+        SearchIndex::open_or_create_for_search_refresh(&ctx.index_root)?
     } else {
         SearchIndex::open_or_create_for_continuous_ingest(&ctx.index_root)?
     };
@@ -49,6 +51,7 @@ pub(super) fn writer_loop(
     let WriterContext {
         index_root: _,
         input_bytes: _,
+        defer_merges: _,
         embeddings,
         do_backfill_embeddings,
         reset_vector_store,
@@ -282,23 +285,21 @@ pub(super) fn pending_ingest_path(paths: &Paths) -> PathBuf {
     paths.state.join("ingest.pending.json")
 }
 
-pub(super) fn finalize_pending_ingest(
-    pending_path: &Path,
+pub(super) fn finalized_pending_ingest(
     deferred_scopes: &[SessionScope],
     next_doc_id: u64,
-) -> Result<()> {
+) -> PendingChange {
     if deferred_scopes.is_empty() {
-        return PendingIngest::clear(pending_path);
+        return PendingChange::Clear;
     }
-    PendingIngest {
+    PendingChange::Replace(PendingIngest {
         next_doc_id,
         source_paths: Vec::new(),
         vector_delete_paths: Vec::new(),
-        session_scopes: deferred_scopes.to_vec(),
+        session_scopes: pending_scope_union(&[], deferred_scopes),
         vector_publication: false,
         embedding_publication: Some(false),
-    }
-    .save(pending_path)
+    })
 }
 
 pub(super) fn pending_scope_union(
@@ -320,39 +321,33 @@ pub(super) fn pending_scope_union(
 }
 
 pub(super) fn prepare_pending_ingest_recovery(
-    paths: &Paths,
-    state: &mut IngestState,
-) -> Result<Option<PendingIngest>> {
-    let pending_path = pending_ingest_path(paths);
-    let Some(pending) = PendingIngest::load(&pending_path)
-        .with_context(|| format!("load pending ingest at {}", pending_path.display()))?
-    else {
-        return Ok(None);
-    };
+    state: &mut CheckpointSession,
+) -> Option<PendingIngest> {
+    let pending = state.pending.clone()?;
 
     for source_path in &pending.source_paths {
-        state.files.remove(source_path);
+        state.delete_file(source_path);
         if crate::sources::opencode::is_database_path(source_path) {
             state.opencode_databases.remove(source_path);
         }
     }
     state.next_doc_id = state.next_doc_id.max(pending.next_doc_id);
-    Ok(Some(pending))
+    Some(pending)
 }
 
-pub(super) fn update_scan_cache(
-    paths: &Paths,
+pub(super) fn updated_scan_cache(
+    cache: Option<ScanCache>,
     files_scanned: usize,
     total_bytes: u64,
-    mut cache: ScanCache,
-) -> Result<()> {
-    let cache_path = paths.state.join("scan_cache.json");
-    cache.update(files_scanned, total_bytes);
-    cache.save(&cache_path)
+) -> Option<ScanCache> {
+    cache.map(|mut cache| {
+        cache.update(files_scanned, total_bytes);
+        cache
+    })
 }
 
 pub(super) struct RecoveredCheckpoint {
-    pub state: IngestState,
+    pub state: CheckpointSession,
     pub pending_recovery: Option<PendingIngest>,
     pub empty_index_rebuild: bool,
 }
@@ -360,18 +355,43 @@ pub(super) struct RecoveredCheckpoint {
 pub(super) fn recover_checkpoint(
     paths: &Paths,
     index: &SearchIndex,
-    _lease: &IngestLease,
+    lease: &IngestLease,
+    header: Option<CheckpointHeader>,
 ) -> Result<RecoveredCheckpoint> {
+    let state_path = paths.state.join("ingest.json");
+    let empty_index = index.doc_count()? == 0;
+    let allow_initialize = if crate::state::checkpoint::has_authority(&state_path)? {
+        false
+    } else if empty_index {
+        true
+    } else {
+        let pending = PendingIngest::load(&pending_ingest_path(paths))?
+            .context("missing ingest checkpoint for a populated index")?;
+        let source_paths = pending.source_paths.iter().collect::<HashSet<_>>();
+        let scopes = pending.session_scopes.iter().collect::<HashSet<_>>();
+        index.for_each_record(|record| {
+            anyhow::ensure!(
+                record.doc_id < pending.next_doc_id
+                    && (source_paths.contains(&record.source_path)
+                        || scopes.contains(&SessionScope {
+                            source_path: record.source_path.clone(),
+                            session_id: record.session_id.clone(),
+                        })),
+                "missing ingest checkpoint: pending intent does not cover indexed records"
+            );
+            Ok(())
+        })?;
+        true
+    };
+    let mut state = CheckpointSession::open(&state_path, lease, allow_initialize, header)?;
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
-    let mut state = IngestState::load(&paths.state.join("ingest.json"))?;
-    let pending_recovery = prepare_pending_ingest_recovery(paths, &mut state)?;
+    let pending_recovery = prepare_pending_ingest_recovery(&mut state);
     cleanup_opencode_spools(&paths.state)?;
     let mut empty_index_rebuild = false;
-    if index.doc_count()? == 0 && (!state.files.is_empty() || !state.opencode_databases.is_empty())
-    {
+    if empty_index && (state.has_files()? || !state.opencode_databases.is_empty()) {
         empty_index_rebuild = true;
-        state.files.clear();
+        state.clear_files();
         state.opencode_databases.clear();
         if paths.vectors.exists() {
             std::fs::remove_dir_all(&paths.vectors)?;

@@ -617,7 +617,7 @@ pub(super) fn collect_unreachable_excluding(
     dry_run: bool,
     doomed: &[PathBuf],
 ) -> Result<usize> {
-    collect_unreachable_with_sync(root, dry_run, doomed, sync_directory)
+    collect_unreachable_with_sync(root, dry_run, doomed, super::fsync_directory)
 }
 
 fn collect_unreachable_with_sync(

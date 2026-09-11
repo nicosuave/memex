@@ -16,15 +16,15 @@ use std::io::{self, Write};
 use std::ops::Bound;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
 use tantivy::columnar::StrColumn;
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
-use tantivy::merge_policy::LogMergePolicy;
+use tantivy::merge_policy::{LogMergePolicy, NoMergePolicy};
 use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::Value;
 use tantivy::schema::{
@@ -76,6 +76,8 @@ pub struct SearchIndex {
     pending_generation: Option<Arc<PendingGeneration>>,
     _generation_lease: Option<Arc<GenerationLease>>,
     incremental_merge_policy: bool,
+    defer_merges: bool,
+    shared_reader: Arc<OnceLock<IndexReader>>,
 }
 
 const GENERATIONS_DIR: &str = "generations";
@@ -83,6 +85,8 @@ const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
+/// Segment count above which a search-triggered refresh schedules background compaction.
+pub const SEARCH_REFRESH_COMPACTION_SEGMENTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationGcReport {
@@ -549,6 +553,19 @@ impl SearchIndex {
         Self::open_or_create_for_ingest_with_merge_policy(dir, true)
     }
 
+    /// Search-triggered refreshes never merge in the foreground. Compaction runs in a
+    /// separate `memex index` process once the segment count passes
+    /// [`SEARCH_REFRESH_COMPACTION_SEGMENTS`].
+    pub fn open_or_create_for_search_refresh(dir: &Path) -> Result<Self> {
+        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, true)?;
+        index.defer_merges = true;
+        Ok(index)
+    }
+
+    pub fn segment_count(&self) -> Result<usize> {
+        Ok(self.index.searchable_segment_metas()?.len())
+    }
+
     fn open_or_create_for_ingest_with_merge_policy(
         dir: &Path,
         incremental_merge_policy: bool,
@@ -616,6 +633,8 @@ impl SearchIndex {
             pending_generation: Some(pending),
             _generation_lease: None,
             incremental_merge_policy,
+            defer_merges: false,
+            shared_reader: Arc::new(OnceLock::new()),
         })
     }
 
@@ -636,6 +655,8 @@ impl SearchIndex {
                 pending_generation: None,
                 _generation_lease: None,
                 incremental_merge_policy: false,
+                defer_merges: false,
+                shared_reader: Arc::new(OnceLock::new()),
             })
         } else {
             create_index_in_dir(dir)
@@ -666,7 +687,9 @@ impl SearchIndex {
         } else {
             self.index.writer(256_000_000)?
         };
-        if self.incremental_merge_policy {
+        if self.defer_merges {
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+        } else if self.incremental_merge_policy {
             let mut policy = LogMergePolicy::default();
             policy.set_min_layer_size(1);
             writer.set_merge_policy(Box::new(policy));
@@ -674,7 +697,16 @@ impl SearchIndex {
         Ok(writer)
     }
 
+    /// One reader per instance. Sealed generations never change; writable instances reload
+    /// the shared reader so committed segments become visible without reopening every file.
     pub fn reader(&self) -> Result<IndexReader> {
+        if let Some(reader) = self.shared_reader.get() {
+            if self.writable {
+                crate::profiling::span!("lexical.reader_reload");
+                reader.reload()?;
+            }
+            return Ok(reader.clone());
+        }
         crate::profiling::span!("lexical.reader_open");
         let reader: IndexReader = self
             .index
@@ -682,6 +714,7 @@ impl SearchIndex {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
         crate::profiling::count!("lexical.readers_opened", 1);
+        let _ = self.shared_reader.set(reader.clone());
         Ok(reader)
     }
 
@@ -739,7 +772,7 @@ impl SearchIndex {
             );
         }
         pending.directory.seal_at(&final_dir)?;
-        sync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
+        fsync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
         atomic_write_current(&pending.index_root, &pending.generation_name)?;
         pending.published.store(true, AtomicOrdering::Release);
         prune_superseded_generations(&pending.index_root, &pending.generation_name)?;
@@ -1981,6 +2014,8 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         pending_generation: None,
         _generation_lease: None,
         incremental_merge_policy: false,
+        defer_merges: false,
+        shared_reader: Arc::new(OnceLock::new()),
     })
 }
 
@@ -2010,6 +2045,8 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         pending_generation: None,
         _generation_lease: Some(generation_lease),
         incremental_merge_policy: false,
+        defer_merges: false,
+        shared_reader: Arc::new(OnceLock::new()),
     })
 }
 
@@ -2144,11 +2181,11 @@ fn validate_committed_generation(generation: &Path) -> Result<u64> {
 }
 
 fn create_generation_lease_file(generation: &Path) -> Result<()> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(generation.join(GENERATION_LEASE_FILE))?
-        .sync_all()?;
+        .open(generation.join(GENERATION_LEASE_FILE))?;
+    fsync_file(&file)?;
     Ok(())
 }
 
@@ -2166,7 +2203,7 @@ fn acquire_generation_lease(generation: &Path) -> Result<GenerationLease> {
 }
 
 fn prune_superseded_generations(index_root: &Path, current: &str) -> Result<()> {
-    prune_superseded_generations_with_sync(index_root, current, sync_directory)
+    prune_superseded_generations_with_sync(index_root, current, fsync_directory)
 }
 
 fn prune_superseded_generations_with_sync(
@@ -2247,7 +2284,7 @@ fn prune_superseded_generations_with_sync(
 }
 
 fn prune_legacy_index_files(index_root: &Path) -> Result<()> {
-    prune_legacy_index_files_with_sync(index_root, sync_directory)
+    prune_legacy_index_files_with_sync(index_root, fsync_directory)
 }
 
 fn prune_legacy_index_files_with_sync(
@@ -2323,8 +2360,9 @@ fn try_lock_generation_exclusive(_generation: &Path) -> Result<Option<File>> {
 fn atomic_write_current(index_root: &Path, generation_name: &str) -> Result<()> {
     let mut temp = tempfile::NamedTempFile::new_in(index_root)?;
     temp.write_all(format!("{generation_name}\n").as_bytes())?;
-    temp.as_file_mut().sync_all()?;
+    fsync_file(temp.as_file())?;
     temp.persist(index_root.join(CURRENT_FILE))?;
+    // The one drive-cache flush of publication: everything written before it lands with it.
     sync_directory(index_root)?;
     Ok(())
 }
@@ -2333,6 +2371,32 @@ fn atomic_write_current(index_root: &Path, generation_name: &str) -> Result<()> 
 fn sync_directory(dir: &Path) -> io::Result<()> {
     use std::fs::File;
     File::open(dir)?.sync_all()
+}
+
+/// Orders writes without a drive-cache flush; the next full sync makes them durable.
+#[cfg(unix)]
+fn fsync_directory(dir: &Path) -> io::Result<()> {
+    fsync_file(&File::open(dir)?)
+}
+
+#[cfg(unix)]
+fn fsync_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_directory(dir: &Path) -> io::Result<()> {
+    sync_directory(dir)
+}
+
+#[cfg(not(unix))]
+fn fsync_file(file: &File) -> io::Result<()> {
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -2692,6 +2756,23 @@ mod tests {
         writer.wait_merging_threads().unwrap();
         assert_eq!(index.index.searchable_segment_metas().unwrap().len(), 1);
         assert_eq!(index.doc_count().unwrap(), 32);
+    }
+
+    #[test]
+    fn search_refresh_never_merges_and_the_shared_reader_sees_each_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..12 {
+            index
+                .add_record(&mut writer, &test_record(id, "deferred"))
+                .unwrap();
+            writer.commit().unwrap();
+            assert_eq!(index.doc_count().unwrap(), id as usize + 1);
+        }
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 12);
+        assert!(index.segment_count().unwrap() < SEARCH_REFRESH_COMPACTION_SEGMENTS);
     }
 
     #[test]

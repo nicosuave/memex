@@ -18,7 +18,7 @@
 - `AnalyticsWriter::prepare`: resolves session facts and labels before SQL persistence. The returned prepared batch borrows the writer until commit, preventing interleaved accumulation. Deletions and inserts commit in one transaction.
 - `MemoryStore::prepare_refresh`: produces a prepared snapshot while holding its write lock; publication is a separate operation.
 
-The existing ingestion lease is retained across observation and execution. Checkpoints are loaded under that lease, so competing refreshes re-observe committed state. Read-only searches remain independent of the indexing writer.
+The existing ingestion lease is retained across observation and execution. Checkpoints are loaded under that lease, so competing refreshes re-observe committed state. Read-only searches remain independent of the indexing writer. The [checkpoint storage contract](checkpoint-storage.md) defines sparse reads/deltas, migration, lifecycle locking, and recovery ordering.
 
 ## Cost contracts
 
@@ -27,7 +27,8 @@ The existing ingestion lease is retained across observation and execution. Check
 - Metadata enrichment performs no subprocess calls. SQL persistence performs no source or repository discovery.
 - Source-ID presence checks reuse one reader; analytics inventory returns only candidate paths.
 - Record delivery remains bounded. Parsed whole-corpus records are never accumulated in a vector.
-- Small known-size batches use a single writer. Ordinary CLI indexing, daemon indexing, and automatic search refresh use tiered automatic merging with Tantivy's `LogMergePolicy` minimum layer size set to one document; ordinary initial indexing uses this policy too. `memex index rebuild` retains the default bulk merge policy. Incremental tiers group small peers without clipping them into the default 10,000-document floor; they are not a byte or latency bound.
+- Small known-size batches use a single writer. Ordinary CLI indexing and daemon indexing use tiered automatic merging with Tantivy's `LogMergePolicy` minimum layer size set to one document; ordinary initial indexing uses this policy too. `memex index rebuild` retains the default bulk merge policy. Incremental tiers group small peers without clipping them into the default 10,000-document floor; they are not a byte or latency bound.
+- Automatic search refresh never merges in the foreground. It appends with `NoMergePolicy`, and when a refresh that added records leaves more than 32 searchable segments it spawns one detached `memex index` process, which compacts with the tiered policy and exits. The probe skips spawning while ingest is busy. Duplicate children can be queued, but each holds the ingest lease for its entire run, so indexing and compaction remain serialized; no resident process is involved.
 - Publication intent is written once after parsing has determined the final document-ID checkpoint and before shared record mutations. Existing pending recovery is retained on cancellation.
 
 See [index-merge-cost-model.md](index-merge-cost-model.md) for the sustained aggregate comparison, including queries and terminal maintenance. See [profiling.md](profiling.md) for traces, counters, and per-thread wall-time flamegraphs. Initial creation, recovery, ordinary append updates, and no-op calls must be measured separately.

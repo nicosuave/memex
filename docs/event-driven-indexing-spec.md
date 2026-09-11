@@ -25,8 +25,8 @@
 
 Started from latest `main` (`04adaca`). This spec replaces the daemon's
 polling loop with OS filesystem events, with periodic reconciliation as the
-correctness backstop. Events are **hints only** — `ingest.json` file-state
-stays the source of truth.
+correctness backstop. Events are hints only; the [checkpoint storage contract](checkpoint-storage.md)
+defines authoritative state, indexed watcher reads, migration, and generated-artifact filtering.
 
 ## 1. Problem
 
@@ -193,9 +193,9 @@ Drop in the watcher callback, in order:
    translated into main-DB hints before filtering the remaining sidecars.
 3. Paths matching the existing `PathExcluder` (config `exclude_paths` + CLI
    `--exclude`). Canonicalize before matching, exactly like discovery does.
-4. Events from our own state writes (`ingest.json`, `scan_cache.json`,
-   `ingest.pending.json`) — these live under `~/.memex/state`, which is not a
-   watch root, so this is defense-in-depth; assert it in a test.
+4. Generated checkpoint artifacts identified by the [canonical checkpoint filter](checkpoint-storage.md),
+   before database-WAL routing, plus existing pending-intent and scan-cache files.
+   These state writes must not trigger ingestion.
 
 What survives: create/modify/rename affecting `*.jsonl`, `*.json`, codex
 history files, opencode `*.sqlite` main files, cursor/grok/copilot session
@@ -280,9 +280,9 @@ covers it:
    all tiers. If the index is empty but state is non-empty (or vice versa),
    Tier 3 rebuilds — events never paper over store divergence.
 
-Invariant to assert in tests: **event-driven converge == poll converge**.
+Invariant to assert in tests: event-driven converge == poll converge.
 Given the same fixture mutation sequence, applying events-then-resync must
-produce byte-identical `ingest.json` (modulo timestamps) and identical record
+produce equal logical checkpoint state (modulo timestamps) and identical record
 counts as a full `ingest_all`. Any divergence is a P0 bug in Tier 1/2 scoping,
 not an acceptable approximation.
 
@@ -307,7 +307,7 @@ not an acceptable approximation.
   (`StartInterval` / `.timer`) are unaffected and stay poll-based.
 - Shutdown: SIGTERM/SIGINT stops the watcher, flushes the dirty set with a
   short grace ingest (bounded, e.g. 5s), then exits. No event may be recorded
-  as "handled" before its ingest commits and `ingest.json` saves.
+  as "handled" before its ingest and checkpoint transaction commit.
 
 ## 10. Observability
 

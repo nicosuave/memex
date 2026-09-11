@@ -135,6 +135,16 @@ fn terminal_merge() -> Result<()> {
     let result = (|| -> Result<()> {
         crate::profiling::span!("benchmark.terminal_merge");
         let root = root()?;
+        let paths = crate::config::Paths::new(Some(
+            root.parent()
+                .context("benchmark root has no parent")?
+                .to_path_buf(),
+        ))?;
+        let lease = crate::lease::IngestLease::acquire(
+            &paths,
+            "checkpoint benchmark maintenance",
+            crate::lease::INGEST_LEASE_TIMEOUT,
+        )?;
         anyhow::ensure!(SearchIndex::exists(&root), "benchmark index is missing");
         let index = SearchIndex::open_or_create_for_ingest_with_merge_policy(&root, false)?;
         let before = receipt(&index, false)?;
@@ -152,11 +162,19 @@ fn terminal_merge() -> Result<()> {
         writer.wait_merging_threads()?;
         index.publish_generation()?;
         let published = SearchIndex::open_or_create(&root)?;
-        let after = receipt(&published, false)?;
+        let mut after = receipt(&published, false)?;
         anyhow::ensure!(after["segments"] == 4);
         anyhow::ensure!(before["retained"] == after["retained"]);
         anyhow::ensure!(before["remainder"]["live_docs"] == after["remainder"]["live_docs"]);
         anyhow::ensure!(after["remainder"]["live_docs"] == after["remainder"]["max_doc"]);
+        let mut checkpoints = crate::state::checkpoint::CheckpointWriter::open(
+            &paths.state.join("ingest.json"),
+            &lease,
+            false,
+        )?;
+        checkpoints.checkpoint()?;
+        after["checkpoint_maintenance"] =
+            serde_json::json!({"mode": "TRUNCATE", "completed": true});
         write_receipt(after)
     })();
     #[cfg(feature = "profiling")]

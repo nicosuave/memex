@@ -2295,6 +2295,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         model: model_choice,
         embed_runtime,
         tool_content_limits,
+        defer_merges: false,
     })
 }
 
@@ -2316,7 +2317,7 @@ fn run_index_selection(
     let operation = if reindex { "reindex" } else { "index" };
     let lease = IngestLease::acquire(&paths, operation, INGEST_LEASE_TIMEOUT)?;
     if reindex {
-        reset_reindex_artifacts(&paths)?;
+        reset_reindex_artifacts(&paths, &lease)?;
     }
     paths.ensure_dirs()?;
     let index = if reindex {
@@ -2357,15 +2358,13 @@ fn run_index_selection(
     Ok(full_scan)
 }
 
-fn reset_reindex_artifacts(paths: &Paths) -> Result<()> {
+fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
+    crate::state::checkpoint::reset(&paths.state.join("ingest.json"), lease)?;
     remove_generated_path(&paths.index)?;
     remove_generated_path(&paths.vectors)?;
     remove_generated_path(&paths.root.join("memory"))?;
 
     for name in [
-        "ingest.json",
-        "ingest.pending.json",
-        "scan_cache.json",
         "analytics.sqlite",
         "analytics.sqlite-wal",
         "analytics.sqlite-shm",
@@ -8930,7 +8929,8 @@ arguments = {
             std::fs::write(paths.state.join(name), "derived").unwrap();
         }
 
-        reset_reindex_artifacts(&paths).unwrap();
+        let lease = IngestLease::acquire(&paths, "rebuild test", INGEST_LEASE_TIMEOUT).unwrap();
+        reset_reindex_artifacts(&paths, &lease).unwrap();
 
         assert!(!paths.index.exists());
         assert!(!paths.vectors.exists());

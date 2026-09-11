@@ -1,9 +1,11 @@
+mod checkpoint;
 mod discovery;
 mod execution;
 mod plan;
 mod publication;
 mod selection;
 
+use checkpoint::CheckpointSession;
 pub(crate) use discovery::{PathExcluder, build_path_excluder};
 use discovery::{
     can_skip_fresh_scan, can_skip_noop_index, is_not_found, vector_index_covers_embeddable_records,
@@ -13,10 +15,9 @@ use execution::{
     cleanup_opencode_spools, flush_embeddings, is_embedding_role, limit_record_tool_content,
     parser_thread_pool, prehydrate_opencode_database, refresh_memories, truncate_for_embedding,
 };
-use publication::{
-    finalize_pending_ingest, pending_ingest_path, pending_scope_union, update_scan_cache,
-    writer_loop,
-};
+#[cfg(test)]
+use publication::pending_ingest_path;
+use publication::{finalized_pending_ingest, pending_scope_union, updated_scan_cache, writer_loop};
 
 use crate::analytics::{
     AnalyticsStore, AnalyticsWriter, analytics_path, backfill_from_index_with_repositories,
@@ -26,8 +27,9 @@ use crate::embed::{EmbedRuntimeConfig, EmbedderHandle, ModelChoice};
 use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
+use crate::state::checkpoint::{CheckpointHeader, CheckpointReader, PendingChange};
 use crate::state::{
-    FileIdentity, FileState, IngestState, PendingIngest, PendingToolCall, ScanCache, SessionScope,
+    FileIdentity, FileState, PendingIngest, PendingToolCall, ScanCache, SessionScope,
 };
 #[cfg(test)]
 use crate::types::RecordLinks;
@@ -75,6 +77,9 @@ pub struct IngestOptions {
     pub model: ModelChoice,
     pub embed_runtime: EmbedRuntimeConfig,
     pub tool_content_limits: IndexedToolContentLimits,
+    /// Search-triggered refreshes append without foreground merges; compaction is scheduled
+    /// separately once segments accumulate.
+    pub defer_merges: bool,
 }
 
 #[derive(Debug)]
@@ -166,6 +171,7 @@ struct WriterContext {
     repositories: Arc<crate::repository::RepositoryResolver>,
     codex_metadata_checkpoints: HashMap<String, (u64, Vec<u64>)>,
     vector_delete_paths: HashSet<String>,
+    defer_merges: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,10 +206,8 @@ pub fn ingest_if_stale(
     lease: &IngestLease,
 ) -> Result<Option<IngestReport>> {
     crate::profiling::span!("ingest.freshness");
-    let cache_path = paths.state.join("scan_cache.json");
-    let cache = ScanCache::load(&cache_path)?;
-
-    if can_skip_fresh_scan(&cache, paths, index, options, ttl_seconds)? {
+    let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
+    if can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)? {
         crate::profiling::count!("ingest.fresh_cache_hits", 1);
         // The transcript scan cache cannot detect edits in a Markdown memory
         // file. Refresh these small documents even when transcript discovery is
@@ -217,7 +221,7 @@ pub fn ingest_if_stale(
     }
 
     crate::profiling::count!("ingest.fresh_cache_misses", 1);
-    let report = ingest_selected(paths, index, options, lease, None, Some(cache))?.report;
+    let report = ingest_selected(paths, index, options, lease, None, Some(header))?.report;
     Ok(Some(report))
 }
 
@@ -246,14 +250,14 @@ fn ingest_selected(
     options: &IngestOptions,
     lease: &IngestLease,
     dirty: Option<&HashSet<PathBuf>>,
-    scan_cache: Option<ScanCache>,
+    checkpoint_header: Option<CheckpointHeader>,
 ) -> Result<DirtyIngestReport> {
     crate::profiling::span!("ingest.all");
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
     let pool = parser_thread_pool()?;
-    let recovered = publication::recover_checkpoint(paths, index, lease)?;
+    let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
     let prepared =
-        discovery::prepare_refresh(paths, index, options, &pool, recovered, dirty, scan_cache)?;
+        discovery::prepare_refresh(paths, index, options, &pool, recovered, dirty, None)?;
     let full_scan = prepared.full_scan;
     if full_scan {
         refresh_memories(paths, options, &repositories)?;
