@@ -50,6 +50,7 @@ use std::time::Duration;
 use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
+mod daemon_upgrade;
 mod surface;
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
@@ -1102,6 +1103,11 @@ impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
 
 #[derive(Subcommand)]
 enum IndexServiceCommand {
+    /// Activate an installed update for an already enabled Memex-owned daemon
+    Reconcile {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Run the configured daemon in the foreground
     Run {
         #[command(flatten)]
@@ -1439,6 +1445,7 @@ pub fn run() -> Result<()> {
             crate::web::serve(root, &listen)?;
         }
         Commands::IndexService { action } => match action {
+            IndexServiceCommand::Reconcile { root } => daemon_upgrade::reconcile(root)?,
             IndexServiceCommand::Run {
                 index,
                 web_ui,
@@ -1920,6 +1927,9 @@ fn run_index_loop(
 ) -> Result<()> {
     // Keep the native listener alive for every daemon watch mode, including
     // the default event loop, and release it when that loop exits or fails.
+    let paths = Paths::new(index.root.clone())?;
+    let mut runtime = crate::daemon_runtime::DaemonRuntime::start(&paths)?;
+    let mut upgrade = daemon_upgrade::Replacement::new()?;
     #[cfg(unix)]
     let _native_server = match crate::native::spawn(index.root.clone()) {
         Ok(server) => Some(server),
@@ -1929,9 +1939,23 @@ fn run_index_loop(
         }
     };
     if mode == WatchMode::Poll {
-        run_poll_loop(index, interval_secs, web_listen, mcp)
+        run_poll_loop(
+            index,
+            interval_secs,
+            web_listen,
+            mcp,
+            &mut runtime,
+            &mut upgrade,
+        )
     } else {
-        run_event_loop(index, Duration::from_secs(interval_secs), web_listen, mcp)
+        run_event_loop(
+            index,
+            Duration::from_secs(interval_secs),
+            web_listen,
+            mcp,
+            &mut runtime,
+            &mut upgrade,
+        )
     }
 }
 
@@ -1940,6 +1964,8 @@ fn run_poll_loop(
     interval_secs: u64,
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
+    runtime: &mut crate::daemon_runtime::DaemonRuntime,
+    upgrade: &mut daemon_upgrade::Replacement,
 ) -> Result<()> {
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
@@ -1953,13 +1979,21 @@ fn run_poll_loop(
                 .transpose()
         },
     )?;
+    runtime.mark_ready()?;
     loop {
-        if let Some(server) = &mcp_server {
-            if !server.wait_timeout(Duration::from_secs(interval_secs))? {
-                return Ok(());
+        let deadline = Instant::now() + Duration::from_secs(interval_secs);
+        while Instant::now() < deadline {
+            upgrade.check();
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1));
+            if let Some(server) = &mcp_server {
+                if !server.wait_timeout(remaining)? {
+                    return Ok(());
+                }
+            } else {
+                std::thread::sleep(remaining);
             }
-        } else {
-            std::thread::sleep(Duration::from_secs(interval_secs));
         }
         run_index_args(index, false, true)?;
         std::io::stdout().flush().ok();
@@ -1984,6 +2018,8 @@ fn run_event_loop(
     resync: Duration,
     web_listen: Option<String>,
     mcp: Option<crate::mcp::HttpOptions>,
+    runtime: &mut crate::daemon_runtime::DaemonRuntime,
+    upgrade: &mut daemon_upgrade::Replacement,
 ) -> Result<()> {
     use crate::watch::{
         FireCause, HOT_SWEEP_INTERVAL, HOT_WINDOW, WatchConfig, WatchService, dirty_needs_ingest,
@@ -2021,9 +2057,11 @@ fn run_event_loop(
         },
     )?;
 
+    runtime.mark_ready()?;
     service.mark_complete(FireCause::Resync);
     let mut last_sweep = Instant::now();
     loop {
+        upgrade.check();
         match service.poll() {
             Some(FireCause::Resync) => {
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
@@ -5697,6 +5735,7 @@ fn run_index_service_enable(
 
     let paths = Paths::new(index.root.clone())?;
     let config = UserConfig::load(&paths)?;
+    daemon_upgrade::ensure_mutable(&paths.root.join("config.toml"))?;
     let mcp = mcp_args.resolve(&config);
     let mcp_listen = mcp.as_ref().map(|options| options.listen);
     let cli_web_ui = web_ui || web_listen.is_some();
@@ -5733,7 +5772,7 @@ fn run_index_service_enable(
         crate::web::validate_listener(&web_listen)?;
     }
 
-    let exe = std::env::current_exe()?;
+    let exe = daemon_upgrade::service_executable()?;
     let program_args = build_index_command_args(
         index,
         continuous,
@@ -5779,6 +5818,9 @@ fn run_index_service_enable(
     result?;
     persist_index_service_config(&paths, &config_updates)?;
     disable_auto_index_on_search_by_default(&paths, &config)?;
+    if continuous {
+        daemon_upgrade::wait_ready(&paths, Duration::from_secs(30))?;
+    }
     if web_ui {
         wait_for_web_ui(&web_listen, Duration::from_secs(5))?;
         println!("web UI: running on {web_listen}");
@@ -6017,6 +6059,12 @@ fn run_index_service_enable_launchd(
         .or_else(|| config.index_service_plist.clone())
         .unwrap_or(default_plist);
     validate_service_label(&label)?;
+    daemon_upgrade::ensure_mutable(&plist_path)?;
+
+    let (domain_target, service_target) = launchctl_targets(&label)?;
+    if launchctl_service_exists(&service_target)? {
+        verify_launchd_job_loaded(&service_target, &plist_path)?;
+    }
 
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -6044,8 +6092,6 @@ fn run_index_service_enable_launchd(
     std::fs::write(&plist_path, contents)?;
 
     println!("wrote launchd plist: {}", plist_path.display());
-    let (domain_target, service_target) = launchctl_targets(&label)?;
-
     // Replace any existing job with the same label to avoid stale launchd state.
     let _ = launchctl_bootout_service(&service_target)?;
 
@@ -6112,6 +6158,10 @@ fn run_index_service_enable_systemd(
 
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
+    daemon_upgrade::ensure_mutable(&service_path)?;
+    daemon_upgrade::ensure_mutable(&timer_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &service_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &timer_path)?;
     let existing_mode = registered_systemd_mode(&service_path, &timer_path)?;
     if let Some(counterpart) =
         systemd_counterpart_unit(&label, continuous, existing_mode, timer_path.exists())
@@ -6188,7 +6238,7 @@ fn run_index_service_status(
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
 
-    if cfg!(target_os = "macos") {
+    let result = if cfg!(target_os = "macos") {
         run_index_service_status_launchd(&config, &paths, label, plist)
     } else if cfg!(target_os = "linux") {
         run_index_service_status_systemd(&config, label, systemd_dir)
@@ -6196,7 +6246,9 @@ fn run_index_service_status(
         Err(anyhow!(
             "background service scheduling is only supported on macOS and Linux"
         ))
-    }
+    };
+    result?;
+    daemon_upgrade::print_runtime(&paths)
 }
 
 fn run_index_service_open(
@@ -6606,7 +6658,11 @@ fn run_index_service_disable_launchd(
         .or_else(|| config.index_service_plist.clone())
         .unwrap_or(default_plist);
     validate_service_label(&label)?;
+    daemon_upgrade::ensure_mutable(&plist_path)?;
     let (_domain_target, service_target) = launchctl_targets(&label)?;
+    if launchctl_service_exists(&service_target)? {
+        verify_launchd_job_loaded(&service_target, &plist_path)?;
+    }
     let _ = launchctl_bootout_service(&service_target)?;
 
     if plist_path.exists() {
@@ -6695,7 +6751,7 @@ fn verify_launchd_job_loaded(service_target: &str, plist_path: &std::path::Path)
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected_path = plist_path.to_string_lossy();
-    if !stdout.contains(&format!("path = {expected_path}")) {
+    if service_output_value(&stdout, "path") != Some(expected_path.as_ref()) {
         return Err(anyhow!(
             "launchd job state mismatch; expected path {}, launchctl output did not match",
             plist_path.display()
@@ -6738,6 +6794,10 @@ fn run_index_service_disable_systemd(
 
     let service_path = systemd_dir.join(format!("{}.service", label));
     let timer_path = systemd_dir.join(format!("{}.timer", label));
+    daemon_upgrade::ensure_mutable(&service_path)?;
+    daemon_upgrade::ensure_mutable(&timer_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &service_path)?;
+    daemon_upgrade::ensure_systemd_owner(&label, &timer_path)?;
 
     // Stop and disable timer if it exists
     if timer_path.exists() {
@@ -7545,6 +7605,19 @@ fn refresh_installed_skills(binary: &Path) -> Result<()> {
     Ok(())
 }
 
+fn activate_installed_daemon(binary: &Path) -> Result<()> {
+    let status = std::process::Command::new(binary)
+        .args(["--no-update-check", "daemon", "reconcile"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("activate daemon using {}", binary.display()))?;
+    anyhow::ensure!(
+        status.success(),
+        "memex is installed, but daemon activation failed ({status}); run `memex daemon reconcile` to retry"
+    );
+    Ok(())
+}
+
 fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBuf> {
     for args in [vec!["update"], vec!["upgrade", HOMEBREW_FORMULA]] {
         let status = std::process::Command::new(brew)
@@ -7596,6 +7669,7 @@ fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBu
         .filter(|value| parse_version_parts(value).is_some())
         .ok_or_else(|| anyhow!("unexpected installed memex version: {version}"))?;
     println!("Installed {version}");
+    activate_installed_daemon(&binary)?;
     refresh_installed_skills(&binary)?;
     if expected_version.is_some_and(|latest| is_newer_version(installed_version, latest)) {
         return Err(anyhow!(
@@ -7630,6 +7704,7 @@ fn update_release(current_exe: &Path, latest: &str) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     if !is_newer_version(current, latest) {
         println!("memex is already up to date (v{current}); refreshing installed skills");
+        activate_installed_daemon(current_exe)?;
         return refresh_installed_skills(current_exe);
     }
     let (os, arch) = detect_platform()?;
@@ -7665,13 +7740,23 @@ fn update_release(current_exe: &Path, latest: &str) -> Result<()> {
     if !status.success() {
         return Err(anyhow!("Failed to extract release"));
     }
-    replace_binary(&tmp_dir.path().join("memex"), current_exe)?;
+    let downloaded = tmp_dir.path().join("memex");
+    anyhow::ensure!(
+        daemon_upgrade::verify_binary(&downloaded)? == latest,
+        "downloaded memex does not match requested release {latest}"
+    );
+    replace_binary(&downloaded, current_exe)?;
     println!("Updated memex to v{latest}");
+    activate_installed_daemon(current_exe)?;
     refresh_installed_skills(current_exe)
 }
 
 fn perform_update(known_latest: Option<&str>) -> Result<()> {
     let current_exe = std::env::current_exe()?.canonicalize()?;
+    anyhow::ensure!(
+        !daemon_upgrade::nix_store(&current_exe),
+        "Nix manages this installation. Update the flake/profile and activate your NixOS or Home Manager configuration; memex update cannot replace an immutable Nix store binary. For a profile-owned daemon, run `memex daemon reconcile` after upgrading the profile."
+    );
     if homebrew_executable(&current_exe) {
         let brew = find_in_path("brew").ok_or_else(|| {
             anyhow!("Homebrew manages this installation, but brew is not on PATH")

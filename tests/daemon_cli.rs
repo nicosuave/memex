@@ -257,6 +257,70 @@ fn configured_daemon_runs_index_web_and_mcp_in_one_process() {
     assert_listener_closes(web);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_hands_off_stable_executable_preserving_arguments_and_environment() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for mode in ["events", "poll"] {
+        let dirs = TestDirs::new();
+        dirs.write_config("auto_index_on_search = false\nindex_service_mcp = false\n");
+        let executable = dirs.home.path().join("memex");
+        symlink(env!("CARGO_BIN_EXE_memex"), &executable).unwrap();
+        let result = dirs.home.path().join("handoff");
+        let args = [
+            "--no-update-check",
+            "daemon",
+            "run",
+            "--root",
+            dirs.root.path().to_str().unwrap(),
+            "--only-source",
+            "claude",
+            "--claude-path",
+            dirs.claude.path().to_str().unwrap(),
+            "--no-embeddings",
+            "--watch-mode",
+            mode,
+            "--poll-interval",
+            "3600",
+        ];
+        let child = Command::new(&executable)
+            .args(args)
+            .env("HOME", dirs.home.path())
+            .env("MEMEX_HANDOFF_RESULT", &result)
+            .env("MEMEX_HANDOFF_VALUE", "preserved")
+            .env_remove("MEMEX_SERVICE_MANAGER")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut daemon = ChildGuard {
+            child,
+            logs: Arc::new(Mutex::new(Vec::new())),
+        };
+        let paths = memex::config::Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !memex::daemon_runtime::read(&paths)
+            .unwrap()
+            .is_some_and(|info| info.ready)
+        {
+            daemon.assert_running();
+            assert!(Instant::now() < deadline, "daemon readiness timed out");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let replacement = dirs.home.path().join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\nif [ \"$1\" = '--version' ]; then printf 'memex 99.0.0\\n'; exit 0; fi\nprintf '%s\\n' \"$MEMEX_HANDOFF_VALUE\" \"$@\" > \"$MEMEX_HANDOFF_RESULT\"\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let staged = dirs.home.path().join("next-link");
+        symlink(&replacement, &staged).unwrap();
+        std::fs::rename(&staged, &executable).unwrap();
+        assert!(daemon.wait_for_exit().success());
+        let expected = format!("preserved\n{}\n", args.join("\n"));
+        assert_eq!(std::fs::read_to_string(&result).unwrap(), expected);
+        assert!(memex::daemon_runtime::read(&paths).unwrap().is_none());
+    }
+}
+
 #[test]
 fn daemon_mcp_flags_override_the_configured_enablement() {
     let dirs = TestDirs::new();

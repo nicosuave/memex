@@ -1,6 +1,7 @@
 pub mod analytics;
 pub mod cli;
 pub mod config;
+pub mod daemon_runtime;
 pub mod embed;
 pub mod herdr;
 pub mod index;
