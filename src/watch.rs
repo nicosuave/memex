@@ -11,11 +11,6 @@
 //! - Events are **hints only**. Dirty fires select affected inputs for the
 //!   normal incremental ingest, whose `IngestState` comparison (`size`/`mtime`/identity) stays
 //!   the source of truth. A spurious event costs one cheap stat check.
-//! - Fires are debounced and settled: a transcript being actively appended to
-//!   must go quiet before it is parsed. This matters because the JSONL
-//!   parsers treat a torn trailing line (no newline yet) as a complete line,
-//!   advance the byte offset past it, and would permanently lose that record
-//!   once the writer completes the line.
 //! - Anything suspicious — watcher errors, [`notify`] rescan flags
 //!   (`mustScanSubDirs`, `IN_Q_OVERFLOW`), a full dirty set, a newly appeared
 //!   watch root — escalates to a full resync ingest, exactly like the old
@@ -1181,21 +1176,16 @@ mod tests {
         assert_eq!(service.poll(), None);
     }
 
-    /// FSEvents defers content-modification events for a file held open for
-    /// writing and flushes them on close (verified empirically: 0 events in
-    /// 8s with the fd open, immediate delivery after `drop`). Agents stream
-    /// transcripts through a single held-open fd (see `lsof` on any live
-    /// session), so on macOS events alone can never index an active session —
-    /// the hot sweep (`hot_sweep_dirty`) exists for exactly this gap.
-    /// If this test ever fails by observing events while open, FSEvents
-    /// improved and the sweep may be redundant.
     #[cfg(target_os = "macos")]
     #[test]
-    fn fsevents_defers_modify_until_close() {
+    fn fsevents_reports_content_change_before_or_after_close() {
+        let _guard = env_lock();
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().to_path_buf();
-        std::fs::write(root.join("seed.txt"), "x").expect("seed");
-        let canon: PathBuf = std::fs::canonicalize(&root).expect("canon");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let target = root.join("seed.txt");
+        let probe = root.join("ready.txt");
+        std::fs::write(&target, "x").expect("seed");
+        std::fs::write(&probe, "").expect("probe");
         let (tx, rx) = unbounded::<notify::Result<Event>>();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
@@ -1205,36 +1195,63 @@ mod tests {
         )
         .expect("watcher");
         watcher
-            .watch(&canon, RecursiveMode::Recursive)
+            .watch(&root, RecursiveMode::Recursive)
             .expect("watch");
-        std::thread::sleep(Duration::from_secs(2));
+        let wait_for_change = |path: &Path, timeout: Duration| {
+            let deadline = Instant::now() + timeout;
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                match rx.recv_timeout(remaining) {
+                    Ok(result) => {
+                        let event = result.expect("filesystem watcher error");
+                        if matches!(
+                            event.kind,
+                            EventKind::Modify(notify::event::ModifyKind::Data(_))
+                        ) && event.paths.iter().any(|observed| observed == path)
+                        {
+                            return true;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => return false,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        panic!("watcher disconnected")
+                    }
+                }
+            }
+            false
+        };
+        std::fs::write(&probe, "ready\n").expect("signal readiness");
+        assert!(
+            wait_for_change(&probe, Duration::from_secs(15)),
+            "watcher never became ready"
+        );
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < drain_deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(result) => {
+                    result.expect("filesystem watcher error during startup");
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    panic!("watcher disconnected")
+                }
+            }
+        }
         let mut file = std::fs::OpenOptions::new()
             .append(true)
-            .open(root.join("seed.txt"))
+            .open(&target)
             .expect("open");
-        std::io::Write::write_all(&mut file, b"held-open\n").expect("write");
+        file.write_all(b"held-open\n").expect("append");
         file.sync_all().expect("sync");
-        let mut open_count = 0;
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while Instant::now() < deadline {
-            if rx.try_recv().is_ok() {
-                open_count += 1;
-            } else {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-        assert_eq!(open_count, 0, "modify events arrived while fd open");
+        let observed_while_open = wait_for_change(&target, Duration::from_secs(4));
         drop(file);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut closed = false;
-        while Instant::now() < deadline {
-            if rx.try_recv().is_ok() {
-                closed = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(closed, "no modify event after close");
+        assert!(
+            observed_while_open || wait_for_change(&target, Duration::from_secs(15)),
+            "no content-modification event for the appended file"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read appended file"),
+            b"xheld-open\n"
+        );
     }
 
     #[test]

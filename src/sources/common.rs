@@ -48,6 +48,29 @@ pub fn jsonl_files(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     files
 }
 
+pub(crate) fn jsonl_files_with_inventory(
+    roots: impl IntoIterator<Item = PathBuf>,
+    inventory: &mut crate::directory_inventory::DiscoveryInventory,
+) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for root in roots {
+        if !root.try_exists()? {
+            continue;
+        }
+        for entry in inventory.walk(&root) {
+            let entry = entry?;
+            if entry.file_type == crate::directory_inventory::EntryType::File
+                && entry.path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            {
+                files.push(entry.path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 pub fn project_from_path(path: &str) -> String {
     Path::new(path)
         .file_name()

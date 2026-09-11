@@ -67,6 +67,20 @@ pub fn discover() -> Vec<SourceFile> {
         .collect()
 }
 
+pub(crate) fn discover_with_inventory(
+    inventory: &mut crate::directory_inventory::DiscoveryInventory,
+) -> Result<Vec<SourceFile>> {
+    Ok(
+        super::common::jsonl_files_with_inventory([sessions_root()], inventory)?
+            .into_iter()
+            .map(|path| SourceFile {
+                source: SourceKind::Pi,
+                path,
+            })
+            .collect(),
+    )
+}
+
 pub fn session_id_from_path(path: &Path) -> String {
     crate::sources::codex::session_id_from_path(path)
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
@@ -242,7 +256,9 @@ pub(crate) fn parse_index_records_for(
 ) -> Result<IndexParseOutput> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
-    let mut start = state.offset as usize;
+    let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
+        simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
+    });
     let mut turn_id = state.turn_id;
 
     let source_path = path.to_string_lossy().to_string();
@@ -275,6 +291,7 @@ pub(crate) fn parse_index_records_for(
         }
     }
     while start < mmap.len() {
+        let line_start = start;
         let slice = &mmap[start..];
         let rel = memchr(b'\n', slice).unwrap_or(slice.len());
         let line = &slice[..rel];
@@ -287,6 +304,11 @@ pub(crate) fn parse_index_records_for(
         let value: BorrowedValue = match simd_json::to_borrowed_value(&mut buf) {
             Ok(v) => v,
             Err(_) => {
+                if rel == slice.len() {
+                    start = line_start;
+                    break;
+                }
+
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
@@ -685,7 +707,7 @@ pub(crate) fn parse_index_records_for(
 
     Ok(IndexParseOutput {
         legacy_turn_id: None,
-        offset: mmap.len() as u64,
+        offset: start as u64,
         turn_id,
         pending_tool_calls,
         session_id: Some(session_id),
