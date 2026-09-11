@@ -4,11 +4,10 @@
 > implements this spec with `--watch-mode events|poll` (`daemon run`,
 > `daemon enable/restart`, hidden on legacy `index --watch`).
 > Two findings from implementation are now part of the design:
-> (1) FSEvents defers content-modification events for files held open for
-> writing (0 events in 8s with the fd open, immediate delivery on close;
-> regression test `fsevents_defers_modify_until_close`) while agents stream
-> transcripts through a single held-open fd (confirmed via `lsof` on live
-> Codex sessions) — so macOS runs a 5s hot sweep re-statting recently
+> (1) FSEvents content notifications may arrive before or after a writer
+> closes its file. `fsevents_reports_content_change_before_or_after_close`
+> verifies eventual content-change delivery for the target path without
+> requiring close-time deferral. macOS retains a 5s hot sweep for recently
 > active files (`hot_sweep_dirty`, `HOT_SWEEP_INTERVAL`, `HOT_WINDOW`).
 > Candidates are selected from stored ingest timestamps before statting;
 > cold sessions resume through events or the periodic resync. Tracked
@@ -94,10 +93,13 @@ for testing; the code must compile there, nothing more.
 - C2. Full reconciliation always converges: startup scan, periodic resync,
   overflow resync, error resync, and delete/rename tombstone sweep (section 8).
   A daemon that missed *every* event still converges on the next resync.
-- C3. No torn-read corruption: a file actively being appended is only parsed
-  after settle (section 7). A partial trailing JSONL line must never advance
-  `offset` past committed data — verify the parsers already skip/retain it;
-  if any parser advances on error, fix that first.
+- C3. Incremental JSONL parsers consume complete records while writers remain
+  open. Invalid unterminated tails remain unconsumed until later writes finish
+  them; valid final JSON without a newline remains accepted. Pending tools and
+  Codex metadata offsets follow the consumed prefix. A legacy checkpoint inside
+  invalid JSON can rewind to that line when parsing next runs. Unchanged legacy
+  files are not automatically reparsed; historical losses beyond a consumed
+  newline require an explicit rebuild. Settling is not a parser-safety barrier.
 - C4. No duplicate records on rename/rotation/truncation: reuse the exact
   `delete_first` paths (`size < previous.size`, mtime regression,
   `file_was_replaced`, parser-version change, Jcode atomic-reparse rule).
@@ -210,11 +212,9 @@ one stat.
 - **Global batch window**: collect all settled paths; fire one ingest covering
   the whole dirty set. Minimum ingest spacing ~2s (prevents ingest thrash when
   5 agents write concurrently).
-- **Settle check at fire time**: re-stat each dirty path; require size+mtime
-  stable across the debounce window (two consecutive stats agree) *or* the
-  quiet period fully elapsed with no new event. If still churning, keep it in
-  the dirty set for the next batch — do not parse a file that grew in the last
-  ~500ms. This plus the trailing-line rule (C3) eliminates torn reads.
+- Settle check at fire time: re-stat each dirty path and defer a changing
+  file until the quiet period or maximum batch age. This reduces repeated
+  parsing; C3 applies even when a maximum-age fire interrupts an active writer.
 - **Opencode SQLite**: extra settle — after the DB file settles, still
   `scan_database` from the stored cursor; if the DB is mid-checkpoint/locked,
   treat like the existing `Err(_) → files_skipped` path and retry next batch,
