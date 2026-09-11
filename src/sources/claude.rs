@@ -413,6 +413,16 @@ pub(crate) fn parse_index_records_with_background(
         let value = match simd_json::to_borrowed_value(&mut buffer) {
             Ok(value) => value,
             Err(_) => {
+                // A writer can pause mid-record without growing the file
+                // between discovery and mmap. Retry that incomplete JSON on
+                // the next append, while still accepting complete final JSON
+                // without a newline and diagnosing malformed complete lines.
+                if !has_newline
+                    && serde_json::from_slice::<Value>(line).is_err_and(|error| error.is_eof())
+                {
+                    start = source_record_offset as usize;
+                    break;
+                }
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }

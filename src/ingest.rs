@@ -1564,14 +1564,28 @@ fn ingest_selected(
 
     // Markers written before `embedding_publication` existed represented every
     // vector publication as an embedding publication. Preserve that recovery
-    // behavior, while new cleanup-only markers can recover without loading a
-    // model or backfilling vectors.
+    // behavior. Pure deletion recovery needs no model, but a mixed batch can
+    // also replay surviving files with new document IDs. Restore their vector
+    // coverage before live-ID reconciliation discards the previous IDs.
     let recover_embeddings = pending_recovery.as_ref().is_some_and(|pending| {
         pending
             .embedding_publication
             .unwrap_or(pending.vector_publication)
+            || (pending.vector_publication
+                && crate::vector::VectorIndex::exists(&paths.vectors)
+                && tasks.iter().any(|task| {
+                    let path = task.path.to_string_lossy();
+                    pending
+                        .source_paths
+                        .iter()
+                        .any(|source| source == path.as_ref())
+                        && !pending
+                            .vector_delete_paths
+                            .iter()
+                            .any(|source| source == path.as_ref())
+                }))
     });
-    // Cleanup-only recovery does not need an embedder, but it still crossed
+    // Pure deletion recovery does not need an embedder, but it still crossed
     // the vector publication boundary and must remove every non-live vector.
     let reconcile_pending_vector_ids = pending_recovery
         .as_ref()
@@ -3434,6 +3448,65 @@ mod tests {
     }
 
     #[test]
+    fn background_marker_completed_after_partial_ingest_reclassifies_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let transcript = source.join("session.jsonl");
+        // Keep appends beyond the identity prefix so only incremental parsing
+        // can discover the marker, rather than a replacement-triggered parse.
+        append_claude_message(&transcript, &"initial text ".repeat(500));
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.claude_sources = vec![source];
+        let lease = ingest_lease(&paths);
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let marker =
+            r#"{"type":"assistant","sessionKind":"bg","message":{"content":"background"}}"#;
+        let split = marker.len() / 2;
+        let marker_offset = transcript.metadata().unwrap().len();
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(&marker.as_bytes()[..split]).unwrap();
+        }
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(
+            state.files[transcript.to_str().unwrap()].offset,
+            marker_offset
+        );
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(&marker.as_bytes()[split..]).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        append_claude_message(&transcript, "after background marker");
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert_eq!(
+            state.files[transcript.to_str().unwrap()].claude_background,
+            Some(true)
+        );
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut count = 0;
+        index
+            .for_each_record(|record| {
+                count += 1;
+                assert_eq!(record.links.conversation_kind.as_deref(), Some("subagent"));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
     fn incremental_claude_background_marker_reclassifies_prior_records() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("claude");
@@ -4102,7 +4175,10 @@ mod tests {
         assert_recovers_cross_store_crash(true);
     }
 
-    fn assert_recovers_vector_crash(publish_interrupted_vectors: bool) {
+    fn assert_recovers_vector_crash(
+        publish_interrupted_vectors: bool,
+        embedding_publication: bool,
+    ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let claude_root = tmp.path().join("claude-projects");
         let project = claude_root.join("-Users-nico-Code-memex");
@@ -4145,7 +4221,7 @@ mod tests {
             vector_delete_paths: Vec::new(),
             session_scopes: Vec::new(),
             vector_publication: true,
-            embedding_publication: Some(true),
+            embedding_publication: Some(embedding_publication),
         }
         .save(&pending_ingest_path(&paths))
         .expect("save interrupted ingest marker");
@@ -4207,6 +4283,7 @@ mod tests {
             std::mem::forget(staged_vectors);
         }
 
+        options.embeddings = false;
         {
             let index =
                 SearchIndex::open_or_create_for_ingest(&paths.index).expect("recovery generation");
@@ -4256,12 +4333,18 @@ mod tests {
 
     #[test]
     fn recovery_reconciles_lexical_publish_before_vector_publish() {
-        assert_recovers_vector_crash(false);
+        assert_recovers_vector_crash(false, true);
     }
 
     #[test]
     fn recovery_removes_vectors_published_before_marker_clear() {
-        assert_recovers_vector_crash(true);
+        assert_recovers_vector_crash(true, true);
+    }
+
+    #[test]
+    fn cleanup_recovery_restores_reparsed_survivor_vectors() {
+        assert_recovers_vector_crash(false, false);
+        assert_recovers_vector_crash(true, false);
     }
 
     #[test]
