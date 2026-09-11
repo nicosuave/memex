@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,8 @@ pub struct FileIdentity {
     /// Nanosecond-resolution modification marker for detecting same-size rewrites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +104,8 @@ pub struct FileState {
     /// migrated safely on their next ingest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_metadata_offsets: Option<Vec<u64>>,
 }
 
 /// Tracks when we last scanned for changes, allowing us to skip
@@ -114,19 +118,38 @@ pub struct ScanCache {
     pub file_count: usize,
     /// Total bytes across all source files
     pub total_bytes: u64,
+    #[serde(default, deserialize_with = "deserialize_directory_inventory")]
+    pub(crate) directory_inventory: Option<crate::directory_inventory::DirectoryInventory>,
+}
+
+fn deserialize_directory_inventory<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::directory_inventory::DirectoryInventory>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 impl ScanCache {
+    const MAX_JSON_BYTES: u64 = 80 * 1024 * 1024;
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.scan_cache.load");
         if !path.exists() {
             return Ok(Self::default());
         }
-        let data = fs::read_to_string(path)?;
-        let cache = serde_json::from_str(&data).unwrap_or_default();
+        let mut data = Vec::new();
+        fs::File::open(path)?
+            .take(Self::MAX_JSON_BYTES + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > Self::MAX_JSON_BYTES {
+            return Ok(Self::default());
+        }
+        let cache = serde_json::from_slice(&data).unwrap_or_default();
         Ok(cache)
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.scan_cache.save");
         let data = serde_json::to_string(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -210,6 +233,7 @@ impl Default for IngestState {
 
 impl IngestState {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        crate::profiling::span!("state.ingest.load");
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -219,6 +243,7 @@ impl IngestState {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.ingest.save");
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -226,6 +251,7 @@ impl IngestState {
 
 impl PendingIngest {
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
+        crate::profiling::span!("state.pending.load");
         if !path.exists() {
             return Ok(None);
         }
@@ -234,6 +260,7 @@ impl PendingIngest {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        crate::profiling::span!("state.pending.save");
         let data = serde_json::to_string_pretty(self)?;
         atomic_write(path, data.as_bytes())
     }
@@ -318,6 +345,7 @@ mod tests {
             last_scan_ts: 12,
             file_count: 3,
             total_bytes: 99,
+            directory_inventory: None,
         };
         cache.save(&path).expect("save cache");
 
@@ -335,6 +363,44 @@ mod tests {
         assert_eq!(cache.last_scan_ts, 0);
         assert_eq!(cache.file_count, 0);
         assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[test]
+    fn optional_scan_cache_invalid_utf8_loads_as_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scan_cache.json");
+        fs::write(&path, b"\xff").unwrap();
+        let cache = ScanCache::load(&path).expect("invalid optional cache must expire");
+        assert_eq!(cache.last_scan_ts, 0);
+        assert_eq!(cache.file_count, 0);
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.directory_inventory.is_none());
+    }
+
+    #[test]
+    fn directory_inventory_cache_compatibility_and_explicit_invalidation() {
+        let legacy = r#"{"last_scan_ts":12,"file_count":3,"total_bytes":99}"#;
+        let cache: ScanCache = serde_json::from_str(legacy).unwrap();
+        assert!(cache.directory_inventory.is_none());
+        for malformed in ["null", "17", "[]", r#"{"version":999}"#] {
+            let payload = format!(
+                "{},\"directory_inventory\":{malformed}}}",
+                &legacy[..legacy.len() - 1]
+            );
+            let cache: ScanCache = serde_json::from_str(&payload).unwrap();
+            assert_eq!(
+                (cache.last_scan_ts, cache.file_count, cache.total_bytes),
+                (12, 3, 99)
+            );
+            assert!(cache.directory_inventory.is_none());
+            assert_eq!(
+                serde_json::to_value(cache)
+                    .unwrap()
+                    .get("directory_inventory"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+        assert!(!cache.is_fresh(0));
     }
 
     #[test]

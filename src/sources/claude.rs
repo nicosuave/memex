@@ -14,7 +14,6 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
@@ -101,28 +100,36 @@ pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
     // `_include_agents` is a retired opt-in kept only for CLI compatibility:
     // agent transcripts are always indexed now, matching every other source.
     // Consumers hide them from default views via `conversation_kind`.
+    Ok(discovered_sessions(
+        root,
+        super::common::jsonl_files([root.to_path_buf()]),
+    ))
+}
+
+pub(crate) fn discover_with_inventory(
+    root: &Path,
+    _include_agents: bool,
+    inventory: &mut crate::directory_inventory::DiscoveryInventory,
+) -> Result<Vec<SourceFile>> {
+    Ok(discovered_sessions(
+        root,
+        super::common::jsonl_files_with_inventory([root.to_path_buf()], inventory)?,
+    ))
+}
+
+fn discovered_sessions(root: &Path, paths: Vec<PathBuf>) -> Vec<SourceFile> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
-        if !entry.file_type().is_file()
-            || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-        {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy();
+    for path in paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let is_agent = name.starts_with("agent-");
-        let under_subagents = entry.path().ancestors().any(|ancestor| {
+        let under_subagents = path.ancestors().any(|ancestor| {
             ancestor.file_name().and_then(|name| name.to_str()) == Some("subagents")
         });
         if under_subagents && !is_agent {
             // Workflow journals and other non-transcript files.
             continue;
         }
-        // Standard sessions live at most two levels below root
-        // (`<project>/<session>.jsonl`); only agent transcripts nest
-        // deeper, under a `subagents/` directory (see `is_subagent_path`).
-        // Anything deeper outside `subagents/` is not a session file.
-        let relative_depth = entry
-            .path()
+        let relative_depth = path
             .strip_prefix(root)
             .map(|path| path.components().count())
             .unwrap_or(0);
@@ -131,11 +138,10 @@ pub fn discover(root: &Path, _include_agents: bool) -> Result<Vec<SourceFile>> {
         }
         files.push(SourceFile {
             source: SourceKind::Claude,
-            path: entry.path().to_path_buf(),
+            path,
         });
     }
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
+    files
 }
 
 pub fn usage_files() -> Vec<PathBuf> {
