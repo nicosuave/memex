@@ -230,87 +230,104 @@ pub fn context_records(
     options: ContextOptions,
 ) -> Result<ContextResult> {
     options.validate()?;
-    let anchor = resolve_record(index, selector)?;
-    let anchor_id = canonical_record_id(&anchor);
-    let session_records = deduplicate_records(
-        index
-            .records_by_session_path(anchor.source, &anchor.session_id, &anchor.source_path)?
-            .into_iter()
-            // Keep this check even though current indexes include `source` in the query. It
-            // preserves the old in-memory isolation contract for legacy projections where the
-            // source field is absent and `record_from_doc` infers it from the path.
-            .filter(|record| record.source == anchor.source)
-            .collect(),
-    );
+    let reader = crate::index::context::ContextReader::new(index)?;
+    let candidates = deduplicate_entries(reader.candidates(selector)?);
+    let anchor = match candidates.as_slice() {
+        [] => bail!("context anchor not found"),
+        [anchor] => anchor,
+        _ => bail!(
+            "context selector is ambiguous; matching record IDs: {}",
+            candidates
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let anchor_id = anchor.id.clone();
+    let session_records = deduplicate_entries(reader.session(anchor, options.expand_interactions)?);
     let anchor_position = session_records
         .iter()
-        .position(|record| canonical_record_id(record) == anchor_id)
+        .position(|entry| entry.id == anchor_id)
         .ok_or_else(|| anyhow!("resolved context anchor is not in its session"))?;
-
     let first = anchor_position.saturating_sub(options.before);
     let last = (anchor_position + options.after + 1).min(session_records.len());
-    let mut selected = HashMap::<String, (Record, ContextRelation, i64)>::new();
-    for (position, record) in session_records[first..last].iter().enumerate() {
-        let absolute = first + position;
-        let key = canonical_record_id(record);
-        let (relation, distance) = if absolute == anchor_position {
-            (ContextRelation::Anchor, 0)
-        } else if absolute < anchor_position {
-            (
-                ContextRelation::Before,
-                -((anchor_position - absolute) as i64),
-            )
-        } else {
-            (ContextRelation::After, (absolute - anchor_position) as i64)
-        };
-        selected.insert(key, (record.clone(), relation, distance));
-    }
-
-    if options.expand_interactions {
-        let interaction_ids = selected
-            .values()
-            .filter_map(|(record, _, _)| tool_interaction_id(record))
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
-        let expanded = session_records
+    let interaction_ids = if options.expand_interactions {
+        session_records[first..last]
             .iter()
-            .filter(|record| {
-                !selected.contains_key(&canonical_record_id(record))
-                    && tool_interaction_id(record)
-                        .is_some_and(|identifier| interaction_ids.contains(identifier))
-            })
-            .collect::<Vec<_>>();
-        if expanded.len() > MAX_INTERACTION_EXPANSION {
-            bail!(
-                "interaction expansion matched {} records, exceeding maximum {}; use a narrower \
-                 context window or disable --expand-interactions",
-                expanded.len(),
-                MAX_INTERACTION_EXPANSION
-            );
-        }
-        for record in expanded {
-            selected.insert(
-                canonical_record_id(record),
-                (record.clone(), ContextRelation::Interaction, 0),
-            );
-        }
+            .filter_map(|entry| tool_interaction_id(&entry.record))
+            .map(str::to_owned)
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let expanded_count = session_records
+        .iter()
+        .enumerate()
+        .filter(|(position, entry)| {
+            !(first..last).contains(position)
+                && tool_interaction_id(&entry.record).is_some_and(|id| interaction_ids.contains(id))
+        })
+        .count();
+    if expanded_count > MAX_INTERACTION_EXPANSION {
+        bail!(
+            "interaction expansion matched {} records, exceeding maximum {}; use a narrower \
+             context window or disable --expand-interactions",
+            expanded_count,
+            MAX_INTERACTION_EXPANSION
+        );
     }
-
-    let mut selected: Vec<(Record, ContextRelation, i64)> = selected.into_values().collect();
-    selected.sort_by(|left, right| record_order(&left.0, &right.0));
-    let records = selected
-        .into_iter()
-        .map(|(record, relation, distance)| ContextRecord {
-            record_id: canonical_record_id(&record),
+    let mut records = Vec::with_capacity(last - first + expanded_count);
+    for (position, entry) in session_records.into_iter().enumerate() {
+        let (relation, distance) = if (first..last).contains(&position) {
+            let distance = position as i64 - anchor_position as i64;
+            let relation = match distance.cmp(&0) {
+                std::cmp::Ordering::Less => ContextRelation::Before,
+                std::cmp::Ordering::Equal => ContextRelation::Anchor,
+                std::cmp::Ordering::Greater => ContextRelation::After,
+            };
+            (relation, distance)
+        } else if tool_interaction_id(&entry.record).is_some_and(|id| interaction_ids.contains(id))
+        {
+            (ContextRelation::Interaction, 0)
+        } else {
+            continue;
+        };
+        records.push(ContextRecord {
+            record_id: entry.id.clone(),
             relation,
             distance,
-            record,
-        })
-        .collect();
+            record: reader.hydrate(entry)?,
+        });
+    }
     Ok(ContextResult {
         anchor_record_id: anchor_id,
         records,
     })
+}
+
+fn deduplicate_entries(
+    entries: Vec<crate::index::context::ContextEntry>,
+) -> Vec<crate::index::context::ContextEntry> {
+    let mut unique = HashMap::<String, crate::index::context::ContextEntry>::new();
+    for entry in entries {
+        match unique.get(&entry.id) {
+            Some(previous) if projection_order(&previous.record, &entry.record).is_ge() => {}
+            _ => {
+                unique.insert(entry.id.clone(), entry);
+            }
+        }
+    }
+    let mut entries = unique.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.record
+            .turn_id
+            .cmp(&right.record.turn_id)
+            .then_with(|| left.record.ts.cmp(&right.record.ts))
+            .then_with(|| left.record.doc_id.cmp(&right.record.doc_id))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entries
 }
 
 /// Resolve exactly one context selector without loading its surrounding conversation.
@@ -524,6 +541,178 @@ mod tests {
     }
 
     #[test]
+    fn large_context_hydrates_only_the_selected_latest_projections() {
+        let mut records = (0..1200)
+            .map(|turn| {
+                let mut row = record(turn as u64, turn, &"payload ".repeat(1024));
+                row.links.event_id = Some(format!("event-{turn}"));
+                row.tool_input = Some("input ".repeat(1024));
+                row.tool_output = Some("output ".repeat(1024));
+                row
+            })
+            .collect::<Vec<_>>();
+        // The latest projection moves to another turn. Deduplicate before counting neighbors.
+        let mut latest = records[600].clone();
+        latest.doc_id = 5000;
+        latest.turn_id = 605;
+        latest.ts = 99_999;
+        latest.text = "latest projection".into();
+        records.push(latest);
+        for projection in 0..64 {
+            let mut duplicate = records[600].clone();
+            duplicate.doc_id = 7000 + projection;
+            duplicate.ts += projection;
+            records.push(duplicate);
+        }
+        // Same source-native identity on another path must not enter the scoped neighborhood.
+        let mut other_path = records[599].clone();
+        other_path.doc_id = 6000;
+        other_path.source_path = "/tmp/other.jsonl".into();
+        records.push(other_path);
+        let mut other_source = records[601].clone();
+        other_source.doc_id = 6001;
+        other_source.source = SourceKind::Claude;
+        records.push(other_source);
+        let index = indexed(&records);
+        let expected_session = deduplicate_records(
+            records
+                .into_iter()
+                .filter(|row| {
+                    row.source == SourceKind::Codex && row.source_path == "/tmp/session.jsonl"
+                })
+                .collect(),
+        );
+        for (anchor_doc, before, after) in [
+            (0, 3, 0),
+            (0, 3, 2),
+            (1199, 1, 4),
+            (600, 2, 0),
+            (600, 0, 3),
+            (599, 1, 2),
+        ] {
+            let anchor_id = if anchor_doc == 600 {
+                canonical_record_id(
+                    expected_session
+                        .iter()
+                        .find(|row| row.doc_id == 5000)
+                        .unwrap(),
+                )
+            } else {
+                canonical_record_id(
+                    expected_session
+                        .iter()
+                        .find(|row| row.doc_id == anchor_doc)
+                        .unwrap(),
+                )
+            };
+            let position = expected_session
+                .iter()
+                .position(|row| canonical_record_id(row) == anchor_id)
+                .unwrap();
+            let first = position.saturating_sub(before);
+            let last = (position + after + 1).min(expected_session.len());
+            crate::index::context::STORED_READS.with(|reads| reads.set(0));
+            let result = context_records(
+                &index,
+                &ContextSelector::doc_id(anchor_doc),
+                ContextOptions {
+                    before,
+                    after,
+                    expand_interactions: false,
+                },
+            )
+            .unwrap();
+            let reads = crate::index::context::STORED_READS.with(|reads| reads.get());
+            assert_eq!(
+                reads,
+                1 + last - first,
+                "one anchor read plus the selected neighborhood"
+            );
+            assert_eq!(result.anchor_record_id, anchor_id);
+            for (offset, (actual, expected)) in result
+                .records
+                .iter()
+                .zip(&expected_session[first..last])
+                .enumerate()
+            {
+                assert_eq!(
+                    serde_json::to_value(&actual.record).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(actual.distance, (first + offset) as i64 - position as i64);
+            }
+            assert_eq!(result.records.len(), last - first);
+        }
+        crate::index::context::STORED_READS.with(|reads| reads.set(0));
+        let result = context_records(
+            &index,
+            &ContextSelector::event_id("event-600"),
+            ContextOptions {
+                before: 0,
+                after: 0,
+                expand_interactions: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].record.text, "latest projection");
+        assert_eq!(
+            crate::index::context::STORED_READS.with(|reads| reads.get()),
+            1,
+            "duplicate anchor projections are resolved from metadata"
+        );
+    }
+
+    #[test]
+    fn context_order_breaks_numeric_ties_by_canonical_identity() {
+        let mut rows = vec![record(7, 3, "a"), record(7, 3, "b"), record(7, 3, "c")];
+        for row in &mut rows {
+            row.links.event_id = Some(row.text.clone());
+        }
+        let index = indexed(&rows);
+        let expected = deduplicate_records(rows);
+        let result = context_records(
+            &index,
+            &ContextSelector::record_id(canonical_record_id(&expected[1])),
+            ContextOptions {
+                before: 1,
+                after: 1,
+                expand_interactions: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|row| row.record.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            result
+                .records
+                .iter()
+                .map(|row| row.distance)
+                .collect::<Vec<_>>(),
+            [-1, 0, 1]
+        );
+        assert!(
+            context_records(
+                &index,
+                &ContextSelector::doc_id(7),
+                ContextOptions::default()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous")
+        );
+    }
+
+    #[test]
     fn context_selects_bounded_ordered_window_and_includes_anchor() {
         let records: Vec<Record> = (1..=5)
             .map(|turn| record(turn as u64, turn, &format!("r{turn}")))
@@ -673,6 +862,7 @@ mod tests {
             vec!["assistant"]
         );
 
+        crate::index::context::STORED_READS.with(|reads| reads.set(0));
         let from_call = context_records(
             &index,
             &ContextSelector::event_id("call"),
@@ -683,6 +873,10 @@ mod tests {
             },
         )
         .expect("expanded tool pair");
+        assert_eq!(
+            crate::index::context::STORED_READS.with(|reads| reads.get()),
+            3
+        );
         assert!(
             from_call
                 .records
@@ -857,6 +1051,7 @@ mod tests {
             records.push(result);
         }
         let index = indexed(&records);
+        crate::index::context::STORED_READS.with(|reads| reads.set(0));
         let error = context_records(
             &index,
             &ContextSelector::event_id("call-a"),
@@ -867,6 +1062,10 @@ mod tests {
             },
         )
         .expect_err("expansion cap");
+        assert_eq!(
+            crate::index::context::STORED_READS.with(|reads| reads.get()),
+            1
+        );
         let message = error.to_string();
         assert!(message.contains("exceeding maximum 100"));
         assert!(message.contains("disable --expand-interactions"));
