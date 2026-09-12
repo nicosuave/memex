@@ -31,6 +31,8 @@ use tantivy::{
     TantivyDocument, Term,
 };
 
+pub(crate) mod context;
+
 #[derive(Clone)]
 pub struct IndexFields {
     /// Optional for reading generations built before transcript presentation metadata.
@@ -905,6 +907,7 @@ impl SearchIndex {
         self.records_matching_query(query)
     }
 
+    #[cfg(test)]
     pub(crate) fn records_by_session_path(
         &self,
         source: crate::types::SourceKind,
