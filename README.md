@@ -300,6 +300,12 @@ TUI:
 memex tui
 ```
 
+The TUI captures the mouse for clicking, resizing, and scrolling. To select text
+with the terminal instead, hold Shift while dragging in Ghostty and most
+xterm-style terminals, or Option while dragging in iTerm2. Press F6 to enter a
+terminal-independent copy mode when that modifier is unavailable or remapped;
+press F6 again to restore Memex mouse controls.
+
 Notes:
 - Embeddings are disabled by default. Pass `--embeddings` to generate them during indexing.
 - Searches run an incremental index refresh by default (configurable).

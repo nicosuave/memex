@@ -646,6 +646,7 @@ struct App {
     project_area: Option<Rect>,
     left_width: Option<u16>,
     dragging: bool,
+    copy_mode: bool,
     stdio_redirect: Option<StdIoRedirect>,
 }
 
@@ -946,7 +947,7 @@ pub fn run(
     app.kickoff_home_activity();
     app.kickoff_home_filters();
 
-    let mut terminal = enter_terminal()?;
+    let mut terminal = enter_terminal(true)?;
     app.suppress_stdio()?;
     let res = run_loop(&mut terminal, &mut app);
     app.restore_stdio()?;
@@ -1066,6 +1067,7 @@ impl App {
             project_area: None,
             left_width: None,
             dragging: false,
+            copy_mode: false,
             stdio_redirect: None,
         }
     }
@@ -2788,6 +2790,11 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    if key.code == KeyCode::F(6) {
+        toggle_copy_mode(terminal, app)?;
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             key.code,
@@ -4883,6 +4890,13 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         LayoutMode::Detail => "detail",
     };
     let mut right_spans = Vec::new();
+    if app.copy_mode {
+        right_spans.push(Span::styled("COPY MODE", theme.accent));
+        right_spans.push(Span::styled(" (F6)   ", theme.muted));
+    } else {
+        right_spans.push(Span::styled("copy", theme.muted));
+        right_spans.push(Span::styled("(F6)   ", theme.accent));
+    }
     if !app.status.is_empty() {
         right_spans.push(Span::styled("\u{25cf} ", theme.accent));
         right_spans.push(Span::styled(app.status.as_str(), theme.text));
@@ -5018,6 +5032,15 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
 }
 
 fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
+    if app.copy_mode {
+        return Line::from(vec![
+            Span::styled("drag", theme.accent),
+            Span::styled(" select  ", theme.muted),
+            Span::styled("F6", theme.accent),
+            Span::styled(" restore mouse", theme.muted),
+        ]);
+    }
+
     if app.layout_mode == LayoutMode::Home {
         if app.home_dropdown != HomeDropdown::None {
             return Line::from(vec![
@@ -5980,7 +6003,7 @@ fn run_external_command(app: &mut App, terminal: &mut TuiTerminal, command: &str
     }
     println!("press Enter to return to memex");
     let _ = std::io::stdin().read_line(&mut String::new());
-    *terminal = enter_terminal()?;
+    *terminal = enter_terminal(!app.copy_mode)?;
     app.suppress_stdio()?;
     Ok(())
 }
@@ -5995,10 +6018,29 @@ fn open_tty() -> Result<TuiWriter> {
     Ok(std::io::stdout())
 }
 
-fn enter_terminal() -> Result<TuiTerminal> {
+fn set_mouse_capture(writer: &mut impl Write, enabled: bool) -> Result<()> {
+    if enabled {
+        execute!(writer, EnableMouseCapture)?;
+    } else {
+        execute!(writer, DisableMouseCapture)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn toggle_copy_mode(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
+    let copy_mode = !app.copy_mode;
+    set_mouse_capture(terminal.backend_mut(), !copy_mode)?;
+    app.copy_mode = copy_mode;
+    app.dragging = false;
+    Ok(())
+}
+
+fn enter_terminal(mouse_capture: bool) -> Result<TuiTerminal> {
     let mut writer = open_tty()?;
     terminal::enable_raw_mode()?;
-    execute!(writer, terminal::EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(writer, terminal::EnterAlternateScreen)?;
+    set_mouse_capture(&mut writer, mouse_capture)?;
     let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -7470,6 +7512,66 @@ mod tests {
         let (_tmp, app) = test_app();
         assert_eq!(app.layout_mode, LayoutMode::Home);
         assert!(matches!(app.focus, Focus::Query));
+        assert!(!app.copy_mode);
+    }
+
+    #[test]
+    fn mouse_capture_commands_enable_and_disable_reporting() {
+        let mut output = Vec::new();
+        set_mouse_capture(&mut output, true).expect("enable mouse capture");
+        let enabled = String::from_utf8(output).expect("terminal sequence");
+        assert!(enabled.contains("\u{1b}[?1000h"));
+        assert!(enabled.contains("\u{1b}[?1006h"));
+
+        let mut output = Vec::new();
+        set_mouse_capture(&mut output, false).expect("disable mouse capture");
+        let disabled = String::from_utf8(output).expect("terminal sequence");
+        assert!(disabled.contains("\u{1b}[?1000l"));
+        assert!(disabled.contains("\u{1b}[?1006l"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f6_toggles_copy_mode_before_focused_or_popup_keys() {
+        let (_tmp, mut app) = test_app();
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("devnull");
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(devnull),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("terminal");
+        app.quick_popup = true;
+        app.dragging = true;
+
+        let key = KeyEvent::new(KeyCode::F(6), KeyModifiers::empty());
+        handle_key(key, &mut terminal, &mut app).expect("enter copy mode");
+        assert!(app.copy_mode);
+        assert!(!app.dragging);
+        assert!(app.quick_popup);
+        assert!(matches!(app.focus, Focus::Query));
+
+        handle_key(key, &mut terminal, &mut app).expect("restore mouse capture");
+        assert!(!app.copy_mode);
+    }
+
+    #[test]
+    fn copy_mode_footer_explains_selection_and_recovery() {
+        let (_tmp, mut app) = test_app();
+        app.copy_mode = true;
+        let theme = Theme::new();
+
+        let footer = footer_shortcuts(&app, &theme, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(footer, "drag select  F6 restore mouse");
     }
 
     #[test]
