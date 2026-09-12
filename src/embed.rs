@@ -493,19 +493,20 @@ fn init_options_with_coreml(
     opts: InitOptions,
     runtime: &EmbedRuntimeConfig,
 ) -> Result<InitOptions> {
-    use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
+    use ort::ep::CoreML;
+    use ort::ep::coreml::ComputeUnits;
 
     let compute_units = runtime
         .compute_units
         .as_deref()
         .map(|v| match v.to_lowercase().as_str() {
-            "ane" | "neural" | "neuralengine" => CoreMLComputeUnits::CPUAndNeuralEngine,
-            "gpu" => CoreMLComputeUnits::CPUAndGPU,
-            "cpu" => CoreMLComputeUnits::CPUOnly,
-            _ => CoreMLComputeUnits::All,
+            "ane" | "neural" | "neuralengine" => ComputeUnits::CPUAndNeuralEngine,
+            "gpu" => ComputeUnits::CPUAndGPU,
+            "cpu" => ComputeUnits::CPUOnly,
+            _ => ComputeUnits::All,
         })
-        .unwrap_or(CoreMLComputeUnits::All);
-    let provider = CoreMLExecutionProvider::default()
+        .unwrap_or(ComputeUnits::All);
+    let provider = CoreML::default()
         .with_subgraphs(true)
         .with_compute_units(compute_units);
     let dispatch = if matches!(runtime.execution_provider, ExecutionProviderChoice::CoreML) {
@@ -528,10 +529,10 @@ fn init_options_with_coreml(
 
 #[cfg(feature = "cuda")]
 fn init_options_with_cuda(opts: InitOptions, runtime: &EmbedRuntimeConfig) -> Result<InitOptions> {
-    use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
+    use ort::ep::{CUDA, ExecutionProvider};
 
     preload_cuda_dependencies(runtime)?;
-    let mut provider = CUDAExecutionProvider::default();
+    let mut provider = CUDA::default();
     if let Some(device_id) = runtime.cuda_device_id {
         provider = provider.with_device_id(device_id);
     }
