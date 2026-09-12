@@ -4193,8 +4193,10 @@ fn results_project_width(results: &[SessionSummary]) -> usize {
 
 /// Columns consumed by everything before the detail text in a session row:
 /// relative time, source dot + label, project column, and the gaps between.
+const SESSION_SOURCE_WIDTH: usize = 11;
+
 fn session_row_fixed_cols(project_width: usize) -> usize {
-    4 + 2 + 2 + 9 + project_width + 2
+    4 + 2 + 2 + SESSION_SOURCE_WIDTH + 1 + project_width + 2
 }
 
 /// Splits a row of `total_width` cells into (project_width, detail_width):
@@ -4226,7 +4228,14 @@ fn session_result_line(
         Span::raw("  "),
         Span::styled("●", Style::default().fg(source_color(session.source))),
         Span::raw(" "),
-        Span::styled(format!("{:<8}", session.source.label()), theme.muted),
+        Span::styled(
+            format!(
+                "{:<width$}",
+                session.source.label(),
+                width = SESSION_SOURCE_WIDTH
+            ),
+            theme.muted,
+        ),
         Span::raw(" "),
         Span::styled(
             format!(
@@ -7597,6 +7606,45 @@ mod tests {
 
         assert!(rendered.contains("Readable session title"));
         assert!(!rendered.contains("01a00000"));
+    }
+
+    #[test]
+    fn session_source_column_accommodates_every_source_label() {
+        assert!(
+            SourceKind::ALL
+                .iter()
+                .all(|source| source.label().chars().count() <= SESSION_SOURCE_WIDTH)
+        );
+
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "session".to_string(),
+            project: "BenchBox".to_string(),
+            source: SourceKind::Codex,
+            last_ts: 1,
+            hit_count: 1,
+            top_score: 0.0,
+            title: "Title".to_string(),
+            snippet: String::new(),
+            source_path: "source.jsonl".to_string(),
+            source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
+        };
+        let render = |session: &SessionSummary| {
+            session_result_line(session, &[], 8, 40, &Theme::new())
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        let codex = render(&session);
+        let mut antigravity_session = session;
+        antigravity_session.source = SourceKind::Antigravity;
+        let antigravity = render(&antigravity_session);
+
+        assert_eq!(codex.find("BenchBox"), antigravity.find("BenchBox"));
     }
 
     #[test]
