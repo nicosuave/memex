@@ -75,6 +75,7 @@ fn parts_root_for_session(session_dir: &Path) -> PathBuf {
 }
 
 pub fn discover_sessions() -> anyhow::Result<Vec<SourceFile>> {
+    crate::profiling::span!("opencode.discover_legacy");
     discover_sessions_from_roots(&data_roots())
 }
 
@@ -116,6 +117,7 @@ pub fn discover_sessions_from_root(root: &Path) -> anyhow::Result<Vec<SourceFile
 /// OpenCode's data directory may be configured as a comma-separated list, so discovery is
 /// deliberately performed against every configured root and sorted globally for stable output.
 pub fn discover_databases() -> anyhow::Result<Vec<SourceFile>> {
+    crate::profiling::span!("opencode.discover_databases");
     discover_databases_from_roots(&data_roots())
 }
 
@@ -389,6 +391,7 @@ pub fn scan_database(
     path: &Path,
     previous: Option<&OpencodeDatabaseState>,
 ) -> Result<DatabaseScan> {
+    crate::profiling::span!("opencode.plan");
     let connection = open_read_only_database(path)?;
     connection
         .execute_batch("BEGIN")

@@ -1282,6 +1282,7 @@ enum IndexServiceCommand {
 }
 
 pub fn run() -> Result<()> {
+    crate::profiling::span!("cli.run");
     let cli = Cli::parse();
     let interactive = interaction_allowed(
         cli.non_interactive,
@@ -2573,6 +2574,7 @@ fn run_search(
     machines: Vec<String>,
     trace: bool,
 ) -> Result<()> {
+    crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
         SearchFormat::Json
     } else {

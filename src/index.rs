@@ -516,6 +516,7 @@ impl SearchIndex {
         dir: &Path,
         suppress_automatic_merges: bool,
     ) -> Result<Self> {
+        crate::profiling::span!("lexical.stage");
         fs::create_dir_all(dir)?;
         let generations = dir.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;
@@ -583,6 +584,7 @@ impl SearchIndex {
     }
 
     pub fn writer(&self) -> Result<IndexWriter> {
+        crate::profiling::span!("lexical.writer_open");
         if !self.writable {
             bail!("cannot create a writer for a sealed index generation");
         }
@@ -594,11 +596,14 @@ impl SearchIndex {
     }
 
     pub fn reader(&self) -> Result<IndexReader> {
-        Ok(self
+        crate::profiling::span!("lexical.reader_open");
+        let reader: IndexReader = self
             .index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
-            .try_into()?)
+            .try_into()?;
+        crate::profiling::count!("lexical.readers_opened", 1);
+        Ok(reader)
     }
 
     /// Open-time snapshot identity. It remains stable for this instance; writable callers must
@@ -660,6 +665,7 @@ impl SearchIndex {
     }
 
     pub(crate) fn publish_generation(&self) -> Result<()> {
+        crate::profiling::span!("lexical.publish");
         let Some(pending) = &self.pending_generation else {
             return Ok(());
         };
@@ -718,6 +724,7 @@ impl SearchIndex {
     }
 
     fn doc_ids_matching_query(&self, query: Box<dyn Query>) -> Result<Vec<u64>> {
+        crate::profiling::span!("lexical.source_ids");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let limit = (searcher.num_docs() as usize).max(1);
@@ -733,6 +740,8 @@ impl SearchIndex {
             }
         }
         doc_ids.sort_unstable();
+        crate::profiling::count!("lexical.source_id_queries", 1);
+        crate::profiling::count!("lexical.source_ids_found", doc_ids.len());
         Ok(doc_ids)
     }
 
@@ -954,6 +963,7 @@ impl SearchIndex {
     }
 
     pub fn search(&self, options: &QueryOptions) -> Result<Vec<(f32, Record)>> {
+        crate::profiling::span!("lexical.search");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let query = build_query(&self.fields, options, &self.index)?;
@@ -1589,6 +1599,7 @@ impl SearchIndex {
     where
         F: FnMut(Record) -> Result<()>,
     {
+        crate::profiling::span!("lexical.walk_records");
         let reader = self.reader()?;
         let searcher = reader.searcher();
         for segment_reader in searcher.segment_readers() {
@@ -1596,6 +1607,7 @@ impl SearchIndex {
             for doc in store.iter::<TantivyDocument>(segment_reader.alive_bitset()) {
                 let doc = doc?;
                 let record = record_from_doc(&self.fields, &doc);
+                crate::profiling::count!("lexical.records_walked", 1);
                 f(record)?;
             }
         }

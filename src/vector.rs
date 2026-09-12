@@ -48,6 +48,7 @@ pub(crate) struct StagedVectorGeneration {
 
 impl StagedVectorGeneration {
     pub(crate) fn publish(mut self) -> Result<()> {
+        crate::profiling::span!("vectors.publish");
         // Once publication starts, keep the generation even on error: current.json may have
         // changed before the error was reported. A later successful save collects it safely.
         self.cleanup_on_drop = false;
@@ -152,6 +153,7 @@ impl VectorIndex {
     }
 
     fn open_from_storage(root: &Path, storage: &ActiveStorage) -> Result<Self> {
+        crate::profiling::span!("vectors.load");
         let index_path = storage.path.join("usearch.index");
         let ids_path = storage.path.join("doc_ids.bin");
         let index = Index::new(&IndexOptions::default())?;
@@ -282,6 +284,7 @@ impl VectorIndex {
     }
 
     pub(crate) fn stage(&self) -> Result<StagedVectorGeneration> {
+        crate::profiling::span!("vectors.stage");
         fs::create_dir_all(&self.root)?;
         let generations = self.root.join(GENERATIONS_DIR);
         fs::create_dir_all(&generations)?;

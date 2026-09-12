@@ -298,15 +298,20 @@ impl AnalyticsStore {
     }
 
     pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
-        self.conn.execute(
+        crate::profiling::span!("analytics.delete_path");
+        crate::profiling::count!("analytics.delete_path.calls", 1);
+        let _rows_deleted = self.conn.execute(
             "DELETE FROM sessions WHERE source_path = ?1",
             params![source_path],
         )?;
+        crate::profiling::count!("analytics.delete_path.rows", _rows_deleted);
         Ok(())
     }
 
     pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
-        self.conn.execute(
+        crate::profiling::span!("analytics.delete_scope");
+        crate::profiling::count!("analytics.delete_scope.calls", 1);
+        let _rows_deleted = self.conn.execute(
             "DELETE FROM sessions WHERE source = ?1 AND source_path = ?2 AND session_id = ?3",
             params![
                 SourceKind::Opencode.storage_label(),
@@ -314,6 +319,7 @@ impl AnalyticsStore {
                 scope.session_id
             ],
         )?;
+        crate::profiling::count!("analytics.delete_scope.rows", _rows_deleted);
         Ok(())
     }
 
@@ -1041,6 +1047,7 @@ impl AnalyticsWriter {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        crate::profiling::span!("analytics.flush");
         if self.sessions.is_empty() {
             return Ok(());
         }
@@ -1126,6 +1133,7 @@ impl AnalyticsWriter {
     }
 
     fn resolve_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
+        crate::profiling::span!("analytics.resolve_metadata");
         if let Some(cached) = self.metadata_cache.get(key) {
             return cached.clone();
         }
@@ -1168,6 +1176,7 @@ struct GitMetadata {
 }
 
 fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
+    crate::profiling::span!("git.metadata");
     let deadline = Instant::now() + GIT_METADATA_TIMEOUT;
     let root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"], deadline);
     let common_dir = git_rev_parse(
