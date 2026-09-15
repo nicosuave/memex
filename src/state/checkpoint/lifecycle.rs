@@ -387,11 +387,11 @@ fn sidecars_match_imported_files(connection: &Connection, state_path: &Path) -> 
     let cache = codec::scan_cache_document(cache.as_deref())
         .map(|value| serde_json::to_string(&value))
         .transpose()?;
-    connection.query_row(
+    Ok(connection.query_row(
         "SELECT pending_json IS ?1 AND scancache_json IS ?2 FROM metadata WHERE singleton=1",
         params![pending, cache],
         |row| row.get(0),
-    )
+    )?)
 }
 
 pub(super) fn open_writer(
