@@ -349,21 +349,49 @@ fn validate_bootstrap(state_path: &Path, lease: &mut File) -> Result<()> {
     if tables == 0 {
         return Ok(());
     }
-    validate(&connection, &identity, 1)?;
+    let version = validate(&connection, &identity, 1)?;
     // `empty` proves this database is our own fresh bootstrap (its origin
-    // carries this bootstrap's identity) rather than foreign content. Imported
-    // sidecars alone only mean a previous attempt committed its import before
-    // activating the marker; retrying that import is idempotent, so resume
-    // instead of rejecting our own interrupted state.
+    // carries this bootstrap's identity) rather than foreign content.
     let empty: bool = connection.query_row(
         "SELECT origin=?1 AND next_doc_id='1' AND opencode_databases='{}' AND legacy_extras='{}' AND NOT EXISTS(SELECT 1 FROM files) FROM metadata WHERE singleton=1",
         [format!("bootstrap:{identity}")], |row| row.get(0),
     )?;
+    // Imported sidecars alone only mean a previous attempt committed its
+    // import before activating the marker, and retrying that import is
+    // idempotent — but only when the stored sidecars match the sidecar files
+    // they were imported from. Anything else is unexplained content in an
+    // authority-less database.
+    let explained: bool = version == 1
+        || connection.query_row(
+            "SELECT pending_json IS NULL AND scancache_json IS NULL FROM metadata WHERE singleton=1", [], |row| row.get(0),
+        )?
+        || sidecars_match_imported_files(&connection, state_path)?;
     ensure!(
-        empty,
+        empty && explained,
         "populated checkpoint database has no authority; restore a consistent snapshot or rebuild"
     );
     Ok(())
+}
+
+/// Compare stored sidecars against the sidecar files an import would read.
+///
+/// A matching pair proves the columns are our own interrupted import rather
+/// than unexplained content. The file reads stay pure so read-only validation
+/// can use this without archiving anything.
+fn sidecars_match_imported_files(connection: &Connection, state_path: &Path) -> Result<bool> {
+    let pending = read_sidecar(state_path, PENDING)?;
+    let cache = read_sidecar(state_path, SCAN_CACHE)?;
+    let pending = codec::pending_document(pending.as_deref())?
+        .map(|value| serde_json::to_string(&value))
+        .transpose()?;
+    let cache = codec::scan_cache_document(cache.as_deref())
+        .map(|value| serde_json::to_string(&value))
+        .transpose()?;
+    connection.query_row(
+        "SELECT pending_json IS ?1 AND scancache_json IS ?2 FROM metadata WHERE singleton=1",
+        params![pending, cache],
+        |row| row.get(0),
+    )
 }
 
 pub(super) fn open_writer(
