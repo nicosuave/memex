@@ -349,16 +349,18 @@ fn validate_bootstrap(state_path: &Path, lease: &mut File) -> Result<()> {
     if tables == 0 {
         return Ok(());
     }
-    let version = validate(&connection, &identity, 1)?;
-    let sidecars_empty: bool = version == 1 || connection.query_row(
-        "SELECT pending_json IS NULL AND scancache_json IS NULL FROM metadata WHERE singleton=1", [], |row| row.get(0),
-    )?;
+    validate(&connection, &identity, 1)?;
+    // `empty` proves this database is our own fresh bootstrap (its origin
+    // carries this bootstrap's identity) rather than foreign content. Imported
+    // sidecars alone only mean a previous attempt committed its import before
+    // activating the marker; retrying that import is idempotent, so resume
+    // instead of rejecting our own interrupted state.
     let empty: bool = connection.query_row(
         "SELECT origin=?1 AND next_doc_id='1' AND opencode_databases='{}' AND legacy_extras='{}' AND NOT EXISTS(SELECT 1 FROM files) FROM metadata WHERE singleton=1",
         [format!("bootstrap:{identity}")], |row| row.get(0),
     )?;
     ensure!(
-        empty && sidecars_empty,
+        empty,
         "populated checkpoint database has no authority; restore a consistent snapshot or rebuild"
     );
     Ok(())

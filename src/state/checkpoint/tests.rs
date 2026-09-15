@@ -275,7 +275,7 @@ fn sparse_reads_and_delta_leave_unrelated_payloads_identical() {
         .unwrap();
     let loaded = writer
         .reader()
-        .load_files(&["file-1".into(), "absent".into()])
+        .load_files(&["file-1".into(), "absent".into()], FileLoadScope::Targeted)
         .unwrap();
     assert_eq!(loaded.len(), 2);
     assert!(loaded["file-1"].is_some());
@@ -542,6 +542,52 @@ fn empty_bootstrap_retry_requires_matching_receipt_and_initialization_permission
     assert!(CheckpointReader::open(&path).is_err());
     fs::write(path.with_file_name(LOCK), receipt).unwrap();
     assert!(CheckpointWriter::open(&path, &lease, true).is_ok());
+}
+
+#[test]
+fn bootstrap_retry_resumes_committed_sidecar_import() {
+    let (_temp, path, lease) = fixture();
+    let (pending, cache) = extended_sidecars(&path);
+    assert!(
+        lifecycle::open_writer(
+            &path,
+            &lease,
+            true,
+            lifecycle::MigrationFailure::At("after_import_commit")
+        )
+        .is_err()
+    );
+    assert!(!has_authority(&path).unwrap());
+    // The interrupted bootstrap committed its sidecar import before activating
+    // the marker. Retrying must resume instead of rejecting the import as
+    // foreign content.
+    let writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+    assert!(has_authority(&path).unwrap());
+    let stored: (Option<String>, Option<String>) = connection(&writer)
+        .query_row(
+            "SELECT pending_json,scancache_json FROM metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored
+            .0
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .unwrap(),
+        Some(pending)
+    );
+    assert_eq!(
+        stored
+            .1
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .unwrap(),
+        Some(cache)
+    );
 }
 
 #[test]

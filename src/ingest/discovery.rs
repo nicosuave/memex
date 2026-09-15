@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::checkpoint::FileLoadScope;
 
 pub(super) const FILE_IDENTITY_PREFIX_BYTES: usize = 4096;
 
@@ -73,6 +74,11 @@ pub(super) fn discover_transcripts(
             .filter(|file| !excluder.is_excluded(&file.path))
             .map(|file| file.path.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
+        if full_scan {
+            FileLoadScope::Bulk
+        } else {
+            FileLoadScope::Targeted
+        },
     )?;
     let loaded = &state.loaded;
     let session_ids = selected
@@ -715,6 +721,11 @@ pub(super) fn discover_opencode(
                 })
                 .map(|file| file.path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
+            if full_scan {
+                FileLoadScope::Bulk
+            } else {
+                FileLoadScope::Targeted
+            },
         )?;
         let mut legacy_cleanup = index.source_paths_with_records(&legacy_candidates)?;
         if !legacy_candidates.is_empty() {

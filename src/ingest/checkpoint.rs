@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::OpencodeDatabaseState;
-use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter, PendingChange};
+use crate::state::checkpoint::{CheckpointDelta, CheckpointWriter, FileLoadScope, PendingChange};
 
 pub(super) struct CheckpointSession {
     writer: CheckpointWriter,
@@ -39,7 +39,7 @@ impl CheckpointSession {
         })
     }
 
-    pub fn preload(&mut self, paths: &[String]) -> Result<()> {
+    pub fn preload(&mut self, paths: &[String], scope: FileLoadScope) -> Result<()> {
         let missing = paths
             .iter()
             .filter(|path| !self.loaded.contains_key(*path))
@@ -52,7 +52,7 @@ impl CheckpointSession {
                 .extend(missing.into_iter().map(|path| (path, None)));
         } else if !missing.is_empty() {
             self.loaded
-                .extend(self.writer.reader().load_files(&missing)?);
+                .extend(self.writer.reader().load_files(&missing, scope)?);
         }
         Ok(())
     }

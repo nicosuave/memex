@@ -19,7 +19,7 @@
 
 use crate::config::Paths;
 use crate::ingest::{IngestOptions, PathExcluder, build_path_excluder};
-use crate::state::checkpoint::{CheckpointReader, is_checkpoint_artifact_name};
+use crate::state::checkpoint::{CheckpointReader, FileLoadScope, is_checkpoint_artifact_name};
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -274,7 +274,7 @@ pub(crate) fn dirty_needs_ingest(paths: &Paths, dirty: &HashSet<PathBuf>) -> Res
         .collect::<Vec<_>>();
     let states = {
         let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
-        reader.load_files(&keys)?
+        reader.load_files(&keys, FileLoadScope::Targeted)?
     };
     for path in dirty {
         let key = path.to_string_lossy().into_owned();

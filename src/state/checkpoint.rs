@@ -9,8 +9,17 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
-/// Full scans request nearly every row; one table scan beats thousands of point lookups.
-const BULK_LOAD_THRESHOLD: usize = 64;
+/// How `load_files` may read the files table.
+///
+/// A full-table scan decodes every stored payload, so it must be requested
+/// explicitly for batches known to cover a large share of history (for example
+/// full-refresh preloads). Targeted batches always use indexed point lookups,
+/// no matter how many paths they hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FileLoadScope {
+    Targeted,
+    Bulk,
+}
 
 mod codec;
 mod lifecycle;
@@ -174,6 +183,7 @@ impl CheckpointReader {
     pub(crate) fn load_files(
         &self,
         paths: &[String],
+        scope: FileLoadScope,
     ) -> Result<HashMap<String, Option<FileState>>> {
         crate::profiling::span!("state.checkpoint.load_files");
         let mut result = HashMap::with_capacity(paths.len());
@@ -190,7 +200,7 @@ impl CheckpointReader {
             }
             Backend::Sqlite { connection, .. } => {
                 let transaction = connection.unchecked_transaction()?;
-                if paths.len() >= BULK_LOAD_THRESHOLD {
+                if scope == FileLoadScope::Bulk {
                     let wanted = paths.iter().map(String::as_str).collect::<HashSet<_>>();
                     let mut statement =
                         transaction.prepare_cached("SELECT path, payload FROM files")?;

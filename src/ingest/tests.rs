@@ -28,6 +28,7 @@ use crate::config::{IndexedToolContentLimits, Paths};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::SearchIndex;
 use crate::state::IngestState;
+use crate::state::checkpoint::FileLoadScope;
 use crate::test_support::{EnvVarGuard, env_lock};
 use crate::vector::VectorIndex;
 use std::fs;
@@ -4617,7 +4618,10 @@ fn checkpoint_session_keeps_unloaded_absent_and_deleted_paths_distinct() {
     initial.save_with_lease(&state_path, &lease).unwrap();
     let mut state = CheckpointSession::open(&state_path, &lease, false, None).unwrap();
     state
-        .preload(&["known".to_string(), "absent".to_string()])
+        .preload(
+            &["known".to_string(), "absent".to_string()],
+            FileLoadScope::Targeted,
+        )
         .unwrap();
     assert_eq!(state.loaded.len(), 2);
     assert!(state.file("known").is_some());
@@ -4628,7 +4632,9 @@ fn checkpoint_session_keeps_unloaded_absent_and_deleted_paths_distinct() {
     state.upsert_file("known".to_string(), file);
     assert!(!state.commit_final(None, PendingChange::Keep).unwrap());
     state.delete_file("unloaded");
-    state.preload(&["unloaded".to_string()]).unwrap();
+    state
+        .preload(&["unloaded".to_string()], FileLoadScope::Targeted)
+        .unwrap();
     assert!(state.file("unloaded").is_none());
     let pending = PendingIngest {
         next_doc_id: 99,
