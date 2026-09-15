@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="${REPO:-nicosuave/memex}"
+REPO="nicosuave/memex"
 BINARY="memex"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -9,8 +9,7 @@ INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 OS="$(uname -s)"
 case "$OS" in
     Darwin) OS="macos" ;;
-    Linux) OS="linux" ;;
-    *) echo "Unsupported OS: $OS (only macOS and Linux are supported)"; exit 1 ;;
+    *) echo "Unsupported OS: $OS (only macOS is supported)"; exit 1 ;;
 esac
 
 # Detect architecture
