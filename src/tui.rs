@@ -1184,6 +1184,11 @@ impl App {
             })();
             match result {
                 Ok(Some(report)) => {
+                    // Maintenance is best effort: a failed schedule must not
+                    // fail the refresh the user asked for.
+                    if report.records_added > 0 || crate::machine::compaction_pending(&paths) {
+                        let _ = crate::machine::schedule_compaction_if_fragmented(&paths);
+                    }
                     let _ = tx.send(IndexUpdate::Done {
                         added: report.records_added,
                         embedded: report.records_embedded,

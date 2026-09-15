@@ -2732,21 +2732,54 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
     if config.auto_index_on_search_default() {
         let report = index_local(paths, config, true)?;
-        if report.records_added > 0 {
+        if report.records_added > 0 || compaction_pending(paths) {
             schedule_compaction_if_fragmented(paths)?;
         }
     }
     Ok(())
 }
 
+/// Sentinel recording that index compaction is still outstanding: a previous
+/// detached run discarded its merge, or the scheduler could not spawn one.
+/// Schedulers treat a present marker like fragmentation so the work is retried
+/// even when later refreshes add no records.
+fn compaction_pending_path(paths: &Paths) -> std::path::PathBuf {
+    paths.state.join("compaction.pending")
+}
+
+pub(crate) fn compaction_pending(paths: &Paths) -> bool {
+    compaction_pending_path(paths).exists()
+}
+
+pub(crate) fn note_compaction_pending(paths: &Paths) -> Result<()> {
+    let path = compaction_pending_path(paths);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, "").context("record pending index compaction")?;
+    Ok(())
+}
+
+pub(crate) fn clear_compaction_pending(paths: &Paths) -> Result<()> {
+    match std::fs::remove_file(compaction_pending_path(paths)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("clear pending index compaction"),
+    }
+}
+
 /// Search refreshes append without merging; once segments accumulate, one detached
 /// `memex index compact` process folds the small ones into one segment and exits. The spawn
 /// is skipped while an ingest holds the lease, and the child takes a compaction lock, so a
 /// second child started in the gap exits instead of merging the same segments again.
-fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
+/// A pending marker left by a discarded run counts like fragmentation, and spawning
+/// itself is best effort: the detached child is reaped on exit, and a spawn failure
+/// records the outstanding work instead of failing the triggering request.
+pub(crate) fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     let small = SearchIndex::open_or_create(&paths.index)?
         .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)?;
-    if small <= crate::index::SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS {
+    if !compaction_pending(paths) && small <= crate::index::SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS
+    {
         return Ok(());
     }
     if !matches!(
@@ -2773,9 +2806,21 @@ fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    command
-        .spawn()
-        .context("spawn background index compaction")?;
+    match command.spawn() {
+        Ok(mut child) => {
+            // The child is fully detached; reap it on exit so long-lived
+            // hosts do not accumulate zombies.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => {
+            // Compaction is best effort: record the outstanding work and let
+            // the triggering request succeed.
+            eprintln!("warning: failed to spawn background index compaction: {error:#}");
+            note_compaction_pending(paths)?;
+        }
+    }
     Ok(())
 }
 

@@ -2443,9 +2443,13 @@ fn run_index_compact(root: Option<PathBuf>) -> Result<()> {
             .to_string();
         if current != base {
             println!("compaction skipped: the index moved while merging");
+            crate::machine::note_compaction_pending(&paths)?;
             return Ok(());
         }
         index.publish_generation()?;
+        crate::machine::clear_compaction_pending(&paths)?;
+    } else {
+        crate::machine::clear_compaction_pending(&paths)?;
     }
     println!(
         "compacted {merged} segments; {} remain",
