@@ -5,11 +5,12 @@ REPO="nicosuave/memex"
 BINARY="memex"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
-# Detect OS
+# Detect OS (Ubuntu falls under Linux)
 OS="$(uname -s)"
 case "$OS" in
     Darwin) OS="macos" ;;
-    *) echo "Unsupported OS: $OS (only macOS is supported)"; exit 1 ;;
+    Linux) OS="linux" ;;
+    *) echo "Unsupported OS: $OS (only macOS and Linux are supported)"; exit 1 ;;
 esac
 
 # Detect architecture
