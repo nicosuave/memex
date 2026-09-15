@@ -6,8 +6,8 @@ mod selection;
 
 pub(crate) use discovery::{PathExcluder, build_path_excluder};
 use discovery::{
-    can_skip_fresh_scan, can_skip_noop_index, is_not_found, vector_index_covers_embeddable_records,
-    vector_migration,
+    can_skip_fresh_scan, can_skip_noop_index, is_not_found, record_needs_embedding,
+    vector_index_covers_embeddable_records, vector_migration,
 };
 use execution::{
     cleanup_opencode_spools, flush_embeddings, is_embedding_role, limit_record_tool_content,

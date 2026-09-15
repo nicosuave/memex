@@ -885,8 +885,10 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
     paths.ensure_dirs().unwrap();
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     let mut writer = index.writer().unwrap();
+    // A non-embeddable role keeps the vector store vacuously covered, so the
+    // empty stream still takes the checkpoint-only path with embeddings on.
     index
-        .add_record(&mut writer, &record(1, "user", "existing"))
+        .add_record(&mut writer, &record(1, "reasoning", "existing"))
         .unwrap();
     writer.commit().unwrap();
     writer.wait_merging_threads().unwrap();
@@ -979,6 +981,33 @@ fn enabling_embeddings_backfills_an_unchanged_lexical_index() {
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
     assert!(!VectorIndex::exists(&paths.vectors));
+    options.embeddings = true;
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.records_added, 0);
+    assert_eq!(report.records_embedded, 1);
+    assert_eq!(VectorIndex::open(&paths.vectors).unwrap().len(), 1);
+}
+
+#[test]
+fn progress_only_append_does_not_skip_missing_embeddings() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "existing searchable message");
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Potion);
+    options.claude_sources = vec![source];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(!VectorIndex::exists(&paths.vectors));
+    // A progress event dirties the transcript but yields no records, so the
+    // writer stream is empty while source changes suppress the execution-layer
+    // vector coverage check.
+    append_claude_progress(&transcript);
     options.embeddings = true;
     let index = SearchIndex::open_or_create(&paths.index).unwrap();
     let report = ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -3237,6 +3266,15 @@ fn append_claude_message(path: &Path, text: &str) {
         })
     )
     .unwrap();
+}
+
+fn append_claude_progress(path: &Path) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{}", serde_json::json!({"type": "progress"})).unwrap();
 }
 
 fn indexed_texts(paths: &Paths) -> Vec<String> {

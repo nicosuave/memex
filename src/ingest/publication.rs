@@ -28,6 +28,7 @@ pub(super) fn writer_loop(
         && !ctx.do_backfill_embeddings
         && !ctx.reset_vector_store
         && !ctx.reconcile_vector_ids
+        && !writer_fast_path_needs_vectors(&index, &ctx)?
     {
         return match decision_rx.recv() {
             Ok(WriterDecision::Commit) => {
@@ -239,6 +240,37 @@ pub(super) fn writer_loop(
         records_added: count,
         records_embedded: embedded_count,
     })
+}
+
+/// Check whether the empty-stream fast path must yield to outstanding vector work.
+///
+/// The execution layer only verifies vector coverage when nothing else changed,
+/// so a clear `do_backfill_embeddings` flag does not imply the vector store is
+/// complete. When embeddings are enabled, confirm coverage before accepting the
+/// checkpoint-only return; a fully covered store still takes the fast path
+/// without loading the embedding model.
+fn writer_fast_path_needs_vectors(index: &SearchIndex, ctx: &WriterContext) -> Result<bool> {
+    if !ctx.embeddings {
+        return Ok(false);
+    }
+    let Some(dimensions) = ctx.model.known_dimensions() else {
+        return Ok(true);
+    };
+    if !crate::vector::VectorIndex::exists(&ctx.vector_dir) {
+        // No vector store: work is outstanding iff some record could need one.
+        let mut needs_embedding = false;
+        index.for_each_record(|record| {
+            needs_embedding |= record_needs_embedding(&record);
+            Ok(())
+        })?;
+        return Ok(needs_embedding);
+    }
+    let vector_index = crate::vector::VectorIndex::open(&ctx.vector_dir)?;
+    if vector_index.model() != Some(ctx.model.as_str()) || vector_index.dimensions() != dimensions {
+        return Ok(true);
+    }
+    Ok(vector_index.needs_backfill()
+        || !vector_index_covers_embeddable_records(index, &vector_index)?)
 }
 
 pub(super) fn backfill_embeddings(
