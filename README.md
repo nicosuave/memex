@@ -19,26 +19,45 @@ A Qt companion is available as well.
 <img width="1178" height="768" alt="download (8)" src="https://github.com/user-attachments/assets/1de09c11-e432-4613-9928-a32b39be204a" />
 
 ## Install
-```bash
-brew install nicosuave/tap/memex
-```
 
-Or
+### Linux (Ubuntu, Debian, etc.) & macOS
+
+Install the prebuilt binary to `~/.local/bin` using the setup script (auto-detects OS and architecture: `x86_64` and `arm64`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nicosuave/memex/main/scripts/setup.sh | sh
 ```
 
-Or (from the [AUR](https://aur.archlinux.org/packages/memex) on Arch Linux):
+> **Ubuntu / Debian note:** Ensure `curl` and `tar` are installed (`sudo apt update && sudo apt install -y curl tar`). If `~/.local/bin` is not yet in your `PATH`, add `export PATH="$HOME/.local/bin:$PATH"` to your `~/.bashrc`.
+
+### Homebrew (macOS)
+
+```bash
+brew install nicosuave/tap/memex
+```
+
+### Arch Linux
+
+From the [AUR](https://aur.archlinux.org/packages/memex):
 
 ```bash
 paru -S memex
 ```
 
-Or (with [Nix](https://nixos.org/)):
+### Nix
+
+With [Nix](https://nixos.org/):
 
 ```bash
 nix run github:nicosuave/memex
+```
+
+### Cargo (Build from source)
+
+```bash
+# On Ubuntu/Debian, install build dependencies first:
+sudo apt update && sudo apt install -y build-essential libssl-dev pkg-config
+cargo install --locked --git https://github.com/nicosuave/memex
 ```
 
 ### Native Mac App
