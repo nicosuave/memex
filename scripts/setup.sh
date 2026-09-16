@@ -5,7 +5,7 @@ REPO="nicosuave/memex"
 BINARY="memex"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
-# Detect OS (Ubuntu falls under Linux)
+# Detect OS
 OS="$(uname -s)"
 case "$OS" in
     Darwin) OS="macos" ;;
