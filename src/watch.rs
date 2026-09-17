@@ -212,7 +212,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
             .filter(|name| {
                 let database = path.with_file_name(name);
                 crate::sources::opencode::is_database_path(name)
-                    || crate::sources::bob::is_db_path(&database)
+                    || crate::sources::bob::is_configured_database(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })

@@ -80,10 +80,33 @@ pub fn roots() -> Vec<PathBuf> {
         .collect()
 }
 
-/// The default database name, or any path configured through `MEMEX_BOB_DB`.
+/// The default database name, or any path configured through `MEMEX_BOB_DB`. Persisted
+/// virtual paths are recognised by this even after the configuration changes.
 pub fn is_db_path(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(DATABASE_NAME)
         || database_paths().iter().any(|database| database == path)
+}
+
+/// A path with its directory canonicalized, so a database reached through a symlinked
+/// directory compares equal whichever spelling a watcher or the configuration used.
+fn canonical_alias(path: &Path) -> Option<PathBuf> {
+    Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
+}
+
+/// Exactly the configured databases, by configured or canonical spelling. Watcher routing
+/// and dirty-path selection use this so a stray `bob.db` beside a custom override, or an
+/// alias of one, never enters discovery through an event.
+pub fn is_configured_database(path: &Path) -> bool {
+    let configured = database_paths();
+    if configured.iter().any(|database| database == path) {
+        return true;
+    }
+    let aliases = configured
+        .iter()
+        .filter_map(|database| canonical_alias(database))
+        .collect::<Vec<_>>();
+    aliases.iter().any(|alias| alias == path)
+        || canonical_alias(path).is_some_and(|path| aliases.contains(&path))
 }
 
 /// Whether a persisted source path is a Bob task (`<db>/<task_id>`).
@@ -1020,6 +1043,9 @@ mod tests {
         assert!(is_db_path(custom));
         assert!(is_db_path(Path::new("/elsewhere/bob.db")));
         assert!(!is_db_path(Path::new("/srv/bob/other.sqlite")));
+        // Watcher routing only accepts the configured inventory.
+        assert!(is_configured_database(custom));
+        assert!(!is_configured_database(Path::new("/elsewhere/bob.db")));
         let path = virtual_path(custom, "task-1");
         assert!(matches_path(&path.to_string_lossy()));
         assert_eq!(
@@ -1228,6 +1254,25 @@ mod tests {
             workspace_from_project_id("file:/Users/me/x%2").as_deref(),
             Some("/Users/me/x%2")
         );
+    }
+
+    #[test]
+    fn configured_databases_match_through_symlinked_directories() {
+        let _guard = crate::test_support::env_lock();
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("tasks.sqlite"), "").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let configured = link.join("tasks.sqlite");
+        let _env = crate::test_support::EnvVarGuard::set_os(&[(
+            "MEMEX_BOB_DB",
+            Some(configured.as_os_str()),
+        )]);
+        assert!(is_configured_database(&configured));
+        assert!(is_configured_database(&real.join("tasks.sqlite")));
+        assert!(!is_configured_database(&real.join("other.sqlite")));
     }
 
     #[test]

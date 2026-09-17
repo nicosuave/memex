@@ -7159,6 +7159,9 @@ fn build_index_command_args(
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
     }
+    if !index.bob || index.no_bob {
+        args.push("--no-bob".to_string());
+    }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
         args.push("--mcp-listen".to_string());
@@ -8614,6 +8617,7 @@ mod tests {
         assert!(args.contains(&"--no-grok".to_string()));
         assert!(args.contains(&"--no-jcode".to_string()));
         assert!(args.contains(&"--no-muse".to_string()));
+        assert!(args.contains(&"--no-bob".to_string()));
     }
 
     #[test]

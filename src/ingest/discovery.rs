@@ -605,10 +605,13 @@ pub(super) fn discover_bob(
     for database in databases {
         match database.metadata() {
             // Like the generic sweep, a deletion counts only while the containing
-            // directory is still readable; an unmounted volume must not purge history.
+            // directory is still readable; an unmounted volume must not purge history,
+            // and a pending replay must wait for it like any other unavailable database.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if database.parent().is_some_and(|parent| parent.is_dir()) {
                     absent.push(database);
+                } else {
+                    result.unreadable_databases.push(database);
                 }
                 continue;
             }
@@ -1313,25 +1316,47 @@ pub(super) fn prepare_refresh(
         }
         None => (None, None),
     };
-    let bob = discovery::discover_bob(options, &excluder, &mut state, bob_selected.as_deref())?;
-    // Recovery replays every task named by the pending intent from scratch (its state was
-    // already dropped), so an unreadable database would publish the deletions with no
-    // replacement. Nothing has been committed yet: abort and retry once it reads again.
-    if let Some(pending) = &pending_recovery
-        && let Some(path) = pending.source_paths.iter().find(|path| {
+    let discovery::BobDiscovery {
+        tasks: mut bob_tasks,
+        unchanged_identities: bob_unchanged_identities,
+        files_scanned: bob_files_scanned,
+        files_skipped: bob_files_skipped,
+        total_bytes: bob_total_bytes,
+        missing_paths: bob_missing_paths,
+        unreadable_databases: bob_unreadable_databases,
+        diagnostics: bob_diagnostics,
+    } = discovery::discover_bob(options, &excluder, &mut state, bob_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        // Recovery replays every task named by the pending intent from scratch (its state
+        // was already dropped), so an unreadable database would publish the deletions
+        // with no replacement. Nothing has been committed yet: abort and retry once it
+        // reads again.
+        if let Some(path) = pending.source_paths.iter().find(|path| {
             crate::sources::bob::split_virtual_path(Path::new(path))
-                .is_some_and(|(database, _)| bob.unreadable_databases.contains(&database))
-        })
-    {
-        anyhow::bail!(
-            "Bob task {path} has an interrupted replay to recover but its database cannot be read; refresh aborted so its indexed records survive"
-        );
+                .is_some_and(|(database, _)| bob_unreadable_databases.contains(&database))
+        }) {
+            anyhow::bail!(
+                "Bob task {path} has an interrupted replay to recover but its database cannot be read; refresh aborted so its indexed records survive"
+            );
+        }
+        // The same tasks look brand-new to discovery, yet their records may still be
+        // indexed: mark them as replacements so a parse failure refuses to publish the
+        // pending deletion on its own.
+        for task in &mut bob_tasks {
+            if pending
+                .source_paths
+                .iter()
+                .any(|path| *path == task.path.to_string_lossy())
+            {
+                task.change = FileChange::Replaced;
+            }
+        }
     }
-    tasks.extend(bob.tasks);
-    unchanged_identities.extend(bob.unchanged_identities);
-    files_scanned += bob.files_scanned;
-    files_skipped += bob.files_skipped;
-    total_bytes += bob.total_bytes;
+    tasks.extend(bob_tasks);
+    unchanged_identities.extend(bob_unchanged_identities);
+    files_scanned += bob_files_scanned;
+    files_skipped += bob_files_skipped;
+    total_bytes += bob_total_bytes;
 
     let Some(opencode) = discovery::discover_opencode(
         paths,
@@ -1366,7 +1391,7 @@ pub(super) fn prepare_refresh(
     let opencode_ready_databases = opencode.ready_databases;
     let opencode_ready_owned_sessions = opencode.ready_owned_sessions;
     let mut opencode_diagnostics = opencode.diagnostics;
-    opencode_diagnostics.merge(bob.diagnostics);
+    opencode_diagnostics.merge(bob_diagnostics);
     let opencode_scope_targets = opencode.scope_targets;
     let opencode_session_cwds = opencode.session_cwds;
     let opencode_database_states = opencode.database_states;
@@ -1394,7 +1419,7 @@ pub(super) fn prepare_refresh(
             }
         }
     }
-    missing_state_paths.extend(bob.missing_paths);
+    missing_state_paths.extend(bob_missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).

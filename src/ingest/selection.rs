@@ -225,7 +225,7 @@ fn classify(root: &Root, path: &Path) -> Match {
             // Every task shares one database and discovery diffs task aggregates
             // itself, so a commit targets the database (`resolve` already routed WAL
             // and journal hints to it). The shared-memory index is read noise.
-            return if parts.len() == 1 && sources::bob::is_db_path(path) {
+            return if parts.len() == 1 && sources::bob::is_configured_database(path) {
                 Match::Database(path.to_path_buf())
             } else {
                 Match::Ignore
@@ -291,7 +291,7 @@ fn resolve(
                             .or_else(|| name.strip_suffix("-journal"))
                     })
                     .map(|name| path.with_file_name(name))
-                    .filter(|database| sources::bob::is_db_path(database))
+                    .filter(|database| sources::bob::is_configured_database(database))
                     .unwrap_or(path),
                 _ => path,
             };
@@ -348,7 +348,7 @@ fn resolve(
                     if !path.is_file() {
                         return Ok(DirtySelection::Resync);
                     }
-                    let source = if sources::bob::is_db_path(&path) {
+                    let source = if sources::bob::is_configured_database(&path) {
                         SourceKind::Bob
                     } else {
                         SourceKind::Opencode
@@ -493,10 +493,22 @@ mod tests {
 
     #[test]
     fn bob_database_commits_target_the_database() {
+        let _guard = crate::test_support::env_lock();
         let temp = tempfile::tempdir().unwrap();
         let database = temp.path().join("bob.db");
         write(&database);
+        let _env = crate::test_support::EnvVarGuard::set_os(&[(
+            "MEMEX_BOB_DB",
+            Some(database.as_os_str()),
+        )]);
+        // A database that is not configured is ignored even with the default name.
+        let stray = temp.path().join("other").join("bob.db");
+        write(&stray);
         let roots = [Root::new(temp.path().to_path_buf(), Shape::Bob)];
+        let DirtySelection::Paths { files, databases } = select(&roots, &stray) else {
+            panic!("unexpected resync for a stray database")
+        };
+        assert!(files.is_empty() && databases.is_empty());
         for hint in ["bob.db", "bob.db-wal", "bob.db-journal"] {
             let DirtySelection::Paths { files, databases } =
                 select(&roots, &temp.path().join(hint))
