@@ -1219,7 +1219,9 @@ pub(super) fn execute_refresh(
             records_embedded: 0,
             files_scanned,
             files_skipped,
-            diagnostics: Default::default(),
+            // Discovery diagnostics (an unreadable database, say) matter most when
+            // nothing else changed.
+            diagnostics: opencode_diagnostics,
         });
     }
 

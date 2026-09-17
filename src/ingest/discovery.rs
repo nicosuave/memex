@@ -563,6 +563,9 @@ pub(super) struct BobDiscovery {
     /// Virtual paths whose task vanished from a readable database, or whose database
     /// was itself deleted.
     pub missing_paths: Vec<String>,
+    /// Databases that exist but could not be read this refresh. Their tasks must not be
+    /// deleted on any path (pending recovery included) because no replacement is coming.
+    pub unreadable_databases: Vec<PathBuf>,
     pub diagnostics: crate::sources::ParseDiagnostics,
 }
 
@@ -615,6 +618,7 @@ pub(super) fn discover_bob(
                     .unreadable_sources
                     .push(database.to_string_lossy().into_owned());
                 result.files_skipped += 1;
+                result.unreadable_databases.push(database);
                 continue;
             }
             Ok(metadata) if !metadata.is_file() => continue,
@@ -630,6 +634,7 @@ pub(super) fn discover_bob(
                     .unreadable_sources
                     .push(database.to_string_lossy().into_owned());
                 result.files_skipped += 1;
+                result.unreadable_databases.push(database);
                 continue;
             }
         };
@@ -1309,6 +1314,19 @@ pub(super) fn prepare_refresh(
         None => (None, None),
     };
     let bob = discovery::discover_bob(options, &excluder, &mut state, bob_selected.as_deref())?;
+    // Recovery replays every task named by the pending intent from scratch (its state was
+    // already dropped), so an unreadable database would publish the deletions with no
+    // replacement. Nothing has been committed yet: abort and retry once it reads again.
+    if let Some(pending) = &pending_recovery
+        && let Some(path) = pending.source_paths.iter().find(|path| {
+            crate::sources::bob::split_virtual_path(Path::new(path))
+                .is_some_and(|(database, _)| bob.unreadable_databases.contains(&database))
+        })
+    {
+        anyhow::bail!(
+            "Bob task {path} has an interrupted replay to recover but its database cannot be read; refresh aborted so its indexed records survive"
+        );
+    }
     tasks.extend(bob.tasks);
     unchanged_identities.extend(bob.unchanged_identities);
     files_scanned += bob.files_scanned;

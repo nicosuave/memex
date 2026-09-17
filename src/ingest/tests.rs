@@ -4898,6 +4898,105 @@ fn bob_ingest_accepts_custom_database_names_and_skips_unreadable_ones() {
 }
 
 #[test]
+fn bob_unreadable_database_is_reported_even_when_nothing_else_changes() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let broken = temp.path().join("broken.db");
+    fs::write(&broken, "not a database").unwrap();
+    let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(broken.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_bob = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    for _ in 0..2 {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+        assert_eq!(report.records_added, 0);
+        assert_eq!(
+            report.diagnostics.unreadable_sources,
+            vec![broken.to_string_lossy().into_owned()]
+        );
+    }
+}
+
+#[test]
+fn bob_recovery_keeps_history_while_its_database_is_unreadable() {
+    use crate::sources::bob::{fixtures, virtual_path};
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("bob").join("db").join("bob.db");
+    let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(database.as_os_str()))]);
+    let writer = fixtures::create(&database);
+    fixtures::insert_task(
+        &writer,
+        "task-a",
+        None,
+        "normal",
+        "file:/work/a",
+        "A",
+        1_000,
+    );
+    fixtures::insert_message(
+        &writer,
+        "a1",
+        "task-a",
+        "user",
+        r#"{"role":"user","content":"alpha","_meta":{"timestamp":1}}"#,
+        1,
+    );
+    writer
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(writer);
+
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_bob = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    assert_eq!(full().records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["alpha"]);
+
+    // An interrupted replay left a publication intent naming the task, and the database
+    // is unreadable when recovery runs: the indexed history must survive.
+    let task_path = virtual_path(&database, "task-a")
+        .to_string_lossy()
+        .into_owned();
+    PendingIngest {
+        next_doc_id: 100,
+        source_paths: vec![task_path],
+        session_scopes: Vec::new(),
+        vector_delete_paths: Vec::new(),
+        vector_publication: false,
+        embedding_publication: Some(false),
+    }
+    .save_with_lease(&pending_ingest_path(&paths), &lease)
+    .unwrap();
+    let original = fs::read(&database).unwrap();
+    fs::write(&database, "not a database").unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let error = ingest_all(&paths, &index, &options, &lease).unwrap_err();
+    assert!(
+        error.to_string().contains("interrupted replay"),
+        "{error:#}"
+    );
+    drop(index);
+    assert_eq!(indexed_texts(&paths), ["alpha"]);
+
+    // Once readable again the recovery replays the task exactly once.
+    fs::write(&database, original).unwrap();
+    assert_eq!(full().records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["alpha"]);
+    assert_eq!(full().records_added, 0);
+}
+
+#[test]
 fn cleanup_recovery_restores_reparsed_survivor_vectors() {
     assert_recovers_vector_crash(false, false);
     assert_recovers_vector_crash(true, false);
