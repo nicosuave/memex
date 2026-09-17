@@ -230,7 +230,7 @@ struct HomeActivityView: View {
             HStack {
                 Text("Activity").font(.title2.weight(.semibold))
                 if let payload = currentPayload {
-                    Text("\(payload.total.formatted(.number.notation(.compactName))) \(metric.title.lowercased())")
+                    Text("\(payload.total.formatted(.number.notation(.compactName).precision(.fractionLength(0...1)))) \(metric.title.lowercased())")
                         .font(.callout).foregroundStyle(.secondary)
                         .help(remainingMachines > 0 ? loadingDetail : "Total activity in the selected timeframe")
                 }
@@ -309,9 +309,8 @@ struct HomeActivityView: View {
                     AxisGridLine()
                     AxisValueLabel {
                         if let amount = value.as(Double.self) {
-                            Text(amount.formatted(.number.notation(.compactName)))
-                                .lineLimit(1).minimumScaleFactor(0.8)
-                                .frame(width: 18, alignment: .trailing)
+                            Text(amount.formatted(.number.notation(.compactName).precision(.fractionLength(0...1))))
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                     }
                 }
