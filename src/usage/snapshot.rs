@@ -169,7 +169,7 @@ fn oneshot_partition(
     {
         return (assembly, warnings);
     }
-    let entry = rebuild_partition(filter, &cache_path, None);
+    let entry = rebuild_partition(filter, &cache_path, None, None);
     (entry.assembly, entry.warnings)
 }
 
@@ -274,7 +274,7 @@ pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<
     // Rebuild. The previous snapshot stays published while scanning, so
     // concurrent queries keep serving it; it is taken for buffer reuse only for
     // the compaction window below.
-    let entry = rebuild_partition(filter, &cache_path, Some(key));
+    let entry = rebuild_partition(filter, &cache_path, Some(key), None);
     let result = (entry.assembly.clone(), entry.warnings.clone());
     let mut store = lock_partitions();
     if store.len() >= MAX_PARTITIONS {
@@ -282,6 +282,28 @@ pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<
     }
     store.insert(key.clone(), entry);
     result
+}
+
+/// Complete a failed cold facts lookup without repeating its input discovery.
+/// The observation is only a pre-scan checkpoint, never evidence of validity.
+pub(crate) fn populate_after_failed_validation(
+    filter: SourceFilter,
+    cache_path: &Path,
+    fingerprint: FileFingerprint,
+) {
+    let Ok(_refresh) = USAGE_SCAN_LOCK.try_lock() else {
+        return;
+    };
+    let key = (filter, Some(cache_path.to_path_buf()));
+    if lock_partitions().contains_key(&key) {
+        return;
+    }
+    let entry = rebuild_partition(filter, &key.1, None, Some(fingerprint));
+    let mut store = lock_partitions();
+    if store.len() >= MAX_PARTITIONS {
+        evict_oldest(&mut store, &key, |entry| entry.checked_at);
+    }
+    store.insert(key, entry);
 }
 
 /// Rebuild one partition, reusing facts where reconciliation permits it and
@@ -292,6 +314,7 @@ fn rebuild_partition(
     filter: SourceFilter,
     cache_path: &Option<PathBuf>,
     previous_key: Option<&PartitionKey>,
+    observed_fingerprint: Option<FileFingerprint>,
 ) -> PartitionEntry {
     let mut warnings = Vec::new();
     let mut cache = match cache_path
@@ -316,14 +339,19 @@ fn rebuild_partition(
         (Some(cache), Some(stored)) if !reconciles_cross_file(filter) => {
             match refresh_partition_from_facts(filter, cache, stored, &mut warnings) {
                 Ok(done) => done,
-                Err(_) => legacy_refresh_partition(filter, Some(cache), &mut warnings),
+                Err(_) => legacy_refresh_partition(
+                    filter,
+                    Some(cache),
+                    &mut warnings,
+                    observed_fingerprint,
+                ),
             }
         }
         // Canonical facts omit suppressed occurrences. Invalidated cross-file
         // sources need raw reconciliation to recover deleted/weakened winners;
         // skip rediscovery merely to reject their facts path. Cursor also needs
         // current transcript-derived project attribution on unchanged DB rows.
-        (cache, _) => legacy_refresh_partition(filter, cache, &mut warnings),
+        (cache, _) => legacy_refresh_partition(filter, cache, &mut warnings, observed_fingerprint),
     };
     let fact_generation = cache
         .as_ref()
@@ -357,6 +385,7 @@ pub(crate) fn legacy_refresh_partition(
     filter: SourceFilter,
     mut cache: Option<&mut UsageCache>,
     warnings: &mut Vec<String>,
+    observed_fingerprint: Option<FileFingerprint>,
 ) -> (Vec<UsageEvent>, FileFingerprint) {
     let scanner = SCANNERS
         .iter()
@@ -364,7 +393,7 @@ pub(crate) fn legacy_refresh_partition(
         .expect("scanner for every source filter");
     // Stamp the inputs before scanning. A source that changes during the scan
     // must not get a checkpoint describing bytes the assembly never read.
-    let fingerprint = discovery_fingerprint(filter);
+    let fingerprint = observed_fingerprint.unwrap_or_else(|| discovery_fingerprint(filter));
     let mut events = run_partition_scanner(filter, scanner, warnings, cache.as_deref_mut());
     publish_scan_progress(None);
     let sort_start = Instant::now();
@@ -721,6 +750,21 @@ pub(crate) fn valid_partition_fingerprint(
     cache_path: Option<&Path>,
     previous_fingerprint: Option<&[(String, u64, i64)]>,
 ) -> Option<FileFingerprint> {
+    let observed = validate_partition(filter, cache_path, previous_fingerprint)?;
+    observed.valid.then_some(observed.fingerprint)
+}
+
+pub(crate) struct PartitionValidation {
+    pub(crate) fingerprint: FileFingerprint,
+    pub(crate) valid: bool,
+}
+
+/// A complete observation remains useful as a rebuild checkpoint when invalid.
+pub(crate) fn validate_partition(
+    filter: SourceFilter,
+    cache_path: Option<&Path>,
+    previous_fingerprint: Option<&[(String, u64, i64)]>,
+) -> Option<PartitionValidation> {
     let files = source_files(filter);
     let mut fingerprint = Vec::with_capacity(files.len());
     let mut observed_metadata = Vec::with_capacity(files.len());
@@ -733,79 +777,83 @@ pub(crate) fn valid_partition_fingerprint(
     }
     append_source_context(filter, &mut fingerprint);
     fingerprint.sort();
-    let Some(cache_path) = cache_path else {
-        // Without recorded database dependencies, re-read after the memo TTL.
-        if matches!(
-            filter,
-            SourceFilter::Hermes | SourceFilter::Cursor | SourceFilter::Opencode
-        ) {
-            return None;
-        }
-        return previous_fingerprint
-            .is_some_and(|previous| fingerprint == previous)
-            .then_some(fingerprint);
-    };
-    if let Some(previous) = previous_fingerprint
-        && stable_triples(filter, &fingerprint) != stable_triples(filter, previous)
-    {
-        return None;
-    }
-    let spec = source_spec(filter);
-    let cache = match UsageCache::open(cache_path) {
-        Ok(cache) => cache,
-        Err(_) => return None,
-    };
-    let expected = fingerprint_files(&stable_triples(filter, &fingerprint));
-    let allow_uncached_codex = match cache.fact_sync(filter.as_str()) {
-        Ok(Some((recorded, version, warnings))) => {
-            if recorded != expected || version != spec.parser_version {
+    let valid = (|| {
+        let Some(cache_path) = cache_path else {
+            // Without recorded database dependencies, re-read after the memo TTL.
+            if matches!(
+                filter,
+                SourceFilter::Hermes | SourceFilter::Cursor | SourceFilter::Opencode
+            ) {
                 return None;
             }
-            // Unresolved forks deliberately have no blob row. They can reuse
-            // facts while still unresolved, but must retry parent resolution
-            // below: an unreadable parent's permissions may have recovered
-            // without changing its size or mtime.
-            filter == SourceFilter::Codex && warnings.is_empty()
-        }
-        _ => return None,
-    };
-    // Validate the metadata that actually produced the facts. The discovery
-    // checkpoint alone misses WAL dependencies and files changed mid-scan.
-    // Missing rows otherwise require a retry rather than making a failed parse
-    // authoritative indefinitely.
-    let rows = match cache.load_source_meta(filter.as_str(), spec.parser_version) {
-        Ok(rows) => rows,
-        Err(_) => return None,
-    };
-    let now = epoch_ms_now();
-    let mut observations = HashMap::new();
-    let parents = (filter == SourceFilter::Codex)
-        .then(|| crate::sources::codex::UsageParentIndex::new(&files));
-    for (path, metadata) in files.iter().zip(observed_metadata) {
-        let key = path.to_string_lossy();
-        let Some(row) = rows.get(key.as_ref()) else {
-            if allow_uncached_codex
-                && parse_source_file(filter, path, parents.as_ref())
-                    .is_ok_and(|parsed| !parsed.cacheable)
-            {
-                continue;
-            }
-            return None;
+            return previous_fingerprint
+                .is_some_and(|previous| fingerprint == previous)
+                .then_some(());
         };
-        let metadata_current = (spec.volatile_reuse_ms)(path).map_or_else(
-            || metadata == (row.size, row.mtime_ns),
-            |window| now.saturating_sub(row.scanned_at_ms) < window,
-        );
-        if !metadata_current
-            || !deps_observed_current(&row.deps, &mut observations)
-            || parents
-                .as_ref()
-                .is_some_and(|parents| !parents.deps_match_current_candidates(&row.deps))
+        if let Some(previous) = previous_fingerprint
+            && stable_triples(filter, &fingerprint) != stable_triples(filter, previous)
         {
             return None;
         }
-    }
-    Some(fingerprint)
+        let spec = source_spec(filter);
+        let cache = match UsageCache::open(cache_path) {
+            Ok(cache) => cache,
+            Err(_) => return None,
+        };
+        let expected = fingerprint_files(&stable_triples(filter, &fingerprint));
+        let allow_uncached_codex = match cache.fact_sync(filter.as_str()) {
+            Ok(Some((recorded, version, warnings))) => {
+                if recorded != expected || version != spec.parser_version {
+                    return None;
+                }
+                // Unresolved forks deliberately have no blob row. They can reuse
+                // facts while still unresolved, but must retry parent resolution
+                // below: an unreadable parent's permissions may have recovered
+                // without changing its size or mtime.
+                filter == SourceFilter::Codex && warnings.is_empty()
+            }
+            _ => return None,
+        };
+        // Validate the metadata that actually produced the facts. The discovery
+        // checkpoint alone misses WAL dependencies and files changed mid-scan.
+        // Missing rows otherwise require a retry rather than making a failed parse
+        // authoritative indefinitely.
+        let rows = match cache.load_source_meta(filter.as_str(), spec.parser_version) {
+            Ok(rows) => rows,
+            Err(_) => return None,
+        };
+        let now = epoch_ms_now();
+        let mut observations = HashMap::new();
+        let parents = (filter == SourceFilter::Codex)
+            .then(|| crate::sources::codex::UsageParentIndex::new(&files));
+        for (path, metadata) in files.iter().zip(observed_metadata) {
+            let key = path.to_string_lossy();
+            let Some(row) = rows.get(key.as_ref()) else {
+                if allow_uncached_codex
+                    && parse_source_file(filter, path, parents.as_ref())
+                        .is_ok_and(|parsed| !parsed.cacheable)
+                {
+                    continue;
+                }
+                return None;
+            };
+            let metadata_current = (spec.volatile_reuse_ms)(path).map_or_else(
+                || metadata == (row.size, row.mtime_ns),
+                |window| now.saturating_sub(row.scanned_at_ms) < window,
+            );
+            if !metadata_current
+                || !deps_observed_current(&row.deps, &mut observations)
+                || parents
+                    .as_ref()
+                    .is_some_and(|parents| !parents.deps_match_current_candidates(&row.deps))
+            {
+                return None;
+            }
+        }
+        Some(())
+    })()
+    .is_some();
+    Some(PartitionValidation { fingerprint, valid })
 }
 
 /// Current disk facts do not validate an older retained assembly. Compare the
@@ -847,6 +895,7 @@ fn append_source_context(filter: SourceFilter, fingerprint: &mut FileFingerprint
 
 /// Current discovery fingerprint for one source, sorted by path.
 pub(crate) fn discovery_fingerprint(filter: SourceFilter) -> FileFingerprint {
+    let start = Instant::now();
     let mut fingerprint = Vec::new();
     for path in source_files(filter) {
         if let Ok(metadata) = usage_file_metadata(&path) {
@@ -855,6 +904,9 @@ pub(crate) fn discovery_fingerprint(filter: SourceFilter) -> FileFingerprint {
     }
     append_source_context(filter, &mut fingerprint);
     fingerprint.sort();
+    usage_timing(start, || {
+        format!("{} discovery fingerprint", filter.as_str())
+    });
     fingerprint
 }
 

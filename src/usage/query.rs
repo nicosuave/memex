@@ -12,7 +12,8 @@ use super::pricing::{PRICE_CATALOG_ID, RateCache, accumulate_usage_event, comput
 use super::scan::{FileFingerprint, SCANNERS};
 use super::snapshot::{
     MAX_PARTITIONS, MergedSnapshot, PartitionEntry, Snapshot, USAGE_SCAN_LOCK, ensure_snapshot,
-    evict_oldest, lock_merged, lock_partitions, refresh_merged, valid_partition_fingerprint,
+    evict_oldest, lock_merged, lock_partitions, populate_after_failed_validation, refresh_merged,
+    validate_partition,
 };
 use super::usage_timing;
 use super::{UsageActivityPoint, UsageEvent, UsageQuery, UsageReport, UsageSummary};
@@ -177,7 +178,14 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
             continue;
         }
         let generation = cache.fact_generation(filter.as_str()).ok()??;
-        let fingerprint = valid_partition_fingerprint(filter, Some(cache_path), None)?;
+        let observed = validate_partition(filter, Some(cache_path), None)?;
+        if !observed.valid {
+            if !ttl.is_zero() && query.source == Some(filter) {
+                populate_after_failed_validation(filter, cache_path, observed.fingerprint);
+            }
+            return None;
+        }
+        let fingerprint = observed.fingerprint;
         let (_, _, warnings) = cache.fact_sync(filter.as_str()).ok()??;
         per_source.push(ColdSource {
             filter,

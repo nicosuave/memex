@@ -7,7 +7,7 @@
 use super::scan::{
     ParsedUsageFile, UsageFileDep, fingerprint_files, source_ordinal, source_spec, stable_triples,
 };
-use super::{TokenBuckets, UsageEvent};
+use super::{TokenBuckets, UsageEvent, usage_timing};
 use crate::types::SourceFilter;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CachedUsageEvent {
@@ -552,6 +552,7 @@ impl UsageCache {
         // Reconciliation still sees every occurrence. Only persistence is
         // incremental: compare each file's final canonical contribution, so a
         // winner change also rewrites affected files whose input did not change.
+        let hash_start = Instant::now();
         let mut contributions: HashMap<&str, Vec<&UsageEvent>> = HashMap::new();
         for event in events {
             contributions
@@ -563,28 +564,47 @@ impl UsageCache {
             .into_par_iter()
             .map(|(path, events)| -> Result<_> {
                 let mut hash = Sha256::new();
+                let mut bytes = Vec::new();
                 for event in events {
-                    let bytes = postcard::to_stdvec(&CachedUsageEventRef::from_event(event))?;
+                    bytes.clear();
+                    postcard::to_io(&CachedUsageEventRef::from_event(event), &mut bytes)?;
                     hash.update((bytes.len() as u64).to_le_bytes());
-                    hash.update(bytes);
+                    hash.update(&bytes);
                 }
                 Ok((path, hash.finalize().to_vec()))
             })
             .collect::<Result<_>>()?;
+        usage_timing(hash_start, || {
+            format!("{} canonical hashes", filter.as_str())
+        });
+        let paths_start = Instant::now();
         let transaction = self.connection.transaction()?;
         let previous: HashMap<String, Option<Vec<u8>>> = {
             let mut statement = transaction.prepare(
-                "WITH paths AS MATERIALIZED (
-                     SELECT DISTINCT path FROM usage_facts WHERE source = ?1
+                // Seek once per file instead of scanning every fact's path.
+                // Enumerate facts, not just digests: old/partial metadata may
+                // omit a file whose obsolete facts must still be removed.
+                "WITH RECURSIVE paths(path) AS (
+                     SELECT min(path) FROM usage_facts WHERE source = ?1
+                     UNION ALL
+                     SELECT (
+                         SELECT min(path) FROM usage_facts
+                         WHERE source = ?1 AND path > paths.path
+                     ) FROM paths WHERE path IS NOT NULL
                  )
                  SELECT paths.path, files.digest FROM paths
                  LEFT JOIN usage_fact_files AS files
-                   ON files.source = ?1 AND files.path = paths.path",
+                   ON files.source = ?1 AND files.path = paths.path
+                 WHERE paths.path IS NOT NULL",
             )?;
             statement
                 .query_map([filter.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?
         };
+        usage_timing(paths_start, || {
+            format!("{} canonical paths", filter.as_str())
+        });
+        let persist_start = Instant::now();
         let mut changed: HashSet<&str> = hashes
             .iter()
             .filter(|(path, digest)| previous.get(**path).and_then(Option::as_ref) != Some(*digest))
@@ -622,6 +642,13 @@ impl UsageCache {
         }
         write_fact_sync(&transaction, filter, fingerprint, warnings)?;
         transaction.commit()?;
+        usage_timing(persist_start, || {
+            format!(
+                "{} canonical writes ({} files)",
+                filter.as_str(),
+                changed.len()
+            )
+        });
         Ok(())
     }
 

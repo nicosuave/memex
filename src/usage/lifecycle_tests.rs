@@ -255,6 +255,96 @@ fn claude_query(temp: &tempfile::TempDir) -> UsageQuery {
 }
 
 #[test]
+fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
+    use super::cache::UsageCache;
+    use super::snapshot::{populate_after_failed_validation, validate_partition};
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let projects = temp.path().join("projects/memex");
+    fs::create_dir_all(&projects).unwrap();
+    let transcript = projects.join("session.jsonl");
+    fs::write(&transcript, claude_line("old", 10)).unwrap();
+    let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(temp.path().as_os_str()))]);
+    let query = claude_query(&temp);
+    let path = query.cache_path.as_deref().unwrap();
+    let key = (SourceFilter::Claude, query.cache_path.clone());
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+    lock_partitions().remove(&key);
+    fs::write(&transcript, claude_line("changed", 20)).unwrap();
+    let observed = validate_partition(SourceFilter::Claude, Some(path), None).unwrap();
+    assert!(!observed.valid);
+    // The supplied checkpoint predates this second mutation. The rebuilt
+    // assembly can answer, but its disk facts must not be marked synchronized.
+    fs::write(&transcript, claude_line("later", 300)).unwrap();
+    populate_after_failed_validation(SourceFilter::Claude, path, observed.fingerprint);
+    assert!(lock_partitions().contains_key(&key));
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 300);
+    assert!(
+        UsageCache::open(path)
+            .unwrap()
+            .fact_sync("claude")
+            .unwrap()
+            .is_none()
+    );
+    expire(&query);
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 300);
+    assert!(
+        validate_partition(SourceFilter::Claude, Some(path), None)
+            .unwrap()
+            .valid
+    );
+
+    // Exercise the actual cold query entry point with a stable changed source.
+    lock_partitions().remove(&key);
+    fs::write(&transcript, claude_line("final", 400)).unwrap();
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 400);
+    assert!(
+        validate_partition(SourceFilter::Claude, Some(path), None)
+            .unwrap()
+            .valid
+    );
+}
+
+#[test]
+fn failed_cold_validation_does_not_replace_a_snapshot_or_wait_for_refresh() {
+    use super::snapshot::{
+        USAGE_SCAN_LOCK, discovery_fingerprint, populate_after_failed_validation,
+    };
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let projects = temp.path().join("projects/memex");
+    fs::create_dir_all(&projects).unwrap();
+    let transcript = projects.join("session.jsonl");
+    fs::write(&transcript, claude_line("old", 10)).unwrap();
+    let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(temp.path().as_os_str()))]);
+    let query = claude_query(&temp);
+    let path = query.cache_path.as_deref().unwrap();
+    let key = (SourceFilter::Claude, query.cache_path.clone());
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+    let original = lock_partitions().get(&key).unwrap().assembly.clone();
+    fs::write(&transcript, claude_line("new", 200)).unwrap();
+    populate_after_failed_validation(
+        SourceFilter::Claude,
+        path,
+        discovery_fingerprint(SourceFilter::Claude),
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &original,
+        &lock_partitions().get(&key).unwrap().assembly
+    ));
+    lock_partitions().remove(&key);
+    let _refresh = USAGE_SCAN_LOCK.lock().unwrap();
+    populate_after_failed_validation(
+        SourceFilter::Claude,
+        path,
+        discovery_fingerprint(SourceFilter::Claude),
+    );
+    assert!(!lock_partitions().contains_key(&key));
+}
+
+#[test]
 fn rewriting_a_winner_recovers_unchanged_suppressed_occurrences() {
     let _guard = env_lock();
     for (replacement, expected) in [
