@@ -70,6 +70,18 @@ fetch "https://github.com/AppImage/appimagetool/releases/download/${appimagetool
 extract_tool "$deploy_image" "linuxdeploy"
 extract_tool "$plugin_image" "linuxdeploy-plugin-qt"
 extract_tool "$tool_image" "appimagetool"
+# The Qt plugin ships patchelf 0.15.0 independently of linuxdeploy. On
+# Fedora x86_64 it relocates .init without updating DT_INIT, so packaged
+# Qt plugins segfault when loaded. Use linuxdeploy's newer copy for both.
+deploy_patchelf="$tools_dir/linuxdeploy.AppDir/usr/bin/patchelf"
+patchelf_version="$("$deploy_patchelf" --version | awk '{print $2}')"
+if [[ -z "$patchelf_version" ]] || ! printf '%s\n' 0.19 "$patchelf_version" | sort -VC; then
+    echo "linuxdeploy must bundle patchelf >= 0.19 (found $patchelf_version)." >&2
+    exit 1
+fi
+ln -sfn ../../../linuxdeploy.AppDir/usr/bin/patchelf \
+    "$tools_dir/linuxdeploy-plugin-qt.AppDir/usr/bin/patchelf"
+echo "Using linuxdeploy's patchelf $patchelf_version for Qt deployment"
 # The tools bundle an ancient binutils strip that fails on modern system
 # libraries (`.relr.dyn`: "unknown type [0x13]"). Point the extracted
 # tools at the host strip, which matches the host toolchain that built
