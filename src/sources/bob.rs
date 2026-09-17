@@ -52,22 +52,27 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 
 const DATABASE_NAME: &str = "bob.db";
 
-/// Databases to index: `MEMEX_BOB_DB` (comma-separated, `~/` expanded) or `~/.bob/db/bob.db`.
-/// Spellings are kept as configured: state keys embed the database path, so a changed
-/// spelling reads as a new database.
+/// Databases to index: `MEMEX_BOB_DB` (comma-separated, `~/` expanded, duplicates dropped)
+/// or `~/.bob/db/bob.db`. Spellings are kept as configured: state keys embed the database
+/// path, so a changed spelling reads as a new database.
 pub fn database_paths() -> Vec<PathBuf> {
     std::env::var_os("MEMEX_BOB_DB")
         .map(|value| {
-            value
-                .to_string_lossy()
-                .split(',')
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(|path| match path.strip_prefix("~/") {
+            let mut paths: Vec<PathBuf> = Vec::new();
+            for path in value.to_string_lossy().split(',').map(str::trim) {
+                if path.is_empty() {
+                    continue;
+                }
+                let path = match path.strip_prefix("~/") {
                     Some(rest) => super::common::home().join(rest),
                     None => PathBuf::from(path),
-                })
-                .collect()
+                };
+                // A repeated entry would schedule every task twice against one checkpoint.
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            paths
         })
         .unwrap_or_else(|| vec![super::common::home().join(".bob/db").join(DATABASE_NAME)])
 }
@@ -1280,9 +1285,10 @@ mod tests {
         let _guard = crate::test_support::env_lock();
         let _env = crate::test_support::EnvVarGuard::set(&[(
             "MEMEX_BOB_DB",
-            Some("~/bob-a.db, /srv/bob-b.db"),
+            Some("~/bob-a.db, /srv/bob-b.db,/srv/bob-b.db, ~/bob-a.db"),
         )]);
         let paths = database_paths();
+        assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], super::super::common::home().join("bob-a.db"));
         assert_eq!(paths[1], Path::new("/srv/bob-b.db"));
     }

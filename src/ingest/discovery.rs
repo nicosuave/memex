@@ -246,6 +246,7 @@ pub(crate) fn start_journal_replay(
 fn journal_hints(
     journal: journal::ReplayHandle,
     state: &CheckpointSession,
+    options: &IngestOptions,
 ) -> Result<(
     Option<journal::JournalCursorUpdate>,
     Option<HashSet<PathBuf>>,
@@ -268,6 +269,15 @@ fn journal_hints(
                     .into_iter()
                     .map(PathBuf::from),
             );
+            // A Bob database with no indexed task yet has no checkpoint to sweep from;
+            // its first WAL-only commits still need a look on every journal refresh.
+            if options.include_bob {
+                paths.extend(
+                    crate::sources::bob::database_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -1215,7 +1225,7 @@ pub(super) fn prepare_refresh(
                 && state_path.exists()
                 && !state.clears_files() =>
         {
-            let (cursor, hints) = journal_hints(journal, &state)?;
+            let (cursor, hints) = journal_hints(journal, &state, options)?;
             journal_cursor = cursor;
             match hints {
                 Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
@@ -1233,7 +1243,7 @@ pub(super) fn prepare_refresh(
             // The hints cannot be used here, but the cursor was captured before anything was
             // read, so it still describes what this refresh is about to cover. Dropping it
             // would make the next refresh replay an interval this scan already handled.
-            let (cursor, _) = journal_hints(journal, &state)?;
+            let (cursor, _) = journal_hints(journal, &state, options)?;
             journal_cursor = cursor;
             selected
         }
