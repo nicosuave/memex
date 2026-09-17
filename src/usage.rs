@@ -17,6 +17,8 @@ mod cache;
 mod compact;
 mod facts;
 mod filter;
+#[cfg(test)]
+mod lifecycle_tests;
 mod merge;
 mod pricing;
 mod progress;

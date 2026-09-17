@@ -3,14 +3,13 @@
 //! Single-source queries read one partition; combined queries merge shared
 //! partitions; cold starts serve valid facts without building anything.
 
+use super::cache::UsageCache;
 use super::compact::UsageAssembly;
-use super::facts::{
-    FactRow, read_fact_points, read_fact_runs, scan_usage_from_facts, stored_warnings_for_scope,
-};
+use super::facts::{FactRow, read_fact_points, read_fact_runs, scan_usage_from_facts};
 use super::filter::filtered_events;
 use super::merge::{MergedPos, MergedView, filtered_merged_positions};
 use super::pricing::{PRICE_CATALOG_ID, RateCache, accumulate_usage_event, compute_cache_waste};
-use super::scan::SCANNERS;
+use super::scan::{FileFingerprint, SCANNERS};
 use super::snapshot::{
     MAX_PARTITIONS, MergedSnapshot, PartitionEntry, Snapshot, USAGE_SCAN_LOCK,
     check_partition_valid, discovery_fingerprint, ensure_snapshot, evict_oldest, lock_merged,
@@ -96,7 +95,12 @@ fn try_cold_serve_points(
         .cache_path
         .as_deref()
         .expect("cold serve needs a cache");
-    let points = read_fact_points(query, cache_path)?;
+    let Ok(points) = read_fact_points(query, cache_path) else {
+        return Ok(None);
+    };
+    if !ready.generations_current(cache_path) {
+        return Ok(None);
+    }
     if query.memo_ttl_ms != 0 {
         populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
     }
@@ -107,7 +111,27 @@ fn try_cold_serve_points(
 /// disk for the whole scope, plus the stored warnings to answer with.
 struct ColdFacts {
     warnings: Vec<String>,
-    per_source: Vec<(SourceFilter, Vec<String>)>,
+    per_source: Vec<ColdSource>,
+}
+
+struct ColdSource {
+    filter: SourceFilter,
+    warnings: Vec<String>,
+    fingerprint: FileFingerprint,
+    generation: String,
+}
+
+impl ColdFacts {
+    fn generations_current(&self, path: &Path) -> bool {
+        let Ok(cache) = UsageCache::open(path) else {
+            return false;
+        };
+        self.per_source.iter().all(|source| {
+            cache
+                .fact_generation(source.filter.as_str())
+                .is_ok_and(|current| current.as_deref() == Some(source.generation.as_str()))
+        })
+    }
 }
 
 /// Cold-start fast path prerequisites: no usable in-memory snapshot, but facts
@@ -142,18 +166,30 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
             }
         }
     }
-    // Whole-scope validity, then stored warnings. Either failing falls back.
+    // Capture the generation before validating/reading. Recheck after reads so
+    // a concurrent refresh cannot pair old rows with a newer checkpoint.
+    let cache = UsageCache::open(cache_path).ok()?;
+    let mut per_source = Vec::new();
     for (filter, _) in SCANNERS {
-        if query.source.is_none_or(|selected| selected == filter)
-            && !check_partition_valid(filter, Some(cache_path), &[])
-        {
+        if query.source.is_some_and(|selected| selected != filter) {
+            continue;
+        }
+        let generation = cache.fact_generation(filter.as_str()).ok()??;
+        let fingerprint = discovery_fingerprint(filter);
+        if !check_partition_valid(filter, Some(cache_path), Some(&fingerprint)) {
             return None;
         }
+        let (_, _, warnings) = cache.fact_sync(filter.as_str()).ok()??;
+        per_source.push(ColdSource {
+            filter,
+            warnings,
+            fingerprint,
+            generation,
+        });
     }
-    let per_source = stored_warnings_for_scope(query.source, cache_path)?;
     let warnings = per_source
         .iter()
-        .flat_map(|(_, warnings)| warnings.iter().cloned())
+        .flat_map(|source| source.warnings.iter().cloned())
         .collect();
     Some(ColdFacts {
         warnings,
@@ -168,12 +204,16 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
 fn populate_snapshots_from_facts(
     source: Option<SourceFilter>,
     cache_path: &Path,
-    per_source: &[(SourceFilter, Vec<String>)],
+    per_source: &[ColdSource],
 ) {
     let Ok(_refresh) = USAGE_SCAN_LOCK.try_lock() else {
         return;
     };
-    for (filter, warnings) in per_source {
+    let Ok(cache) = UsageCache::open(cache_path) else {
+        return;
+    };
+    for source in per_source {
+        let filter = &source.filter;
         if lock_partitions().contains_key(&(*filter, Some(cache_path.to_path_buf()))) {
             continue;
         }
@@ -185,7 +225,15 @@ fn populate_snapshots_from_facts(
             .flatten()
             .map(FactRow::into_event)
             .collect();
-        let fingerprint = discovery_fingerprint(*filter);
+        if cache
+            .fact_generation(filter.as_str())
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(source.generation.as_str())
+        {
+            continue;
+        }
         let assembly = Arc::new(UsageAssembly::new(events, None));
         let mut store = lock_partitions();
         if store.len() >= MAX_PARTITIONS {
@@ -196,9 +244,10 @@ fn populate_snapshots_from_facts(
             (*filter, Some(cache_path.to_path_buf())),
             PartitionEntry {
                 checked_at: Instant::now(),
-                fingerprint,
+                fingerprint: source.fingerprint.clone(),
+                fact_generation: Some(source.generation.clone()),
                 assembly,
-                warnings: Arc::new(warnings.clone()),
+                warnings: Arc::new(source.warnings.clone()),
             },
         );
     }
@@ -237,8 +286,7 @@ pub fn scan_usage(query: &UsageQuery) -> Result<UsageReport> {
         usage_timing(facts_start, || "facts report".to_string());
         match facts_report {
             Ok(facts_report)
-                if facts_report.events == report.events
-                    && facts_report.total_tokens == report.total_tokens =>
+                if serde_json::to_value(&facts_report)? == serde_json::to_value(&report)? =>
             {
                 return Ok(facts_report);
             }
@@ -272,7 +320,12 @@ fn try_cold_serve_report(query: &UsageQuery) -> Result<Option<UsageReport>> {
         .cache_path
         .as_deref()
         .expect("cold serve needs a cache");
-    let report = scan_usage_from_facts(query, cache_path, &ready.warnings)?;
+    let Ok(report) = scan_usage_from_facts(query, cache_path, &ready.warnings) else {
+        return Ok(None);
+    };
+    if !ready.generations_current(cache_path) {
+        return Ok(None);
+    }
     if query.memo_ttl_ms != 0 {
         populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
     }
@@ -642,12 +695,12 @@ mod tests {
             .map(|entry| entry.fingerprint.clone())
             .expect("snapshot published");
         assert!(
-            check_partition_valid(key.0, key.1.as_deref(), &fingerprint),
+            check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
             "unchanged corpus revalidates"
         );
         std::fs::write(&transcript, format!("{}{}", line(10), line(70))).expect("grow transcript");
         assert!(
-            !check_partition_valid(key.0, key.1.as_deref(), &fingerprint),
+            !check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
             "appended transcript invalidates"
         );
         // Let the 1ms TTL lapse so the next query revalidates instead of reusing.
@@ -658,9 +711,63 @@ mod tests {
             .map(|entry| entry.fingerprint.clone())
             .expect("snapshot republished");
         assert!(
-            check_partition_valid(key.0, key.1.as_deref(), &fingerprint),
+            check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
             "refreshed corpus revalidates"
         );
+    }
+
+    #[test]
+    fn hermes_wal_only_change_invalidates_partition() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("hermes");
+        std::fs::create_dir_all(&root).expect("create hermes root");
+        let db_path = root.join("state.db");
+        let conn = Connection::open(&db_path).expect("create db");
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, model TEXT, started_at INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, billing_provider TEXT, estimated_cost_usd REAL, cwd TEXT, git_repo_root TEXT, profile_name TEXT); \
+             INSERT INTO sessions VALUES ('s1', 'model', 1000, 10, 5, 0, 0, 0, NULL, NULL, '/repo/memex', NULL, NULL);",
+        )
+        .expect("seed session");
+        drop(conn);
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+        let cache = tmp.path().join("usage-cache.sqlite3");
+        let query = UsageQuery {
+            source: Some(SourceFilter::Hermes),
+            cache_path: Some(cache.clone()),
+            memo_ttl_ms: 60_000,
+            ..UsageQuery::default()
+        };
+        let key = (SourceFilter::Hermes, Some(cache));
+
+        let first = scan_usage(&query).expect("warm scan");
+        assert!(first.events > 0, "seeded session is counted");
+        let fingerprint = lock_partitions()
+            .get(&key)
+            .map(|entry| entry.fingerprint.clone())
+            .expect("snapshot published");
+        assert!(check_partition_valid(
+            key.0,
+            key.1.as_deref(),
+            Some(&fingerprint)
+        ));
+        // Commits landing entirely in the WAL leave the main file's metadata
+        // untouched: the listing fingerprint cannot see them, so only the
+        // recorded WAL dependency keeps the check honest.
+        let wal = db_path.with_extension("db-wal");
+        std::fs::write(&wal, "wal-1").expect("write wal");
+        assert!(
+            !check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
+            "WAL-only change invalidates"
+        );
+        std::fs::remove_file(&wal).expect("remove wal");
+        assert!(check_partition_valid(
+            key.0,
+            key.1.as_deref(),
+            Some(&fingerprint)
+        ));
     }
 
     #[test]

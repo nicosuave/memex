@@ -176,7 +176,7 @@ mod tests {
         sort_usage_events(&mut b);
         let parts = vec![
             Arc::new(UsageAssembly::new(a.clone(), None)),
-            Arc::new(UsageAssembly::Owned(b.clone())),
+            Arc::new(UsageAssembly::new(b.clone(), None)),
         ];
         let order = build_merged_order(&parts);
         let mut combined = [a, b].concat();

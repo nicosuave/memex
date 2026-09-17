@@ -4,7 +4,6 @@
 //! refreshes and cold starts can skip blob decoding. Writes are atomic per
 //! partition (or per changed-file set) together with the freshness fingerprint.
 
-use super::cache::UsageCache;
 use super::compact::{FilterFields, UsageEventView};
 use super::filter::FilterPlan;
 use super::merge::{MergedPos, merge_runs};
@@ -59,7 +58,7 @@ fn read_fact_point_runs(
                 query.push_str(" AND timestamp_ms < ?");
                 params.push((until as i64).into());
             }
-            query.push_str(" ORDER BY ordinal, timestamp_ms, path, source_order");
+            query.push_str(" ORDER BY ordinal, timestamp_ms, path, source_order, row_idx");
             let mut statement = connection.prepare(&query)?;
             let rows = statement
                 .query_map(params_from_iter(params), |row| {
@@ -95,24 +94,6 @@ fn read_fact_point_runs(
         }
     }
     Ok(runs)
-}
-
-/// Stored per-source warnings in scanner order, for cold-start reports. `None`
-/// on any gap (missing sync row, unreadable database): the caller falls back to
-/// a normal scan, which heals it.
-pub(crate) fn stored_warnings_for_scope(
-    source: Option<SourceFilter>,
-    cache_path: &Path,
-) -> Option<Vec<(SourceFilter, Vec<String>)>> {
-    let cache = UsageCache::open(cache_path).ok()?;
-    let mut per_source = Vec::new();
-    for (filter, _) in SCANNERS {
-        if source.is_none_or(|selected| selected == filter) {
-            let (_, _, warnings) = cache.fact_sync(filter.as_str()).ok()??;
-            per_source.push((filter, warnings));
-        }
-    }
-    Some(per_source)
 }
 
 pub(crate) fn read_fact_points(
@@ -292,7 +273,7 @@ pub(crate) fn read_ordinal_run(
         query.push_str(" AND timestamp_ms < ?");
         params.push((until as i64).into());
     }
-    query.push_str(" ORDER BY ordinal, timestamp_ms, path, source_order");
+    query.push_str(" ORDER BY ordinal, timestamp_ms, path, source_order, row_idx");
     let mut statement = connection.prepare(&query)?;
     let rows = statement
         .query_map(params_from_iter(params), map_fact_row)?
@@ -588,6 +569,242 @@ mod tests {
             serde_json::to_value(&refreshed).unwrap(),
             serde_json::to_value(&legacy).unwrap(),
             "facts-backed refresh matches a legacy rebuild"
+        );
+    }
+
+    #[test]
+    fn oneshot_scan_keeps_facts_consistent_for_later_refresh() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        let line = |id: &str, input: u64| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&projects.join("a.jsonl"), line("m-10", 10)).expect("write transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let retaining = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            memo_ttl_ms: 1,
+            ..UsageQuery::default()
+        };
+        assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 10);
+        std::fs::write(
+            &projects.join("a.jsonl"),
+            format!("{}{}", line("m-10", 10), line("m-30", 30)),
+        )
+        .expect("grow transcript");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // A one-shot serves fresh and maintains the facts it touched: blobs
+        // and facts must agree afterwards, or the next facts-backed refresh
+        // would serve the pre-append rows as current.
+        let oneshot = UsageQuery {
+            memo_ttl_ms: 0,
+            ..retaining.clone()
+        };
+        assert_eq!(
+            scan_usage(&oneshot).expect("one-shot scan").total_tokens,
+            40
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let refreshed = scan_usage(&retaining).expect("later refresh");
+        assert_eq!(refreshed.total_tokens, 40);
+        let legacy = scan_usage(&UsageQuery {
+            cache_path: Some(tmp.path().join("fresh-cache.sqlite3")),
+            ..retaining.clone()
+        })
+        .expect("legacy rebuild");
+        assert_eq!(
+            serde_json::to_value(&refreshed).unwrap(),
+            serde_json::to_value(&legacy).unwrap(),
+            "post-one-shot refresh matches a legacy rebuild"
+        );
+    }
+
+    #[test]
+    fn facts_advanced_elsewhere_invalidate_retained_snapshots() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        let line = |id: &str, input: u64| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&projects.join("a.jsonl"), line("m-10", 10)).expect("write transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let retaining = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            memo_ttl_ms: 50,
+            ..UsageQuery::default()
+        };
+        assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 10);
+        std::fs::write(
+            &projects.join("a.jsonl"),
+            format!("{}{}", line("m-10", 10), line("m-30", 30)),
+        )
+        .expect("grow transcript");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // An external writer (here a one-shot in the same cache database)
+        // advances disk and facts past the retained snapshot.
+        let oneshot = UsageQuery {
+            memo_ttl_ms: 0,
+            ..retaining.clone()
+        };
+        assert_eq!(
+            scan_usage(&oneshot).expect("one-shot scan").total_tokens,
+            40
+        );
+        // Past the TTL the old snapshot must not serve: disk-vs-facts
+        // agreement alone would reuse it even though its generation is stale.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let refreshed = scan_usage(&retaining).expect("expired refresh");
+        assert_eq!(refreshed.total_tokens, 40);
+    }
+
+    #[test]
+    fn deleted_reconcile_winner_resurrects_the_loser() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        // Same (message, request) in two files: the 70-token copy wins the
+        // reconcile, so facts store only the winner.
+        let line = |input: u64| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"shared","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&projects.join("a.jsonl"), line(10)).expect("write loser");
+        std::fs::write(&projects.join("b.jsonl"), line(70)).expect("write winner");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let retaining = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            memo_ttl_ms: 1,
+            ..UsageQuery::default()
+        };
+        assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 70);
+        // Deleting the winner must resurrect the loser (which the facts never
+        // stored), so the refresh has to fall back to the legacy full rebuild.
+        std::fs::remove_file(&projects.join("b.jsonl")).expect("delete winner");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let refreshed = scan_usage(&retaining).expect("refresh after delete");
+        assert_eq!(refreshed.total_tokens, 10);
+        let legacy = scan_usage(&UsageQuery {
+            cache_path: Some(tmp.path().join("fresh-cache.sqlite3")),
+            ..retaining.clone()
+        })
+        .expect("legacy rebuild");
+        assert_eq!(
+            serde_json::to_value(&refreshed).unwrap(),
+            serde_json::to_value(&legacy).unwrap(),
+            "post-delete refresh matches a legacy rebuild"
+        );
+    }
+
+    #[test]
+    fn new_file_stealing_the_reconcile_win_rebuilds() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        let line = |input: u64| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"shared","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&projects.join("a.jsonl"), line(10)).expect("write transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let retaining = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            memo_ttl_ms: 1,
+            ..UsageQuery::default()
+        };
+        assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 10);
+        // A new file claims the same (message, request) with more tokens: the
+        // stored hit must lose, so per-file upsert cannot apply and the
+        // refresh falls back to the legacy full rebuild (no double count).
+        std::fs::write(&projects.join("b.jsonl"), line(70)).expect("write challenger");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let refreshed = scan_usage(&retaining).expect("refresh after steal");
+        assert_eq!(refreshed.total_tokens, 70);
+        let legacy = scan_usage(&UsageQuery {
+            cache_path: Some(tmp.path().join("fresh-cache.sqlite3")),
+            ..retaining.clone()
+        })
+        .expect("legacy rebuild");
+        assert_eq!(
+            serde_json::to_value(&refreshed).unwrap(),
+            serde_json::to_value(&legacy).unwrap(),
+            "post-steal refresh matches a legacy rebuild"
+        );
+    }
+
+    #[test]
+    fn tied_reconcile_win_does_not_flip_on_refresh() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).expect("create projects");
+        // Same (message, request, tokens) in two files: the reconcile tie
+        // breaks toward discovery order. Warm with only the later path, then
+        // add a tied copy on a discovery-earlier path: the legacy rebuild
+        // flips the win to the newcomer.
+        let line = |id: &str, timestamp_ms: u64, input: u64| {
+            format!(
+                r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":{timestamp_ms},"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
+            ) + "\n"
+        };
+        std::fs::write(&projects.join("z.jsonl"), line("shared", 2, 10)).expect("write transcript");
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
+        let retaining = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            cache_path: Some(tmp.path().join("usage-cache.sqlite3")),
+            memo_ttl_ms: 1,
+            ..UsageQuery::default()
+        };
+        let cold = scan_usage(&retaining).expect("cold scan");
+        assert_eq!(cold.events, 1);
+        assert_eq!(cold.details[0].timestamp_ms, 2000);
+        // The newcomer shares the reconcile key, so per-file upsert cannot
+        // apply: re-running the reconcile over stored hits first would keep
+        // the old winner instead of flipping to the discovery-earlier copy.
+        std::fs::write(&projects.join("a.jsonl"), line("shared", 1, 10)).expect("write challenger");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let refreshed = scan_usage(&retaining).expect("refresh");
+        assert_eq!(refreshed.events, 1);
+        let legacy = scan_usage(&UsageQuery {
+            cache_path: Some(tmp.path().join("fresh-cache.sqlite3")),
+            ..retaining.clone()
+        })
+        .expect("legacy rebuild");
+        assert_eq!(legacy.details[0].timestamp_ms, 1000);
+        assert_eq!(
+            serde_json::to_value(&refreshed).unwrap(),
+            serde_json::to_value(&legacy).unwrap(),
+            "refresh flips to the discovery-earlier winner like a legacy rebuild"
         );
     }
 

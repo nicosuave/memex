@@ -12,10 +12,9 @@ pub(crate) type UsageEventView<'a> = UsageEventData<&'a str, &'a str>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct StringId(NonZeroUsize);
 
-pub(crate) enum UsageAssembly {
-    Owned(Vec<UsageEvent>),
-    Compact(CompactUsageAssembly),
-}
+/// Retained usage events: every assembly is compacted (dictionary-encoded
+/// text), so filtering and reporting borrow instead of cloning per event.
+pub(crate) struct UsageAssembly(CompactUsageAssembly);
 
 pub(crate) struct FilterFields<'a> {
     pub source: &'static str,
@@ -26,48 +25,29 @@ pub(crate) struct FilterFields<'a> {
 
 impl UsageAssembly {
     pub fn new(events: Vec<UsageEvent>, previous: Option<Self>) -> Self {
-        let previous = match previous {
-            Some(Self::Compact(assembly)) => Some(assembly),
-            _ => None,
-        };
-        Self::Compact(CompactUsageAssembly::new(events, previous))
+        Self(CompactUsageAssembly::new(
+            events,
+            previous.map(|assembly| assembly.0),
+        ))
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::Owned(events) => events.len(),
-            Self::Compact(assembly) => assembly.events.len(),
-        }
+        self.0.events.len()
     }
 
     pub fn timestamp_ms(&self, index: usize) -> u64 {
-        match self {
-            Self::Owned(events) => events[index].timestamp_ms,
-            Self::Compact(assembly) => assembly.events[index].timestamp_ms,
-        }
+        self.0.events[index].timestamp_ms
     }
 
     /// Global sort key: timestamp, source path, then source order. Merging
     /// partitions by this key reproduces the combined assembly's sort exactly.
     pub fn sort_key(&self, index: usize) -> (u64, &str, u64) {
-        match self {
-            Self::Owned(events) => {
-                let event = &events[index];
-                (
-                    event.timestamp_ms,
-                    event.source_path.as_ref(),
-                    event.source_order,
-                )
-            }
-            Self::Compact(assembly) => {
-                let event = &assembly.events[index];
-                (
-                    event.timestamp_ms,
-                    assembly.text(event.source_path),
-                    event.source_order,
-                )
-            }
-        }
+        let event = &self.0.events[index];
+        (
+            event.timestamp_ms,
+            self.0.text(event.source_path),
+            event.source_order,
+        )
     }
 
     /// Lower bound of `since` in the timestamp-sorted assembly.
@@ -101,47 +81,25 @@ impl UsageAssembly {
     }
 
     pub fn filter_fields(&self, index: usize) -> FilterFields<'_> {
-        match self {
-            Self::Owned(events) => {
-                let event = &events[index];
-                FilterFields {
-                    source: event.source,
-                    permission_review: event.permission_review,
-                    project: event.project.as_deref(),
-                    session_id: event.session_id.as_deref(),
-                }
-            }
-            Self::Compact(assembly) => {
-                let event = &assembly.events[index];
-                FilterFields {
-                    source: event.source,
-                    permission_review: event.permission_review,
-                    project: event.project.map(|id| assembly.text(id)),
-                    session_id: event.session_id.map(|id| assembly.text(id)),
-                }
-            }
+        let event = &self.0.events[index];
+        FilterFields {
+            source: event.source,
+            permission_review: event.permission_review,
+            project: event.project.map(|id| self.0.text(id)),
+            session_id: event.session_id.map(|id| self.0.text(id)),
         }
     }
 
     pub fn activity_point(&self, index: usize) -> UsageActivityPoint {
-        match self {
-            Self::Owned(events) => events[index].activity_point(),
-            Self::Compact(assembly) => assembly.events[index].activity_point(),
-        }
+        self.0.events[index].activity_point()
     }
 
     pub fn view(&self, index: usize) -> UsageEventView<'_> {
-        match self {
-            Self::Owned(events) => events[index].view(),
-            Self::Compact(assembly) => assembly.view(index),
-        }
+        self.0.view(index)
     }
 
     pub fn details(&self, indices: impl Iterator<Item = usize>) -> Vec<UsageEvent> {
-        match self {
-            Self::Owned(events) => indices.map(|index| events[index].clone()).collect(),
-            Self::Compact(assembly) => assembly.details(indices),
-        }
+        self.0.details(indices)
     }
 }
 
@@ -280,7 +238,6 @@ mod tests {
         empty.source_order = 0;
         let original = vec![event, empty];
         let assembly = CompactUsageAssembly::new(original.clone(), None);
-        let owned = UsageAssembly::Owned(original.clone());
         for (index, expected) in original.iter().enumerate() {
             let actual = assembly.event(index);
             assert_eq!(
@@ -294,10 +251,6 @@ mod tests {
             assert_eq!(actual.source_order, expected.source_order);
             assert_eq!(
                 serde_json::to_value(assembly.view(index)).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-            assert_eq!(
-                serde_json::to_value(owned.view(index)).unwrap(),
                 serde_json::to_value(expected).unwrap()
             );
         }
@@ -388,32 +341,6 @@ impl<S, P> UsageEventData<S, P> {
             provider: self.provider.map(&mut map),
             model: self.model.map(&mut map),
             tokens: self.tokens,
-            source_cost_usd: self.source_cost_usd,
-            cost_authoritative: self.cost_authoritative,
-            dedupe_confidence: self.dedupe_confidence,
-            conservative_undercount: self.conservative_undercount,
-            cache_chain_excluded: self.cache_chain_excluded,
-            sidechain: self.sidechain,
-            permission_review: self.permission_review,
-            source_order: self.source_order,
-        }
-    }
-}
-
-impl UsageEvent {
-    fn view(&self) -> UsageEventView<'_> {
-        UsageEventData {
-            source: self.source,
-            source_path: &self.source_path,
-            source_record_id: self.source_record_id.as_deref(),
-            session_id: self.session_id.as_deref(),
-            request_id: self.request_id.as_deref(),
-            message_id: self.message_id.as_deref(),
-            timestamp_ms: self.timestamp_ms,
-            project: self.project.as_deref(),
-            provider: self.provider.as_deref(),
-            model: self.model.as_deref(),
-            tokens: self.tokens.clone(),
             source_cost_usd: self.source_cost_usd,
             cost_authoritative: self.cost_authoritative,
             dedupe_confidence: self.dedupe_confidence,

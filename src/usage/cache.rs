@@ -13,6 +13,7 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,6 +141,9 @@ impl CachedUsageEvent {
 
 pub(crate) struct UsageCache {
     pub(crate) connection: Connection,
+    // Serializes multi-transaction refreshes across processes. Blob chunks can
+    // still commit independently so interrupted scans retain their progress.
+    _refresh_lock: Option<File>,
 }
 
 pub(crate) struct CachedFileRow {
@@ -180,6 +184,24 @@ impl From<LegacyUsageFileDep> for UsageFileDep {
 }
 
 impl UsageCache {
+    pub(crate) fn open_for_refresh(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".refresh.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock.lock()?;
+        let mut cache = Self::open(path)?;
+        cache._refresh_lock = Some(lock);
+        Ok(cache)
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -220,74 +242,132 @@ impl UsageCache {
                  events_blob BLOB NOT NULL,
                  deps_blob BLOB NOT NULL,
                  PRIMARY KEY (source, path)
-             );
-             CREATE TABLE IF NOT EXISTS usage_facts (
-                 source TEXT NOT NULL,
-                 path TEXT NOT NULL,
-                 source_order INTEGER NOT NULL,
-                 ordinal INTEGER NOT NULL,
-                 timestamp_ms INTEGER NOT NULL,
-                 session_id TEXT,
-                 project TEXT,
-                 provider TEXT,
-                 model TEXT,
-                 source_record_id TEXT,
-                 request_id TEXT,
-                 message_id TEXT,
-                 raw_input INTEGER NOT NULL DEFAULT 0,
-                 uncached_input INTEGER NOT NULL DEFAULT 0,
-                 cache_read INTEGER NOT NULL DEFAULT 0,
-                 cache_write INTEGER NOT NULL DEFAULT 0,
-                 cache_write_1h INTEGER NOT NULL DEFAULT 0,
-                 output INTEGER NOT NULL DEFAULT 0,
-                 reasoning INTEGER NOT NULL DEFAULT 0,
-                 source_cost_usd REAL,
-                 cost_authoritative INTEGER NOT NULL DEFAULT 0,
-                 dedupe_confidence TEXT NOT NULL DEFAULT '',
-                 conservative_undercount INTEGER NOT NULL DEFAULT 0,
-                 cache_chain_excluded INTEGER NOT NULL DEFAULT 0,
-                 sidechain INTEGER NOT NULL DEFAULT 0,
-                 permission_review INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY (source, path, source_order)
-             );
-             CREATE INDEX IF NOT EXISTS usage_facts_time
-                 ON usage_facts(timestamp_ms);
-             CREATE INDEX IF NOT EXISTS usage_facts_session
-                 ON usage_facts(source, session_id);
-             -- Per-source report order, served straight from the index with no
-             -- sort step, including time-bounded ranges.
-             CREATE INDEX IF NOT EXISTS usage_facts_source_time
-                 ON usage_facts(ordinal, timestamp_ms, path, source_order);
-             -- Facts freshness per source: fingerprint of the file set the facts
-             -- were built from (full identity for plain logs, paths only for
-             -- volatile databases, whose bytes are judged by reuse windows),
-             -- plus the parser version that built them and the warnings that
-             -- build reported. Written atomically with the facts themselves, so
-             -- a match means the facts (and their warnings) are current.
-              CREATE TABLE IF NOT EXISTS usage_fact_sync (
-                  source TEXT PRIMARY KEY,
-                  fingerprint TEXT NOT NULL,
-                  parser_version INTEGER NOT NULL,
-                  warnings TEXT NOT NULL DEFAULT '[]'
-              );",
+             );",
         )?;
-        // Migrate sync rows written before warnings were recorded: absent column
-        // reads as missing (forcing one legacy rebuild), but keep them readable.
-        let sync_columns: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('usage_fact_sync')
-             WHERE name = 'warnings'",
-            [],
-            |row| row.get(0),
-        )?;
-        if sync_columns < 1 {
-            connection.execute_batch(
-                "ALTER TABLE usage_fact_sync ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]';",
+        // Pre-row_idx facts keyed (source, path, source_order): files with
+        // several same-order events (every Cursor database) could never
+        // insert, and surviving rows predate the refresh reconcile gates.
+        // Facts are disposable derived state, so drop them — and their sync
+        // rows, which would otherwise validate an empty table — and let the
+        // next refresh rebuild through the legacy path.
+        /// Canonical facts DDL. `row_idx` is the event's position within its file's
+        /// contribution (not a timestamp): sources like Cursor emit many events with
+        /// identical `(timestamp, source_order)`, so the old `(source, path,
+        /// source_order)` key collided and every multi-event file failed its facts
+        /// write. Reads break ties with `row_idx` after the report keys, which
+        /// reproduces the assembly order exactly: a file's rows are always written in
+        /// sorted order, so its `row_idx` subsequence preserves it.
+        const FACTS_DDL: &str = "CREATE TABLE IF NOT EXISTS usage_facts (
+                  source TEXT NOT NULL,
+                  path TEXT NOT NULL,
+                  row_idx INTEGER NOT NULL DEFAULT 0,
+                  source_order INTEGER NOT NULL,
+                  ordinal INTEGER NOT NULL,
+                  timestamp_ms INTEGER NOT NULL,
+                  session_id TEXT,
+                  project TEXT,
+                  provider TEXT,
+                  model TEXT,
+                  source_record_id TEXT,
+                  request_id TEXT,
+                  message_id TEXT,
+                  raw_input INTEGER NOT NULL DEFAULT 0,
+                  uncached_input INTEGER NOT NULL DEFAULT 0,
+                  cache_read INTEGER NOT NULL DEFAULT 0,
+                  cache_write INTEGER NOT NULL DEFAULT 0,
+                  cache_write_1h INTEGER NOT NULL DEFAULT 0,
+                  output INTEGER NOT NULL DEFAULT 0,
+                  reasoning INTEGER NOT NULL DEFAULT 0,
+                  source_cost_usd REAL,
+                  cost_authoritative INTEGER NOT NULL DEFAULT 0,
+                  dedupe_confidence TEXT NOT NULL DEFAULT '',
+                  conservative_undercount INTEGER NOT NULL DEFAULT 0,
+                  cache_chain_excluded INTEGER NOT NULL DEFAULT 0,
+                  sidechain INTEGER NOT NULL DEFAULT 0,
+                  permission_review INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY (source, path, row_idx)
+              );
+              CREATE INDEX IF NOT EXISTS usage_facts_time
+                  ON usage_facts(timestamp_ms);
+              CREATE INDEX IF NOT EXISTS usage_facts_session
+                  ON usage_facts(source, session_id);
+              -- Per-source report order, served straight from the index with no
+              -- sort step, including time-bounded ranges. `row_idx` is the
+              -- final tiebreak so equal-key rows come out deterministic.
+              -- Old-schema databases lose their facts table (and sync rows) to
+              -- the row_idx migration above, so their indexes are rebuilt
+              -- together with the table; steady-state opens hit the IF NOT
+              -- EXISTS no-op below instead of rebuilding the index every time.
+              CREATE INDEX IF NOT EXISTS usage_facts_source_time
+                  ON usage_facts(ordinal, timestamp_ms, path, source_order, row_idx);
+              -- Facts freshness per source: fingerprint of the file set the facts
+              -- were built from (full identity for plain logs, paths only for
+              -- volatile databases, whose bytes are judged by reuse windows),
+              -- plus the parser version that built them and the warnings that
+              -- build reported. Written atomically with the facts themselves, so
+              -- a match means the facts (and their warnings) are current.
+               CREATE TABLE IF NOT EXISTS usage_fact_sync (
+                   source TEXT PRIMARY KEY,
+                   fingerprint TEXT NOT NULL,
+                   parser_version INTEGER NOT NULL,
+                   generation TEXT NOT NULL,
+                   warnings TEXT NOT NULL DEFAULT '[]'
+               );";
+        // Inspect before creating indexes that reference the new columns. DDL
+        // and sync invalidation commit together: interruption cannot leave an
+        // old checkpoint validating a newly empty facts table.
+        let schema_current = |connection: &Connection| -> rusqlite::Result<bool> {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_facts') WHERE name = 'row_idx')
+                    AND EXISTS(SELECT 1 FROM pragma_table_info('usage_fact_sync') WHERE name = 'generation')",
+                [],
+                |row| row.get(0),
+            )
+        };
+        if !schema_current(&connection)? {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &connection,
+                rusqlite::TransactionBehavior::Immediate,
             )?;
+            // Another process may have migrated while this connection waited.
+            if !schema_current(&transaction)? {
+                transaction.execute_batch(
+                    "DROP TABLE IF EXISTS usage_facts;
+                     DROP TABLE IF EXISTS usage_fact_sync;",
+                )?;
+                transaction.execute_batch(FACTS_DDL)?;
+            }
+            transaction.commit()?;
         }
+        connection.execute_batch(FACTS_DDL)?;
+        if event_format != 1 || current_columns < 2 {
+            connection.execute("DELETE FROM usage_fact_sync", [])?;
+        }
+        // A blob update is not a facts update. Invalidate in the same SQLite
+        // transaction, including deletes/quarantines and writes from other
+        // connections, so an interrupted refresh cannot bless old facts with
+        // new blob metadata.
+        connection.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS usage_blob_insert_invalidates_facts
+             AFTER INSERT ON usage_file_cache BEGIN
+                 DELETE FROM usage_fact_sync WHERE source = NEW.source;
+             END;
+             CREATE TRIGGER IF NOT EXISTS usage_blob_update_invalidates_facts
+             AFTER UPDATE ON usage_file_cache BEGIN
+                 DELETE FROM usage_fact_sync WHERE source IN (OLD.source, NEW.source);
+             END;
+             CREATE TRIGGER IF NOT EXISTS usage_blob_delete_invalidates_facts
+             AFTER DELETE ON usage_file_cache BEGIN
+                 DELETE FROM usage_fact_sync WHERE source = OLD.source;
+             END;",
+        )?;
         // No VACUUM on the report path: it runs synchronously under the scan lock and
         // causes occasional large latency spikes. Run `vacuum_if_bloated` explicitly
         // from maintenance instead.
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _refresh_lock: None,
+        })
     }
 
     /// Chunked saves rewrite blob rows continuously and freed pages are never returned to
@@ -505,6 +585,26 @@ impl UsageCache {
         )
         .transpose()
     }
+
+    /// Identity of the committed facts that a snapshot actually loaded. This
+    /// changes even when source filenames/mtimes do not (e.g. WAL updates).
+    pub(crate) fn fact_generation(&self, source: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT generation FROM usage_fact_sync WHERE source = ?1",
+                [source],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn invalidate_facts(&self, source: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM usage_fact_sync WHERE source = ?1", [source])?;
+        Ok(())
+    }
 }
 
 /// Insert canonical fact rows. The caller owns atomicity (same transaction as any
@@ -519,7 +619,7 @@ fn insert_fact_events(
     let ordinal = source_ordinal(filter) as i64;
     let mut statement = connection.prepare(
         "INSERT INTO usage_facts(
-             source, path, source_order, ordinal, timestamp_ms, session_id,
+             source, path, row_idx, source_order, ordinal, timestamp_ms, session_id,
              project, provider, model, source_record_id, request_id, message_id,
              raw_input, uncached_input, cache_read, cache_write, cache_write_1h,
              output, reasoning, source_cost_usd, cost_authoritative,
@@ -527,14 +627,24 @@ fn insert_fact_events(
              sidechain, permission_review
          ) VALUES (
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+             ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
          )",
     )?;
+    // Per-file positions, in insertion order. Callers insert in sorted order
+    // (full rewrites) or sorted-filtered order (upserts), so each file's
+    // subsequence preserves the report order and `row_idx` reproduces it as
+    // the final read tiebreak.
+    let mut per_file: HashMap<&str, i64> = HashMap::new();
     for event in events {
         debug_assert_eq!(event.source, filter.as_str());
+        let path: &str = event.source_path.as_ref();
+        let row_idx = per_file.entry(path).or_insert(0);
+        let current = *row_idx;
+        *row_idx += 1;
         statement.execute(params![
             filter.as_str(),
-            event.source_path.as_ref(),
+            path,
+            current,
             event.source_order as i64,
             ordinal,
             event.timestamp_ms as i64,
@@ -575,12 +685,13 @@ pub(crate) fn write_fact_sync(
     warnings: &[String],
 ) -> Result<()> {
     connection.execute(
-        "INSERT INTO usage_fact_sync(source, fingerprint, parser_version, warnings)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO usage_fact_sync(source, fingerprint, parser_version, warnings, generation)
+         VALUES (?1, ?2, ?3, ?4, hex(randomblob(16)))
          ON CONFLICT(source) DO UPDATE SET
              fingerprint = excluded.fingerprint,
              parser_version = excluded.parser_version,
-             warnings = excluded.warnings",
+             warnings = excluded.warnings,
+             generation = excluded.generation",
         params![
             filter.as_str(),
             fingerprint_files(&stable_triples(filter, fingerprint)),
@@ -670,6 +781,78 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn old_facts_schema_migrates_without_trusting_its_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        let cache = UsageCache::open(&path).unwrap();
+        cache
+            .connection
+            .execute_batch(
+                "DROP TABLE usage_facts;
+             DROP TABLE usage_fact_sync;
+             CREATE TABLE usage_facts (
+                 source TEXT, path TEXT, source_order INTEGER,
+                 PRIMARY KEY (source, path, source_order));
+             INSERT INTO usage_facts VALUES ('cursor', 'state.vscdb', 0);
+             CREATE TABLE usage_fact_sync (
+                 source TEXT PRIMARY KEY, fingerprint TEXT, parser_version INTEGER);
+             INSERT INTO usage_fact_sync VALUES ('cursor', 'old-checkpoint', 1);",
+            )
+            .unwrap();
+        drop(cache);
+        // No old index is present: migration must precede new index creation.
+        let mut migrated = UsageCache::open(&path).unwrap();
+        assert!(migrated.fact_sync("cursor").unwrap().is_none());
+        let mut event = cache_event("session", 0, "model", 10, 0, 0);
+        event.source = "cursor";
+        let other = event.clone();
+        migrated
+            .replace_partition_facts(SourceFilter::Cursor, &[event, other], &[], &[])
+            .unwrap();
+        let rows: u64 = migrated
+            .connection
+            .query_row("SELECT count(*) FROM usage_facts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert!(migrated.fact_generation("cursor").unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_facts_migration_rolls_back_the_old_rows_and_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache.sqlite3");
+        let cache = UsageCache::open(&path).unwrap();
+        cache
+            .connection
+            .execute_batch(
+                "DROP TABLE usage_facts;
+             DROP TABLE usage_fact_sync;
+             CREATE TABLE usage_facts (source TEXT, source_order INTEGER);
+             INSERT INTO usage_facts VALUES ('cursor', 0);
+             CREATE TABLE usage_fact_sync (source TEXT, fingerprint TEXT);
+             INSERT INTO usage_fact_sync VALUES ('cursor', 'old-checkpoint');
+             CREATE TABLE usage_facts_time (block_index_creation INTEGER);",
+            )
+            .unwrap();
+        drop(cache);
+        assert!(
+            UsageCache::open(&path).is_err(),
+            "conflicting schema must abort migration"
+        );
+        let connection = Connection::open(&path).unwrap();
+        let rows: u64 = connection
+            .query_row("SELECT count(*) FROM usage_facts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "old facts restored when DDL fails");
+        let fingerprint: String = connection
+            .query_row("SELECT fingerprint FROM usage_fact_sync", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fingerprint, "old-checkpoint");
+    }
 
     #[test]
     fn usage_event_layout_change_rebuilds_cached_rows() {
@@ -799,6 +982,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn same_order_facts_rows_do_not_collide() {
+        // Cursor emits every event of a database with source_order 0; the
+        // old (source, path, source_order) key rejected all but one row per
+        // file and every such facts write failed.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("usage-cache.sqlite3");
+        let mut cache = UsageCache::open(&path).expect("open cache");
+        let event = |record: &str| UsageEvent {
+            source: "cursor",
+            source_path: Arc::from("/tmp/state.vscdb"),
+            source_record_id: Some(record.to_string()),
+            session_id: Some("session".to_string()),
+            request_id: None,
+            message_id: None,
+            timestamp_ms: 1000,
+            project: None,
+            provider: None,
+            model: None,
+            tokens: TokenBuckets::disjoint(10, 0, 0, 5),
+            source_cost_usd: None,
+            cost_authoritative: false,
+            dedupe_confidence: "exact",
+            conservative_undercount: false,
+            cache_chain_excluded: false,
+            sidechain: false,
+            permission_review: false,
+            source_order: 0,
+        };
+        let events = vec![event("a"), event("b")];
+        cache
+            .replace_partition_facts(crate::types::SourceFilter::Cursor, &events, &[], &[])
+            .expect("facts write");
+        let rows: i64 = cache
+            .connection
+            .query_row(
+                "SELECT count(*) FROM usage_facts WHERE source = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        // Equal-key rows read back deterministic in write order (row_idx
+        // tiebreak), matching the assembly order exactly.
+        let runs = super::super::facts::read_fact_runs(
+            &path,
+            Some(crate::types::SourceFilter::Cursor),
+            None,
+            None,
+        )
+        .expect("read facts");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0]
+                .iter()
+                .map(|row| row.source_record_id.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("a".to_string()), Some("b".to_string())]
+        );
     }
 
     #[test]

@@ -13,9 +13,8 @@ use super::merge::{MergedPos, build_merged_order};
 use super::progress::{UsageScanProgress, publish_scan_progress};
 use super::scan::{
     FileFingerprint, PARSE_SAVE_CHUNK, SCANNERS, deps_observed_current, fingerprint_files,
-    parse_missing_usage_files, parse_source_file, reconcile_source_partition,
-    run_partition_scanner, source_files, source_ordinal, source_spec, stable_triples,
-    usage_file_metadata,
+    parse_missing_usage_files, parse_source_file, run_partition_scanner, source_files,
+    source_ordinal, source_spec, stable_triples, usage_file_metadata,
 };
 use super::{UsageEvent, UsageQuery, usage_timing};
 use crate::types::SourceFilter;
@@ -36,9 +35,9 @@ pub(crate) struct PartitionEntry {
     /// Last time this entry was served fresh or revalidated. The query TTL decides
     /// when to re-check freshness — not when to discard usable state.
     pub(crate) checked_at: Instant,
-    /// Discovery fingerprint (path, size, mtime), sorted by path. Used when no disk
-    /// cache backs the query; cache-backed queries revalidate against cache rows.
+    /// Inputs observed for this assembly, including Cursor project attribution.
     pub(crate) fingerprint: FileFingerprint,
+    pub(crate) fact_generation: Option<String>,
     pub(crate) assembly: Arc<UsageAssembly>,
     pub(crate) warnings: Arc<Vec<String>>,
 }
@@ -101,9 +100,7 @@ pub(crate) fn lock_merged() -> std::sync::MutexGuard<'static, HashMap<Option<Pat
 pub(crate) fn ensure_snapshot(query: &UsageQuery) -> Result<Snapshot> {
     let ttl = Duration::from_millis(query.memo_ttl_ms);
     if ttl.is_zero() {
-        // One-shot queries bypass retention entirely: no store reads or writes, so
-        // they never evict another caller's still-valid snapshot, and no dictionary
-        // is built for an assembly nobody will reuse.
+        // One-shot queries never publish or evict another caller's snapshot.
         return Ok(oneshot_snapshot(query));
     }
     match query.source {
@@ -118,32 +115,79 @@ pub(crate) fn ensure_snapshot(query: &UsageQuery) -> Result<Snapshot> {
     }
 }
 
-/// Combined assembly without retention, preserving the previous one-shot path
-/// exactly. Single-source one-shots scan only that source.
+/// Combined assembly without retention: one partition per source through the
+/// same facts-maintained rebuild as retaining refreshes, merged without
+/// publishing. Single-source one-shots scan only that source. Unlike the old
+/// blob-only assembly, every rebuild keeps facts consistent with the blobs it
+/// wrote, so a one-shot can never strand the facts behind (which used to
+/// poison later facts-backed refreshes with permanently stale rows).
 pub(crate) fn oneshot_snapshot(query: &UsageQuery) -> Snapshot {
+    let _refresh = USAGE_SCAN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let assembly_start = Instant::now();
-    let (events, warnings) = assemble_usage_events(query.source, query.cache_path.as_deref());
-    usage_timing(assembly_start, || {
-        format!("assemble total ({} events)", events.len())
-    });
-    match query.source {
-        Some(_) => Snapshot::Partition(Arc::new(UsageAssembly::Owned(events)), Arc::new(warnings)),
-        // The merged query path works uniformly over partitions; a one-shot
-        // combined assembly is just a single-partition merged view.
-        None => {
-            let assembly = Arc::new(UsageAssembly::Owned(events));
-            let order: Vec<MergedPos> = (0..assembly.len())
-                .map(|index| MergedPos {
-                    part: 0,
-                    index: index as u32,
-                })
-                .collect();
-            Snapshot::Merged(MergedSnapshot {
-                parts: vec![assembly],
-                order: Arc::new(order),
-                warnings: Arc::new(warnings),
-            })
+    let snapshot = match query.source {
+        Some(filter) => {
+            let (assembly, warnings) = oneshot_partition(filter, query.cache_path.clone());
+            Snapshot::Partition(assembly, warnings)
         }
+        None => Snapshot::Merged(oneshot_merged(&query.cache_path)),
+    };
+    let events = match &snapshot {
+        Snapshot::Partition(assembly, _) => assembly.len(),
+        Snapshot::Merged(merged) => merged.order.len(),
+    };
+    usage_timing(assembly_start, || {
+        format!("assemble total ({events} events)")
+    });
+    snapshot
+}
+
+/// One source partition without retention: a still-valid retained snapshot is
+/// reused read-only (no freshness stamp, no eviction), otherwise the partition
+/// rebuilds through the facts-maintained path without publishing.
+fn oneshot_partition(
+    filter: SourceFilter,
+    cache_path: Option<PathBuf>,
+) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
+    let key = (filter, cache_path.clone());
+    let previous = lock_partitions().get(&key).map(|entry| {
+        (
+            entry.fingerprint.clone(),
+            entry.fact_generation.clone(),
+            entry.assembly.clone(),
+            entry.warnings.clone(),
+        )
+    });
+    if let Some((fingerprint, generation, assembly, warnings)) = previous
+        && check_snapshot_valid(
+            filter,
+            key.1.as_deref(),
+            &fingerprint,
+            generation.as_deref(),
+        )
+    {
+        return (assembly, warnings);
+    }
+    let entry = rebuild_partition(filter, &cache_path, None);
+    (entry.assembly, entry.warnings)
+}
+
+/// Fresh merged view without retention: per-source reuse-or-rebuild plus a
+/// merged order, never published to the merged store.
+fn oneshot_merged(cache_path: &Option<PathBuf>) -> MergedSnapshot {
+    let mut parts = Vec::with_capacity(SCANNERS.len());
+    let mut warnings = Vec::new();
+    for (filter, _) in SCANNERS {
+        let (assembly, partition_warnings) = oneshot_partition(filter, cache_path.clone());
+        warnings.extend(partition_warnings.iter().cloned());
+        parts.push(assembly);
+    }
+    let order = Arc::new(build_merged_order(&parts));
+    MergedSnapshot {
+        parts,
+        order,
+        warnings: Arc::new(warnings),
     }
 }
 
@@ -196,18 +240,21 @@ pub(crate) fn ensure_partition(
 /// Revalidates or rebuilds one partition. Callers must hold `USAGE_SCAN_LOCK`.
 pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
     let (filter, cache_path) = (key.0, key.1.clone());
-    let (previous_fingerprint, have_entry) = {
+    let previous = {
         let store = lock_partitions();
-        match store.get(key) {
-            Some(entry) => (entry.fingerprint.clone(), true),
-            None => (Vec::new(), false),
-        }
+        store
+            .get(key)
+            .map(|entry| (entry.fingerprint.clone(), entry.fact_generation.clone()))
     };
     let check_start = Instant::now();
-    let valid = check_partition_valid(filter, cache_path.as_deref(), &previous_fingerprint);
-    // A valid check only reuses when a snapshot exists; otherwise the refresh
-    // below still has to build (and publish) one.
-    let reuse = valid && have_entry;
+    let reuse = previous.as_ref().is_some_and(|(fingerprint, generation)| {
+        check_snapshot_valid(
+            filter,
+            cache_path.as_deref(),
+            fingerprint,
+            generation.as_deref(),
+        )
+    });
     usage_timing(check_start, || {
         format!(
             "{} freshness check ({})",
@@ -227,17 +274,37 @@ pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<
     // Rebuild. The previous snapshot stays published while scanning, so
     // concurrent queries keep serving it; it is taken for buffer reuse only for
     // the compaction window below.
+    let entry = rebuild_partition(filter, &cache_path, Some(key));
+    let result = (entry.assembly.clone(), entry.warnings.clone());
+    let mut store = lock_partitions();
+    if store.len() >= MAX_PARTITIONS {
+        evict_oldest(&mut store, key, |entry| entry.checked_at);
+    }
+    store.insert(key.clone(), entry);
+    result
+}
+
+/// Rebuild one partition, reusing facts where reconciliation permits it and
+/// otherwise scanning raw/blob occurrences. A retained entry stays available
+/// while scanning, then donates compact buffers when no reader holds them.
+/// The caller publishes the result or discards it after a one-shot query.
+fn rebuild_partition(
+    filter: SourceFilter,
+    cache_path: &Option<PathBuf>,
+    previous_key: Option<&PartitionKey>,
+) -> PartitionEntry {
     let mut warnings = Vec::new();
-    let mut cache = match cache_path.as_deref().map(UsageCache::open).transpose() {
+    let mut cache = match cache_path
+        .as_deref()
+        .map(UsageCache::open_for_refresh)
+        .transpose()
+    {
         Ok(cache) => cache,
         Err(error) => {
             warnings.push(format!("usage cache disabled: {error:#}"));
             None
         }
     };
-    // Facts-backed refresh when a sync row exists: hits reuse their fact rows
-    // with no blob decode, and only changed files parse. Otherwise the legacy
-    // full pipeline, which also backfills facts (e.g. pre-facts databases).
     let stored_warnings = cache.as_ref().and_then(|cache| {
         cache
             .fact_sync(filter.as_str())
@@ -254,35 +321,27 @@ pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<
         }
         (cache, _) => legacy_refresh_partition(filter, cache, &mut warnings),
     };
-    // Reuse the previous compact buffers when no concurrent query still holds
-    // them; otherwise (the common lock-free case) allocate fresh and let the old
-    // snapshot drain naturally.
-    let previous = lock_partitions()
-        .remove(key)
-        .and_then(|entry| Arc::try_unwrap(entry.assembly).ok());
+    let fact_generation = cache
+        .as_ref()
+        .and_then(|cache| cache.fact_generation(filter.as_str()).ok().flatten());
     // Stamp after assembly: an assembly slower than the TTL would otherwise be
     // expired the moment it finishes, and queued follow-up queries would reassemble.
     let compaction_start = Instant::now();
     let event_count = events.len();
+    let previous = previous_key
+        .and_then(|key| lock_partitions().remove(key))
+        .and_then(|entry| Arc::try_unwrap(entry.assembly).ok());
     let assembly = Arc::new(UsageAssembly::new(events, previous));
     usage_timing(compaction_start, || {
         format!("{} compact ({event_count} events)", filter.as_str())
     });
-    let warnings = Arc::new(warnings);
-    let mut store = lock_partitions();
-    if store.len() >= MAX_PARTITIONS {
-        evict_oldest(&mut store, key, |entry| entry.checked_at);
+    PartitionEntry {
+        checked_at: Instant::now(),
+        assembly,
+        warnings: Arc::new(warnings),
+        fingerprint,
+        fact_generation,
     }
-    store.insert(
-        key.clone(),
-        PartitionEntry {
-            checked_at: Instant::now(),
-            fingerprint,
-            assembly: assembly.clone(),
-            warnings: warnings.clone(),
-        },
-    );
-    (assembly, warnings)
 }
 
 /// Legacy full partition rebuild: scan every file (decoding all cached blobs),
@@ -299,6 +358,9 @@ pub(crate) fn legacy_refresh_partition(
         .iter()
         .find_map(|(candidate, scanner)| (*candidate == filter).then_some(*scanner))
         .expect("scanner for every source filter");
+    // Stamp the inputs before scanning. A source that changes during the scan
+    // must not get a checkpoint describing bytes the assembly never read.
+    let fingerprint = discovery_fingerprint(filter);
     let mut events = run_partition_scanner(filter, scanner, warnings, cache.as_deref_mut());
     publish_scan_progress(None);
     let sort_start = Instant::now();
@@ -306,19 +368,36 @@ pub(crate) fn legacy_refresh_partition(
     usage_timing(sort_start, || {
         format!("{} sort ({} events)", filter.as_str(), events.len())
     });
-    let fingerprint = discovery_fingerprint(filter);
     // Canonical facts mirror the partition exactly (a failed write only warns,
     // like blob saves; the next refresh rewrites the partition atomically).
     if let Some(cache) = cache {
         let facts_start = Instant::now();
-        if let Err(error) = cache.replace_partition_facts(filter, &events, &fingerprint, warnings) {
+        let written = cache.replace_partition_facts(filter, &events, &fingerprint, warnings);
+        if let Err(error) = written {
             warnings.push(format!("{} facts write failed: {error:#}", filter.as_str()));
+            let _ = cache.invalidate_facts(filter.as_str());
+        } else if fingerprint != discovery_fingerprint(filter) {
+            let _ = cache.invalidate_facts(filter.as_str());
         }
         usage_timing(facts_start, || {
             format!("{} facts ({} events)", filter.as_str(), events.len())
         });
     }
     (events, fingerprint)
+}
+
+/// Whether a source's `reconcile_usage` decides across files (mirrors
+/// `reconcile_source_partition`'s arms). Only these sources need the
+/// facts-refresh reconcile gates; the rest reconcile to a no-op.
+fn reconciles_cross_file(filter: SourceFilter) -> bool {
+    matches!(
+        filter,
+        SourceFilter::Claude
+            | SourceFilter::Codex
+            | SourceFilter::Cursor
+            | SourceFilter::Copilot
+            | SourceFilter::Opencode
+    )
 }
 
 /// Facts-backed partition refresh: hits reuse their fact rows with no blob
@@ -379,16 +458,24 @@ pub(crate) fn refresh_partition_from_facts(
             missing.push((index, path.clone(), *metadata));
         }
     }
-    // Stale blob rows (vanished files): delete like the scan does.
     let stale: Vec<String> = rows
         .keys()
         .filter(|key| !live.contains(*key))
         .cloned()
         .collect();
+    // Canonical facts omit suppressed occurrences. Any mutation in a source
+    // with cross-file reconciliation can change winners in untouched files,
+    // including when an existing winner is rewritten to weaker or empty usage.
+    // Reconcile all raw/blob occurrences until provenance is persisted.
+    // Cursor also needs fresh project attribution on otherwise unchanged hits.
+    if filter == SourceFilter::Cursor
+        || (reconciles_cross_file(filter)
+            && (!missing.is_empty() || !stale.is_empty() || examined.len() != files.len()))
+    {
+        return Err(anyhow::anyhow!("{name} needs a complete source reconcile"));
+    }
     if !stale.is_empty() {
-        cache
-            .delete_stale(name, &stale)
-            .map_err(|_| anyhow::anyhow!("{name} usage cache write failed"))?;
+        cache.delete_stale(name, &stale)?;
     }
     // Hits' events come from facts (no blob decode); changed and stale rows are
     // excluded by the hit set. Vanished files simply have no rows to read.
@@ -401,7 +488,7 @@ pub(crate) fn refresh_partition_from_facts(
         .collect();
     // Parse what changed, with chunked saves mirroring the scan loop.
     let parse = |path: &Path| parse_source_file(filter, path, parents.as_ref());
-    let mut parsed_paths: Vec<String> = Vec::new();
+    let mut parsed_paths: HashSet<String> = HashSet::new();
     let mut parsed_events: Vec<UsageEvent> = Vec::new();
     if !missing.is_empty() {
         publish_scan_progress(Some(UsageScanProgress {
@@ -423,8 +510,18 @@ pub(crate) fn refresh_partition_from_facts(
             warnings.push(format!("{name} usage cache write failed: {error:#}"));
         }
         for file in parsed {
-            parsed_paths.push(file.path.to_string_lossy().to_string());
+            parsed_paths.insert(file.path.to_string_lossy().to_string());
             parsed_events.extend(file.events);
+        }
+    }
+    // Files that failed to parse contribute no events — like the scan loop's
+    // empty slot — so they join the removed set below instead of lingering as
+    // stale fact rows. (The legacy path likewise serves nothing for them while
+    // keeping the blob row for a later retry.)
+    for (_, path, _) in &missing {
+        let key = path.to_string_lossy().to_string();
+        if !parsed_paths.contains(&key) {
+            parsed_paths.insert(key);
         }
     }
     if missing_count > 0 {
@@ -434,11 +531,6 @@ pub(crate) fn refresh_partition_from_facts(
     }
     publish_scan_progress(None);
     events.extend(parsed_events);
-    let reconcile_start = Instant::now();
-    reconcile_source_partition(filter, &mut events);
-    usage_timing(reconcile_start, || {
-        format!("{} reconcile ({} events)", filter.as_str(), events.len())
-    });
     let sort_start = Instant::now();
     sort_usage_events(&mut events);
     usage_timing(sort_start, || {
@@ -477,15 +569,17 @@ pub(crate) fn refresh_partition_from_facts(
         }
     }
     let upsert_start = Instant::now();
-    cache
-        .upsert_file_facts(
-            filter,
-            &removed.into_iter().collect::<Vec<_>>(),
-            &changed,
-            &fingerprint,
-            &stored,
-        )
-        .map_err(|_| anyhow::anyhow!("{name} facts write failed"))?;
+    if !removed.is_empty() {
+        cache
+            .upsert_file_facts(
+                filter,
+                &removed.into_iter().collect::<Vec<_>>(),
+                &changed,
+                &fingerprint,
+                &stored,
+            )
+            .map_err(|_| anyhow::anyhow!("{name} facts write failed"))?;
+    }
     usage_timing(upsert_start, || {
         format!(
             "{} facts upsert ({} events)",
@@ -493,6 +587,7 @@ pub(crate) fn refresh_partition_from_facts(
             changed.len()
         )
     });
+    *warnings = stored;
     Ok((events, fingerprint))
 }
 
@@ -612,62 +707,138 @@ pub(crate) fn evict_oldest<K, V>(
 /// I/O hiccup (or a missing sync row, e.g. a pre-facts database) returns false
 /// so the refresh reproduces today's exact behavior instead of reusing on
 /// uncertain ground.
+/// `previous_fingerprint` binds a retained snapshot to its own generation:
+/// `Some` requires the current discovery set to match what the snapshot was
+/// built from (stable-compared, so volatile mtimes don't churn), because
+/// another process may have advanced the facts past what the snapshot
+/// describes — disk-vs-facts agreement alone would then reuse stale data.
+/// `None` (cold checks with no snapshot) skips the binding: there is nothing
+/// to bind, only disk-vs-facts agreement matters.
 pub(crate) fn check_partition_valid(
     filter: SourceFilter,
     cache_path: Option<&Path>,
-    previous_fingerprint: &[(String, u64, i64)],
+    previous_fingerprint: Option<&[(String, u64, i64)]>,
 ) -> bool {
     let files = source_files(filter);
     let mut fingerprint = Vec::with_capacity(files.len());
+    let mut observed_metadata = Vec::with_capacity(files.len());
     for path in &files {
         let Ok(metadata) = usage_file_metadata(path) else {
             return false;
         };
         fingerprint.push((path.to_string_lossy().to_string(), metadata.0, metadata.1));
+        observed_metadata.push(metadata);
     }
+    append_source_context(filter, &mut fingerprint);
     fingerprint.sort();
     let Some(cache_path) = cache_path else {
-        // Without a disk cache there are no rows to compare: the discovery
-        // fingerprint alone decides.
-        return fingerprint == previous_fingerprint;
+        // Without recorded database dependencies, re-read after the memo TTL.
+        if matches!(
+            filter,
+            SourceFilter::Hermes | SourceFilter::Cursor | SourceFilter::Opencode
+        ) {
+            return false;
+        }
+        return previous_fingerprint.is_some_and(|previous| fingerprint == previous);
     };
+    if let Some(previous) = previous_fingerprint
+        && stable_triples(filter, &fingerprint) != stable_triples(filter, previous)
+    {
+        return false;
+    }
     let spec = source_spec(filter);
     let cache = match UsageCache::open(cache_path) {
         Ok(cache) => cache,
         Err(_) => return false,
     };
     let expected = fingerprint_files(&stable_triples(filter, &fingerprint));
-    match cache.fact_sync(filter.as_str()) {
-        Ok(Some((recorded, version, _))) => {
+    let allow_uncached_codex = match cache.fact_sync(filter.as_str()) {
+        Ok(Some((recorded, version, warnings))) => {
             if recorded != expected || version != spec.parser_version {
                 return false;
             }
+            // Unresolved forks deliberately have no blob row. They can reuse
+            // facts while still unresolved, but must retry parent resolution
+            // below: an unreadable parent's permissions may have recovered
+            // without changing its size or mtime.
+            filter == SourceFilter::Codex && warnings.is_empty()
         }
         _ => return false,
-    }
-    // Volatile databases are judged by reuse windows, not fingerprints: their
-    // bytes can change under an unchanged mtime while WAL content is pending.
-    if files
-        .iter()
-        .any(|path| (spec.volatile_reuse_ms)(path).is_some())
-    {
-        let rows = match cache.load_source_meta(filter.as_str(), spec.parser_version) {
-            Ok(rows) => rows,
-            Err(_) => return false,
-        };
-        let now_ms = epoch_ms_now();
-        for path in &files {
-            let Some(window) = (spec.volatile_reuse_ms)(path) else {
+    };
+    // Validate the metadata that actually produced the facts. The discovery
+    // checkpoint alone misses WAL dependencies and files changed mid-scan.
+    // Missing rows otherwise require a retry rather than making a failed parse
+    // authoritative indefinitely.
+    let rows = match cache.load_source_meta(filter.as_str(), spec.parser_version) {
+        Ok(rows) => rows,
+        Err(_) => return false,
+    };
+    let now = epoch_ms_now();
+    let mut observations = HashMap::new();
+    let parents = (filter == SourceFilter::Codex)
+        .then(|| crate::sources::codex::UsageParentIndex::new(&files));
+    for (path, metadata) in files.iter().zip(observed_metadata) {
+        let key = path.to_string_lossy();
+        let Some(row) = rows.get(key.as_ref()) else {
+            if allow_uncached_codex
+                && parse_source_file(filter, path, parents.as_ref())
+                    .is_ok_and(|parsed| !parsed.cacheable)
+            {
                 continue;
-            };
-            let key = path.to_string_lossy().to_string();
-            match rows.get(&key) {
-                Some(row) if now_ms.saturating_sub(row.scanned_at_ms) < window => {}
-                _ => return false,
             }
+            return false;
+        };
+        let metadata_current = (spec.volatile_reuse_ms)(path).map_or_else(
+            || metadata == (row.size, row.mtime_ns),
+            |window| now.saturating_sub(row.scanned_at_ms) < window,
+        );
+        if !metadata_current
+            || !deps_observed_current(&row.deps, &mut observations)
+            || parents
+                .as_ref()
+                .is_some_and(|parents| !parents.deps_match_current_candidates(&row.deps))
+        {
+            return false;
         }
     }
     true
+}
+
+/// Current disk facts do not validate an older retained assembly. Compare the
+/// identity of the facts this snapshot actually loaded as well as its inputs.
+fn check_snapshot_valid(
+    filter: SourceFilter,
+    cache_path: Option<&Path>,
+    fingerprint: &FileFingerprint,
+    generation: Option<&str>,
+) -> bool {
+    if !check_partition_valid(filter, cache_path, Some(fingerprint)) {
+        return false;
+    }
+    let Some(path) = cache_path else {
+        return true;
+    };
+    generation.is_some()
+        && UsageCache::open(path)
+            .and_then(|cache| cache.fact_generation(filter.as_str()))
+            .is_ok_and(|current| current.as_deref() == generation)
+}
+
+/// Cursor attribution comes from transcripts independently of the usage DB.
+/// Checkpoint the mapping so additions/removals invalidate retained and cold
+/// facts without forcing an unchanged database to be parsed again.
+fn append_source_context(filter: SourceFilter, fingerprint: &mut FileFingerprint) {
+    if filter == SourceFilter::Cursor {
+        let mut projects: Vec<_> = crate::sources::cursor::project_by_session()
+            .into_iter()
+            .collect();
+        projects.sort();
+        for (session, project) in projects {
+            let identity =
+                serde_json::to_string(&(session, project)).expect("string pair serializes");
+            fingerprint.push((format!("\0cursor-project:{identity}"), 0, 0));
+        }
+    }
 }
 
 /// Current discovery fingerprint for one source, sorted by path.
@@ -678,38 +849,9 @@ pub(crate) fn discovery_fingerprint(filter: SourceFilter) -> FileFingerprint {
             fingerprint.push((path.to_string_lossy().to_string(), metadata.0, metadata.1));
         }
     }
+    append_source_context(filter, &mut fingerprint);
     fingerprint.sort();
     fingerprint
-}
-
-pub(crate) fn assemble_usage_events(
-    source: Option<SourceFilter>,
-    cache_path: Option<&Path>,
-) -> (Vec<UsageEvent>, Vec<String>) {
-    let mut events = Vec::new();
-    let mut warnings = Vec::new();
-    let mut cache = match cache_path.map(UsageCache::open).transpose() {
-        Ok(cache) => cache,
-        Err(error) => {
-            warnings.push(format!("usage cache disabled: {error:#}"));
-            None
-        }
-    };
-    for (filter, scanner) in SCANNERS {
-        if source.is_none_or(|selected| selected == filter) {
-            events.extend(run_partition_scanner(
-                filter,
-                scanner,
-                &mut warnings,
-                cache.as_mut(),
-            ));
-        }
-    }
-    publish_scan_progress(None);
-    let sort_start = Instant::now();
-    sort_usage_events(&mut events);
-    usage_timing(sort_start, || "sort".to_string());
-    (events, warnings)
 }
 
 /// Preserve stable event ordering without the full event-sized scratch allocation

@@ -125,7 +125,10 @@ fn usage_project_matches_precomputed(
 }
 
 fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
+    // `get` refuses a cut inside a multibyte char; byte slicing would panic.
+    haystack
+        .get(..needle.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle))
 }
 
 fn project_tail(value: &str) -> &str {
@@ -154,6 +157,21 @@ mod tests {
     use rusqlite::Connection;
     use std::fs;
     use std::sync::Arc;
+
+    #[test]
+    fn multibyte_project_prefix_cannot_panic_prefix_match() {
+        // "--abcdeéxyz--" puts a two-byte char across the 6-byte "users-"
+        // cut; byte slicing would panic instead of returning false.
+        let mut cache = HashMap::new();
+        assert!(!usage_project_matches(
+            "--abcdeéxyz--",
+            "nomatch",
+            ProjectGrouping::Flat,
+            &mut cache,
+        ));
+        assert!(!starts_with_ignore_ascii_case("abécd", "users-"));
+        assert!(starts_with_ignore_ascii_case("Users-memex", "users-"));
+    }
 
     #[test]
     fn usage_project_matching_normalizes_paths_slugs_and_remotes() {
