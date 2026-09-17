@@ -1771,3 +1771,46 @@ fn the_journal_cursor_round_trips_under_its_fingerprint_and_survives_a_missing_t
         Some(9)
     );
 }
+
+#[test]
+fn bob_hot_sweep_uses_indexed_owners_without_scanning_checkpoint_keys() {
+    let (_temp, path, lease) = fixture();
+    let mut writer = CheckpointWriter::open(&path, &lease, true).unwrap();
+    let mut upserts: HashMap<_, _> = (0..10_000)
+        .map(|i| (format!("/claude/{i}.jsonl"), file(1)))
+        .collect();
+    writer
+        .commit_delta(&CheckpointDelta {
+            upserts: std::mem::take(&mut upserts),
+            ..Default::default()
+        })
+        .unwrap();
+    let before = KEY_SCANS.get();
+    let (hot, databases) = crate::watch::sweep_candidates(writer.reader(), 2).unwrap();
+    assert!(hot.is_empty());
+    assert!(databases.is_empty());
+    assert_eq!(KEY_SCANS.get(), before);
+
+    // Persisted ownership works for a custom name even without a configured Bob root.
+    let database = "/custom/history.sqlite".to_string();
+    let mut task = file(3);
+    task.identity.bob_database = Some(database.clone());
+    writer
+        .commit_delta(&CheckpointDelta {
+            upserts: HashMap::from([(format!("{database}/task"), task)]),
+            ..Default::default()
+        })
+        .unwrap();
+    let (hot, databases) = crate::watch::sweep_candidates(writer.reader(), 2).unwrap();
+    assert!(hot.is_empty());
+    assert_eq!(databases, HashSet::from([database.clone()]));
+    assert_eq!(KEY_SCANS.get(), before);
+
+    writer
+        .commit_delta(&CheckpointDelta {
+            deletes: HashSet::from([format!("{database}/task")]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(writer.reader().bob_database_paths().unwrap().is_empty());
+}

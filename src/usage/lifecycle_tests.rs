@@ -732,3 +732,36 @@ fn cursor_mapping_only_changes_survive_retained_and_cold_fact_queries() {
     let unmapped = scan_usage(&query).unwrap();
     assert_report_matches(&unmapped, &initial);
 }
+
+#[test]
+fn bob_usage_matches_through_uncached_and_canonical_fact_scans() {
+    use crate::sources::bob::fixtures;
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("bob.db");
+    let writer = fixtures::create(&database);
+    fixtures::insert_task(&writer, "task", None, "normal", "file:/work/repo", "T", 1);
+    fixtures::insert_message(
+        &writer,
+        "message",
+        "task",
+        "assistant",
+        r#"{"role":"assistant","content":"done","_meta":{"timestamp":1700000000002,"spend":{"input":100,"output":20,"cost":0.0125}}}"#,
+        1,
+    );
+    let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(database.as_os_str()))]);
+    let query = UsageQuery {
+        source: Some(SourceFilter::Bob),
+        include_events: true,
+        ..Default::default()
+    };
+    let uncached = scan_usage(&query).unwrap();
+    assert_eq!(uncached.events, 1);
+    assert_eq!(uncached.total_tokens, 120);
+    let cached_query = UsageQuery {
+        cache_path: Some(temp.path().join("usage.sqlite3")),
+        ..query
+    };
+    assert_report_matches(&scan_usage(&cached_query).unwrap(), &uncached);
+    assert_report_matches(&scan_usage(&cached_query).unwrap(), &uncached);
+}

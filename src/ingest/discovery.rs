@@ -376,6 +376,7 @@ pub(super) fn file_identity(
     };
 
     FileIdentity {
+        bob_database: None,
         sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
@@ -613,6 +614,19 @@ pub(super) fn discover_bob(
     let mut absent: Vec<PathBuf> = Vec::new();
     let mut current: HashSet<String> = HashSet::new();
     for database in databases {
+        let canonical_database =
+            crate::sources::bob::canonical_alias(&database).filter(|alias| *alias != database);
+        if excluder.is_excluded(&database)
+            || canonical_database
+                .as_ref()
+                .is_some_and(|alias| excluder.is_excluded(alias))
+        {
+            // Exclusion is authoritative even when the store is locked or unavailable.
+            // Reconcile all previously owned tasks without opening the database.
+            result.files_skipped += 1;
+            absent.push(database);
+            continue;
+        }
         match database.metadata() {
             // Like the generic sweep, a deletion counts only while the containing
             // directory is still readable; an unmounted volume must not purge history,
@@ -664,8 +678,6 @@ pub(super) fn discover_bob(
         current.extend(keys.iter().cloned());
         // A virtual path cannot be canonicalized (`ENOTDIR`), so exclusions written against
         // the real directory of a symlinked database are checked on the alias explicitly.
-        let canonical_database =
-            crate::sources::bob::canonical_alias(&database).filter(|alias| *alias != database);
         for (task, key) in tasks.iter().zip(keys) {
             let path = PathBuf::from(&key);
             let excluded = excluder.is_excluded(&path)
@@ -684,6 +696,7 @@ pub(super) fn discover_bob(
             result.files_scanned += 1;
             result.total_bytes += task.message_count;
             let identity = FileIdentity {
+                bob_database: Some(database.to_string_lossy().into_owned()),
                 prefix_sha256: Some(task.fingerprint()),
                 prefix_bytes: 1,
                 ..FileIdentity::default()

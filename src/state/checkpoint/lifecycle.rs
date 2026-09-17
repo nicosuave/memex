@@ -230,6 +230,11 @@ fn ensure_discovery_schema(connection: &Connection) -> Result<()> {
     drop_outdated_directories(connection)?;
     connection.execute_batch(DIRECTORIES_SCHEMA)?;
     connection.execute_batch(JOURNAL_SCHEMA)?;
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS files_bob_database
+         ON files(json_extract(payload, '$.identity.bob_database'))
+         WHERE json_extract(payload, '$.identity.bob_database') IS NOT NULL;",
+    )?;
     Ok(())
 }
 

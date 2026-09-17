@@ -26,6 +26,11 @@ mod lifecycle;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    static KEY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const DATABASE: &str = "checkpoints.sqlite";
 const LOCK: &str = ".checkpoints.lock";
 const FORMAT_VERSION: i64 = 2;
@@ -317,6 +322,8 @@ impl CheckpointReader {
     }
 
     pub(crate) fn file_keys(&self) -> Result<Vec<String>> {
+        #[cfg(test)]
+        KEY_SCANS.set(KEY_SCANS.get() + 1);
         crate::profiling::count!("state.checkpoint.key_scans", 1);
         match &self.backend {
             Backend::Legacy(value) => Ok(value["files"]
@@ -327,6 +334,33 @@ impl CheckpointReader {
                 .collect()),
             Backend::Sqlite { connection, .. } => {
                 let mut statement = connection.prepare("SELECT path FROM files")?;
+                Ok(statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            }
+        }
+    }
+
+    /// Read indexed Bob ownership entries. Legacy inventory is collected during the
+    /// existing `sqlite_backed_paths` pass, without adding another history traversal.
+    pub(crate) fn bob_database_paths(&self) -> Result<HashSet<String>> {
+        match &self.backend {
+            Backend::Legacy(_) => Ok(HashSet::new()),
+            Backend::Sqlite { connection, .. } => {
+                // Older checkpoints acquire the index on the next writer open. Configured
+                // roots seed the watcher until discovery backfills ownership metadata.
+                let indexed: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='files_bob_database')",
+                    [], |row| row.get(0),
+                )?;
+                if !indexed {
+                    return Ok(HashSet::new());
+                }
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT json_extract(payload, '$.identity.bob_database')
+                     FROM files INDEXED BY files_bob_database
+                     WHERE json_extract(payload, '$.identity.bob_database') IS NOT NULL",
+                )?;
                 Ok(statement
                     .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?)
@@ -384,8 +418,16 @@ impl CheckpointReader {
                 Ok(state
                     .files
                     .into_iter()
-                    .filter(|(_, file)| file.identity.sqlite_wal.is_some())
-                    .map(|(path, _)| path)
+                    .filter_map(|(path, file)| {
+                        if file.identity.sqlite_wal.is_some() {
+                            Some(path)
+                        } else {
+                            file.identity.bob_database.or_else(|| {
+                                crate::sources::bob::split_virtual_path(Path::new(&path))
+                                    .map(|(database, _)| database.to_string_lossy().into_owned())
+                            })
+                        }
+                    })
                     .collect())
             }
             Backend::Sqlite { connection, .. } => {

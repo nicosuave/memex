@@ -124,6 +124,10 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::muse::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Bob => SourceSpec {
+            parser_version: crate::sources::bob::VERSIONS.usage,
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+        },
         SourceFilter::Antigravity => SourceSpec {
             parser_version: crate::sources::antigravity::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
@@ -166,6 +170,7 @@ pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
         SourceFilter::Jcode => crate::sources::jcode::usage_files(),
         SourceFilter::Muse => crate::sources::muse::usage_files(),
         SourceFilter::Antigravity => crate::sources::antigravity::usage_files(),
+        SourceFilter::Bob => crate::sources::bob::usage_files(),
     }
 }
 
@@ -481,6 +486,7 @@ pub(crate) fn parse_source_file(
             crate::sources::grok::parse_usage_file(path).map(FileParse::cacheable)
         }
         SourceFilter::Hermes => crate::sources::hermes::parse_usage_file(path),
+        SourceFilter::Bob => crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
         SourceFilter::Jcode => {
             crate::sources::jcode::parse_usage_file(path).map(FileParse::cacheable)
         }
@@ -787,6 +793,29 @@ pub(crate) fn scan_antigravity(
     Ok(())
 }
 
+fn scan_bob(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::bob::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "bob",
+            parser_version: crate::sources::bob::VERSIONS.usage,
+            // WAL commits leave the main file's size and mtime untouched until a
+            // checkpoint, so metadata alone would serve stale spend indefinitely.
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
 pub(crate) type SourceScanner =
     fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
 
@@ -803,10 +832,10 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 14] = [
     (SourceFilter::Copilot, scan_copilot),
     (SourceFilter::Grok, scan_grok),
     (SourceFilter::Hermes, scan_hermes),
-    (SourceFilter::Bob, scan_bob),
     (SourceFilter::Jcode, scan_jcode),
     (SourceFilter::Muse, scan_muse),
     (SourceFilter::Antigravity, scan_antigravity),
+    (SourceFilter::Bob, scan_bob),
 ];
 
 /// Scan and reconcile one source partition. Shared by combined assembly and
@@ -1070,66 +1099,3 @@ mod tests {
         assert!(warnings[0].contains(vanished.to_string_lossy().as_ref()));
     }
 }
-
-fn scan_bob(
-    out: &mut Vec<UsageEvent>,
-    warnings: &mut Vec<String>,
-    cache: Option<&mut UsageCache>,
-) -> Result<()> {
-    let files = crate::sources::bob::usage_files();
-    scan_files_cached(
-        SourceScan {
-            source: "bob",
-            parser_version: crate::sources::bob::VERSIONS.usage,
-            // WAL commits leave the main file's size and mtime untouched until a
-            // checkpoint, so metadata alone would serve stale spend indefinitely.
-            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
-        },
-        &files,
-        cache,
-        warnings,
-        out,
-        |path| crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
-    );
-    Ok(())
-}
-
-// Rates are nano-USD per million tokens. The catalog is deliberately small and versioned:
-// unknown models remain unpriced instead of silently inheriting a guessed family rate.
-const PRICE_CATALOG_ID: &str = "official-api-prices-2026-07-15";
-
-#[derive(Clone, Copy)]
-struct Rates {
-    input: u64,
-    cache_read: u64,
-    cache_write_5m: u64,
-    cache_write_1h: u64,
-    output: u64,
-}
-
-const fn usd_per_million(value_milli_usd: u64) -> u64 {
-    value_milli_usd * 1_000_000
-}
-
-pub(crate) fn event_cost_nanos<S: std::ops::Deref<Target = str>, P>(
-    event: &UsageEventData<S, P>,
-    mode: CostMode,
-) -> Option<u64> {
-    let source = event
-        .source_cost_usd
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .and_then(|value| {
-            let nanos = value * 1_000_000_000.0;
-            (nanos <= u64::MAX as f64).then_some(nanos.round() as u64)
-        });
-    match mode {
-        CostMode::Source => source,
-        CostMode::Auto => source.or_else(|| {
-            (!event.cost_authoritative)
-                .then(|| calculated_cost_nanos(event))
-                .flatten()
-        }),
-        CostMode::Reprice => calculated_cost_nanos(event),
-    }
-}
-

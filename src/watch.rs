@@ -398,13 +398,11 @@ pub(crate) fn sweep_candidates(
     // are still noticed.
     snapshot.retain(|key, file| {
         file.identity.sqlite_wal.is_none()
+            && file.identity.bob_database.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
-    databases.extend(reader.file_keys()?.iter().filter_map(|key| {
-        crate::sources::bob::split_virtual_path(Path::new(key))
-            .map(|(database, _)| database.to_string_lossy().into_owned())
-    }));
+    databases.extend(reader.bob_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -1342,6 +1340,7 @@ mod tests {
             pending_tool_calls: HashMap::new(),
             codex_metadata_offsets: None,
             identity: FileIdentity {
+                bob_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,

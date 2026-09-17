@@ -2524,6 +2524,7 @@ fn truncation_and_replacement_clear_stale_pending_calls() {
 #[test]
 fn device_renumbering_preserves_append_continuity() {
     let previous = FileIdentity {
+        bob_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2544,6 +2545,7 @@ fn device_renumbering_preserves_append_continuity() {
 #[test]
 fn device_renumbering_does_not_hide_file_replacement() {
     let previous = FileIdentity {
+        bob_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -4940,12 +4942,23 @@ fn bob_exclusions_match_the_real_directory_of_a_symlinked_database() {
     assert_eq!(run(&options).records_added, 1);
     assert_eq!(indexed_texts(&paths), ["alpha"]);
 
-    // An exclusion written against the real directory applies, and cleans up.
-    options.exclude_patterns = vec![format!("{}/**", real.canonicalize().unwrap().display())];
-    let report = run(&options);
-    assert_eq!(report.records_added, 0);
-    assert_eq!(report.files_skipped, 1);
-    assert!(indexed_texts(&paths).is_empty());
+    // Both a directory glob and an exact canonical database exclusion clean up aliases.
+    for pattern in [
+        format!("{}/**", real.canonicalize().unwrap().display()),
+        real.canonicalize()
+            .unwrap()
+            .join("bob.db")
+            .to_string_lossy()
+            .into_owned(),
+    ] {
+        options.exclude_patterns = vec![pattern];
+        let report = run(&options);
+        assert_eq!(report.records_added, 0);
+        assert_eq!(report.files_skipped, 1);
+        assert!(indexed_texts(&paths).is_empty());
+        options.exclude_patterns.clear();
+        assert_eq!(run(&options).records_added, 1);
+    }
 }
 
 #[test]
@@ -5748,4 +5761,54 @@ fn full_scan_preserves_the_cursor_captured_before_fallback() {
     )
     .unwrap();
     assert_eq!(prepared.state.journal_cursor, Some(cursor));
+}
+
+#[test]
+fn bob_database_and_task_exclusions_apply_on_fresh_index_and_refresh() {
+    use crate::sources::bob::{fixtures, virtual_path};
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("bob.db");
+    let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(database.as_os_str()))]);
+    let writer = fixtures::create(&database);
+    for task in ["a", "b"] {
+        fixtures::insert_task(&writer, task, None, "normal", "file:/work/a", task, 1_000);
+        fixtures::insert_message(
+            &writer,
+            task,
+            task,
+            "user",
+            &format!(r#"{{"role":"user","content":"{task}","_meta":{{"timestamp":1}}}}"#),
+            1,
+        );
+    }
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_bob = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    for pattern in [database.to_string_lossy().into_owned(), "**/bob.db".into()] {
+        options.exclude_patterns = vec![pattern.clone()];
+        assert_eq!(run(&options).records_added, 0);
+        assert!(indexed_texts(&paths).is_empty());
+        options.exclude_patterns.clear();
+        assert_eq!(run(&options).records_added, 2);
+        options.exclude_patterns =
+            vec![virtual_path(&database, "a").to_string_lossy().into_owned()];
+        run(&options);
+        assert_eq!(indexed_texts(&paths), ["b"]);
+        options.exclude_patterns = vec![pattern];
+        run(&options);
+        assert!(indexed_texts(&paths).is_empty());
+        assert!(
+            IngestState::load(&paths.state.join("ingest.json"))
+                .unwrap()
+                .files
+                .is_empty()
+        );
+    }
 }
