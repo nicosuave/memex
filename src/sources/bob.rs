@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -657,6 +657,12 @@ pub(crate) fn parse_index_records(
         })
         .map_err(skipped)?;
     let connection = open_read_only(&database).map_err(skipped)?;
+    // One read transaction: the task row and its messages come from the same snapshot,
+    // so a rewrite landing mid-parse cannot pair old metadata with new rows.
+    let connection = connection
+        .unchecked_transaction()
+        .with_context(|| format!("begin Bob read transaction for {}", database.display()))
+        .map_err(skipped)?;
     let Some(task) = lookup_task(&connection, &database, &task_id).map_err(skipped)? else {
         return Ok(IndexParseOutput {
             offset: 0,
@@ -747,43 +753,33 @@ pub(crate) fn parse_index_records(
     })
 }
 
-/// Token usage from every assistant message that recorded `_meta.spend`.
-pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
-    let connection = open_read_only(path)?;
-    let source_path: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
-    let mut statement = connection
-        .prepare(
-            "SELECT m.id, m.task_id, m.data, m.created_at, t.project_id, t.task_type
-             FROM messages AS m
-             JOIN tasks AS t ON t.id = m.task_id
-             WHERE m.role = 'assistant' AND m.data LIKE '%\"spend\"%'
-             ORDER BY m.rowid",
-        )
-        .with_context(|| format!("prepare Bob usage query for {}", path.display()))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
-        .with_context(|| format!("query Bob usage in {}", path.display()))?;
-    let mut events = Vec::new();
-    for (order, row) in rows.enumerate() {
-        let (message_id, task_id, data, created_at, project_id, task_type) = row?;
-        let Ok(data) = serde_json::from_str::<Value>(&data) else {
-            continue;
-        };
+/// Per-request token usage: every assistant message with `_meta.spend`, including the
+/// assistant messages of sub-agent transcripts embedded in `spawn_subagent` results.
+struct UsageCollector<'a> {
+    source_path: Arc<str>,
+    project: Option<String>,
+    seen: &'a mut HashSet<String>,
+    events: &'a mut Vec<UsageEvent>,
+}
+
+impl UsageCollector<'_> {
+    fn spend_event(
+        &mut self,
+        message_id: &str,
+        session_id: &str,
+        data: &Value,
+        ts: u64,
+        sidechain: bool,
+    ) {
         let Some(spend) = data
             .pointer("/_meta/spend")
             .filter(|spend| spend.is_object())
         else {
-            continue;
+            return;
         };
+        if !self.seen.insert(message_id.to_string()) {
+            return;
+        }
         // Observed convention: `input` is the full prompt including cached tokens
         // (input ≈ cacheRead + cacheWrite + fresh), like OpenAI-shaped usage.
         let usage = |key: &str| spend.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -793,21 +789,19 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
         let output = usage("output");
         let reasoning = usage("reasoningTokens").min(output);
         if input == 0 && output == 0 {
-            continue;
+            return;
         }
-        let project = project_id
-            .as_deref()
-            .and_then(workspace_from_project_id)
-            .map(|workspace| super::common::project_from_path(&workspace));
-        events.push(UsageEvent {
+        let cost = spend.get("cost").and_then(Value::as_f64);
+        let order = self.events.len() as u64;
+        self.events.push(UsageEvent {
             source: "bob",
-            source_path: source_path.clone(),
-            source_record_id: Some(message_id.clone()),
-            session_id: Some(task_id),
-            request_id: Some(message_id.clone()),
-            message_id: Some(message_id),
-            timestamp_ms: message_timestamp(&data, created_at),
-            project,
+            source_path: self.source_path.clone(),
+            source_record_id: Some(message_id.to_string()),
+            session_id: Some(session_id.to_string()),
+            request_id: Some(message_id.to_string()),
+            message_id: Some(message_id.to_string()),
+            timestamp_ms: ts,
+            project: self.project.clone(),
             provider: Some("ibm".to_string()),
             model: None,
             tokens: TokenBuckets {
@@ -819,16 +813,108 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 output,
                 reasoning,
             },
-            source_cost_usd: spend.get("cost").and_then(Value::as_f64),
+            source_cost_usd: cost,
             // Bob prices its own requests; without a recorded cost nothing is authoritative.
-            cost_authoritative: spend.get("cost").and_then(Value::as_f64).is_some(),
+            cost_authoritative: cost.is_some(),
             dedupe_confidence: "exact",
             conservative_undercount: false,
             cache_chain_excluded: true,
-            sidechain: task_type.as_deref() == Some("subagent"),
+            sidechain,
             permission_review: false,
-            source_order: order as u64,
+            source_order: order,
         });
+    }
+
+    /// Walk an embedded sub-agent transcript (and any it spawned in turn).
+    fn embedded(&mut self, data: &Value, fallback_ts: u64, depth: u8) {
+        if depth >= MAX_SUBAGENT_DEPTH {
+            return;
+        }
+        let (Some(messages), Some(child_id)) = (
+            data.get("messages").and_then(Value::as_array),
+            data.pointer("/_meta/subagentId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty()),
+        ) else {
+            return;
+        };
+        for (index, message) in messages.iter().enumerate() {
+            let ts = message
+                .pointer("/_meta/timestamp")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .unwrap_or(fallback_ts);
+            match message.get("role").and_then(Value::as_str) {
+                Some("assistant") => {
+                    let message_id = message
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{child_id}:{index}"));
+                    self.spend_event(&message_id, child_id, message, ts, true);
+                }
+                Some("tool") => self.embedded(message, ts, depth + 1),
+                _ => {}
+            }
+        }
+    }
+}
+
+pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
+    let connection = open_read_only(path)?;
+    let source_path: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
+    let mut statement = connection
+        .prepare(
+            "SELECT m.id, m.task_id, m.role, m.data, m.created_at, t.project_id, t.task_type
+             FROM messages AS m
+             JOIN tasks AS t ON t.id = m.task_id
+             WHERE (m.role = 'assistant' AND m.data LIKE '%\"spend\"%')
+                OR (m.role = 'tool' AND m.data LIKE '%\"subagentId\"%')
+             ORDER BY m.rowid",
+        )
+        .with_context(|| format!("prepare Bob usage query for {}", path.display()))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .with_context(|| format!("query Bob usage in {}", path.display()))?;
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        let (message_id, task_id, role, data, created_at, project_id, task_type) = row?;
+        let Ok(data) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let mut collector = UsageCollector {
+            source_path: source_path.clone(),
+            project: project_id
+                .as_deref()
+                .and_then(workspace_from_project_id)
+                .map(|workspace| super::common::project_from_path(&workspace)),
+            seen: &mut seen,
+            events: &mut events,
+        };
+        let ts = message_timestamp(&data, created_at);
+        match role.as_str() {
+            "assistant" => collector.spend_event(
+                &message_id,
+                &task_id,
+                &data,
+                ts,
+                task_type.as_deref() == Some("subagent"),
+            ),
+            "tool" => collector.embedded(&data, ts, 0),
+            _ => {}
+        }
     }
     Ok(events)
 }
@@ -1012,7 +1098,7 @@ mod tests {
             "m4",
             "task-1",
             "tool",
-            r#"{"role":"tool","content":"<task_result>2 files</task_result>","toolUsage":{"signature":{"id":"call-1","name":"spawn_subagent"}},"_meta":{"timestamp":1700000000900,"subagentId":"child-1","agentType":"general"},"messages":[{"role":"system","content":"You are Bob","id":"c0"},{"role":"assistant","content":"two files","id":"c2","_meta":{"timestamp":1700000000800}},{"role":"user","content":"count files","id":"c1","_meta":{"timestamp":1700000000400}},{"role":"assistant","content":"","id":"c3","_meta":{"timestamp":1700000000500},"toolCalls":[{"id":"call-2","name":"execute_command","arguments":{"command":"ls"}}]},{"role":"tool","content":"a b","id":"c4","toolUsage":{"signature":{"id":"call-2","name":"execute_command"}},"_meta":{"timestamp":1700000000600,"hide":true}}]}"#,
+            r#"{"role":"tool","content":"<task_result>2 files</task_result>","toolUsage":{"signature":{"id":"call-1","name":"spawn_subagent"}},"_meta":{"timestamp":1700000000900,"subagentId":"child-1","agentType":"general"},"messages":[{"role":"system","content":"You are Bob","id":"c0"},{"role":"assistant","content":"two files","id":"c2","_meta":{"timestamp":1700000000800,"spend":{"input":50,"output":5,"cacheRead":10,"cacheWrite":0,"cost":0.002}}},{"role":"user","content":"count files","id":"c1","_meta":{"timestamp":1700000000400}},{"role":"assistant","content":"","id":"c3","_meta":{"timestamp":1700000000500},"toolCalls":[{"id":"call-2","name":"execute_command","arguments":{"command":"ls"}}]},{"role":"tool","content":"a b","id":"c4","toolUsage":{"signature":{"id":"call-2","name":"execute_command"}},"_meta":{"timestamp":1700000000600,"hide":true}}]}"#,
             1_700_000_900_003,
         );
 
@@ -1062,6 +1148,17 @@ mod tests {
             records[6].links.parent_tool_use_id.as_deref(),
             Some("call-2")
         );
+
+        // Usage reaches into the embedded transcript and attributes it to the child.
+        let events = parse_usage_file(&database).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("child-1"));
+        assert_eq!(events[0].message_id.as_deref(), Some("c2"));
+        assert_eq!(events[0].timestamp_ms, 1_700_000_000_800);
+        assert_eq!(events[0].tokens.raw_input, 50);
+        assert_eq!(events[0].tokens.uncached_input, 40);
+        assert!(events[0].sidechain);
+        assert_eq!(events[0].source_cost_usd, Some(0.002));
     }
 
     #[test]

@@ -393,13 +393,18 @@ pub(crate) fn sweep_candidates(
     let mut snapshot = reader.hot_files_since(cutoff)?;
     let mut databases: HashSet<String> = reader.header()?.opencode_databases.into_keys().collect();
     databases.extend(reader.sqlite_backed_paths()?);
-    // Bob tasks are virtual `<db>/<task_id>` paths: they cannot be stat'ed, and commits
-    // to their database already reach the daemon through WAL events and resyncs.
+    // Bob tasks are virtual `<db>/<task_id>` paths that cannot be stat'ed; their database
+    // joins the sweep instead, so WAL commits FSEvents defers while Bob holds the file open
+    // are still noticed.
     snapshot.retain(|key, file| {
         file.identity.sqlite_wal.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
+    databases.extend(reader.file_keys()?.iter().filter_map(|key| {
+        crate::sources::bob::split_virtual_path(Path::new(key))
+            .map(|(database, _)| database.to_string_lossy().into_owned())
+    }));
     Ok((snapshot, databases))
 }
 
@@ -1529,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_candidates_skip_virtual_bob_task_paths() {
+    fn sweep_candidates_skip_virtual_bob_task_paths_but_watch_their_database() {
         use crate::state::checkpoint::CheckpointReader;
         let _guard = env_lock();
         let temp = tempfile::tempdir().unwrap();
@@ -1537,13 +1542,10 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let hot = temp.path().join("hot.jsonl");
         std::fs::write(&hot, "{}\n").unwrap();
+        let database = temp.path().join("bob/db/bob.db");
         let mut task = file_state_for(&hot);
         task.mtime = i64::MAX / 2;
-        let task_key = temp
-            .path()
-            .join("bob/db/bob.db/task-1")
-            .to_string_lossy()
-            .into_owned();
+        let task_key = database.join("task-1").to_string_lossy().into_owned();
         write_ingest_state(
             &paths.root,
             HashMap::from([
@@ -1555,10 +1557,12 @@ mod tests {
         let reader = CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
         let (files, databases) = sweep_candidates(&reader, 0).unwrap();
 
-        // Hot by mtime, but a virtual path can never be stat'ed by the sweep.
+        // Hot by mtime, but a virtual path can never be stat'ed by the sweep; the
+        // database it lives in is polled instead.
         assert!(files.contains_key(&hot.to_string_lossy().into_owned()));
         assert!(!files.contains_key(&task_key));
         assert!(!databases.contains(&task_key));
+        assert!(databases.contains(&database.to_string_lossy().into_owned()));
     }
 
     #[test]

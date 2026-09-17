@@ -80,7 +80,7 @@ pub(super) fn parse_bob_task(
     progress: &Arc<Progress>,
 ) -> Result<()> {
     let source_path = task.path.to_string_lossy().to_string();
-    let parsed = crate::sources::bob::parse_index_records(
+    let parsed = match crate::sources::bob::parse_index_records(
         &task.path,
         crate::sources::IndexParseState {
             offset: task.offset,
@@ -93,7 +93,20 @@ pub(super) fn parse_bob_task(
             progress.add_produced(SourceKind::Bob, 1);
             tx_record.send(record)
         },
-    )?;
+    ) {
+        Ok(parsed) => parsed,
+        // A changed task is scheduled for a delete-first replay. Skipping it now would
+        // publish the deletion without its replacement, so the refresh fails instead and
+        // the indexed records survive until the database reads again. A brand-new task
+        // has nothing to lose and simply waits for the next refresh.
+        Err(error) if task.delete_first() && is_not_found(&error) => {
+            return Err(anyhow!(
+                "Bob task {} became unreadable during its replay; refresh aborted to keep its indexed records ({error:#})",
+                task.path.display()
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     finish_source_parse(
         task,
         tx_update,
