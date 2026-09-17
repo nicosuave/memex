@@ -10,9 +10,11 @@ use super::scan::{
 use super::{TokenBuckets, UsageEvent};
 use crate::types::SourceFilter;
 use anyhow::Result;
+use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
@@ -333,13 +335,35 @@ impl UsageCache {
             if !schema_current(&transaction)? {
                 transaction.execute_batch(
                     "DROP TABLE IF EXISTS usage_facts;
-                     DROP TABLE IF EXISTS usage_fact_sync;",
+                     DROP TABLE IF EXISTS usage_fact_sync;
+                     DROP TABLE IF EXISTS usage_fact_files;",
                 )?;
                 transaction.execute_batch(FACTS_DDL)?;
             }
             transaction.commit()?;
         }
         connection.execute_batch(FACTS_DDL)?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_fact_files (
+                 source TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 digest BLOB NOT NULL,
+                 PRIMARY KEY (source, path)
+             );
+             CREATE TRIGGER IF NOT EXISTS usage_fact_insert_invalidates_digest
+             AFTER INSERT ON usage_facts BEGIN
+                 DELETE FROM usage_fact_files WHERE source = NEW.source AND path = NEW.path;
+             END;
+             CREATE TRIGGER IF NOT EXISTS usage_fact_update_invalidates_digest
+             AFTER UPDATE ON usage_facts BEGIN
+                 DELETE FROM usage_fact_files WHERE source = OLD.source AND path = OLD.path;
+                 DELETE FROM usage_fact_files WHERE source = NEW.source AND path = NEW.path;
+             END;
+             CREATE TRIGGER IF NOT EXISTS usage_fact_delete_invalidates_digest
+             AFTER DELETE ON usage_facts BEGIN
+                 DELETE FROM usage_fact_files WHERE source = OLD.source AND path = OLD.path;
+             END;",
+        )?;
         if event_format != 1 || current_columns < 2 {
             connection.execute("DELETE FROM usage_fact_sync", [])?;
         }
@@ -525,12 +549,77 @@ impl UsageCache {
         fingerprint: &[(String, u64, i64)],
         warnings: &[String],
     ) -> Result<()> {
+        // Reconciliation still sees every occurrence. Only persistence is
+        // incremental: compare each file's final canonical contribution, so a
+        // winner change also rewrites affected files whose input did not change.
+        let mut contributions: HashMap<&str, Vec<&UsageEvent>> = HashMap::new();
+        for event in events {
+            contributions
+                .entry(event.source_path.as_ref())
+                .or_default()
+                .push(event);
+        }
+        let hashes: HashMap<&str, Vec<u8>> = contributions
+            .into_par_iter()
+            .map(|(path, events)| -> Result<_> {
+                let mut hash = Sha256::new();
+                for event in events {
+                    let bytes = postcard::to_stdvec(&CachedUsageEventRef::from_event(event))?;
+                    hash.update((bytes.len() as u64).to_le_bytes());
+                    hash.update(bytes);
+                }
+                Ok((path, hash.finalize().to_vec()))
+            })
+            .collect::<Result<_>>()?;
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM usage_facts WHERE source = ?1",
-            params![filter.as_str()],
+        let previous: HashMap<String, Option<Vec<u8>>> = {
+            let mut statement = transaction.prepare(
+                "WITH paths AS MATERIALIZED (
+                     SELECT DISTINCT path FROM usage_facts WHERE source = ?1
+                 )
+                 SELECT paths.path, files.digest FROM paths
+                 LEFT JOIN usage_fact_files AS files
+                   ON files.source = ?1 AND files.path = paths.path",
+            )?;
+            statement
+                .query_map([filter.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut changed: HashSet<&str> = hashes
+            .iter()
+            .filter(|(path, digest)| previous.get(**path).and_then(Option::as_ref) != Some(*digest))
+            .map(|(path, _)| *path)
+            .collect();
+        changed.extend(
+            previous
+                .keys()
+                .map(String::as_str)
+                .filter(|path| !hashes.contains_key(path)),
+        );
+        {
+            let mut delete =
+                transaction.prepare("DELETE FROM usage_facts WHERE source = ?1 AND path = ?2")?;
+            for path in &changed {
+                delete.execute(params![filter.as_str(), path])?;
+            }
+        }
+        insert_fact_events(
+            &transaction,
+            filter,
+            events
+                .iter()
+                .filter(|event| changed.contains(event.source_path.as_ref())),
         )?;
-        insert_fact_events(&transaction, filter, events)?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT OR REPLACE INTO usage_fact_files(source, path, digest) VALUES (?1, ?2, ?3)",
+            )?;
+            for path in &changed {
+                if let Some(digest) = hashes.get(path) {
+                    insert.execute(params![filter.as_str(), path, digest])?;
+                }
+            }
+        }
         write_fact_sync(&transaction, filter, fingerprint, warnings)?;
         transaction.commit()?;
         Ok(())
@@ -611,10 +700,10 @@ impl UsageCache {
 /// accompanying deletes and the sync row) and ordering (partition order for full
 /// rewrites; per-file order is irrelevant since reads order by key). `connection`
 /// accepts transactions through deref.
-fn insert_fact_events(
+fn insert_fact_events<'a>(
     connection: &Connection,
     filter: SourceFilter,
-    events: &[UsageEvent],
+    events: impl IntoIterator<Item = &'a UsageEvent>,
 ) -> Result<()> {
     let ordinal = source_ordinal(filter) as i64;
     let mut statement = connection.prepare(

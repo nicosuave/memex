@@ -313,12 +313,16 @@ fn rebuild_partition(
             .map(|(_, _, warnings)| warnings)
     });
     let (events, fingerprint) = match (cache.as_mut(), stored_warnings) {
-        (Some(cache), Some(stored)) => {
+        (Some(cache), Some(stored)) if !reconciles_cross_file(filter) => {
             match refresh_partition_from_facts(filter, cache, stored, &mut warnings) {
                 Ok(done) => done,
                 Err(_) => legacy_refresh_partition(filter, Some(cache), &mut warnings),
             }
         }
+        // Canonical facts omit suppressed occurrences. Invalidated cross-file
+        // sources need raw reconciliation to recover deleted/weakened winners;
+        // skip rediscovery merely to reject their facts path. Cursor also needs
+        // current transcript-derived project attribution on unchanged DB rows.
         (cache, _) => legacy_refresh_partition(filter, cache, &mut warnings),
     };
     let fact_generation = cache
@@ -345,8 +349,8 @@ fn rebuild_partition(
 }
 
 /// Legacy full partition rebuild: scan every file (decoding all cached blobs),
-/// reconcile, sort, and rewrite facts from scratch. Used when no sync row exists
-/// (e.g. pre-facts databases, which this backfills) and as the fallback when a
+/// reconcile, sort, and persist changed canonical contributions. Used when no
+/// sync row exists (e.g. pre-facts databases) and as the fallback when a
 /// facts-backed refresh hits any error. Returns sorted events plus the discovery
 /// fingerprint for the snapshot entry.
 pub(crate) fn legacy_refresh_partition(
@@ -369,7 +373,7 @@ pub(crate) fn legacy_refresh_partition(
         format!("{} sort ({} events)", filter.as_str(), events.len())
     });
     // Canonical facts mirror the partition exactly (a failed write only warns,
-    // like blob saves; the next refresh rewrites the partition atomically).
+    // like blob saves; the next refresh retries the atomic delta).
     if let Some(cache) = cache {
         let facts_start = Instant::now();
         let written = cache.replace_partition_facts(filter, &events, &fingerprint, warnings);
@@ -400,8 +404,9 @@ fn reconciles_cross_file(filter: SourceFilter) -> bool {
     )
 }
 
-/// Facts-backed partition refresh: hits reuse their fact rows with no blob
-/// decode, and only changed files parse. Any error returns `Err` so the caller
+/// Facts-backed refresh for sources without cross-file reconciliation: hits
+/// reuse their fact rows with no blob decode, and only changed files parse.
+/// Any error returns `Err` so the caller
 /// falls back to the legacy path, which reproduces today's exact behavior.
 /// Returns sorted events plus the discovery fingerprint for the snapshot entry.
 pub(crate) fn refresh_partition_from_facts(
@@ -463,17 +468,6 @@ pub(crate) fn refresh_partition_from_facts(
         .filter(|key| !live.contains(*key))
         .cloned()
         .collect();
-    // Canonical facts omit suppressed occurrences. Any mutation in a source
-    // with cross-file reconciliation can change winners in untouched files,
-    // including when an existing winner is rewritten to weaker or empty usage.
-    // Reconcile all raw/blob occurrences until provenance is persisted.
-    // Cursor also needs fresh project attribution on otherwise unchanged hits.
-    if filter == SourceFilter::Cursor
-        || (reconciles_cross_file(filter)
-            && (!missing.is_empty() || !stale.is_empty() || examined.len() != files.len()))
-    {
-        return Err(anyhow::anyhow!("{name} needs a complete source reconcile"));
-    }
     if !stale.is_empty() {
         cache.delete_stale(name, &stale)?;
     }
@@ -719,12 +713,20 @@ pub(crate) fn check_partition_valid(
     cache_path: Option<&Path>,
     previous_fingerprint: Option<&[(String, u64, i64)]>,
 ) -> bool {
+    valid_partition_fingerprint(filter, cache_path, previous_fingerprint).is_some()
+}
+
+pub(crate) fn valid_partition_fingerprint(
+    filter: SourceFilter,
+    cache_path: Option<&Path>,
+    previous_fingerprint: Option<&[(String, u64, i64)]>,
+) -> Option<FileFingerprint> {
     let files = source_files(filter);
     let mut fingerprint = Vec::with_capacity(files.len());
     let mut observed_metadata = Vec::with_capacity(files.len());
     for path in &files {
         let Ok(metadata) = usage_file_metadata(path) else {
-            return false;
+            return None;
         };
         fingerprint.push((path.to_string_lossy().to_string(), metadata.0, metadata.1));
         observed_metadata.push(metadata);
@@ -737,25 +739,27 @@ pub(crate) fn check_partition_valid(
             filter,
             SourceFilter::Hermes | SourceFilter::Cursor | SourceFilter::Opencode
         ) {
-            return false;
+            return None;
         }
-        return previous_fingerprint.is_some_and(|previous| fingerprint == previous);
+        return previous_fingerprint
+            .is_some_and(|previous| fingerprint == previous)
+            .then_some(fingerprint);
     };
     if let Some(previous) = previous_fingerprint
         && stable_triples(filter, &fingerprint) != stable_triples(filter, previous)
     {
-        return false;
+        return None;
     }
     let spec = source_spec(filter);
     let cache = match UsageCache::open(cache_path) {
         Ok(cache) => cache,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let expected = fingerprint_files(&stable_triples(filter, &fingerprint));
     let allow_uncached_codex = match cache.fact_sync(filter.as_str()) {
         Ok(Some((recorded, version, warnings))) => {
             if recorded != expected || version != spec.parser_version {
-                return false;
+                return None;
             }
             // Unresolved forks deliberately have no blob row. They can reuse
             // facts while still unresolved, but must retry parent resolution
@@ -763,7 +767,7 @@ pub(crate) fn check_partition_valid(
             // without changing its size or mtime.
             filter == SourceFilter::Codex && warnings.is_empty()
         }
-        _ => return false,
+        _ => return None,
     };
     // Validate the metadata that actually produced the facts. The discovery
     // checkpoint alone misses WAL dependencies and files changed mid-scan.
@@ -771,7 +775,7 @@ pub(crate) fn check_partition_valid(
     // authoritative indefinitely.
     let rows = match cache.load_source_meta(filter.as_str(), spec.parser_version) {
         Ok(rows) => rows,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     let now = epoch_ms_now();
     let mut observations = HashMap::new();
@@ -786,7 +790,7 @@ pub(crate) fn check_partition_valid(
             {
                 continue;
             }
-            return false;
+            return None;
         };
         let metadata_current = (spec.volatile_reuse_ms)(path).map_or_else(
             || metadata == (row.size, row.mtime_ns),
@@ -798,10 +802,10 @@ pub(crate) fn check_partition_valid(
                 .as_ref()
                 .is_some_and(|parents| !parents.deps_match_current_candidates(&row.deps))
         {
-            return false;
+            return None;
         }
     }
-    true
+    Some(fingerprint)
 }
 
 /// Current disk facts do not validate an older retained assembly. Compare the

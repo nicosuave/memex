@@ -6,6 +6,222 @@ use rusqlite::Connection;
 use std::fs;
 use std::time::{Duration, Instant};
 
+fn fact_event(path: &str, record: &str) -> super::UsageEvent {
+    super::UsageEvent {
+        source: "cursor",
+        source_path: path.into(),
+        source_record_id: Some(record.into()),
+        session_id: None,
+        request_id: None,
+        message_id: None,
+        timestamp_ms: 1000,
+        project: None,
+        provider: None,
+        model: None,
+        tokens: super::TokenBuckets::disjoint(10, 0, 0, 5),
+        source_cost_usd: None,
+        cost_authoritative: false,
+        dedupe_confidence: "exact",
+        conservative_undercount: false,
+        cache_chain_excluded: false,
+        sidechain: false,
+        permission_review: false,
+        source_order: 0,
+    }
+}
+
+fn stored_fact_events(cache: &super::cache::UsageCache) -> Vec<super::UsageEvent> {
+    super::facts::read_ordinal_run(
+        &cache.connection,
+        super::scan::source_ordinal(SourceFilter::Cursor) as i64,
+        None,
+        None,
+    )
+    .unwrap()
+    .into_iter()
+    .map(super::facts::FactRow::into_event)
+    .collect()
+}
+
+#[test]
+fn canonical_delta_preserves_untouched_files_and_removes_empty_contributions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cache = super::cache::UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+    let kept = fact_event("kept", "same");
+    let removed = fact_event("removed", "old");
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[kept.clone(), removed], &[], &[])
+        .unwrap();
+    cache
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER protect_kept_delete BEFORE DELETE ON usage_facts
+         WHEN OLD.path = 'kept' BEGIN SELECT RAISE(ABORT, 'untouched file deleted'); END;
+         CREATE TRIGGER protect_kept_insert BEFORE INSERT ON usage_facts
+         WHEN NEW.path = 'kept' BEGIN SELECT RAISE(ABORT, 'untouched file inserted'); END;",
+        )
+        .unwrap();
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[kept], &[], &[])
+        .unwrap();
+    let events = stored_fact_events(&cache);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].source_path.as_ref(), "kept");
+    cache
+        .connection
+        .execute_batch("DROP TRIGGER protect_kept_delete; DROP TRIGGER protect_kept_insert;")
+        .unwrap();
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[], &[], &[])
+        .unwrap();
+    assert!(stored_fact_events(&cache).is_empty());
+}
+
+#[test]
+fn canonical_delta_persists_equal_key_order_and_internal_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cache = super::cache::UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+    let first = fact_event("file", "first");
+    let mut second = fact_event("file", "second");
+    cache
+        .replace_partition_facts(
+            SourceFilter::Cursor,
+            &[first.clone(), second.clone()],
+            &[],
+            &[],
+        )
+        .unwrap();
+    cache
+        .replace_partition_facts(
+            SourceFilter::Cursor,
+            &[second.clone(), first.clone()],
+            &[],
+            &[],
+        )
+        .unwrap();
+    let events = stored_fact_events(&cache);
+    assert_eq!(events[0].source_record_id.as_deref(), Some("second"));
+    assert_eq!(events[1].source_record_id.as_deref(), Some("first"));
+    second.cache_chain_excluded = true;
+    second.permission_review = true;
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[second, first], &[], &[])
+        .unwrap();
+    let events = stored_fact_events(&cache);
+    assert!(events[0].cache_chain_excluded);
+    assert!(events[0].permission_review);
+}
+
+#[test]
+fn canonical_delta_recovers_missing_digests_and_incremental_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cache = super::cache::UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+    let original = fact_event("file", "original");
+    cache
+        .replace_partition_facts(
+            SourceFilter::Cursor,
+            &[original.clone(), fact_event("orphan", "removed")],
+            &[],
+            &[],
+        )
+        .unwrap();
+    // Simulate a pre-digest database: existing facts are still authoritative
+    // for detecting removed paths, even without any hash metadata.
+    cache
+        .connection
+        .execute("DELETE FROM usage_fact_files", [])
+        .unwrap();
+    cache
+        .replace_partition_facts(
+            SourceFilter::Cursor,
+            std::slice::from_ref(&original),
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(stored_fact_events(&cache).len(), 1);
+    cache
+        .upsert_file_facts(
+            SourceFilter::Cursor,
+            &["file".into()],
+            &[fact_event("file", "incremental")],
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        stored_fact_events(&cache)[0].source_record_id.as_deref(),
+        Some("incremental")
+    );
+    // Returning to the original contribution must not match a stale digest
+    // left over from before the incremental write.
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[original], &[], &[])
+        .unwrap();
+    assert_eq!(
+        stored_fact_events(&cache)[0].source_record_id.as_deref(),
+        Some("original")
+    );
+}
+
+#[test]
+fn canonical_delta_rolls_back_facts_digests_and_generation_on_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cache = super::cache::UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[fact_event("file", "old")], &[], &[])
+        .unwrap();
+    let generation = cache.fact_generation("cursor").unwrap();
+    let digest = |cache: &super::cache::UsageCache| -> Vec<u8> {
+        cache
+            .connection
+            .query_row(
+                "SELECT digest FROM usage_fact_files WHERE source = 'cursor' AND path = 'file'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let old_digest = digest(&cache);
+    cache
+        .connection
+        .execute_batch(
+            "CREATE TRIGGER fail_sync BEFORE UPDATE ON usage_fact_sync
+         BEGIN SELECT RAISE(ABORT, 'simulated commit failure'); END;",
+        )
+        .unwrap();
+    let replacement = fact_event("file", "new");
+    assert!(
+        cache
+            .replace_partition_facts(
+                SourceFilter::Cursor,
+                std::slice::from_ref(&replacement),
+                &[],
+                &[],
+            )
+            .is_err()
+    );
+    assert_eq!(
+        stored_fact_events(&cache)[0].source_record_id.as_deref(),
+        Some("old")
+    );
+    assert_eq!(digest(&cache), old_digest);
+    assert_eq!(cache.fact_generation("cursor").unwrap(), generation);
+    cache
+        .connection
+        .execute_batch("DROP TRIGGER fail_sync")
+        .unwrap();
+    cache
+        .replace_partition_facts(SourceFilter::Cursor, &[replacement], &[], &[])
+        .unwrap();
+    assert_eq!(
+        stored_fact_events(&cache)[0].source_record_id.as_deref(),
+        Some("new")
+    );
+    assert_ne!(digest(&cache), old_digest);
+    assert_ne!(cache.fact_generation("cursor").unwrap(), generation);
+}
+
 fn expire(query: &UsageQuery) {
     lock_partitions()
         .get_mut(&(query.source.unwrap(), query.cache_path.clone()))

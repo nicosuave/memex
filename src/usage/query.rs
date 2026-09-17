@@ -1,7 +1,7 @@
 //! Report construction over snapshots and facts.
 //!
 //! Single-source queries read one partition; combined queries merge shared
-//! partitions; cold starts serve valid facts without building anything.
+//! partitions; cold starts reuse valid facts to populate snapshots or serve one-shots.
 
 use super::cache::UsageCache;
 use super::compact::UsageAssembly;
@@ -11,9 +11,8 @@ use super::merge::{MergedPos, MergedView, filtered_merged_positions};
 use super::pricing::{PRICE_CATALOG_ID, RateCache, accumulate_usage_event, compute_cache_waste};
 use super::scan::{FileFingerprint, SCANNERS};
 use super::snapshot::{
-    MAX_PARTITIONS, MergedSnapshot, PartitionEntry, Snapshot, USAGE_SCAN_LOCK,
-    check_partition_valid, discovery_fingerprint, ensure_snapshot, evict_oldest, lock_merged,
-    lock_partitions, refresh_merged,
+    MAX_PARTITIONS, MergedSnapshot, PartitionEntry, Snapshot, USAGE_SCAN_LOCK, ensure_snapshot,
+    evict_oldest, lock_merged, lock_partitions, refresh_merged, valid_partition_fingerprint,
 };
 use super::usage_timing;
 use super::{UsageActivityPoint, UsageEvent, UsageQuery, UsageReport, UsageSummary};
@@ -95,14 +94,17 @@ fn try_cold_serve_points(
         .cache_path
         .as_deref()
         .expect("cold serve needs a cache");
+    if query.memo_ttl_ms != 0 {
+        // Retaining callers answer from the assembly we load here. Reading
+        // points first would scan the same facts twice on the first query.
+        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+        return Ok(None);
+    }
     let Ok(points) = read_fact_points(query, cache_path) else {
         return Ok(None);
     };
     if !ready.generations_current(cache_path) {
         return Ok(None);
-    }
-    if query.memo_ttl_ms != 0 {
-        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
     }
     Ok(Some((points, ready.warnings)))
 }
@@ -175,10 +177,7 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
             continue;
         }
         let generation = cache.fact_generation(filter.as_str()).ok()??;
-        let fingerprint = discovery_fingerprint(filter);
-        if !check_partition_valid(filter, Some(cache_path), Some(&fingerprint)) {
-            return None;
-        }
+        let fingerprint = valid_partition_fingerprint(filter, Some(cache_path), None)?;
         let (_, _, warnings) = cache.fact_sync(filter.as_str()).ok()??;
         per_source.push(ColdSource {
             filter,
@@ -320,14 +319,15 @@ fn try_cold_serve_report(query: &UsageQuery) -> Result<Option<UsageReport>> {
         .cache_path
         .as_deref()
         .expect("cold serve needs a cache");
+    if query.memo_ttl_ms != 0 {
+        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+        return Ok(None);
+    }
     let Ok(report) = scan_usage_from_facts(query, cache_path, &ready.warnings) else {
         return Ok(None);
     };
     if !ready.generations_current(cache_path) {
         return Ok(None);
-    }
-    if query.memo_ttl_ms != 0 {
-        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
     }
     Ok(Some(report))
 }
@@ -491,6 +491,109 @@ mod tests {
     use super::super::snapshot::{check_partition_valid, lock_merged, lock_partitions};
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn cold_retaining_activity_keeps_events_outside_the_first_query_range() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).unwrap();
+        let lines: String = [("early", 1000, 10), ("late", 2000, 70)]
+            .into_iter()
+            .map(|(id, timestamp, input)| {
+                serde_json::json!({
+                    "type": "assistant", "sessionId": "session", "timestamp": timestamp,
+                    "message": { "id": id, "model": "claude-sonnet-4-6",
+                        "usage": { "inputTokens": input } }
+                })
+                .to_string()
+                    + "\n"
+            })
+            .collect();
+        std::fs::write(projects.join("session.jsonl"), lines).unwrap();
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(temp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            cache_path: Some(temp.path().join("cache.sqlite3")),
+            memo_ttl_ms: 60_000,
+            ..UsageQuery::default()
+        };
+        let key = (SourceFilter::Claude, query.cache_path.clone());
+        let expected = scan_usage_activity_with_warnings(&query).unwrap();
+        assert_eq!(expected.0.len(), 2);
+        lock_partitions().remove(&key);
+        let narrow = UsageQuery {
+            since_ms: Some(expected.0[1].timestamp_ms),
+            ..query.clone()
+        };
+        let cold = scan_usage_activity_with_warnings(&narrow).unwrap();
+        assert_eq!(cold.0, expected.0[1..]);
+        assert_eq!(cold.1, expected.1);
+        assert!(lock_partitions().contains_key(&key));
+        assert_eq!(scan_usage_activity_with_warnings(&query).unwrap(), expected);
+        // The visitor must run after cold population releases refresh locks.
+        lock_partitions().remove(&key);
+        visit_usage_activity(&narrow, |_| {
+            let _refresh = USAGE_SCAN_LOCK
+                .try_lock()
+                .expect("callback outside refresh lock");
+            let _partitions = lock_partitions();
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cold_population_rejects_a_stale_generation_and_skips_a_busy_refresh() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects/memex");
+        std::fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("session.jsonl");
+        let line = |input| {
+            serde_json::json!({
+                "type": "assistant", "sessionId": "session", "timestamp": 1000,
+                "message": { "id": "message", "usage": { "inputTokens": input } }
+            })
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(&transcript, line(10)).unwrap();
+        let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(temp.path().as_os_str()))]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            cache_path: Some(temp.path().join("cache.sqlite3")),
+            memo_ttl_ms: 60_000,
+            ..UsageQuery::default()
+        };
+        let key = (SourceFilter::Claude, query.cache_path.clone());
+        assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+        lock_partitions().remove(&key);
+        let ready = cold_facts_ready(&query).expect("valid cold facts");
+        let cache_path = query.cache_path.as_deref().unwrap();
+        {
+            let _refresh = USAGE_SCAN_LOCK.lock().unwrap();
+            populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+            assert!(!lock_partitions().contains_key(&key));
+        }
+        std::fs::write(&transcript, line(800)).unwrap();
+        assert_eq!(
+            scan_usage(&UsageQuery {
+                memo_ttl_ms: 0,
+                ..query.clone()
+            })
+            .unwrap()
+            .total_tokens,
+            800,
+        );
+        assert!(!ready.generations_current(cache_path));
+        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+        assert!(!lock_partitions().contains_key(&key));
+        assert_eq!(scan_usage(&query).unwrap().total_tokens, 800);
+    }
 
     #[test]
     fn claude_lines_with_both_session_field_spellings_are_counted() {
