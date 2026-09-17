@@ -4,7 +4,7 @@
 //! refreshes and cold starts can skip blob decoding. Writes are atomic per
 //! partition (or per changed-file set) together with the freshness fingerprint.
 
-use super::compact::{FilterFields, UsageEventView};
+use super::compact::{FilterFields, UsageAssembly, UsageAssemblyBuilder, UsageEventView};
 use super::filter::FilterPlan;
 use super::merge::{MergedPos, merge_runs};
 use super::pricing::{PRICE_CATALOG_ID, RateCache, accumulate_usage_event, compute_cache_waste};
@@ -179,6 +179,73 @@ const FACT_COLUMNS: &str =
         cache_read, cache_write, cache_write_1h, output, reasoning, source_cost_usd,
         cost_authoritative, dedupe_confidence, conservative_undercount,
         cache_chain_excluded, sidechain, permission_review";
+
+/// Retained cold reads intern SQLite's borrowed text directly, avoiding an
+/// owned fact row and event (including a separately allocated path) per record.
+pub(crate) fn read_fact_assembly(
+    connection: &Connection,
+    filter: SourceFilter,
+) -> Result<UsageAssembly> {
+    let read_start = Instant::now();
+    // Ordered index reads revisit table pages across files. Let SQLite borrow
+    // up to 256 MiB from the OS page cache instead of repeatedly copying pages
+    // through its small default cache. Unsupported platforms ignore this.
+    connection.pragma_update(None, "mmap_size", 256 * 1024 * 1024)?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {FACT_COLUMNS} FROM usage_facts WHERE ordinal = ?
+         ORDER BY ordinal, timestamp_ms, path, source_order, row_idx"
+    ))?;
+    let mut rows = statement.query([source_ordinal(filter) as i64])?;
+    let mut builder = UsageAssemblyBuilder::default();
+    while let Some(row) = rows.next()? {
+        let text = |index| row.get_ref(index)?.as_str().map_err(rusqlite::Error::from);
+        let optional_text = |index| -> rusqlite::Result<Option<&str>> {
+            match row.get_ref(index)? {
+                rusqlite::types::ValueRef::Null => Ok(None),
+                value => Ok(Some(value.as_str()?)),
+            }
+        };
+        let as_u64 = |index| row.get::<_, i64>(index).map(|value| value as u64);
+        builder.push(UsageEventData {
+            source: filter.as_str(),
+            source_path: text(1)?,
+            source_order: as_u64(2)?,
+            timestamp_ms: as_u64(3)?,
+            session_id: optional_text(4)?,
+            project: optional_text(5)?,
+            provider: optional_text(6)?,
+            model: optional_text(7)?,
+            source_record_id: optional_text(8)?,
+            request_id: optional_text(9)?,
+            message_id: optional_text(10)?,
+            tokens: TokenBuckets {
+                raw_input: as_u64(11)?,
+                uncached_input: as_u64(12)?,
+                cache_read: as_u64(13)?,
+                cache_write: as_u64(14)?,
+                cache_write_1h: as_u64(15)?,
+                output: as_u64(16)?,
+                reasoning: as_u64(17)?,
+            },
+            source_cost_usd: row.get(18)?,
+            cost_authoritative: row.get::<_, i64>(19)? != 0,
+            dedupe_confidence: match text(20)? {
+                "exact" => "exact",
+                "strong" => "strong",
+                _ => "heuristic",
+            },
+            conservative_undercount: row.get::<_, i64>(21)? != 0,
+            cache_chain_excluded: row.get::<_, i64>(22)? != 0,
+            sidechain: row.get::<_, i64>(23)? != 0,
+            permission_review: row.get::<_, i64>(24)? != 0,
+        });
+    }
+    let assembly = builder.finish();
+    usage_timing(read_start, || {
+        format!("facts compact read ({} rows)", assembly.len())
+    });
+    Ok(assembly)
+}
 
 fn map_fact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, FactRow)> {
     let ordinal: i64 = row.get(0)?;
@@ -442,6 +509,65 @@ mod tests {
     use super::super::{CostMode, SourceFilter, UsageQuery, query::visit_inner, scan_usage};
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn borrowed_fact_assembly_preserves_ties_text_and_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache =
+            super::super::cache::UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+        let mut events = Vec::new();
+        for index in 0..12 {
+            let mut event = super::super::cache_event("会話", index / 6, "モデル", index, 2, 3);
+            event.source_path = Arc::from(if index % 2 == 0 { "a" } else { "会話.jsonl" });
+            event.source_order = 0;
+            event.source_record_id = Some(format!("record-{index}"));
+            event.request_id = (index % 2 == 0).then(|| "要求".into());
+            event.message_id = Some(String::new());
+            event.project = Some("/projects/é".into());
+            event.provider = None;
+            if index == 0 {
+                event.session_id = None;
+                event.project = None;
+                event.model = None;
+                event.source_record_id = None;
+                event.message_id = None;
+            }
+            event.source_cost_usd = Some(0.125);
+            event.cost_authoritative = index % 2 == 0;
+            event.cache_chain_excluded = index % 3 == 0;
+            event.sidechain = index % 4 == 0;
+            event.permission_review = index % 5 == 0;
+            event.conservative_undercount = index % 2 != 0;
+            event.dedupe_confidence = ["exact", "strong", "heuristic"][index as usize % 3];
+            events.push(event);
+        }
+        super::super::snapshot::sort_usage_events(&mut events);
+        cache
+            .replace_partition_facts(SourceFilter::Claude, &events, &[], &[])
+            .unwrap();
+        let assembly = read_fact_assembly(&cache.connection, SourceFilter::Claude).unwrap();
+        let expected = UsageAssembly::new(events, None);
+        assert_eq!(assembly.len(), expected.len());
+        for index in 0..expected.len() {
+            let actual = assembly.view(index);
+            let expected = expected.view(index);
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(actual.cost_authoritative, expected.cost_authoritative);
+            assert_eq!(actual.cache_chain_excluded, expected.cache_chain_excluded);
+            assert_eq!(actual.sidechain, expected.sidechain);
+            assert_eq!(actual.permission_review, expected.permission_review);
+            assert_eq!(actual.source_order, expected.source_order);
+        }
+        assert_eq!(
+            read_fact_assembly(&cache.connection, SourceFilter::Codex)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
 
     #[test]
     fn facts_report_matches_assembly_report() {

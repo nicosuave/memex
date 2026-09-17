@@ -914,27 +914,147 @@ pub(crate) fn discovery_fingerprint(filter: SourceFilter) -> FileFingerprint {
 /// used by a parallel merge sort. Sorting indices also avoids repeatedly moving the
 /// large owned records. Original positions break equal-key ties exactly as before.
 pub(crate) fn sort_usage_events(events: &mut [UsageEvent]) {
-    let mut order: Vec<usize> = (0..events.len()).collect();
-    order.par_sort_unstable_by(|&left, &right| {
+    let keys_start = Instant::now();
+    // Most comparisons are decided by timestamp. Keep it beside the index so
+    // sorting does not repeatedly fetch large, scattered event records.
+    let mut order: Vec<(u64, usize)> = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| (event.timestamp_ms, index))
+        .collect();
+    usage_timing(keys_start, || "sort key extraction".to_string());
+    let ordering_start = Instant::now();
+    order.par_sort_unstable_by(|&(left_time, left), &(right_time, right)| {
+        let by_time = left_time.cmp(&right_time);
+        if !by_time.is_eq() {
+            return by_time;
+        }
         let a = &events[left];
         let b = &events[right];
-        (a.timestamp_ms, &a.source_path, a.source_order)
-            .cmp(&(b.timestamp_ms, &b.source_path, b.source_order))
+        (&a.source_path, a.source_order)
+            .cmp(&(&b.source_path, b.source_order))
             .then_with(|| left.cmp(&right))
     });
-    // Each entry maps a destination to its original position. Follow each cycle,
-    // placing its next record and marking visited positions as fixed points.
+    usage_timing(ordering_start, || "sort index ordering".to_string());
+    let permutation_start = Instant::now();
+    // Each entry maps a destination to its original position. Rotate each cycle
+    // through one hole: swapping would copy these large records three times.
+    let base = events.as_mut_ptr();
     for start in 0..order.len() {
-        let mut current = start;
-        loop {
-            let next = order[current];
-            order[current] = current;
-            if next == start {
-                break;
-            }
-            events.swap(current, next);
-            current = next;
+        if order[start].1 == start {
+            continue;
         }
+        let mut current = start;
+        // SAFETY: sorting preserves the permutation of 0..events.len(), so every
+        // index is in bounds and each unvisited cycle returns to its start.
+        // Read the start into a temporary, move each successor into the hole,
+        // then fill the final hole with the saved record. Distinct cycle indices
+        // do not overlap. There are no allocations, callbacks, or panicking
+        // operations while the hole exists, and every record is owned once again
+        // before leaving this block. Visited cycles become fixed points.
+        unsafe {
+            let saved = base.add(start).read();
+            loop {
+                let position = &mut order.get_unchecked_mut(current).1;
+                let next = *position;
+                *position = current;
+                if next == start {
+                    base.add(current).write(saved);
+                    break;
+                }
+                std::ptr::copy_nonoverlapping(base.add(next), base.add(current), 1);
+                current = next;
+            }
+        }
+    }
+    usage_timing(permutation_start, || "sort event permutation".to_string());
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    #[test]
+    fn event_rotation_preserves_ownership_for_every_small_permutation() {
+        fn check(order: &[usize]) {
+            let path: Arc<str> = Arc::from("shared");
+            let mut events: Vec<_> = (0..order.len())
+                .map(|index| {
+                    let mut event = super::super::cache_event(
+                        &format!("session-{index}"),
+                        0,
+                        "model",
+                        index as u64,
+                        0,
+                        0,
+                    );
+                    event.source_path = path.clone();
+                    event.message_id = Some(format!("owned-{index}"));
+                    event
+                })
+                .collect();
+            for (rank, &index) in order.iter().enumerate() {
+                events[index].timestamp_ms = rank as u64;
+            }
+            let expected: Vec<_> = order.iter().map(|&index| events[index].clone()).collect();
+            sort_usage_events(&mut events);
+            assert_eq!(
+                serde_json::to_value(&events).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            drop(events);
+            drop(expected);
+            assert_eq!(Arc::strong_count(&path), 1);
+        }
+        fn permutations(order: &mut [usize], start: usize) {
+            if start == order.len() {
+                check(order);
+                return;
+            }
+            for index in start..order.len() {
+                order.swap(start, index);
+                permutations(order, start + 1);
+                order.swap(start, index);
+            }
+        }
+        // Includes empty/singleton inputs, fixed points, swaps, long cycles,
+        // and multiple disjoint cycles, with owned strings and shared paths.
+        for len in 0..=7 {
+            permutations(&mut (0..len).collect::<Vec<_>>(), 0);
+        }
+    }
+
+    #[test]
+    fn timestamp_index_sort_matches_stable_full_event_sort() {
+        let mut events: Vec<_> = (0..513)
+            .map(|index| {
+                let mut event =
+                    super::super::cache_event("session", index % 7, "model", index, 0, 0);
+                event.timestamp_ms = if index % 19 == 0 { u64::MAX } else { index % 7 };
+                event.source_path = Arc::from(["/é", "/a", ""][index as usize % 3]);
+                event.source_order = index % 2;
+                event
+            })
+            .collect();
+        let mut expected = events.clone();
+        expected.sort_by(|a, b| {
+            (a.timestamp_ms, &a.source_path, a.source_order).cmp(&(
+                b.timestamp_ms,
+                &b.source_path,
+                b.source_order,
+            ))
+        });
+        sort_usage_events(&mut events);
+        assert_eq!(
+            serde_json::to_value(&events).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        sort_usage_events(&mut events);
+        assert_eq!(
+            serde_json::to_value(&events).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        sort_usage_events(&mut []);
     }
 }
 

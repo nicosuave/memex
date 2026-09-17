@@ -5,7 +5,7 @@
 
 use super::cache::UsageCache;
 use super::compact::UsageAssembly;
-use super::facts::{FactRow, read_fact_points, read_fact_runs, scan_usage_from_facts};
+use super::facts::{read_fact_assembly, read_fact_points, scan_usage_from_facts};
 use super::filter::filtered_events;
 use super::merge::{MergedPos, MergedView, filtered_merged_positions};
 use super::pricing::{PRICE_CATALOG_ID, RateCache, accumulate_usage_event, compute_cache_waste};
@@ -204,8 +204,8 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
     })
 }
 
-/// Build snapshot assemblies from facts for amortization: map rows to owned
-/// events (already canonical and ordered, so no reconcile or sort) and compact.
+/// Build snapshot assemblies from canonical, ordered facts, interning borrowed
+/// SQLite text directly without intermediate owned events or reconciliation.
 /// Best-effort and non-blocking — if a refresh is already running, it will
 /// publish anyway. Failures simply leave the store empty for the next attempt.
 fn populate_snapshots_from_facts(
@@ -224,14 +224,9 @@ fn populate_snapshots_from_facts(
         if lock_partitions().contains_key(&(*filter, Some(cache_path.to_path_buf()))) {
             continue;
         }
-        let Ok(runs) = read_fact_runs(cache_path, Some(*filter), None, None) else {
+        let Ok(assembly) = read_fact_assembly(&cache.connection, *filter) else {
             continue;
         };
-        let events: Vec<UsageEvent> = runs
-            .into_iter()
-            .flatten()
-            .map(FactRow::into_event)
-            .collect();
         if cache
             .fact_generation(filter.as_str())
             .ok()
@@ -241,7 +236,7 @@ fn populate_snapshots_from_facts(
         {
             continue;
         }
-        let assembly = Arc::new(UsageAssembly::new(events, None));
+        let assembly = Arc::new(assembly);
         let mut store = lock_partitions();
         if store.len() >= MAX_PARTITIONS {
             let key = (*filter, Some(cache_path.to_path_buf()));

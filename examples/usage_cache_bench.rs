@@ -4,7 +4,10 @@
 //! `--verify` hashes detailed reports and filter/cost variants without printing records.
 //! Live/peak bytes count requested Rust allocations; native allocations and allocator
 //! retention are excluded. macOS footprint/RSS measurements include the whole process.
-//! Allocation counters instrument both variants equally; times are instrumented timings.
+//! Default builds measure timings without allocation-counter overhead. Build separately
+//! with `MEMEX_BENCH_ALLOCATIONS=1 mbx build --release --example usage_cache_bench`
+//! to measure allocations; compare timing builds and allocation builds separately.
+//! Correctness hashing and serialization are outside all measured phases.
 //! `--stream` benchmarks daily bucket aggregation. Build the candidate example with
 //! `mbx rustc --release --example usage_cache_bench -- --cfg memex_native_usage_visitor`;
 //! the baseline build collects points before invoking the same aggregation callback.
@@ -19,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 struct MeasuredAllocator;
+const TRACK_ALLOCATIONS: bool = option_env!("MEMEX_BENCH_ALLOCATIONS").is_some();
 // Keep the hot counters together and isolated from unrelated globals. Otherwise
 // binary layout can change cache-line contention during parallel blob decoding.
 #[repr(align(128))]
@@ -39,25 +43,27 @@ fn allocated(bytes: usize) {
 unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
+        if TRACK_ALLOCATIONS && !pointer.is_null() {
             allocated(layout.size());
         }
         pointer
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
-        if !pointer.is_null() {
+        if TRACK_ALLOCATIONS && !pointer.is_null() {
             allocated(layout.size());
         }
         pointer
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         unsafe { System.dealloc(pointer, layout) };
-        ALLOCATIONS.live.fetch_sub(layout.size(), Ordering::Relaxed);
+        if TRACK_ALLOCATIONS {
+            ALLOCATIONS.live.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let replacement = unsafe { System.realloc(pointer, layout, size) };
-        if !replacement.is_null() {
+        if TRACK_ALLOCATIONS && !replacement.is_null() {
             if size >= layout.size() {
                 allocated(size - layout.size());
             } else {
@@ -90,17 +96,23 @@ fn process_memory() -> (u64, u64) {
 }
 
 fn measure<T>(name: &str, action: impl FnOnce() -> T) -> T {
-    ALLOCATIONS
-        .peak
-        .store(ALLOCATIONS.live.load(Ordering::Relaxed), Ordering::Relaxed);
+    if TRACK_ALLOCATIONS {
+        ALLOCATIONS
+            .peak
+            .store(ALLOCATIONS.live.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
     let start = Instant::now();
     let result = action();
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let live_bytes = ALLOCATIONS.live.load(Ordering::Relaxed);
-    let peak_bytes = ALLOCATIONS.peak.load(Ordering::Relaxed);
-    println!(
-        "phase={name} elapsed_ms={elapsed_ms:.3} live_bytes={live_bytes} peak_bytes={peak_bytes}"
-    );
+    if TRACK_ALLOCATIONS {
+        let live_bytes = ALLOCATIONS.live.load(Ordering::Relaxed);
+        let peak_bytes = ALLOCATIONS.peak.load(Ordering::Relaxed);
+        println!(
+            "phase={name} elapsed_ms={elapsed_ms:.3} live_bytes={live_bytes} peak_bytes={peak_bytes}"
+        );
+    } else {
+        println!("phase={name} elapsed_ms={elapsed_ms:.3}");
+    }
     #[cfg(target_os = "macos")]
     {
         let (resident_bytes, footprint_bytes) = process_memory();
@@ -111,22 +123,38 @@ fn measure<T>(name: &str, action: impl FnOnce() -> T) -> T {
     result
 }
 
-fn chart_digest(query: &UsageQuery) -> anyhow::Result<String> {
-    if std::env::args().any(|argument| argument == "--stream") {
-        return stream_chart(query);
-    }
-    let (points, partial) = scan_usage_activity(query)?;
-    let mut digest = Sha256::new();
-    digest.update([u8::from(partial)]);
-    for point in &points {
-        digest.update(point.source.as_bytes());
-        digest.update(point.timestamp_ms.to_le_bytes());
-        digest.update(point.total_tokens.to_le_bytes());
-    }
-    Ok(format!("{:x}", digest.finalize()))
+enum Chart {
+    Points(Vec<memex::usage::UsageActivityPoint>, bool),
+    Buckets(BTreeMap<u64, u64>, bool),
 }
 
-fn stream_chart(query: &UsageQuery) -> anyhow::Result<String> {
+fn chart_digest(chart: Chart) -> String {
+    let mut digest = Sha256::new();
+    match chart {
+        Chart::Points(points, partial) => {
+            digest.update([u8::from(partial)]);
+            for point in points {
+                digest.update(point.source.as_bytes());
+                digest.update(point.timestamp_ms.to_le_bytes());
+                digest.update(point.total_tokens.to_le_bytes());
+            }
+        }
+        Chart::Buckets(buckets, partial) => {
+            digest.update([u8::from(partial)]);
+            for (day, total) in buckets {
+                digest.update(day.to_le_bytes());
+                digest.update(total.to_le_bytes());
+            }
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn chart(query: &UsageQuery, stream: bool) -> anyhow::Result<Chart> {
+    if !stream {
+        let (points, partial) = scan_usage_activity(query)?;
+        return Ok(Chart::Points(points, partial));
+    }
     let mut buckets = BTreeMap::<u64, u64>::new();
     let mut consume = |point: memex::usage::UsageActivityPoint| {
         let total = buckets.entry(point.timestamp_ms / 86_400_000).or_default();
@@ -142,17 +170,12 @@ fn stream_chart(query: &UsageQuery) -> anyhow::Result<String> {
         }
         partial
     };
-    let mut digest = Sha256::new();
-    digest.update([u8::from(partial)]);
-    for (day, total) in buckets {
-        digest.update(day.to_le_bytes());
-        digest.update(total.to_le_bytes());
-    }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(Chart::Buckets(buckets, partial))
 }
 
 fn main() -> anyhow::Result<()> {
     let cache = std::env::args().nth(1).expect("usage-cache path required");
+    let stream = std::env::args().any(|argument| argument == "--stream");
     let mut query = UsageQuery {
         source: Some(SourceFilter::Codex),
         cache_path: Some(cache.into()),
@@ -165,35 +188,29 @@ fn main() -> anyhow::Result<()> {
     }
     if std::env::args().any(|argument| argument == "--no-memo") {
         query.memo_ttl_ms = 0;
-        let digest = measure("no_memo_chart", || chart_digest(&query))?;
+        let digest = chart_digest(measure("no_memo_chart", || chart(&query, stream))?);
         println!("chart_sha256={digest}");
         return Ok(());
     }
-    let first_digest = measure("first_chart", || chart_digest(&query))?;
+    let first_digest = chart_digest(measure("first_chart", || chart(&query, stream))?);
     println!("chart_sha256={first_digest}");
     measure("warm_chart_20", || -> anyhow::Result<()> {
         for _ in 0..20 {
-            if std::env::args().any(|argument| argument == "--stream") {
-                std::hint::black_box(stream_chart(&query)?);
-            } else {
-                std::hint::black_box(scan_usage_activity(&query)?);
-            }
+            std::hint::black_box(chart(&query, stream)?);
         }
         Ok(())
     })?;
-    measure("report", || -> anyhow::Result<()> {
-        let report = scan_usage(&query)?;
-        println!(
-            "events={} warnings={} report_sha256={:x}",
-            report.events,
-            report.warnings.len(),
-            Sha256::digest(serde_json::to_vec(&report)?)
-        );
-        Ok(())
-    })?;
+    let report = measure("report", || scan_usage(&query))?;
+    println!(
+        "events={} warnings={} report_sha256={:x}",
+        report.events,
+        report.warnings.len(),
+        Sha256::digest(serde_json::to_vec(&report)?)
+    );
+    drop(report);
     query.memo_ttl_ms = 1;
     std::thread::sleep(Duration::from_millis(2));
-    let refresh_digest = measure("refresh", || chart_digest(&query))?;
+    let refresh_digest = chart_digest(measure("refresh", || chart(&query, stream))?);
     assert_eq!(refresh_digest, first_digest);
     let refreshes = std::env::args()
         .find_map(|argument| {
@@ -206,14 +223,18 @@ fn main() -> anyhow::Result<()> {
     if refreshes > 1 {
         for refresh in 2..=refreshes {
             std::thread::sleep(Duration::from_millis(2));
-            let digest = measure(&format!("refresh_{refresh}"), || chart_digest(&query))?;
+            let digest = chart_digest(measure(&format!("refresh_{refresh}"), || {
+                chart(&query, stream)
+            })?);
             assert_eq!(digest, first_digest);
         }
     }
-    println!(
-        "retained_bytes={}",
-        ALLOCATIONS.live.load(Ordering::Relaxed)
-    );
+    if TRACK_ALLOCATIONS {
+        println!(
+            "retained_bytes={}",
+            ALLOCATIONS.live.load(Ordering::Relaxed)
+        );
+    }
     if std::env::args().any(|argument| argument == "--verify") {
         query.memo_ttl_ms = 60_000;
         query.include_events = true;
@@ -259,7 +280,7 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "verify={case} events={} chart_sha256={} report_sha256={:x}",
                 report.events,
-                chart_digest(&filtered)?,
+                chart_digest(chart(&filtered, stream)?),
                 Sha256::digest(serde_json::to_vec(&report)?)
             );
         }

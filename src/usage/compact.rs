@@ -16,6 +16,34 @@ pub(super) struct StringId(NonZeroUsize);
 /// text), so filtering and reporting borrow instead of cloning per event.
 pub(crate) struct UsageAssembly(CompactUsageAssembly);
 
+/// Compact borrowed rows while their backing storage is still available.
+#[derive(Default)]
+pub(crate) struct UsageAssemblyBuilder {
+    assembly: CompactUsageAssembly,
+    dictionary: HashMap<String, StringId>,
+}
+
+impl UsageAssemblyBuilder {
+    pub(crate) fn push(&mut self, event: UsageEventView<'_>) {
+        let intern_text = |text: &str, dictionary: &mut HashMap<String, StringId>| {
+            dictionary
+                .get(text)
+                .copied()
+                .unwrap_or_else(|| intern(dictionary, text.to_owned()))
+        };
+        let path = intern_text(event.source_path, &mut self.dictionary);
+        self.assembly
+            .events
+            .push(event.map_text(path, |text| intern_text(text, &mut self.dictionary)));
+    }
+
+    pub(crate) fn finish(mut self) -> UsageAssembly {
+        self.assembly.events.shrink_to_fit();
+        self.assembly.pack_dictionary(self.dictionary);
+        UsageAssembly(self.assembly)
+    }
+}
+
 pub(crate) struct FilterFields<'a> {
     pub source: &'static str,
     pub permission_review: bool,
@@ -128,6 +156,11 @@ impl CompactUsageAssembly {
             event.map_text(path, |text| intern(&mut dictionary, text))
         }));
 
+        assembly.pack_dictionary(dictionary);
+        assembly
+    }
+
+    fn pack_dictionary(&mut self, dictionary: HashMap<String, StringId>) {
         // Pack the dictionary into one allocation; keep neither a lookup hash table
         // nor one allocation per unique string alive between requests.
         let mut ordered = vec![String::new(); dictionary.len()];
@@ -136,13 +169,12 @@ impl CompactUsageAssembly {
             bytes += text.len();
             ordered[id.0.get() - 1] = text;
         }
-        assembly.text.reserve(bytes);
-        assembly.ends.reserve(ordered.len());
+        self.text.reserve(bytes);
+        self.ends.reserve(ordered.len());
         for value in ordered {
-            assembly.text.push_str(&value);
-            assembly.ends.push(assembly.text.len());
+            self.text.push_str(&value);
+            self.ends.push(self.text.len());
         }
-        assembly
     }
 
     pub fn text(&self, id: StringId) -> &str {

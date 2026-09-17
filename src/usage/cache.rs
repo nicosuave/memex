@@ -553,15 +553,20 @@ impl UsageCache {
         // incremental: compare each file's final canonical contribution, so a
         // winner change also rewrites affected files whose input did not change.
         let hash_start = Instant::now();
-        let mut contributions: HashMap<&str, Vec<&UsageEvent>> = HashMap::new();
+        let mut contributions =
+            HashMap::<&str, Vec<&UsageEvent>, hashbrown::DefaultHashBuilder>::default();
         for run in events.chunk_by(|left, right| left.source_path == right.source_path) {
             contributions
                 .entry(run[0].source_path.as_ref())
                 .or_default()
                 .extend(run);
         }
+        usage_timing(hash_start, || {
+            format!("{} canonical grouping", filter.as_str())
+        });
+        let serialization_start = Instant::now();
         let hashes: HashMap<&str, Vec<u8>> = contributions
-            .into_par_iter()
+            .par_iter()
             .map(|(path, events)| -> Result<_> {
                 let mut hash = Sha256::new();
                 let mut bytes = Vec::new();
@@ -579,9 +584,12 @@ impl UsageCache {
                     }
                 }
                 hash.update(&bytes);
-                Ok((path, hash.finalize().to_vec()))
+                Ok((*path, hash.finalize().to_vec()))
             })
             .collect::<Result<_>>()?;
+        usage_timing(serialization_start, || {
+            format!("{} canonical serialization and SHA256", filter.as_str())
+        });
         usage_timing(hash_start, || {
             format!("{} canonical hashes", filter.as_str())
         });
@@ -624,6 +632,7 @@ impl UsageCache {
                 .map(String::as_str)
                 .filter(|path| !hashes.contains_key(path)),
         );
+        let rows_start = Instant::now();
         {
             let mut delete =
                 transaction.prepare("DELETE FROM usage_facts WHERE source = ?1 AND path = ?2")?;
@@ -631,13 +640,25 @@ impl UsageCache {
                 delete.execute(params![filter.as_str(), path])?;
             }
         }
-        insert_fact_events(
-            &transaction,
-            filter,
-            events
-                .iter()
-                .filter(|event| changed.contains(event.source_path.as_ref())),
-        )?;
+        if contributions.keys().all(|path| changed.contains(path)) {
+            // A full population already visits every event. Keep physical rows
+            // in report order so the first ordered read has good page locality.
+            insert_fact_events(&transaction, filter, events)?;
+        } else {
+            insert_fact_events(
+                &transaction,
+                filter,
+                changed
+                    .iter()
+                    .filter_map(|path| contributions.get(path))
+                    .flatten()
+                    .copied(),
+            )?;
+        }
+        usage_timing(rows_start, || {
+            format!("{} canonical row updates", filter.as_str())
+        });
+        let checkpoint_start = Instant::now();
         {
             let mut insert = transaction.prepare(
                 "INSERT OR REPLACE INTO usage_fact_files(source, path, digest) VALUES (?1, ?2, ?3)",
@@ -650,6 +671,9 @@ impl UsageCache {
         }
         write_fact_sync(&transaction, filter, fingerprint, warnings)?;
         transaction.commit()?;
+        usage_timing(checkpoint_start, || {
+            format!("{} canonical checkpoint and commit", filter.as_str())
+        });
         usage_timing(persist_start, || {
             format!(
                 "{} canonical writes ({} files)",
@@ -732,8 +756,8 @@ impl UsageCache {
 }
 
 /// Insert canonical fact rows. The caller owns atomicity (same transaction as any
-/// accompanying deletes and the sync row) and ordering (partition order for full
-/// rewrites; per-file order is irrelevant since reads order by key). `connection`
+/// accompanying deletes and the sync row) and ordering within each file. The
+/// order between files is irrelevant since reads order by key. `connection`
 /// accepts transactions through deref.
 fn insert_fact_events<'a>(
     connection: &Connection,
@@ -754,9 +778,8 @@ fn insert_fact_events<'a>(
              ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
          )",
     )?;
-    // Per-file positions, in insertion order. Callers insert in sorted order
-    // (full rewrites) or sorted-filtered order (upserts), so each file's
-    // subsequence preserves the report order and `row_idx` reproduces it as
+    // Per-file positions, in insertion order. Callers preserve the sorted
+    // subsequence of each file, so `row_idx` reproduces report order as
     // the final read tiebreak.
     let mut per_file: HashMap<&str, i64> = HashMap::new();
     for event in events {
@@ -1106,6 +1129,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn canonical_delta_preserves_tied_row_order_in_each_changed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+        let mut events = Vec::new();
+        for index in 0..18 {
+            let mut event = cache_event("session", index / 6, "model", index, 0, 0);
+            event.source_path = Arc::from(["a", "keep", "z"][index as usize % 3]);
+            event.source_order = 0;
+            events.push(event);
+        }
+        super::super::snapshot::sort_usage_events(&mut events);
+        cache
+            .replace_partition_facts(SourceFilter::Claude, &events, &[], &[])
+            .unwrap();
+        cache
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER protect_unchanged BEFORE DELETE ON usage_facts
+                 WHEN OLD.path = 'keep'
+                 BEGIN SELECT RAISE(ABORT, 'unchanged file rewritten'); END;",
+            )
+            .unwrap();
+        for event in &mut events {
+            if event.source_path.as_ref() != "keep" {
+                event.tokens.output += 100;
+            }
+        }
+        cache
+            .replace_partition_facts(SourceFilter::Claude, &events, &[], &[])
+            .unwrap();
+        let actual: Vec<_> = super::super::facts::read_ordinal_run(
+            &cache.connection,
+            source_ordinal(SourceFilter::Claude) as i64,
+            None,
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(super::super::facts::FactRow::into_event)
+        .collect();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(events).unwrap()
+        );
     }
 
     #[test]
