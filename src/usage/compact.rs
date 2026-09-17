@@ -3,7 +3,7 @@
 //! this assembly; only callers requesting detailed events allocate owned strings again.
 
 use super::{UsageActivityPoint, UsageEvent, UsageEventData};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 

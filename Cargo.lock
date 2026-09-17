@@ -3379,6 +3379,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gix",
  "globset",
+ "hashbrown 0.17.1",
  "hmac",
  "indicatif 0.17.11",
  "libc",

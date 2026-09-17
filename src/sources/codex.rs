@@ -1852,18 +1852,34 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
                 && event.source_record_id.is_some()
         })
         .count();
-    let mut seen = HashSet::with_capacity(eligible_count);
-    events.retain(|event| {
+    // Borrow deduplication keys while the input is immutable. Cloning both
+    // strings for every event is expensive even when there are no duplicates.
+    let mut seen = hashbrown::HashSet::with_capacity(eligible_count);
+    let mut duplicate_indices = Vec::new();
+    for (index, event) in events.iter().enumerate() {
         if event.source != "codex" {
-            return true;
+            continue;
         }
         let Some(session) = &event.session_id else {
-            return true;
+            continue;
         };
         let Some(record) = &event.source_record_id else {
-            return true;
+            continue;
         };
-        seen.insert((session.clone(), record.clone(), event.tokens.clone()))
+        if !seen.insert((session.as_str(), record.as_str(), &event.tokens)) {
+            duplicate_indices.push(index);
+        }
+    }
+    drop(seen);
+    if duplicate_indices.is_empty() {
+        return;
+    }
+    let mut duplicates = duplicate_indices.into_iter().peekable();
+    let mut index = 0;
+    events.retain(|_| {
+        let keep = duplicates.next_if_eq(&index).is_none();
+        index += 1;
+        keep
     });
 }
 
@@ -1889,6 +1905,48 @@ mod tests {
     use rusqlite::Connection;
     use std::collections::HashSet;
     use std::fs;
+
+    #[test]
+    fn usage_reconciliation_preserves_first_occurrence_and_ineligible_events() {
+        let mut first = crate::usage::cache_event("session", 1, "model", 10, 0, 0);
+        first.source = "codex";
+        first.source_record_id = Some("record".into());
+        first.permission_review = true;
+        let mut events = vec![first; 11];
+        for (index, event) in events.iter_mut().enumerate() {
+            event.source_path = Arc::from(format!("file-{index}"));
+        }
+        // Duplicates need not be adjacent or agree on fields outside the key.
+        events[1].permission_review = false;
+        events[1].source_cost_usd = Some(1.0);
+        events[2].tokens.cache_write_1h = 1;
+        events[3].source = "claude";
+        events[4].session_id = None;
+        events[5].session_id = None;
+        events[6].source_record_id = None;
+        events[7].source_record_id = None;
+        events[8].session_id = Some("other session".into());
+        events[9].source_record_id = Some("other record".into());
+        reconcile_usage(&mut events);
+        let paths: Vec<_> = events
+            .iter()
+            .map(|event| event.source_path.as_ref())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "file-0", "file-2", "file-3", "file-4", "file-5", "file-6", "file-7", "file-8",
+                "file-9"
+            ]
+        );
+        assert!(events[0].permission_review);
+        assert_eq!(events[0].source_cost_usd, None);
+        // A second pass has no duplicates and must preserve every survivor.
+        let expected = serde_json::to_value(&events).unwrap();
+        reconcile_usage(&mut events);
+        assert_eq!(serde_json::to_value(&events).unwrap(), expected);
+        reconcile_usage(&mut Vec::new());
+    }
 
     fn usage(input: u64, cached: u64, output: u64) -> UsageTokens {
         UsageTokens {

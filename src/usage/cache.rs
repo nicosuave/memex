@@ -554,11 +554,11 @@ impl UsageCache {
         // winner change also rewrites affected files whose input did not change.
         let hash_start = Instant::now();
         let mut contributions: HashMap<&str, Vec<&UsageEvent>> = HashMap::new();
-        for event in events {
+        for run in events.chunk_by(|left, right| left.source_path == right.source_path) {
             contributions
-                .entry(event.source_path.as_ref())
+                .entry(run[0].source_path.as_ref())
                 .or_default()
-                .push(event);
+                .extend(run);
         }
         let hashes: HashMap<&str, Vec<u8>> = contributions
             .into_par_iter()
@@ -566,11 +566,19 @@ impl UsageCache {
                 let mut hash = Sha256::new();
                 let mut bytes = Vec::new();
                 for event in events {
-                    bytes.clear();
+                    // Keep the persisted digest's length-prefixed byte stream,
+                    // but feed SHA256 batches rather than two updates per event.
+                    let prefix = bytes.len();
+                    bytes.extend_from_slice(&[0; 8]);
                     postcard::to_io(&CachedUsageEventRef::from_event(event), &mut bytes)?;
-                    hash.update((bytes.len() as u64).to_le_bytes());
-                    hash.update(&bytes);
+                    let length = (bytes.len() - prefix - 8) as u64;
+                    bytes[prefix..prefix + 8].copy_from_slice(&length.to_le_bytes());
+                    if bytes.len() >= 64 * 1024 {
+                        hash.update(&bytes);
+                        bytes.clear();
+                    }
                 }
+                hash.update(&bytes);
                 Ok((path, hash.finalize().to_vec()))
             })
             .collect::<Result<_>>()?;
@@ -1098,6 +1106,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn canonical_digest_keeps_legacy_framing_across_batches_and_interleaved_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut cache = UsageCache::open(&temp.path().join("cache.sqlite3")).unwrap();
+        let mut events = Vec::new();
+        for index in 0..600 {
+            let mut event = cache_event("会話", index, "model", index, 0, 0);
+            event.source_path = Arc::from(if index % 3 == 0 { "other" } else { "file" });
+            event.message_id = Some(format!("{index}:{}", "é".repeat(200)));
+            // Include one record larger than a hash batch as well as many small
+            // records, so both batch flushing and final remainder are covered.
+            if index == 10 {
+                event.project = Some("large".repeat(20_000));
+            }
+            events.push(event);
+        }
+        cache
+            .replace_partition_facts(SourceFilter::Claude, &events, &[], &[])
+            .unwrap();
+        for path in ["file", "other"] {
+            let mut expected = Sha256::new();
+            for event in events
+                .iter()
+                .filter(|event| event.source_path.as_ref() == path)
+            {
+                let bytes = postcard::to_stdvec(&CachedUsageEvent::from_event(event)).unwrap();
+                expected.update((bytes.len() as u64).to_le_bytes());
+                expected.update(bytes);
+            }
+            let stored: Vec<u8> = cache
+                .connection
+                .query_row(
+                    "SELECT digest FROM usage_fact_files WHERE source = 'claude' AND path = ?1",
+                    [path],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, expected.finalize().as_slice());
+        }
+        // Compatible digests must reuse existing facts without rewriting them.
+        cache
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_rewrite BEFORE DELETE ON usage_facts
+             BEGIN SELECT RAISE(ABORT, 'unchanged canonical contribution'); END;",
+            )
+            .unwrap();
+        cache
+            .replace_partition_facts(SourceFilter::Claude, &events, &[], &[])
+            .unwrap();
     }
 
     #[test]

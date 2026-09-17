@@ -19,12 +19,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 struct MeasuredAllocator;
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+// Keep the hot counters together and isolated from unrelated globals. Otherwise
+// binary layout can change cache-line contention during parallel blob decoding.
+#[repr(align(128))]
+struct AllocationCounters {
+    live: AtomicUsize,
+    peak: AtomicUsize,
+}
+static ALLOCATIONS: AllocationCounters = AllocationCounters {
+    live: AtomicUsize::new(0),
+    peak: AtomicUsize::new(0),
+};
 
 fn allocated(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
+    let live = ALLOCATIONS.live.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    ALLOCATIONS.peak.fetch_max(live, Ordering::Relaxed);
 }
 
 unsafe impl GlobalAlloc for MeasuredAllocator {
@@ -44,7 +53,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         unsafe { System.dealloc(pointer, layout) };
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        ALLOCATIONS.live.fetch_sub(layout.size(), Ordering::Relaxed);
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let replacement = unsafe { System.realloc(pointer, layout, size) };
@@ -52,7 +61,9 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
             if size >= layout.size() {
                 allocated(size - layout.size());
             } else {
-                LIVE.fetch_sub(layout.size() - size, Ordering::Relaxed);
+                ALLOCATIONS
+                    .live
+                    .fetch_sub(layout.size() - size, Ordering::Relaxed);
             }
         }
         replacement
@@ -79,12 +90,14 @@ fn process_memory() -> (u64, u64) {
 }
 
 fn measure<T>(name: &str, action: impl FnOnce() -> T) -> T {
-    PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    ALLOCATIONS
+        .peak
+        .store(ALLOCATIONS.live.load(Ordering::Relaxed), Ordering::Relaxed);
     let start = Instant::now();
     let result = action();
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let live_bytes = LIVE.load(Ordering::Relaxed);
-    let peak_bytes = PEAK.load(Ordering::Relaxed);
+    let live_bytes = ALLOCATIONS.live.load(Ordering::Relaxed);
+    let peak_bytes = ALLOCATIONS.peak.load(Ordering::Relaxed);
     println!(
         "phase={name} elapsed_ms={elapsed_ms:.3} live_bytes={live_bytes} peak_bytes={peak_bytes}"
     );
@@ -197,7 +210,10 @@ fn main() -> anyhow::Result<()> {
             assert_eq!(digest, first_digest);
         }
     }
-    println!("retained_bytes={}", LIVE.load(Ordering::Relaxed));
+    println!(
+        "retained_bytes={}",
+        ALLOCATIONS.live.load(Ordering::Relaxed)
+    );
     if std::env::args().any(|argument| argument == "--verify") {
         query.memo_ttl_ms = 60_000;
         query.include_events = true;
