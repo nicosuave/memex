@@ -18,10 +18,11 @@ pub enum SourceKind {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 13] = [
+    pub const ALL: [SourceKind; 14] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -35,6 +36,7 @@ impl SourceKind {
         SourceKind::Jcode,
         SourceKind::Muse,
         SourceKind::Antigravity,
+        SourceKind::Bob,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -53,6 +55,7 @@ impl SourceKind {
             SourceKind::Jcode => 10,
             SourceKind::Muse => 11,
             SourceKind::Antigravity => 12,
+            SourceKind::Bob => 13,
         }
     }
 
@@ -71,6 +74,7 @@ impl SourceKind {
             10 => Some(SourceKind::Jcode),
             11 => Some(SourceKind::Muse),
             12 => Some(SourceKind::Antigravity),
+            13 => Some(SourceKind::Bob),
             _ => None,
         }
     }
@@ -90,6 +94,7 @@ impl SourceKind {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
         }
     }
 
@@ -108,6 +113,7 @@ impl SourceKind {
             SourceKind::Jcode => "jcode",
             SourceKind::Muse => "muse",
             SourceKind::Antigravity => "antigravity",
+            SourceKind::Bob => "bob",
         }
     }
 
@@ -130,6 +136,7 @@ impl SourceKind {
             "jcode" => Some(SourceKind::Jcode),
             "muse" => Some(SourceKind::Muse),
             "antigravity" => Some(SourceKind::Antigravity),
+            "bob" => Some(SourceKind::Bob),
             _ => None,
         }
     }
@@ -153,6 +160,7 @@ pub enum SourceFilter {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
 }
 
 impl SourceFilter {
@@ -171,6 +179,7 @@ impl SourceFilter {
             SourceFilter::Jcode => source == SourceKind::Jcode,
             SourceFilter::Muse => source == SourceKind::Muse,
             SourceFilter::Antigravity => source == SourceKind::Antigravity,
+            SourceFilter::Bob => source == SourceKind::Bob,
         }
     }
 
@@ -189,6 +198,7 @@ impl SourceFilter {
             SourceFilter::Jcode => &["jcode"],
             SourceFilter::Muse => &["muse"],
             SourceFilter::Antigravity => &["antigravity"],
+            SourceFilter::Bob => &["bob"],
         }
     }
 
@@ -207,6 +217,7 @@ impl SourceFilter {
             SourceFilter::Jcode => "jcode",
             SourceFilter::Muse => "muse",
             SourceFilter::Antigravity => "antigravity",
+            SourceFilter::Bob => "bob",
         }
     }
 }

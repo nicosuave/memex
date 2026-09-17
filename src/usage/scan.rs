@@ -792,7 +792,7 @@ pub(crate) type SourceScanner =
 
 /// Scanner ordinals double as merge tiebreaks: partitions are laid out and merged in
 /// this order, reproducing the combined assembly's stable sort exactly.
-pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
+pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 14] = [
     (SourceFilter::Claude, scan_claude),
     (SourceFilter::Codex, scan_codex),
     (SourceFilter::Opencode, scan_opencode),
@@ -803,6 +803,7 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
     (SourceFilter::Copilot, scan_copilot),
     (SourceFilter::Grok, scan_grok),
     (SourceFilter::Hermes, scan_hermes),
+    (SourceFilter::Bob, scan_bob),
     (SourceFilter::Jcode, scan_jcode),
     (SourceFilter::Muse, scan_muse),
     (SourceFilter::Antigravity, scan_antigravity),
@@ -1069,3 +1070,66 @@ mod tests {
         assert!(warnings[0].contains(vanished.to_string_lossy().as_ref()));
     }
 }
+
+fn scan_bob(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::bob::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "bob",
+            parser_version: crate::sources::bob::VERSIONS.usage,
+            // WAL commits leave the main file's size and mtime untouched until a
+            // checkpoint, so metadata alone would serve stale spend indefinitely.
+            volatile_reuse_ms: |_| Some(VOLATILE_DB_REUSE_MS),
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
+// Rates are nano-USD per million tokens. The catalog is deliberately small and versioned:
+// unknown models remain unpriced instead of silently inheriting a guessed family rate.
+const PRICE_CATALOG_ID: &str = "official-api-prices-2026-07-15";
+
+#[derive(Clone, Copy)]
+struct Rates {
+    input: u64,
+    cache_read: u64,
+    cache_write_5m: u64,
+    cache_write_1h: u64,
+    output: u64,
+}
+
+const fn usd_per_million(value_milli_usd: u64) -> u64 {
+    value_milli_usd * 1_000_000
+}
+
+pub(crate) fn event_cost_nanos<S: std::ops::Deref<Target = str>, P>(
+    event: &UsageEventData<S, P>,
+    mode: CostMode,
+) -> Option<u64> {
+    let source = event
+        .source_cost_usd
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .and_then(|value| {
+            let nanos = value * 1_000_000_000.0;
+            (nanos <= u64::MAX as f64).then_some(nanos.round() as u64)
+        });
+    match mode {
+        CostMode::Source => source,
+        CostMode::Auto => source.or_else(|| {
+            (!event.cost_authoritative)
+                .then(|| calculated_cost_nanos(event))
+                .flatten()
+        }),
+        CostMode::Reprice => calculated_cost_nanos(event),
+    }
+}
+

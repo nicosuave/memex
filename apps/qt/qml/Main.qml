@@ -273,7 +273,7 @@ ApplicationWindow {
             ComboBox {
                 Layout.fillWidth: true
                 model: ["All providers", "claude", "codex", "cursor", "opencode", "pi", "omp", "openclaw", "copilot",
-                    "grok", "hermes", "jcode", "muse"]
+                    "grok", "hermes", "jcode", "muse", "bob"]
                 currentIndex: store.provider ? model.indexOf(store.provider) : 0
                 onActivated: store.configure({
                                                  provider: currentIndex ? model[currentIndex] : ""

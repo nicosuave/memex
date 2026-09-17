@@ -163,6 +163,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_antigravity {
         roots.push(crate::sources::antigravity::sessions_root());
     }
+    if options.include_bob {
+        roots.extend(crate::sources::bob::roots());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -209,6 +212,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
             .filter(|name| {
                 let database = path.with_file_name(name);
                 crate::sources::opencode::is_database_path(name)
+                    || crate::sources::bob::is_db_path(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -389,7 +393,13 @@ pub(crate) fn sweep_candidates(
     let mut snapshot = reader.hot_files_since(cutoff)?;
     let mut databases: HashSet<String> = reader.header()?.opencode_databases.into_keys().collect();
     databases.extend(reader.sqlite_backed_paths()?);
-    snapshot.retain(|key, file| file.identity.sqlite_wal.is_none() && !databases.contains(key));
+    // Bob tasks are virtual `<db>/<task_id>` paths: they cannot be stat'ed, and commits
+    // to their database already reach the daemon through WAL events and resyncs.
+    snapshot.retain(|key, file| {
+        file.identity.sqlite_wal.is_none()
+            && !databases.contains(key)
+            && !crate::sources::bob::matches_path(key)
+    });
     Ok((snapshot, databases))
 }
 
@@ -770,6 +780,7 @@ mod tests {
             include_jcode: true,
             include_muse: true,
             include_antigravity: true,
+            include_bob: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -882,6 +893,7 @@ mod tests {
         options.include_jcode = false;
         options.include_muse = false;
         options.include_antigravity = false;
+        options.include_bob = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -1514,6 +1526,39 @@ mod tests {
         // Cold by mtime, so only its WAL backing makes it a candidate.
         assert!(databases.contains(&database));
         assert!(!files.contains_key(&database));
+    }
+
+    #[test]
+    fn sweep_candidates_skip_virtual_bob_task_paths() {
+        use crate::state::checkpoint::CheckpointReader;
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let hot = temp.path().join("hot.jsonl");
+        std::fs::write(&hot, "{}\n").unwrap();
+        let mut task = file_state_for(&hot);
+        task.mtime = i64::MAX / 2;
+        let task_key = temp
+            .path()
+            .join("bob/db/bob.db/task-1")
+            .to_string_lossy()
+            .into_owned();
+        write_ingest_state(
+            &paths.root,
+            HashMap::from([
+                (hot.to_string_lossy().into_owned(), task.clone()),
+                (task_key.clone(), task),
+            ]),
+        );
+
+        let reader = CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+        let (files, databases) = sweep_candidates(&reader, 0).unwrap();
+
+        // Hot by mtime, but a virtual path can never be stat'ed by the sweep.
+        assert!(files.contains_key(&hot.to_string_lossy().into_owned()));
+        assert!(!files.contains_key(&task_key));
+        assert!(!databases.contains(&task_key));
     }
 
     #[test]

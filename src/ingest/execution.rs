@@ -72,6 +72,38 @@ pub(super) fn parse_antigravity_file(
     )
 }
 
+pub(super) fn parse_bob_task(
+    task: &FileTask,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::bob::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            legacy_turn_id: task.legacy_turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Bob, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Bob,
+        source_path,
+        parsed,
+    )
+}
+
 pub(super) fn parse_codex_session(
     task: &FileTask,
     include_reasoning: bool,
@@ -787,6 +819,13 @@ impl ParserContext<'_> {
                 SourceKind::Antigravity => parse_antigravity_file(
                     task,
                     self.options.include_reasoning,
+                    self.records,
+                    self.updates,
+                    self.next_id,
+                    self.progress,
+                ),
+                SourceKind::Bob => parse_bob_task(
+                    task,
                     self.records,
                     self.updates,
                     self.next_id,

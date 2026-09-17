@@ -51,6 +51,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
+        include_bob: false,
         embeddings,
         backfill_embeddings: false,
         model,
@@ -2830,6 +2831,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
+        include_bob: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3461,6 +3463,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
+        include_bob: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -4733,6 +4736,165 @@ fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
     full();
     assert_eq!(indexed_texts(&paths), ["full scan update"]);
     assert_eq!(full().records_added, 0);
+}
+
+#[test]
+fn bob_ingest_replays_changed_tasks_and_reconciles_deleted_ones() {
+    use crate::sources::bob::{fixtures, virtual_path};
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("bob").join("db").join("bob.db");
+    let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(database.as_os_str()))]);
+    let writer = fixtures::create(&database);
+    let user = |text: &str, ts: i64| {
+        format!(r#"{{"role":"user","content":"{text}","_meta":{{"timestamp":{ts}}}}}"#)
+    };
+    fixtures::insert_task(
+        &writer,
+        "task-a",
+        None,
+        "normal",
+        "file:/work/a",
+        "A",
+        1_000,
+    );
+    fixtures::insert_task(
+        &writer,
+        "task-b",
+        None,
+        "normal",
+        "file:/work/b",
+        "B",
+        1_000,
+    );
+    fixtures::insert_message(&writer, "a1", "task-a", "user", &user("alpha", 1), 1);
+    fixtures::insert_message(&writer, "b1", "task-b", "user", &user("bravo", 2), 2);
+
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_bob = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+
+    let report = full();
+    assert_eq!(report.files_scanned, 2);
+    assert_eq!(report.records_added, 2);
+    assert_eq!(indexed_texts(&paths), ["alpha", "bravo"]);
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let records = index.records_by_session_id("task-a").unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].source, SourceKind::Bob);
+    assert_eq!(records[0].project, "a");
+    assert_eq!(
+        records[0].source_path,
+        virtual_path(&database, "task-a").to_string_lossy()
+    );
+    drop(index);
+
+    // Nothing changed: every task is skipped.
+    let report = full();
+    assert_eq!(report.records_added, 0);
+    assert_eq!(report.files_skipped, 2);
+
+    // A new message only replays its own task, even though the main database file
+    // is untouched (the commit lives in the WAL).
+    let before = database.metadata().unwrap();
+    fixtures::insert_message(&writer, "a2", "task-a", "user", &user("alpha two", 3), 3);
+    writer
+        .execute("UPDATE tasks SET updated_at = 2000 WHERE id = 'task-a'", [])
+        .unwrap();
+    assert_eq!(database.metadata().unwrap().len(), before.len());
+    let report = full();
+    assert_eq!(report.files_scanned, 2);
+    assert_eq!(report.files_skipped, 1);
+    assert_eq!(report.records_added, 2);
+    assert_eq!(indexed_texts(&paths), ["alpha", "alpha two", "bravo"]);
+    assert!(crate::watch::dirty_needs_ingest(&paths, &HashSet::from([database.clone()])).unwrap());
+
+    // Deleting a task removes its records on the next scan.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE task_id = 'task-b'; DELETE FROM tasks WHERE id = 'task-b';",
+        )
+        .unwrap();
+    full();
+    assert_eq!(indexed_texts(&paths), ["alpha", "alpha two"]);
+    assert_eq!(full().records_added, 0);
+
+    // A watcher hint for the database (or its WAL) narrows the refresh to Bob only.
+    fixtures::insert_message(&writer, "a3", "task-a", "user", &user("alpha three", 4), 4);
+    writer
+        .execute("UPDATE tasks SET updated_at = 3000 WHERE id = 'task-a'", [])
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let wal = database.with_file_name("bob.db-wal");
+    let result = ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([wal])).unwrap();
+    assert!(!result.full_scan);
+    assert_eq!(result.report.files_scanned, 1);
+    assert_eq!(result.report.records_added, 3);
+    assert_eq!(indexed_texts(&paths), ["alpha", "alpha three", "alpha two"]);
+    drop(index);
+
+    // Deleting the database itself drops every task it owned.
+    drop(writer);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(database.with_file_name(format!("bob.db{suffix}")));
+    }
+    let report = full();
+    assert_eq!(report.files_scanned, 0);
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn bob_ingest_accepts_custom_database_names_and_skips_unreadable_ones() {
+    use crate::sources::bob::fixtures;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let custom = temp.path().join("custom").join("mybob.sqlite");
+    let broken = temp.path().join("broken.db");
+    fs::write(&broken, "not a database").unwrap();
+    let configured = format!("{},{}", custom.display(), broken.display());
+    let _env = EnvVarGuard::set(&[("MEMEX_BOB_DB", Some(configured.as_str()))]);
+    let writer = fixtures::create(&custom);
+    fixtures::insert_task(
+        &writer,
+        "task-a",
+        None,
+        "normal",
+        "file:/work/a",
+        "A",
+        1_000,
+    );
+    fixtures::insert_message(
+        &writer,
+        "a1",
+        "task-a",
+        "user",
+        r#"{"role":"user","content":"alpha"}"#,
+        1,
+    );
+
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_bob = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    // The unreadable database is skipped without aborting the refresh, and named.
+    assert_eq!(report.records_added, 1);
+    assert_eq!(report.files_skipped, 1);
+    assert_eq!(indexed_texts(&paths), ["alpha"]);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![broken.to_string_lossy().into_owned()]
+    );
 }
 
 #[test]

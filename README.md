@@ -1,6 +1,6 @@
 # memex
 
-Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, GitHub Copilot CLI, Grok, Jcode, and Muse. Also supports Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
+Fast local history search for Claude, Codex CLI, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, GitHub Copilot CLI, Grok, Jcode, Muse, and IBM Bob. Also supports Hermes usage records. Uses BM-25 and optionally embeds your transcripts locally for hybrid search.
 
 Agents can use Memex through its MCP server or CLI skill. Ask about a previous session, then narrow the search and retrieve source records as needed.
 
@@ -235,7 +235,11 @@ The main search, indexing, and maintenance commands are organized as follows:
 Index all supported sources by default. Use repeatable `--only-source <source>` or
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
 to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
-`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, and `muse`.
+`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, `muse`, and `bob`.
+Bob tasks are read from `~/.bob/db/bob.db` (override with `MEMEX_BOB_DB`, a comma-separated
+list of database paths with any file name, `~/` expanded); each task is indexed under the
+virtual source path `<db>/<task_id>`, and sub-agent runs embedded in a task appear as their own
+sessions. A database that cannot be read is skipped with a warning and its indexed tasks are kept.
 
 ### Agent memories
 
@@ -509,7 +513,7 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, Hermes, Jcode, and Muse records:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, Hermes, Jcode, Muse, and IBM Bob records:
 
 ```
 memex usage
@@ -730,7 +734,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|bob`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`
@@ -935,6 +939,7 @@ opencode_resume_cmd = "opencode --session {session_id}"
 pi_resume_cmd = "pi --session {source_path_shell}"
 # copilot_resume_cmd = "your-copilot-resume-command {session_id}"
 grok_resume_cmd = "cd {cwd_shell} && grok --resume {session_id}"
+bob_resume_cmd = "cd {cwd_shell} && bob --resume {session_id}"
 jcode_resume_cmd = "cd {cwd_shell} && jcode --resume {session_id}"
 muse_resume_cmd = "cd {cwd_shell} && muse resume {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"

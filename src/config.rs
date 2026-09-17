@@ -181,6 +181,8 @@ pub struct UserConfig {
     pub muse_resume_cmd: Option<String>,
     /// Resume command template for Grok sessions.
     pub grok_resume_cmd: Option<String>,
+    /// Resume command template for IBM Bob tasks.
+    pub bob_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
     pub herdr_resume: Option<String>,
     /// Glob patterns matched against transcript source paths; matched files are

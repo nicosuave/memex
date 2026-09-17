@@ -108,6 +108,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(SourceKind::Bob, super::bob::usage_files());
 
     push(
         SourceKind::Omp,
@@ -137,8 +138,8 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
         ..SourceAudit::default()
     };
     for file in files {
-        if source == SourceKind::Hermes {
-            // Hermes usage truth is SQLite aggregate data. Audit must not
+        if matches!(source, SourceKind::Hermes | SourceKind::Bob) {
+            // Hermes usage truth and Bob tasks are SQLite data. Audit must not
             // reinterpret the database as JSON, and in particular must not
             // read transcript/message columns: count the file, skip content.
             continue;
@@ -355,6 +356,8 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
                 increment(&mut audit.semantic_types, "tool_calls");
             }
         }
+        // Bob never reaches here: it contributes no files to the audit.
+        SourceKind::Bob => {}
     }
 }
 

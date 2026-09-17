@@ -6,6 +6,7 @@
 
 pub mod antigravity;
 pub mod audit;
+pub mod bob;
 pub mod claude;
 pub mod codex;
 pub mod common;
@@ -134,6 +135,9 @@ pub struct ParseDiagnostics {
     pub encrypted_reasoning_dropped: u64,
     pub truncated_tool_inputs: u64,
     pub truncated_tool_outputs: u64,
+    /// Source stores discovery could not read this refresh (locked, corrupt, or on an
+    /// unsupported schema). Their previously indexed records are kept until they read again.
+    pub unreadable_sources: Vec<String>,
 }
 
 impl ParseDiagnostics {
@@ -169,6 +173,9 @@ impl ParseDiagnostics {
         for (key, count) in other.unknown_semantic_types {
             *self.unknown_semantic_types.entry(key).or_default() += count;
         }
+        self.unreadable_sources.extend(other.unreadable_sources);
+        self.unreadable_sources.sort();
+        self.unreadable_sources.dedup();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -283,6 +290,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Jcode => jcode::VERSIONS,
         SourceKind::Muse => muse::VERSIONS,
         SourceKind::Antigravity => antigravity::VERSIONS,
+        SourceKind::Bob => bob::VERSIONS,
     }
 }
 
@@ -314,7 +322,9 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
 /// Compatibility classification for persisted records that only carry a source path.
 /// Individual path rules stay beside the source discovery code that defines them.
 pub fn classify_path(path: &str) -> SourceKind {
-    if let Some(source) = codex::classify_path(path) {
+    if bob::matches_path(path) {
+        SourceKind::Bob
+    } else if let Some(source) = codex::classify_path(path) {
         source
     } else if opencode::matches_path(path) {
         SourceKind::Opencode

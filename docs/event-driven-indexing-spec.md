@@ -172,6 +172,7 @@ Resolver output derives from the enabled-source flags in `IngestOptions`:
 | Jcode | `JCODE_HOME` / `~/.jcode/sessions` | Single-JSON files: atomic reparse rule already exists; event just triggers it sooner. |
 | Muse | `MUSE_HOME` / `~/.local/share/muse/sessions` | |
 | Hermes | `HERMES_HOME` profiles | Currently discovery-only; include for free via `profile_roots()`. |
+| Bob | `MEMEX_BOB_DB` parents / `~/.bob/db` | One shared database; tasks are virtual `<db>/<task_id>` paths. Main-file, WAL and journal events route to the database and narrow the refresh to a Bob task diff (no other source is rescanned). Ignore `-shm`. |
 | Memory docs | Inputs live in project memory directories, not just Memex's outputs. Refresh during full ingestion/reconciliation and the existing search-time refresh path; targeted transcript batches do not rediscover memory inputs. Memory documents are not independently watched in v1. |
 | Config | `~/.memex/config.toml` | Change → re-resolve roots (add/drop watches), re-read debounce/resync settings. Debounce this harder (5s); never trigger an ingest by itself. |
 

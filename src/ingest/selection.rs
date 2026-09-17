@@ -32,6 +32,7 @@ enum Shape {
     Jcode,
     Muse,
     Antigravity,
+    Bob,
 }
 
 struct Root {
@@ -125,6 +126,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
             Shape::Antigravity,
         ));
     }
+    if options.include_bob {
+        roots.extend(
+            sources::bob::roots()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Bob)),
+        );
+    }
     roots
 }
 
@@ -213,6 +221,16 @@ fn classify(root: &Root, path: &Path) -> Match {
             (name.starts_with("session_") && name.ends_with(".json")).then_some(SourceKind::Jcode)
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
+        Shape::Bob => {
+            // Every task shares one database and discovery diffs task aggregates
+            // itself, so a commit targets the database (`resolve` already routed WAL
+            // and journal hints to it). The shared-memory index is read noise.
+            return if parts.len() == 1 && sources::bob::is_db_path(path) {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
         Shape::Antigravity => {
             let in_profile = parts.first().is_some_and(|part| {
                 *part == "antigravity-ide"
@@ -255,15 +273,27 @@ fn resolve(
             if excluder.is_excluded(&path) || excluder.is_excluded(hint) {
                 continue;
             }
-            let path = if matches!(root.shape, Shape::Antigravity) {
-                path.file_name()
+            // SQLite commits may touch only a sidecar; route the hint to the database
+            // so classification and the stat below see the file that exists.
+            let path = match root.shape {
+                Shape::Antigravity => path
+                    .file_name()
                     .and_then(|name| name.to_str())
                     .and_then(|name| name.strip_suffix("-wal"))
                     .filter(|name| name.ends_with(".db"))
                     .map(|name| path.with_file_name(name))
-                    .unwrap_or(path)
-            } else {
-                path
+                    .unwrap_or(path),
+                Shape::Bob => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-journal"))
+                    })
+                    .map(|name| path.with_file_name(name))
+                    .filter(|database| sources::bob::is_db_path(database))
+                    .unwrap_or(path),
+                _ => path,
             };
             if excluder.is_excluded(&path) {
                 continue;
@@ -318,13 +348,12 @@ fn resolve(
                     if !path.is_file() {
                         return Ok(DirtySelection::Resync);
                     }
-                    (
-                        SourceFile {
-                            source: SourceKind::Opencode,
-                            path,
-                        },
-                        true,
-                    )
+                    let source = if sources::bob::is_db_path(&path) {
+                        SourceKind::Bob
+                    } else {
+                        SourceKind::Opencode
+                    };
+                    (SourceFile { source, path }, true)
                 }
             };
             // WalkDir does not follow nested symlinks. A root symlink is valid,
@@ -435,6 +464,7 @@ mod tests {
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,
+            include_bob: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
             backfill_embeddings: false,
@@ -459,6 +489,36 @@ mod tests {
             &PathExcluder::build(&[]).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn bob_database_commits_target_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("bob.db");
+        write(&database);
+        let roots = [Root::new(temp.path().to_path_buf(), Shape::Bob)];
+        for hint in ["bob.db", "bob.db-wal", "bob.db-journal"] {
+            let DirtySelection::Paths { files, databases } =
+                select(&roots, &temp.path().join(hint))
+            else {
+                panic!("unexpected resync for {hint}")
+            };
+            assert!(files.is_empty(), "{hint}");
+            assert_eq!(
+                databases,
+                vec![SourceFile {
+                    source: SourceKind::Bob,
+                    path: database.clone(),
+                }],
+                "{hint}"
+            );
+        }
+        let DirtySelection::Paths { files, databases } =
+            select(&roots, &temp.path().join("bob.db-shm"))
+        else {
+            panic!("unexpected resync for shm")
+        };
+        assert!(files.is_empty() && databases.is_empty());
     }
 
     #[test]

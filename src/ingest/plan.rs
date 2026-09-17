@@ -58,9 +58,13 @@ pub(super) fn classify_file(
     if size == previous.size && mtime == previous.mtime {
         return FileChange::Unchanged;
     }
-    // A jcode session is one JSON object and an antigravity store is rewritten wholesale
-    // as the conversation grows, so a byte offset cannot resume mid-file for either.
-    if matches!(source, SourceKind::Jcode | SourceKind::Antigravity) {
+    // A jcode session is one JSON object, an antigravity store is rewritten wholesale
+    // as the conversation grows, and a Bob task is a database query, so a byte offset
+    // cannot resume mid-file for any of them.
+    if matches!(
+        source,
+        SourceKind::Jcode | SourceKind::Antigravity | SourceKind::Bob
+    ) {
         FileChange::Replaced
     } else {
         FileChange::Append
