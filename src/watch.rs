@@ -712,10 +712,21 @@ impl WatchService {
             .unwrap_or_default()
             .as_secs()
             .saturating_sub(window.as_secs()) as i64;
-        let (snapshot, databases) = {
+        let (snapshot, mut databases) = {
             let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
             sweep_candidates(&reader, cutoff)?
         };
+        // A Bob database with no indexed task yet has no state key to derive from; seed it
+        // from the configuration whenever this daemon watches its directory, so the first
+        // commits through a held-open WAL are noticed too.
+        for database in crate::sources::bob::database_paths() {
+            if database.is_file()
+                && crate::sources::bob::canonical_alias(&database)
+                    .is_some_and(|alias| self.watched.iter().any(|root| alias.starts_with(root)))
+            {
+                databases.insert(database.to_string_lossy().into_owned());
+            }
+        }
         self.hot_databases
             .retain(|path, _| databases.contains(path.to_string_lossy().as_ref()));
         for key in databases {
@@ -1531,6 +1542,42 @@ mod tests {
         // Cold by mtime, so only its WAL backing makes it a candidate.
         assert!(databases.contains(&database));
         assert!(!files.contains_key(&database));
+    }
+
+    #[test]
+    fn hot_sweep_seeds_configured_bob_databases_under_watched_roots() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("memex");
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        let paths = Paths::new(Some(root.clone())).unwrap();
+        write_ingest_state(&root, HashMap::new());
+        let bob_dir = temp.path().join("bob");
+        std::fs::create_dir_all(&bob_dir).unwrap();
+        let database = bob_dir.join("bob.db");
+        std::fs::write(&database, "").unwrap();
+        let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(database.as_os_str()))]);
+
+        let options = test_options();
+        let excluder = watch_excluder(&options).unwrap();
+        let mut service =
+            WatchService::new(vec![bob_dir.clone()], excluder, WatchConfig::default()).unwrap();
+        // No task indexed yet, but the database is configured and watched: it is polled.
+        assert_eq!(
+            service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+            vec![database.clone()]
+        );
+        assert!(
+            service
+                .hot_sweep_dirty(&paths, HOT_WINDOW)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&database, "x").unwrap();
+        assert_eq!(
+            service.hot_sweep_dirty(&paths, HOT_WINDOW).unwrap(),
+            vec![database]
+        );
     }
 
     #[test]

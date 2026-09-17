@@ -4898,6 +4898,57 @@ fn bob_ingest_accepts_custom_database_names_and_skips_unreadable_ones() {
 }
 
 #[test]
+fn bob_exclusions_match_the_real_directory_of_a_symlinked_database() {
+    use crate::sources::bob::fixtures;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let configured = link.join("bob.db");
+    let _env = EnvVarGuard::set_os(&[("MEMEX_BOB_DB", Some(configured.as_os_str()))]);
+    let writer = fixtures::create(&real.join("bob.db"));
+    fixtures::insert_task(
+        &writer,
+        "task-a",
+        None,
+        "normal",
+        "file:/work/a",
+        "A",
+        1_000,
+    );
+    fixtures::insert_message(
+        &writer,
+        "a1",
+        "task-a",
+        "user",
+        r#"{"role":"user","content":"alpha","_meta":{"timestamp":1}}"#,
+        1,
+    );
+
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_bob = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    assert_eq!(run(&options).records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["alpha"]);
+
+    // An exclusion written against the real directory applies, and cleans up.
+    options.exclude_patterns = vec![format!("{}/**", real.canonicalize().unwrap().display())];
+    let report = run(&options);
+    assert_eq!(report.records_added, 0);
+    assert_eq!(report.files_skipped, 1);
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
 fn bob_unreadable_database_is_reported_even_when_nothing_else_changes() {
     let _guard = env_lock();
     let temp = tempfile::tempdir().unwrap();

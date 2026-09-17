@@ -6647,6 +6647,11 @@ fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
     {
         return Some(cwd);
     }
+    if session.source == SourceKind::Bob {
+        // Virtual `<db>/<task_id>` paths are not transcripts; ask the database.
+        return crate::sources::bob::session_cwd(std::path::Path::new(&session.source_path))
+            .map(|cwd| cwd.to_string_lossy().into_owned());
+    }
     let file = std::fs::File::open(&session.source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;

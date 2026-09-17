@@ -652,10 +652,23 @@ pub(super) fn discover_bob(
         // Point lookups: Bob keys are a small share of the files table even on a full scan.
         state.preload(&keys, FileLoadScope::Targeted)?;
         current.extend(keys.iter().cloned());
+        // A virtual path cannot be canonicalized (`ENOTDIR`), so exclusions written against
+        // the real directory of a symlinked database are checked on the alias explicitly.
+        let canonical_database =
+            crate::sources::bob::canonical_alias(&database).filter(|alias| *alias != database);
         for (task, key) in tasks.iter().zip(keys) {
             let path = PathBuf::from(&key);
-            if excluder.is_excluded(&path) {
+            let excluded = excluder.is_excluded(&path)
+                || canonical_database
+                    .as_ref()
+                    .is_some_and(|alias| excluder.is_excluded(&alias.join(&task.id)));
+            if excluded {
                 result.files_skipped += 1;
+                // The generic exclusion cleanup only sees the configured spelling.
+                if state.file(&key).is_some() {
+                    state.delete_file(&key);
+                    result.missing_paths.push(key);
+                }
                 continue;
             }
             result.files_scanned += 1;

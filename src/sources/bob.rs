@@ -89,7 +89,7 @@ pub fn is_db_path(path: &Path) -> bool {
 
 /// A path with its directory canonicalized, so a database reached through a symlinked
 /// directory compares equal whichever spelling a watcher or the configuration used.
-fn canonical_alias(path: &Path) -> Option<PathBuf> {
+pub(crate) fn canonical_alias(path: &Path) -> Option<PathBuf> {
     Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
 }
 
