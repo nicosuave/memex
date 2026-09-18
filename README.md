@@ -113,6 +113,14 @@ For the macOS app:
 brew install nicosuave/tap/memex-app
 ```
 
+The [native macOS app](apps/macos/README.md):
+
+<img width="1876" height="1146" alt="Memex native macOS app" src="https://github.com/user-attachments/assets/6e112c96-5b1c-4de3-80bc-c06939dac18a" />
+
+The [Qt companion](apps/qt/README.md):
+
+<img width="1178" height="768" alt="Memex Qt companion" src="https://github.com/user-attachments/assets/1de09c11-e432-4613-9928-a32b39be204a" />
+
 For the browser:
 
 ```bash
