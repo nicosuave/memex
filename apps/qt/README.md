@@ -69,8 +69,8 @@ apps/qt/scripts/smoke-appimage.sh apps/qt/build/memex-qt-*-linux-*.AppImage
 
 The smoke test extracts the AppImage without FUSE, checks that the Qt runtime
 and CLI are bundled, and boots the app headless. Release AppImages are built
-on Ubuntu 22.04 for a low glibc baseline; do not expect Fedora-built archives
-to run on older distributions.
+on Ubuntu 24.04 because the bundled ONNX Runtime 1.28 requires glibc 2.38 or
+newer; do not expect them or Fedora-built archives to run on older distributions.
 
 The script uses Boxington (`mbx`) when installed. An explicit CLI or data root
 can be selected without changing user configuration:
