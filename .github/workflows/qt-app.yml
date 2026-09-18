@@ -5,11 +5,19 @@ on:
     branches: [main]
     paths:
       - "apps/qt/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
       - ".github/workflows/qt-app.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     paths:
       - "apps/qt/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
       - ".github/workflows/qt-app.yml"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 permissions:
@@ -55,20 +63,11 @@ jobs:
       - name: Package native Qt development build
         run: bash apps/qt/scripts/build.sh dev
 
-      - name: Build Qt AppImage (smoke)
-        run: bash apps/qt/scripts/build-appimage.sh dev
-
-      - name: Smoke-test Qt AppImage
-        run: bash apps/qt/scripts/smoke-appimage.sh apps/qt/build/memex-qt-dev-linux-*.AppImage
-
       - name: Upload Qt development archive
         uses: actions/upload-artifact@v7
         with:
           name: memex-qt-linux-x86_64-dev
-          path: |
-            apps/qt/build/*.tar.gz
-            apps/qt/build/*.AppImage
-            apps/qt/build/*.sha256
+          path: apps/qt/build/*.tar.gz
           if-no-files-found: error
 
       - name: Upload Qt test screenshots
@@ -78,3 +77,49 @@ jobs:
           name: memex-qt-linux-x86_64-dev-screenshots
           path: ${{ runner.temp }}/memex-qt-captures
           if-no-files-found: warn
+
+  appimage-ubuntu-22-04:
+    # Match the release environment so the low-glibc AppImage and its bundled
+    # CLI are proven before a tag is pushed.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.10.*"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential gcc-12 g++-12 lld curl file libssl-dev pkg-config libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+
+      - name: Build Qt AppImage
+        env:
+          CC: gcc-12
+          CXX: g++-12
+        run: bash apps/qt/scripts/build-appimage.sh dev
+
+      - name: Smoke-test Qt AppImage
+        run: bash apps/qt/scripts/smoke-appimage.sh apps/qt/build/memex-qt-dev-linux-*.AppImage
+
+      - name: Upload Qt AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: memex-qt-linux-x86_64-dev-appimage
+          path: |
+            apps/qt/build/*.AppImage
+            apps/qt/build/*.sha256
+          if-no-files-found: error

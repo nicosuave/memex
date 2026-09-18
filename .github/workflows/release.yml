@@ -113,9 +113,14 @@ jobs:
           cache: true
       - name: Install system dependencies
         # libssl-dev/pkg-config are for the bundled memex CLI (openssl-sys);
-        # file(1) is required by appimagetool.
-        run: sudo apt-get update && sudo apt-get install -y build-essential lld curl file libssl-dev pkg-config libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+        # file(1) is required by appimagetool. Ubuntu 22.04's default GCC 11
+        # cannot compile usearch's AVX-512 FP16 support, so select GCC 12 while
+        # retaining the older distro's glibc baseline.
+        run: sudo apt-get update && sudo apt-get install -y build-essential gcc-12 g++-12 lld curl file libssl-dev pkg-config libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
       - name: Build AppImage
+        env:
+          CC: gcc-12
+          CXX: g++-12
         run: bash apps/qt/scripts/build-appimage.sh "${RELEASE_TAG#v}"
       - name: Smoke-test AppImage
         run: bash apps/qt/scripts/smoke-appimage.sh apps/qt/build/memex-qt-*-linux-*.AppImage
