@@ -1,4 +1,6 @@
-use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analytics_path};
+use crate::analytics::{
+    AnalyticsStore, ProjectGrouping, SessionDetailRow, SessionKindFilter, analytics_path,
+};
 use crate::config::{MachineConfig, Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
@@ -308,12 +310,53 @@ pub struct SessionActivityPointWire {
     pub timestamp_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListSpec {
+    #[serde(default)]
+    pub origin: Option<SessionKindFilter>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    pub source: Option<SourceFilter>,
+    pub project: Option<String>,
+    pub cwd: Option<String>,
+    pub since_ms: Option<u64>,
+    pub limit: usize,
+}
+
+#[derive(Debug)]
+pub struct LocatedSession {
+    pub machine: String,
+    pub session: SessionDetailRow,
+    pub resume_cmd: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionListing {
+    #[serde(flatten)]
+    session: SessionDetailRow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_cmd: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct Federated<T> {
     pub items: Vec<T>,
     pub failures: Vec<(String, String)>,
     /// Number of candidates collected before the final result limit was applied.
     pub candidate_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SessionsInput {
+    Request {
+        request: crate::cli::SessionsRequest,
+    },
+    Spec {
+        spec: SessionListSpec,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,7 +367,8 @@ enum RpcOperation {
         source: Option<SourceFilter>,
     },
     Sessions {
-        request: crate::cli::SessionsRequest,
+        #[serde(flatten)]
+        input: SessionsInput,
     },
     SessionCount {
         request: crate::cli::SessionsRequest,
@@ -839,6 +883,101 @@ pub fn federated_recent(
         failures,
         candidate_count,
     })
+}
+
+pub fn federated_sessions(
+    paths: &Paths,
+    config: &UserConfig,
+    requested: &[String],
+    spec: &SessionListSpec,
+) -> Result<Federated<LocatedSession>> {
+    let ids = selected_machine_ids(config, requested)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let tx = tx.clone();
+            let spec = spec.clone();
+            if id == LOCAL_MACHINE_ID {
+                let paths = paths.clone();
+                scope.spawn(move || {
+                    let _ = tx.send((LOCAL_MACHINE_ID.to_string(), sessions_local(&paths, &spec)));
+                });
+            } else {
+                let machine = config
+                    .machines
+                    .iter()
+                    .find(|machine| machine.id == *id)
+                    .expect("selected machines were validated")
+                    .clone();
+                scope.spawn(move || {
+                    let result = rpc_sessions(config, &machine, spec);
+                    let _ = tx.send((machine.id.clone(), result));
+                });
+            }
+        }
+        drop(tx);
+    });
+
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for (machine, result) in rx {
+        match result {
+            Ok(sessions) => successes.push((machine, sessions)),
+            Err(err) => failures.push((machine, err.to_string())),
+        }
+    }
+    if successes.is_empty() {
+        bail!(
+            "all machine session queries failed: {}",
+            failures
+                .iter()
+                .map(|(machine, error)| format!("{machine}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(merge_sessions(successes, failures, spec.limit))
+}
+
+fn merge_sessions(
+    successes: Vec<(String, Vec<SessionListing>)>,
+    mut failures: Vec<(String, String)>,
+    limit: usize,
+) -> Federated<LocatedSession> {
+    let mut items = successes
+        .into_iter()
+        .flat_map(|(machine, sessions)| {
+            sessions.into_iter().map(move |session| LocatedSession {
+                machine: machine.clone(),
+                session: session.session,
+                resume_cmd: session.resume_cmd,
+            })
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        right
+            .session
+            .last_at
+            .cmp(&left.session.last_at)
+            .then_with(|| right.session.started_at.cmp(&left.session.started_at))
+            .then_with(|| left.machine.cmp(&right.machine))
+            .then_with(|| {
+                left.session
+                    .source
+                    .storage_label()
+                    .cmp(right.session.source.storage_label())
+            })
+            .then_with(|| left.session.session_id.cmp(&right.session.session_id))
+            .then_with(|| left.session.source_path.cmp(&right.session.source_path))
+    });
+    failures.sort_by(|left, right| left.0.cmp(&right.0));
+    let candidate_count = items.len();
+    items.truncate(limit);
+    Federated {
+        items,
+        failures,
+        candidate_count,
+    }
 }
 
 pub fn session_records(
@@ -1871,7 +2010,14 @@ pub(crate) fn remote_sessions(
     id: &str,
     request: crate::cli::SessionsRequest,
 ) -> Result<Vec<serde_json::Value>> {
-    match metadata_rpc(config, id, RpcOperation::Sessions { request }, "sessions")? {
+    match metadata_rpc(
+        config,
+        id,
+        RpcOperation::Sessions {
+            input: SessionsInput::Request { request },
+        },
+        "sessions",
+    )? {
         RpcPayload::Sessions { sessions } => Ok(sessions),
         _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
     }
@@ -2081,7 +2227,9 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
             projects: crate::cli::collect_projects(paths, source)?,
         }),
-        RpcOperation::Sessions { request } => Ok(RpcPayload::Sessions {
+        RpcOperation::Sessions {
+            input: SessionsInput::Request { request },
+        } => Ok(RpcPayload::Sessions {
             sessions: crate::cli::collect_sessions(
                 request.session_id,
                 request.source_path,
@@ -2236,10 +2384,45 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         RpcOperation::SessionActivity { spec } => Ok(RpcPayload::SessionActivity {
             points: session_activity_local(paths, &spec)?,
         }),
+        RpcOperation::Sessions {
+            input: SessionsInput::Spec { spec },
+        } => Ok(RpcPayload::Sessions {
+            sessions: sessions_local(paths, &spec)?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<_, _>>()?,
+        }),
         RpcOperation::HomeActivity { request, now } => Ok(RpcPayload::HomeActivity {
             activity: crate::web::raw_activity_payload(paths, &request, now)?,
         }),
     }
+}
+
+fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let config = UserConfig::load(paths)?;
+    let cwd = crate::cli::canonical_cwd_filter(spec.cwd.as_ref().map(std::path::PathBuf::from));
+    let rows = store.query_sessions_detailed_selected(
+        spec.source,
+        spec.project.as_deref(),
+        cwd.as_deref(),
+        spec.since_ms,
+        spec.origin,
+        spec.session_id.as_deref(),
+        spec.source_path.as_deref(),
+        Some(spec.limit),
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|session| {
+            let resume_cmd =
+                crate::cli::session_resume_command(&config, &session).map(|(command, _)| command);
+            SessionListing {
+                session,
+                resume_cmd,
+            }
+        })
+        .collect())
 }
 
 fn usage_local(paths: &Paths, config: &UserConfig, spec: &UsageSpec) -> Result<UsageReportWire> {
@@ -2972,6 +3155,29 @@ fn rpc_records(
         RpcPayload::Records { records } => Ok(records),
         RpcPayload::Error { message } => Err(anyhow!("{context} failed: {message}")),
         other => Err(anyhow!("{context} returned unexpected response: {other:?}")),
+    }
+}
+
+fn rpc_sessions(
+    config: &UserConfig,
+    machine: &MachineConfig,
+    spec: SessionListSpec,
+) -> Result<Vec<SessionListing>> {
+    match metadata_rpc(
+        config,
+        &machine.id,
+        RpcOperation::Sessions {
+            input: SessionsInput::Spec { spec },
+        },
+        "sessions",
+    )? {
+        RpcPayload::Sessions { sessions } => sessions
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into),
+        RpcPayload::Error { message } => Err(anyhow!("sessions failed: {message}")),
+        other => Err(anyhow!("sessions returned unexpected response: {other:?}")),
     }
 }
 
@@ -4268,7 +4474,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
         std::fs::write(
             paths.root.join("config.toml"),
-            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n",
+            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n[multi_machine]\ndefault = ['unavailable']\n[[machines]]\nid = 'unavailable'\nssh = 'unavailable'\n",
         )
         .unwrap();
         let config = UserConfig::load(&paths).unwrap();
@@ -4292,7 +4498,9 @@ mod tests {
             }))
             .unwrap();
             let encoded = serde_json::to_vec(&RpcOperation::Sessions {
-                request: request.clone(),
+                input: SessionsInput::Request {
+                    request: request.clone(),
+                },
             })
             .unwrap();
             let decoded: RpcOperation = serde_json::from_slice(&encoded).unwrap();
@@ -4483,6 +4691,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn session_feed_keeps_successes_and_machine_provenance() {
+        let session = |id: &str, last_at: u64| SessionListing {
+            resume_cmd: None,
+            session: SessionDetailRow {
+                label: None,
+                conversation_kind: None,
+                source: SourceKind::Codex,
+                session_id: id.to_string(),
+                source_path: format!("{id}.jsonl"),
+                project: "memex".to_string(),
+                repo_project: None,
+                cwd: None,
+                git_root: None,
+                started_at: last_at.saturating_sub(1),
+                last_at,
+                message_count: 1,
+            },
+        };
+        let result = merge_sessions(
+            vec![
+                ("local".to_string(), vec![session("older", 10)]),
+                ("mini".to_string(), vec![session("newer", 20)]),
+            ],
+            vec![("offline".to_string(), "unavailable".to_string())],
+            1,
+        );
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].machine, "mini");
+        assert_eq!(result.items[0].session.session_id, "newer");
+        assert_eq!(result.candidate_count, 2);
+        assert_eq!(result.failures[0].0, "offline");
     }
 
     #[test]

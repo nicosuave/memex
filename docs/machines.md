@@ -37,7 +37,15 @@ SSH keys, users, ports, jump hosts, and host-key policy remain in `~/.ssh/config
 memex search "tantivy corruption"             # configured defaults
 memex search "tantivy corruption" --machine mini
 memex usage --machine local --machine mini
+memex sessions --machine local --machine mini --limit 20
 ```
+
+`memex sessions` uses the configured default machines, merges sessions by latest activity,
+and includes `machine` in every row. The limit applies across the merged results; exact
+`--source`, `--session-id`, and `--source-path` selectors apply on each machine. Use
+`--machine local` for only this machine. Each machine resolves `--cwd` against its own
+filesystem. `sessions --count` retains its single-machine
+behavior and defaults to local. Both peers need a version supporting federated session lists.
 
 Unavailable machines produce partial results with a warning. Remote token usage requires
 `token_usage = true` in that machine's memex config. The index backend is intentionally
