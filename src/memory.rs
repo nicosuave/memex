@@ -220,6 +220,15 @@ impl MemoryStore {
         &self.snapshot_path
     }
 
+    /// Atomic snapshot replacement changes this cheap identity without loading its contents.
+    pub(crate) fn revision(&self) -> Result<Option<FileFingerprint>> {
+        match fs::metadata(&self.snapshot_path) {
+            Ok(metadata) => file_fingerprint(&metadata).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Load one complete published snapshot. Transient replacement/read races are retried.
     pub fn load(&self) -> Result<MemorySnapshot> {
         let mut last_error = None;
@@ -1031,7 +1040,7 @@ fn read_consistent(path: &Path) -> Result<(String, fs::Metadata)> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FileFingerprint {
+pub(crate) struct FileFingerprint {
     len: u64,
     modified_ns: u128,
     #[cfg(unix)]

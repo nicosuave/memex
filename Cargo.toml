@@ -32,6 +32,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
+signal-hook = "0.3"
 simd-json = { version = "0.13", features = ["serde"] }
 tantivy = { version = "0.22", features = ["quickwit"] }
 usearch = "2"

@@ -1160,6 +1160,11 @@ pub(super) fn refresh_memories(
         );
     }
     if options.embeddings {
+        let _embedding_lease = IngestLease::acquire_embedding(
+            paths,
+            "ingest-memory-vectors",
+            crate::lease::INGEST_LEASE_TIMEOUT,
+        )?;
         let count =
             crate::memory_search::embed_memory(paths, options.model, &options.embed_runtime)?;
         if count > 0 {
@@ -1284,7 +1289,16 @@ pub(super) fn execute_refresh(
             || !opencode_scope_targets.is_empty()
             || !opencode_database_paths_to_delete.is_empty()
             || !vector_delete_paths.is_empty())
-            && crate::vector::VectorIndex::exists(&paths.vectors));
+            && (crate::vector::VectorIndex::exists(&paths.vectors)
+                || crate::lease::is_embedding_held(paths)));
+    let _embedding_lease = if vector_publication {
+        match IngestLease::try_acquire_embedding(paths, "ingest-vectors")? {
+            crate::lease::LeaseAttempt::Acquired(lease) => Some(lease),
+            crate::lease::LeaseAttempt::Busy(_) => return Err(crate::lease::EmbeddingBusy.into()),
+        }
+    } else {
+        None
+    };
     let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
