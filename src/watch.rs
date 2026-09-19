@@ -374,6 +374,14 @@ fn enqueue_event(
     overflow: &AtomicBool,
     event: notify::Result<Event>,
 ) {
+    // Ingestion itself emits Linux access events. Discard them before they can
+    // overflow the queue and trigger another scan of the same files.
+    if event
+        .as_ref()
+        .is_ok_and(|event| matches!(event.kind, EventKind::Access(_)) && !event.need_rescan())
+    {
+        return;
+    }
     // Never block the OS watcher during ingestion. One sticky bit preserves
     // the need to reconcile when bounded buffering cannot retain all hints.
     if let Err(TrySendError::Full(_)) = sender.try_send(event) {
@@ -1007,6 +1015,36 @@ mod tests {
                 assert!(interesting_event_paths(&event, &excluder).0.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn access_events_do_not_fill_the_queue() {
+        let (sender, receiver) = bounded(1);
+        let overflow = AtomicBool::new(false);
+        for _ in 0..EVENT_QUEUE_CAPACITY + 1 {
+            enqueue_event(
+                &sender,
+                &overflow,
+                Ok(Event::new(EventKind::Access(
+                    notify::event::AccessKind::Any,
+                ))),
+            );
+        }
+        assert!(receiver.is_empty());
+        assert!(!overflow.load(Ordering::Acquire));
+        enqueue_event(&sender, &overflow, Ok(Event::new(EventKind::Any)));
+        assert_eq!(receiver.len(), 1);
+        receiver.try_recv().unwrap().unwrap();
+        enqueue_event(
+            &sender,
+            &overflow,
+            Ok(
+                Event::new(EventKind::Access(notify::event::AccessKind::Any))
+                    .set_flag(notify::event::Flag::Rescan),
+            ),
+        );
+        assert!(receiver.try_recv().unwrap().unwrap().need_rescan());
+        assert!(!overflow.load(Ordering::Acquire));
     }
 
     #[test]
