@@ -11,3 +11,5 @@
 {"step_index":10,"source":"MODEL","type":"SEARCH_WEB","status":"DONE","content":"Rust documentation search result"}
 {"step_index":11,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"code_action","args":{"TargetFile":"/repo/src/main.rs"}}]}
 {"step_index":12,"source":"MODEL","type":"CODE_ACTION","status":"DONE","content":"Applied edit to /repo/src/main.rs"}
+not-json-at-all
+{"step_index":13,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-09-15T23:44:57Z","content":"Error: The stream was interrupted. Please continue the task you were working on."}

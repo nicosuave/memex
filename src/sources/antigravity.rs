@@ -816,6 +816,37 @@ fn index_transcript_file(
                 }
             }
             "SYSTEM_MESSAGE" => {}
+            "ERROR_MESSAGE" => {
+                let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let text = if trimmed.to_ascii_lowercase().starts_with("error") {
+                        trimmed.to_string()
+                    } else {
+                        format!("Error: {trimmed}")
+                    };
+                    let links = RecordLinks {
+                        event_id: Some(format!("{session_id}:{step_index}:error")),
+                        ..Default::default()
+                    };
+                    emit(Record {
+                        source: SourceKind::Antigravity,
+                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        ts,
+                        project: project.clone(),
+                        session_id: session_id.clone(),
+                        turn_id,
+                        role: "tool".to_string(),
+                        text: text.clone(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: Some(text),
+                        links,
+                        source_path: source_path.to_string(),
+                    })?;
+                    turn_id += 1;
+                }
+            }
             other => diagnostics.increment_unknown_top_level(other),
         }
     }
@@ -1597,7 +1628,7 @@ mod tests {
         )
         .unwrap();
         let (records, output) = emit_collect(&path, false);
-        assert_eq!(records.len(), 13);
+        assert_eq!(records.len(), 14);
         assert_eq!(output.session_cwd.as_deref(), Some("/repo"));
         for (index, name) in [
             "run_command",
@@ -1630,6 +1661,22 @@ mod tests {
         let metadata: Value =
             serde_json::from_str(records[8].links.source_content.as_deref().unwrap()).unwrap();
         assert_eq!(metadata["truncated_fields"], serde_json::json!(["content"]));
+        // The malformed line is skipped and the stream error is indexed.
+        let error = &records[13];
+        assert_eq!(error.role, "tool");
+        assert_eq!(
+            error.tool_output.as_deref(),
+            Some(
+                "Error: The stream was interrupted. Please continue the task you were working on."
+            )
+        );
+        assert!(
+            error
+                .links
+                .event_id
+                .as_deref()
+                .is_some_and(|id| id.ends_with(":error"))
+        );
     }
 
     #[test]
