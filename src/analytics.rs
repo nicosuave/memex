@@ -4,7 +4,7 @@ use crate::types::{
     Record, SourceFilter, SourceKind, jcode_text_is_subagent_directive,
     jcode_tmp_cwd_is_worker_sandbox,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1194,11 +1194,27 @@ pub(crate) struct PreparedAnalytics<'a> {
 
 impl PreparedAnalytics<'_> {
     pub(crate) fn commit(self, delete_paths: &[String], scopes: &[SessionScope]) -> Result<()> {
+        self.commit_inner(delete_paths, scopes, false)
+    }
+
+    fn replace_all_and_mark_complete(self) -> Result<()> {
+        self.commit_inner(&[], &[], true)
+    }
+
+    fn commit_inner(
+        self,
+        delete_paths: &[String],
+        scopes: &[SessionScope],
+        replace_all: bool,
+    ) -> Result<()> {
         crate::profiling::span!("analytics.persist");
-        if self.rows.is_empty() && delete_paths.is_empty() && scopes.is_empty() {
+        if self.rows.is_empty() && delete_paths.is_empty() && scopes.is_empty() && !replace_all {
             return Ok(());
         }
         let tx = self.writer.store.conn.transaction()?;
+        if replace_all {
+            tx.execute("DELETE FROM sessions", [])?;
+        }
         for scope in scopes {
             delete_scope(&tx, scope)?;
         }
@@ -1254,6 +1270,13 @@ impl PreparedAnalytics<'_> {
                     conversation_kind,
                 ])?;
             }
+        }
+        if replace_all {
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES('analytics_complete', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
         }
         tx.commit()?;
         self.writer.sessions.clear();
@@ -2198,12 +2221,10 @@ pub fn rebuild_from_records(
     records: impl IntoIterator<Item = Record>,
 ) -> Result<()> {
     let mut writer = AnalyticsWriter::open(path)?;
-    writer.clear()?;
     for record in records {
         writer.record(&record)?;
     }
-    writer.flush()?;
-    writer.store.mark_complete()
+    writer.prepare().replace_all_and_mark_complete()
 }
 
 pub fn backfill_from_index(
@@ -2218,16 +2239,22 @@ pub(crate) fn backfill_from_index_with_repositories(
     index: &crate::index::SearchIndex,
     repositories: Arc<RepositoryResolver>,
 ) -> Result<()> {
+    let expected_records = index.doc_count()?;
+    let mut scanned_records = 0usize;
     let mut writer = AnalyticsWriter::with_repositories(path, repositories)?;
-    writer.clear()?;
     index
         .for_each_record(|record| {
+            scanned_records += 1;
             writer.record(&record)?;
             Ok(())
         })
         .context("read records for analytics backfill")?;
-    writer.flush()?;
-    writer.store.mark_complete()
+    if scanned_records != expected_records {
+        bail!(
+            "analytics backfill read {scanned_records} of {expected_records} indexed records; keeping the existing analytics cache"
+        );
+    }
+    writer.prepare().replace_all_and_mark_complete()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2539,6 +2566,78 @@ mod tests {
         assert_eq!(rows[0].session_id, "s1");
         assert_eq!(rows[0].message_count, 2);
         assert_eq!(rows[0].last_at, 20);
+    }
+
+    #[test]
+    fn replacement_keeps_previous_session_visible_until_flush() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write transcript");
+        let db = tmp.path().join("analytics.sqlite");
+        let source_path = transcript.to_string_lossy().to_string();
+
+        let mut initial = AnalyticsWriter::open(&db).expect("open initial analytics");
+        initial
+            .record(&record("memex", "s1", &transcript, 10))
+            .expect("record initial session");
+        initial.flush().expect("flush initial session");
+
+        let mut replacement = AnalyticsWriter::open(&db).expect("open replacement analytics");
+        replacement
+            .record(&record("memex", "s1", &transcript, 20))
+            .expect("record replacement session");
+
+        let before_flush = AnalyticsStore::open_read_only(&db).expect("open existing catalog");
+        let rows = before_flush
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query existing catalog");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_at, 10);
+        drop(before_flush);
+
+        replacement
+            .prepare()
+            .commit(&[source_path], &[])
+            .expect("flush replacement");
+        let after_flush = AnalyticsStore::open_read_only(&db).expect("open replaced catalog");
+        let rows = after_flush
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .expect("query replaced catalog");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_at, 20);
+        assert_eq!(rows[0].message_count, 1);
+    }
+
+    #[test]
+    fn failed_rebuild_preserves_previous_complete_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("session.jsonl");
+        rebuild_from_records(&db, [record("memex", "old", &transcript, 10)]).unwrap();
+        let store = AnalyticsStore::open(&db).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_new_session BEFORE INSERT ON sessions
+             WHEN NEW.session_id = 'new'
+             BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
+            )
+            .unwrap();
+        assert!(rebuild_from_records(&db, [record("memex", "new", &transcript, 20)]).is_err());
+        assert!(store.complete().unwrap());
+        let rows = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "old");
+        assert_eq!(rows[0].message_count, 1);
     }
 
     #[test]
