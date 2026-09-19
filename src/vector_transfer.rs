@@ -42,8 +42,10 @@ fn decode(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
         "cached vector dimensions mismatch"
     );
     let values: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     ensure!(
         values.iter().all(|value| value.is_finite()),
