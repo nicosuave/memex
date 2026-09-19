@@ -1583,6 +1583,43 @@ fn empty_index_rebuild_persists_cleared_database_state() {
 }
 
 #[test]
+fn empty_index_recovery_preserves_existing_vectors_and_checkpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut state = IngestState {
+        next_doc_id: 57,
+        ..IngestState::default()
+    };
+    state.opencode_databases.insert(
+        "previous.db".into(),
+        crate::state::OpencodeDatabaseState::default(),
+    );
+    state.save(&paths.state.join("ingest.json")).unwrap();
+    let mut vectors = VectorIndex::open_or_create(&paths.vectors, 3, Some("fixture")).unwrap();
+    vectors.add(56, &[0.25, 0.5, 0.75]).unwrap();
+    vectors.save().unwrap();
+    let pointer = fs::read(paths.vectors.join("current.json")).unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let error = ingest_all(
+        &paths,
+        &index,
+        &ingest_options(false, ModelChoice::default()),
+        &ingest_lease(&paths),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to discard"));
+    assert_eq!(
+        fs::read(paths.vectors.join("current.json")).unwrap(),
+        pointer
+    );
+    assert!(VectorIndex::open(&paths.vectors).unwrap().contains(56));
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(state.opencode_databases.contains_key("previous.db"));
+    assert_eq!(state.next_doc_id, 57);
+}
+
+#[test]
 fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
     use tantivy::Directory;
 

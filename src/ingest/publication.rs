@@ -451,13 +451,14 @@ pub(super) fn recover_checkpoint(
     cleanup_opencode_spools(&paths.state)?;
     let mut empty_index_rebuild = false;
     if empty_index && (state.has_files()? || !state.opencode_databases.is_empty()) {
+        anyhow::ensure!(
+            !crate::vector::VectorIndex::exists(&paths.vectors)
+                || crate::vector::VectorIndex::open(&paths.vectors)?.is_empty(),
+            "empty lexical index has existing vectors; refusing to discard them: restore the lexical index or follow docs/vector-migration.md"
+        );
         empty_index_rebuild = true;
         state.clear_files();
         state.opencode_databases.clear();
-        if paths.vectors.exists() {
-            std::fs::remove_dir_all(&paths.vectors)?;
-            std::fs::create_dir_all(&paths.vectors)?;
-        }
     }
 
     Ok(RecoveredCheckpoint {

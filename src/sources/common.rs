@@ -21,7 +21,9 @@ use walkdir::WalkDir;
 /// losing it would show up as a slow rebuild and nothing else.
 pub(crate) fn map_sequential(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
     let mmap = unsafe { memmap2::Mmap::map(file)? };
-    if mmap.advise(memmap2::Advice::Sequential).is_ok() {
+    let _advice = mmap.advise(memmap2::Advice::Sequential);
+    #[cfg(feature = "profiling")]
+    if _advice.is_ok() {
         crate::profiling::count!("sources.mmap_advice_accepted", 1);
     } else {
         crate::profiling::count!("sources.mmap_advice_refused", 1);
