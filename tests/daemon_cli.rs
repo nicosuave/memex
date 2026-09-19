@@ -663,3 +663,417 @@ fn daemon_event_mode_indexes_held_open_wal_without_resync() {
     }
     daemon.stop();
 }
+
+#[cfg(unix)]
+#[test]
+fn daemon_embedding_worker_tracks_new_records_in_events_and_poll_modes() {
+    use memex::config::Paths;
+    use memex::vector::VectorIndex;
+    use std::io::Write;
+
+    for mode in ["events", "poll"] {
+        let dirs = TestDirs::new();
+        dirs.write_config("auto_index_on_search = false\n");
+        let transcript = dirs.claude.path().join("session.jsonl");
+        std::fs::write(&transcript, "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"worker-test\",\"message\":{\"content\":\"first searchable request\"}}\n").unwrap();
+        let mut daemon = ChildGuard::spawn(
+            &dirs,
+            &[
+                "daemon",
+                "run",
+                "--root",
+                dirs.root.path().to_str().unwrap(),
+                "--only-source",
+                "claude",
+                "--claude-path",
+                dirs.claude.path().to_str().unwrap(),
+                "--embeddings",
+                "--model",
+                "bge",
+                "--poll-interval",
+                "1",
+                "--watch-mode",
+                mode,
+            ],
+        );
+        let paths = Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+        for expected in [1, 2] {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                daemon.assert_running();
+                if VectorIndex::inventory(&paths.vectors)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|inventory| inventory.vector_count == expected)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "embedding worker did not reach {expected} vectors in {mode}: {}",
+                    daemon.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if expected == 1 {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&transcript)
+                    .unwrap();
+                writeln!(file, "{{\"type\":\"assistant\",\"uuid\":\"a1\",\"sessionId\":\"worker-test\",\"message\":{{\"content\":\"second searchable answer\"}}}}").unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while memex::lease::is_embedding_held(&paths) {
+            daemon.assert_running();
+            assert!(
+                Instant::now() < deadline,
+                "embedding worker did not finish: {}",
+                daemon.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!paths.state.join("embed-backfill.sqlite3").exists());
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &daemon.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(daemon.wait_for_exit().success());
+        assert!(!memex::lease::is_embedding_held(&paths));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn poll_daemon_reaps_worker_for_deletion_and_resumes_after_shutdown() {
+    use memex::config::Paths;
+    use memex::vector::VectorIndex;
+    use memex::vector_backfill;
+
+    let dirs = TestDirs::new();
+    dirs.write_config("auto_index_on_search = false\n");
+    let original = dirs.claude.path().join("original.jsonl");
+    std::fs::write(&original, "{\"type\":\"user\",\"uuid\":\"old\",\"sessionId\":\"old-session\",\"message\":{\"content\":\"existing vector\"}}\n").unwrap();
+    let mut seed = ChildGuard::spawn(
+        &dirs,
+        &[
+            "index",
+            "--root",
+            dirs.root.path().to_str().unwrap(),
+            "--only-source",
+            "claude",
+            "--claude-path",
+            dirs.claude.path().to_str().unwrap(),
+            "--no-embeddings",
+        ],
+    );
+    assert!(seed.wait_for_exit().success(), "{}", seed.diagnostics());
+    let paths = Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+    let index = memex::index::SearchIndex::open_or_create(&paths.index).unwrap();
+    let old_id = index
+        .doc_ids_by_source_path(original.to_str().unwrap())
+        .unwrap()[0];
+    drop(index);
+    let mut vectors = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
+    vectors.add(old_id, &vec![0.25; 384]).unwrap();
+    vectors.save().unwrap();
+    drop(vectors);
+    let transcript = (0..4096)
+        .map(|id| format!("{{\"type\":\"user\",\"uuid\":\"u{id}\",\"sessionId\":\"resume-test\",\"message\":{{\"content\":\"request {id}: explain why durable embedding checkpoints avoid repeating inference after a process stops\"}}}}\n"))
+        .collect::<String>();
+    std::fs::write(dirs.claude.path().join("session.jsonl"), transcript).unwrap();
+    let args = [
+        "daemon",
+        "run",
+        "--root",
+        dirs.root.path().to_str().unwrap(),
+        "--only-source",
+        "claude",
+        "--claude-path",
+        dirs.claude.path().to_str().unwrap(),
+        "--embeddings",
+        "--model",
+        "bge",
+        "--poll-interval",
+        "1",
+        "--watch-mode",
+        "poll",
+    ];
+    let mut daemon = ChildGuard::spawn(&dirs, &args);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let worker_pid = loop {
+        daemon.assert_running();
+        if let Some(status) = vector_backfill::status(&paths).unwrap()
+            && status.running
+            && status.checkpointed > 0
+            && status.completed < status.total
+        {
+            break status.pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not produce a partial checkpoint: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    std::fs::remove_file(&original).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let replacement_worker_pid = loop {
+        daemon.assert_running();
+        let index = memex::index::SearchIndex::open_or_create(&paths.index).unwrap();
+        let deleted = index
+            .doc_ids_by_source_path(original.to_str().unwrap())
+            .unwrap()
+            .is_empty();
+        if deleted
+            && let Some(status) = vector_backfill::status(&paths).unwrap()
+            && status.running
+            && status.pid != worker_pid
+            && status.checkpointed > 0
+        {
+            break status.pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "poll daemon did not reap and restart its worker for deletion: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        !Command::new("kill")
+            .args(["-0", &worker_pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let worker_pid = replacement_worker_pid;
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &daemon.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(daemon.wait_for_exit().success());
+    assert!(
+        !Command::new("kill")
+            .args(["-0", &worker_pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let checkpoint = vector_backfill::status(&paths)
+        .unwrap()
+        .expect("durable checkpoint survives shutdown");
+    assert!(!checkpoint.running);
+    assert!(checkpoint.checkpointed > 0);
+    assert_eq!(
+        VectorIndex::inventory(&paths.vectors)
+            .unwrap()
+            .unwrap()
+            .vector_count,
+        0
+    );
+
+    let mut restarted = ChildGuard::spawn(&dirs, &args);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        restarted.assert_running();
+        if VectorIndex::inventory(&paths.vectors)
+            .ok()
+            .flatten()
+            .is_some_and(|inventory| inventory.vector_count == 4096)
+            && !paths.state.join("embed-backfill.sqlite3").exists()
+            && restarted.diagnostics().contains(&format!(
+                "{} resumed from checkpoints",
+                checkpoint.checkpointed
+            ))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resumed worker did not finish: {}",
+            restarted.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &restarted.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(restarted.wait_for_exit().success());
+    assert!(!memex::lease::is_embedding_held(&paths));
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_embeds_memory_only_startup_and_edits_without_conversation_changes() {
+    use memex::config::Paths;
+    use memex::vector::VectorIndex;
+
+    for mode in ["events", "poll"] {
+        let dirs = TestDirs::new();
+        dirs.write_config("auto_index_on_search = false\n");
+        let note = dirs.claude.path().join("project/memory/note.md");
+        std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+        std::fs::write(&note, "# Knowledge\nFirst memory fact.\n").unwrap();
+        let paths = Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+        let mut daemon = ChildGuard::spawn(
+            &dirs,
+            &[
+                "daemon",
+                "run",
+                "--root",
+                dirs.root.path().to_str().unwrap(),
+                "--only-source",
+                "claude",
+                "--claude-path",
+                dirs.claude.path().to_str().unwrap(),
+                "--embeddings",
+                "--model",
+                "bge",
+                "--poll-interval",
+                "1",
+                "--watch-mode",
+                mode,
+            ],
+        );
+        let mut previous = None;
+        for pass in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                daemon.assert_running();
+                let generation = std::fs::read_dir(paths.root.join("memory/vectors"))
+                    .ok()
+                    .and_then(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .map(|entry| entry.path())
+                            .find(|path| {
+                                Some(path) != previous.as_ref()
+                                    && VectorIndex::inventory(path)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|inventory| inventory.vector_count > 0)
+                            })
+                    });
+                if generation.is_some() && !memex::lease::is_embedding_held(&paths) {
+                    previous = generation;
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "memory-only pass {pass} was not embedded in {mode}: {}",
+                    daemon.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if pass == 0 {
+                // No conversation changed and the previous embedding worker has exited.
+                std::fs::write(&note, "# Knowledge\nA changed memory fact.\n").unwrap();
+            }
+        }
+        assert!(
+            !VectorIndex::exists(&paths.vectors)
+                || VectorIndex::open(&paths.vectors).unwrap().is_empty()
+        );
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &daemon.child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(daemon.wait_for_exit().success());
+    }
+}
+
+#[test]
+fn poll_daemon_defers_deletion_while_an_external_embedding_writer_holds_the_lease() {
+    use memex::config::Paths;
+    use memex::index::SearchIndex;
+    use memex::lease::IngestLease;
+    use memex::vector::VectorIndex;
+
+    let dirs = TestDirs::new();
+    dirs.write_config("auto_index_on_search = false\n");
+    let transcript = dirs.claude.path().join("session.jsonl");
+    std::fs::write(&transcript, "{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"external-test\",\"message\":{\"content\":\"external embedding writer\"}}\n").unwrap();
+    let paths = Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+    let mut daemon = ChildGuard::daemon(&dirs, &["--watch-mode", "poll"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !memex::daemon_runtime::read(&paths)
+        .unwrap()
+        .is_some_and(|state| state.ready)
+    {
+        daemon.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not become ready: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let doc_id = index
+        .doc_ids_by_source_path(transcript.to_str().unwrap())
+        .unwrap()[0];
+    let lease =
+        IngestLease::acquire_embedding(&paths, "external embed", Duration::from_secs(1)).unwrap();
+    let mut vectors = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
+    vectors.add(doc_id, &vec![0.25; 384]).unwrap();
+    vectors.save().unwrap();
+    drop(vectors);
+    std::fs::remove_file(&transcript).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon
+        .diagnostics()
+        .contains("index deferred while another embedding writer")
+    {
+        daemon.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "poll daemon did not defer: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .doc_count()
+            .unwrap(),
+        1
+    );
+    drop(lease);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while SearchIndex::open_or_create(&paths.index)
+        .unwrap()
+        .doc_count()
+        .unwrap()
+        != 0
+    {
+        daemon.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "poll daemon did not retry deletion: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(VectorIndex::open(&paths.vectors).unwrap().is_empty());
+    daemon.stop();
+}

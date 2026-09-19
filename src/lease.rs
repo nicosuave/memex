@@ -11,6 +11,17 @@ pub const INGEST_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const INGEST_LEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug)]
+pub(crate) struct EmbeddingBusy;
+
+impl std::fmt::Display for EmbeddingBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("embedding writer is busy; retry after the current backfill finishes")
+    }
+}
+
+impl std::error::Error for EmbeddingBusy {}
+
+#[derive(Debug)]
 pub enum LeaseAttempt {
     Acquired(IngestLease),
     Busy(Option<LeaseHolder>),
@@ -30,11 +41,21 @@ pub struct LeaseHolder {
 
 impl IngestLease {
     pub fn try_acquire(paths: &Paths, operation: impl Into<String>) -> Result<LeaseAttempt> {
-        let path = lease_path(paths);
+        Self::try_acquire_path(lease_path(paths, "ingest"), operation.into())
+    }
+
+    pub fn try_acquire_embedding(
+        paths: &Paths,
+        operation: impl Into<String>,
+    ) -> Result<LeaseAttempt> {
+        Self::try_acquire_path(lease_path(paths, "embed"), operation.into())
+    }
+
+    fn try_acquire_path(path: PathBuf, operation: String) -> Result<LeaseAttempt> {
         let mut file = open_lease_file(&path)?;
         match file.try_lock() {
             Ok(()) => {
-                write_holder(&mut file, operation.into())?;
+                write_holder(&mut file, operation)?;
                 Ok(LeaseAttempt::Acquired(Self { file }))
             }
             Err(TryLockError::WouldBlock) => Ok(LeaseAttempt::Busy(read_holder(&path))),
@@ -44,12 +65,22 @@ impl IngestLease {
     }
 
     pub fn acquire(paths: &Paths, operation: impl Into<String>, timeout: Duration) -> Result<Self> {
+        Self::acquire_path(lease_path(paths, "ingest"), operation.into(), timeout)
+    }
+
+    pub fn acquire_embedding(
+        paths: &Paths,
+        operation: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::acquire_path(lease_path(paths, "embed"), operation.into(), timeout)
+    }
+
+    fn acquire_path(path: PathBuf, operation: String, timeout: Duration) -> Result<Self> {
         crate::profiling::span!("ingest.lease_wait");
-        let path = lease_path(paths);
-        let operation = operation.into();
         let started = Instant::now();
         loop {
-            match Self::try_acquire(paths, operation.clone())? {
+            match Self::try_acquire_path(path.clone(), operation.clone())? {
                 LeaseAttempt::Acquired(lease) => return Ok(lease),
                 LeaseAttempt::Busy(_) if started.elapsed() < timeout => {
                     thread::sleep(INGEST_LEASE_POLL_INTERVAL);
@@ -66,6 +97,39 @@ impl Drop for IngestLease {
     fn drop(&mut self) {
         let _ = self.file.set_len(0);
         let _ = self.file.unlock();
+    }
+}
+
+pub fn is_embedding_held_by(paths: &Paths, pid: u32) -> bool {
+    is_path_held_by(&lease_path(paths, "embed"), pid)
+}
+
+pub fn is_embedding_held(paths: &Paths) -> bool {
+    let path = lease_path(paths, "embed");
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
+fn is_path_held_by(path: &Path, pid: u32) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => read_holder(path).is_some_and(|holder| holder.pid == pid),
+        Err(TryLockError::Error(_)) => false,
     }
 }
 
@@ -91,7 +155,7 @@ impl CompactionLock {
 }
 
 fn compaction_lock_path(paths: &Paths) -> PathBuf {
-    let path = lease_path(paths);
+    let path = lease_path(paths, "ingest");
     path.with_file_name(
         path.file_name()
             .and_then(|name| name.to_str())
@@ -100,7 +164,7 @@ fn compaction_lock_path(paths: &Paths) -> PathBuf {
     )
 }
 
-fn lease_path(paths: &Paths) -> PathBuf {
+fn lease_path(paths: &Paths, kind: &str) -> PathBuf {
     let parent = paths.root.parent().unwrap_or_else(|| Path::new("."));
     let root_name = paths
         .root
@@ -108,7 +172,7 @@ fn lease_path(paths: &Paths) -> PathBuf {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("memex");
-    parent.join(format!(".{root_name}.ingest.lock"))
+    parent.join(format!(".{root_name}.{kind}.lock"))
 }
 
 fn open_lease_file(path: &Path) -> Result<File> {
@@ -174,6 +238,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_second_compaction_is_refused_while_the_first_holds_its_own_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
+        assert_ne!(compaction_lock_path(&paths), lease_path(&paths, "ingest"));
+
+        let first = CompactionLock::try_acquire(&paths)
+            .expect("first compaction lock")
+            .expect("first compaction should be available");
+        assert!(
+            CompactionLock::try_acquire(&paths)
+                .expect("second compaction lock")
+                .is_none()
+        );
+
+        let ingest = match IngestLease::try_acquire(&paths, "refresh").expect("ingest lease") {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Busy(_) => panic!("compaction lock must not hold the ingest lease"),
+        };
+        drop(ingest);
+
+        drop(first);
+        assert!(
+            CompactionLock::try_acquire(&paths)
+                .expect("third compaction lock")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn contended_lease_reports_holder() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
@@ -197,32 +290,22 @@ mod tests {
     }
 
     #[test]
-    fn a_second_compaction_is_refused_while_the_first_holds_its_own_lock() {
+    fn ingest_and_embedding_leases_are_independent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(temp.path().join("memex"))).expect("paths");
-        assert_ne!(compaction_lock_path(&paths), lease_path(&paths));
+        let _ingest = IngestLease::acquire(&paths, "index", Duration::from_secs(1)).unwrap();
+        let embed =
+            IngestLease::acquire_embedding(&paths, "embed", Duration::from_secs(1)).unwrap();
 
-        let first = CompactionLock::try_acquire(&paths)
-            .expect("first compaction lock")
-            .expect("first compaction should be available");
-        assert!(
-            CompactionLock::try_acquire(&paths)
-                .expect("second compaction lock")
-                .is_none()
-        );
-
-        let ingest = match IngestLease::try_acquire(&paths, "refresh").expect("ingest lease") {
-            LeaseAttempt::Acquired(lease) => lease,
-            LeaseAttempt::Busy(_) => panic!("compaction lock must not hold the ingest lease"),
-        };
-        drop(ingest);
-
-        drop(first);
-        assert!(
-            CompactionLock::try_acquire(&paths)
-                .expect("third compaction lock")
-                .is_some()
-        );
+        assert!(is_embedding_held(&paths));
+        assert!(is_embedding_held_by(&paths, std::process::id()));
+        assert!(matches!(
+            IngestLease::try_acquire_embedding(&paths, "second embed").unwrap(),
+            LeaseAttempt::Busy(_)
+        ));
+        drop(embed);
+        assert!(!is_embedding_held(&paths));
+        assert!(!is_embedding_held_by(&paths, std::process::id()));
     }
 
     #[test]

@@ -178,6 +178,12 @@ impl Directory for SealedDirectory {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexRevision {
+    pub(crate) opstamp: u64,
+    pub(crate) segments: Vec<(String, Option<u64>)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
     pub query: String,
@@ -718,6 +724,21 @@ impl SearchIndex {
         } else {
             create_index_in_dir(dir)
         }
+    }
+
+    /// Return a cheap identity for the last committed lexical index snapshot.
+    pub(crate) fn revision(&self) -> Result<IndexRevision> {
+        let metadata = self.index.load_metas()?;
+        let mut segments = metadata
+            .segments
+            .iter()
+            .map(|segment| (segment.id().uuid_string(), segment.delete_opstamp()))
+            .collect::<Vec<_>>();
+        segments.sort_unstable();
+        Ok(IndexRevision {
+            opstamp: metadata.opstamp,
+            segments,
+        })
     }
 
     pub(crate) fn is_writable(&self) -> bool {

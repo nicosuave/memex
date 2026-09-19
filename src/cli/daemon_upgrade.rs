@@ -86,7 +86,7 @@ impl Replacement {
         })
     }
 
-    pub(super) fn check(&mut self) {
+    pub(super) fn check(&mut self, stop_worker: impl FnOnce() -> Result<()>) {
         if self.checked.elapsed() < Duration::from_secs(2) {
             return;
         }
@@ -100,6 +100,8 @@ impl Replacement {
                 return Ok(());
             }
             verify_binary(path)?;
+            // exec does not run Rust destructors: reap the supervised embedder first.
+            stop_worker()?;
             // Retry failures later; a partially written replacement must not strand
             // the old daemon or be mistaken for an activated build.
             eprintln!("daemon: activating updated executable {}", path.display());

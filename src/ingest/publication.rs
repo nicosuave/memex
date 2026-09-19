@@ -448,6 +448,18 @@ pub(super) fn recover_checkpoint(
     // Apply additive analytics migrations even when the scan finds no changed files.
     drop(AnalyticsStore::open(analytics_path(&paths.state))?);
     let pending_recovery = prepare_pending_ingest_recovery(&mut state);
+    let _embedding_lease = if empty_index
+        && (state.has_files()? || !state.opencode_databases.is_empty())
+        && paths.vectors.exists()
+    {
+        Some(IngestLease::acquire_embedding(
+            paths,
+            "recover-vectors",
+            crate::lease::INGEST_LEASE_TIMEOUT,
+        )?)
+    } else {
+        None
+    };
     cleanup_opencode_spools(&paths.state)?;
     let mut empty_index_rebuild = false;
     if empty_index && (state.has_files()? || !state.opencode_databases.is_empty()) {

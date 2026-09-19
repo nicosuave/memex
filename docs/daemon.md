@@ -42,6 +42,23 @@ memex daemon disable
 The daemon reads config defaults for its mode, interval, listeners, and log paths.
 Flags override those defaults.
 
+### Resumable embeddings
+
+When embeddings are enabled, continuous indexing runs background backfills in a supervised
+`memex embed` child. New lexical records can be indexed during backfill; replacements and
+deletions coordinate with the embedding writer. Existing parser-version migrations and
+interrupted synchronous embedding operations retain their recovery behavior.
+
+Completed batches are checkpointed in
+`state/embed-backfill.sqlite3`; restarting the daemon or rerunning `memex embed` resumes
+those batches. The active vector generation stays searchable until its replacement is ready.
+`memex stats` reports checkpoint progress, the worker PID, and an estimated remaining time.
+
+The daemon stops and reaps its child on shutdown, embedding-configuration changes, and
+executable handoff. `--no-embeddings` disables its worker. Explicit index rebuilds discard
+embedding checkpoints along with the derived indexes. Changing embedding models discards
+incompatible checkpoint vectors; embeddings cannot be reused between models.
+
 ### Reclaiming obsolete index generations
 
 After an upgrade, normal indexing automatically migrates a legacy index and removes obsolete
