@@ -123,17 +123,49 @@ fn machine_discovery_lists_all_enabled_peers_without_transport_details() {
 }
 
 #[test]
-fn metadata_keeps_local_defaults_and_round_trips_complete_peer_results() {
+fn metadata_respects_command_defaults_and_round_trips_complete_peer_results() {
     let fixture = Fixture::new();
-    for command in ["projects", "sessions"] {
-        let local = fixture.json(&[command, "--format", "json"]);
-        assert_eq!(local.as_array().unwrap().len(), 1);
-        assert!(local[0].get("machine").is_none());
-        let explicit = fixture.json(&[command, "--machine", "local", "--format", "json"]);
-        let mut expected = local;
-        expected[0]["machine"] = json!("local");
-        assert_eq!(explicit, expected);
-    }
+    let local_projects = fixture.json(&["projects", "--format", "json"]);
+    assert_eq!(local_projects.as_array().unwrap().len(), 1);
+    assert!(local_projects[0].get("machine").is_none());
+    let mut expected = local_projects;
+    expected[0]["machine"] = json!("local");
+    assert_eq!(
+        fixture.json(&["projects", "--machine", "local", "--format", "json"]),
+        expected
+    );
+
+    // Sessions use configured defaults; projects retain their local default.
+    let default_sessions = fixture.json(&["sessions", "--format", "json"]);
+    assert_eq!(default_sessions.as_array().unwrap().len(), 20);
+    assert!(default_sessions.as_array().unwrap().iter().all(|session| {
+        session["machine"] == "peer" && session["repo_project"] == "peer-project"
+    }));
+    assert_eq!(
+        fixture.json(&["sessions", "--machine", "peer", "--format", "json"]),
+        default_sessions
+    );
+    let local_sessions = fixture.json(&["sessions", "--machine", "local", "--format", "json"]);
+    assert_eq!(local_sessions.as_array().unwrap().len(), 1);
+    assert_eq!(local_sessions[0]["machine"], "local");
+    assert_eq!(local_sessions[0]["repo_project"], "local-project");
+    let complete_sessions = fixture.json(&["sessions", "--limit", "300", "--format", "json"]);
+    let complete_sessions = complete_sessions.as_array().unwrap();
+    assert_eq!(complete_sessions.len(), 225);
+    assert!(
+        complete_sessions
+            .iter()
+            .all(|session| session["machine"] == "peer")
+    );
+    assert_eq!(
+        complete_sessions
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap().to_owned())
+            .collect::<std::collections::HashSet<_>>(),
+        (0..225)
+            .map(|index| format!("s-{index}"))
+            .collect::<std::collections::HashSet<_>>()
+    );
     let projects = fixture.json(&["projects", "--machine", "peer", "--format", "json"]);
     assert_eq!(
         projects,
