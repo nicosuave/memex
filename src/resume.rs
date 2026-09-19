@@ -87,7 +87,108 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
     }
 }
 
+/// Returns true if `path` points into an agent's internal transcript storage
+/// directory (such as `~/.local/share/muse/sessions`, `~/.claude/projects`, etc.)
+/// rather than a user project repository/working directory.
+pub fn is_internal_storage_dir(path: &str) -> bool {
+    let p = path.trim();
+    if p.is_empty() {
+        return false;
+    }
+    let normalized = p.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+
+    // Explicitly allow worktrees such as `~/.codex/worktrees/...`
+    if trimmed.contains("/.codex/worktrees/")
+        || trimmed.contains(".codex/worktrees")
+        || trimmed.ends_with("/.codex/worktrees")
+    {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    let matches_token = |token: &str| -> bool {
+        lower == token
+            || lower.starts_with(&format!("{token}/"))
+            || lower.contains(&format!("/{token}/"))
+            || lower.ends_with(&format!("/{token}"))
+    };
+
+    if matches_token(".local/share/muse/sessions")
+        || matches_token("muse/sessions")
+        || matches_token(".grok/sessions")
+        || matches_token(".claude/projects")
+        || matches_token(".config/claude")
+        || matches_token(".codex/sessions")
+        || matches_token(".codex/archived_sessions")
+        || matches_token(".pi/agent/sessions")
+        || matches_token(".pi/sessions")
+        || matches_token(".jcode/sessions")
+        || matches_token(".local/share/opencode")
+        || matches_token(".config/opencode")
+        || matches_token(".config/github-copilot")
+        || matches_token(".openclaw/sessions")
+        || matches_token(".omp/sessions")
+        || matches_token(".hermes/sessions")
+        || matches_token(".cursor/sessions")
+        || matches_token("antigravity-cli/brain")
+        || matches_token("antigravity/brain")
+        || matches_token("antigravity-ide/brain")
+    {
+        return true;
+    }
+
+    // Also check canonicalized path if path exists on disk (resolves symlinks and `.` / `..`)
+    if let Ok(canon) = std::fs::canonicalize(p) {
+        let canon_str = canon.to_string_lossy().replace('\\', "/");
+        let canon_trimmed = canon_str.trim_end_matches('/');
+        if canon_trimmed.contains("/.codex/worktrees/")
+            || canon_trimmed.contains(".codex/worktrees")
+        {
+            return false;
+        }
+        let canon_lower = canon_trimmed.to_ascii_lowercase();
+        let canon_matches = |token: &str| -> bool {
+            canon_lower == token
+                || canon_lower.starts_with(&format!("{token}/"))
+                || canon_lower.contains(&format!("/{token}/"))
+                || canon_lower.ends_with(&format!("/{token}"))
+        };
+        if canon_matches(".local/share/muse/sessions")
+            || canon_matches("muse/sessions")
+            || canon_matches(".grok/sessions")
+            || canon_matches(".claude/projects")
+            || canon_matches(".config/claude")
+            || canon_matches(".codex/sessions")
+            || canon_matches(".codex/archived_sessions")
+            || canon_matches(".pi/agent/sessions")
+            || canon_matches(".pi/sessions")
+            || canon_matches(".jcode/sessions")
+            || canon_matches(".local/share/opencode")
+            || canon_matches(".config/opencode")
+            || canon_matches(".config/github-copilot")
+            || canon_matches(".openclaw/sessions")
+            || canon_matches(".omp/sessions")
+            || canon_matches(".hermes/sessions")
+            || canon_matches(".cursor/sessions")
+            || canon_matches("antigravity-cli/brain")
+            || canon_matches("antigravity/brain")
+            || canon_matches("antigravity-ide/brain")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str) -> String {
+    let effective_cwd = if is_internal_storage_dir(cwd) {
+        ""
+    } else {
+        cwd
+    };
     template
         .replace("{session_id}", session.session_id)
         .replace("{project}", session.project)
@@ -96,8 +197,8 @@ pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str
         .replace("{source_path}", session.source_path)
         .replace("{source_dir_shell}", &shell_quote(session.source_dir))
         .replace("{source_dir}", session.source_dir)
-        .replace("{cwd_shell}", &shell_quote(cwd))
-        .replace("{cwd}", cwd)
+        .replace("{cwd_shell}", &shell_quote(effective_cwd))
+        .replace("{cwd}", effective_cwd)
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -186,5 +287,61 @@ mod tests {
             default_resume_template("antigravity", true).as_deref(),
             Some("cd {cwd_shell} && agy --conversation {session_id}")
         );
+    }
+
+    #[test]
+    fn detects_internal_storage_directories() {
+        assert!(is_internal_storage_dir(
+            "/Users/joe/.local/share/muse/sessions/2026/08/08/e89a358e-084e-43c7-a68b-6d088a689f0b"
+        ));
+        assert!(is_internal_storage_dir(
+            "~/.claude/projects/-Users-joe-Developer-memex"
+        ));
+        assert!(is_internal_storage_dir(
+            "/home/user/.codex/sessions/2026/01/01"
+        ));
+        assert!(is_internal_storage_dir(
+            "/home/user/.codex/archived_sessions/2026/01/01"
+        ));
+        assert!(is_internal_storage_dir("/Users/joe/.grok/sessions"));
+        assert!(is_internal_storage_dir("/Users/joe/.jcode/sessions"));
+        assert!(is_internal_storage_dir(
+            "/Users/joe/.gemini/antigravity-cli/brain/487a8c64/.system_generated/logs"
+        ));
+        assert!(is_internal_storage_dir("/Users/joe/.pi/agent/sessions"));
+
+        // User workspaces and projects must NOT be identified as internal storage
+        assert!(!is_internal_storage_dir("/Users/joe/Developer/memex"));
+        assert!(!is_internal_storage_dir("/Users/joe/Developer/obento"));
+        assert!(!is_internal_storage_dir("/home/user/workspace"));
+
+        // Codex worktrees must NOT be identified as internal storage
+        assert!(!is_internal_storage_dir(
+            "/Users/joe/.codex/worktrees/24fe/omnigent"
+        ));
+        assert!(!is_internal_storage_dir(
+            "/Users/joe/.codex/worktrees/3cb4/BenchBox"
+        ));
+    }
+
+    #[test]
+    fn template_expansion_preserves_cd_cwd_for_real_workspace() {
+        let tmpl = "cd {cwd_shell} && muse resume {session_id}";
+        let out = expand_resume_template(tmpl, &session(), "/Users/joe/Developer/obento");
+        assert_eq!(
+            out,
+            "cd '/Users/joe/Developer/obento' && muse resume abc-123"
+        );
+    }
+
+    #[test]
+    fn template_expansion_blanks_cwd_for_internal_storage() {
+        let tmpl = "cd {cwd_shell} && agy --conversation {session_id}";
+        let out = expand_resume_template(
+            tmpl,
+            &session(),
+            "/Users/joe/.gemini/antigravity-cli/brain/487a8c64/.system_generated/logs",
+        );
+        assert_eq!(out, "cd '' && agy --conversation abc-123");
     }
 }
