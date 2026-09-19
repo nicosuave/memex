@@ -74,7 +74,7 @@ impl SessionKindFilter {
 }
 
 /// A session row with every stored column, for `memex sessions`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionDetailRow {
     pub source: SourceKind,
     pub session_id: String,

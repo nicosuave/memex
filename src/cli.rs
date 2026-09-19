@@ -7,8 +7,9 @@ use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
-    SessionPageRequest, UsageSpec, federated_memory_search, federated_search, federated_usage,
-    read_context, read_memory, read_record, read_session_pages, session_page_context,
+    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_search,
+    federated_sessions, federated_usage, read_context, read_memory, read_record,
+    read_session_pages, session_page_context,
 };
 use crate::memory::{MemoryFreshness, MemoryStore};
 use crate::memory_search::{
@@ -656,9 +657,9 @@ EXAMPLES:
         /// Count conversations matching this lexical query; requires --count
         #[arg(long, requires = "count", conflicts_with = "cwd")]
         query: Option<String>,
-        /// Read one machine (defaults to local; ignores configured search defaults)
+        /// Query these machines (repeatable; defaults to configured machines)
         #[arg(long)]
-        machine: Option<String>,
+        machine: Vec<String>,
         /// Match this exact session ID
         #[arg(long)]
         session_id: Option<String>,
@@ -1861,8 +1862,13 @@ pub fn run() -> Result<()> {
                     limit,
                     origin,
                 };
+                anyhow::ensure!(
+                    machine.len() <= 1,
+                    "session counts accept at most one machine"
+                );
                 let result = if let Some(id) = machine
-                    .as_deref()
+                    .first()
+                    .map(String::as_str)
                     .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
                 {
                     crate::machine::remote_session_count(
@@ -5058,7 +5064,7 @@ fn open_analytics_read_only(paths: &Paths) -> Result<AnalyticsStore> {
     AnalyticsStore::open_read_only(&db)
 }
 
-fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
+pub(crate) fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
     let cwd = cwd?;
     let resolved = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     Some(resolved.to_string_lossy().to_string())
@@ -5153,7 +5159,7 @@ fn source_dir_of(source_path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn session_resume_command(
+pub(crate) fn session_resume_command(
     config: &UserConfig,
     row: &crate::analytics::SessionDetailRow,
 ) -> Option<(String, String)> {
@@ -5186,45 +5192,43 @@ fn run_sessions(
     origin: SessionOrigin,
     output: OutputOptions,
     root: Option<PathBuf>,
-    machine: Option<String>,
+    machine: Vec<String>,
 ) -> Result<()> {
-    let mut items = if let Some(id) = machine
-        .as_deref()
-        .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
-    {
-        let paths = Paths::new(root)?;
-        let config = UserConfig::load(&paths)?;
-        crate::machine::remote_sessions(
-            &config,
-            id,
-            SessionsRequest {
-                session_id,
-                source_path,
-                cwd: cwd.map(|value| value.to_string_lossy().to_string()),
-                project,
-                source: source.map(|value| value.as_str().to_string()),
-                since,
-                limit,
-                origin,
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let result = federated_sessions(
+        &paths,
+        &config,
+        &machine,
+        &SessionListSpec {
+            source,
+            project,
+            cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+            since_ms: parse_ts_millis(since)?,
+            limit,
+            origin: match origin {
+                SessionOrigin::All => None,
+                other => Some(other.into()),
             },
-        )?
-    } else {
-        collect_sessions(
             session_id,
             source_path,
-            cwd,
-            project,
-            source,
-            since,
-            limit,
-            origin,
-            root,
-        )?
-    };
-    if let Some(machine) = machine {
-        for item in &mut items {
-            item["machine"] = Value::String(machine.clone());
+        },
+    )?;
+    for (machine, error) in result.failures {
+        eprintln!("{machine}: {error}");
+    }
+    let mut items = Vec::new();
+    for located in result.items {
+        let row = located.session;
+        let resume_cmd = located.resume_cmd;
+        let mut value = serde_json::to_value(&row)?;
+        value["machine"] = Value::String(located.machine);
+        value["started_at"] = Value::String(format_ts(row.started_at));
+        value["last_at"] = Value::String(format_ts(row.last_at));
+        if let Some(command) = resume_cmd {
+            value["resume_cmd"] = Value::String(command);
         }
+        items.push(value);
     }
     output.print_values(items)
 }
