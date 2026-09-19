@@ -28,10 +28,11 @@ pub mod tui;
 pub mod types;
 pub mod usage;
 pub mod vector;
-pub mod vector_transfer;
 pub mod watch;
 pub mod web;
 pub mod web_auth;
+
+pub mod vector_transfer;
 
 #[cfg(test)]
 pub mod test_support;
