@@ -673,9 +673,7 @@ impl SearchIndex {
                 check_term_dictionary_format(&existing, &load_fields(existing.schema())?, dir)?;
                 existing
             } else {
-                drop(existing);
-                directory.reset()?;
-                Index::create(directory, build_schema()?, Default::default())?
+                return Err(stale_schema_error(dir));
             }
         } else {
             Index::create(directory, build_schema()?, Default::default())?
@@ -2063,7 +2061,7 @@ impl tantivy::collector::CustomSegmentScorer<SessionReverseOrder> for SessionOrd
 
 fn stale_schema_error(dir: &Path) -> anyhow::Error {
     anyhow!(
-        "index schema at {} is stale; run `memex index` or `memex index rebuild` to rebuild it",
+        "index schema at {} is stale; see docs/vector-migration.md for vector-preserving migration, or explicitly run `memex index rebuild` to discard and rebuild it",
         dir.display()
     )
 }
@@ -3053,7 +3051,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_metadata_upgrade_keeps_old_generation_readable_until_publish() {
+    fn missing_reader_metadata_requires_explicit_migration() {
         let tmp = tempfile::tempdir().unwrap();
         let mut schema =
             serde_json::to_value(build_schema_with_canonical_record_id(true).unwrap()).unwrap();
@@ -3071,33 +3069,13 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
         drop(writer);
-        let fresh = SearchIndex::open_or_create_for_ingest(tmp.path()).unwrap();
-        assert!(fresh.fields.reader_metadata.is_some());
-        assert_eq!(fresh.doc_count().unwrap(), 0);
-        // Ingest detects the empty private generation and reparses all source files;
-        // the published generation remains intact throughout that rebuild.
+        assert!(SearchIndex::open_or_create_for_ingest(tmp.path()).is_err());
         assert_eq!(
             SearchIndex::open_or_create(tmp.path())
                 .unwrap()
                 .doc_count()
                 .unwrap(),
             1
-        );
-        let mut reparsed = test_record(1, "legacy record");
-        reparsed.links.source_turn_id = Some("recovered-turn".to_string());
-        let mut writer = fresh.writer().unwrap();
-        fresh.add_record(&mut writer, &reparsed).unwrap();
-        writer.commit().unwrap();
-        drop(writer);
-        fresh.publish_generation().unwrap();
-        let reopened = SearchIndex::open_or_create(tmp.path()).unwrap();
-        let rows = reopened
-            .records_by_context_scope(Some("session"), Some(crate::types::SourceKind::Codex))
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].links.source_turn_id.as_deref(),
-            Some("recovered-turn")
         );
     }
 
@@ -3581,23 +3559,12 @@ mod tests {
     }
 
     #[test]
-    fn ingest_open_recreates_stale_schema_index() {
+    fn ingest_open_preserves_stale_schema_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
         create_stale_schema_index(tmp.path());
-
-        let index =
-            SearchIndex::open_or_create_for_ingest(tmp.path()).expect("recreate stale index");
-
-        assert_eq!(index.doc_count().expect("doc count"), 0);
-        index.publish_generation().expect("publish generation");
-        assert!(SearchIndex::exists(tmp.path()));
-        assert_eq!(
-            SearchIndex::open_or_create(tmp.path())
-                .expect("open published generation")
-                .doc_count()
-                .expect("published doc count"),
-            0
-        );
+        let before = fs::read(tmp.path().join("meta.json")).unwrap();
+        assert!(SearchIndex::open_or_create_for_ingest(tmp.path()).is_err());
+        assert_eq!(fs::read(tmp.path().join("meta.json")).unwrap(), before);
     }
 
     #[test]

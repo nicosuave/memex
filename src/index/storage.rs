@@ -264,21 +264,6 @@ impl SharedDirectory {
         Self::open(root, destination, false)?.ok_or_else(|| anyhow!("missing staging manifest"))
     }
 
-    pub fn reset(&self) -> Result<()> {
-        let mut view = self.view.write().unwrap();
-        for entry in fs::read_dir(&view.path)? {
-            let entry = entry?;
-            if entry.file_name() != GENERATION_LEASE_FILE && entry.file_type()?.is_file() {
-                fs::remove_file(entry.path())?;
-            }
-        }
-        view.manifest = Manifest::empty();
-        view.created.clear();
-        view.deleted.clear();
-        view.durable_metadata.clear();
-        view.manifest.write(&view.path, None)
-    }
-
     pub fn prepare_publication(
         &self,
         root: &Path,
