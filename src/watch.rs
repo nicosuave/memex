@@ -1034,7 +1034,7 @@ mod tests {
         assert!(!overflow.load(Ordering::Acquire));
         enqueue_event(&sender, &overflow, Ok(Event::new(EventKind::Any)));
         assert_eq!(receiver.len(), 1);
-        receiver.try_recv().unwrap();
+        receiver.try_recv().unwrap().unwrap();
         enqueue_event(
             &sender,
             &overflow,
