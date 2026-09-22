@@ -152,11 +152,13 @@ TUI:
 memex tui
 ```
 
-The TUI captures the mouse for clicking, resizing, and scrolling. To select text
-with the terminal instead, hold Shift while dragging in Ghostty and most
-xterm-style terminals, or Option while dragging in iTerm2. Press F6 to enter a
-terminal-independent copy mode when that modifier is unavailable or remapped;
-press F6 again to restore Memex mouse controls.
+Drag over visible text to select it; releasing the mouse sends the selection to
+your clipboard. Selection stays within the pane where the drag began. Normal
+clicks, scrolling, and dragging the split divider continue to work without a mode
+switch. Copying requires OSC 52 clipboard writes to be enabled in your terminal
+(and multiplexer, if used). Memex cannot confirm whether the terminal accepted
+the clipboard write. You can also use native terminal selection by holding Shift
+while dragging in Ghostty and most xterm-style terminals, or Option in iTerm2.
 
 Notes:
 - Embeddings are disabled by default. Pass `--embeddings` to generate them during indexing.

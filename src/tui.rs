@@ -655,7 +655,8 @@ struct App {
     project_area: Option<Rect>,
     left_width: Option<u16>,
     dragging: bool,
-    copy_mode: bool,
+    text_selection: Option<TextSelection>,
+    rendered: ratatui::buffer::Buffer,
     stdio_redirect: Option<StdIoRedirect>,
 }
 
@@ -946,7 +947,7 @@ pub fn run(
     app.kickoff_home_activity();
     app.kickoff_home_filters();
 
-    let mut terminal = enter_terminal(true)?;
+    let mut terminal = enter_terminal()?;
     app.suppress_stdio()?;
     let res = run_loop(&mut terminal, &mut app);
     app.restore_stdio()?;
@@ -1066,7 +1067,8 @@ impl App {
             project_area: None,
             left_width: None,
             dragging: false,
-            copy_mode: false,
+            text_selection: None,
+            rendered: ratatui::buffer::Buffer::empty(Rect::default()),
             stdio_redirect: None,
         }
     }
@@ -2801,6 +2803,10 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
                             dirty = true;
                         }
                     }
+                    Event::Resize(_, _) => {
+                        app.text_selection = None;
+                        dirty = true;
+                    }
                     _ => {
                         dirty = true;
                     }
@@ -2821,11 +2827,7 @@ fn run_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
-    if key.code == KeyCode::F(6) {
-        toggle_copy_mode(terminal, app)?;
-        return Ok(false);
-    }
-
+    app.text_selection = None;
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
             key.code,
@@ -3269,6 +3271,15 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
 }
 
 fn draw_ui(frame: &mut ratatui::Frame, app: &mut App) {
+    draw_content(frame, app);
+    if let Some(selection) = &app.text_selection {
+        selection.render(frame.buffer_mut());
+    } else {
+        app.rendered = frame.buffer_mut().clone();
+    }
+}
+
+fn draw_content(frame: &mut ratatui::Frame, app: &mut App) {
     let theme = Theme::new();
     frame.render_widget(Block::default().style(theme.base), frame.area());
     let area = inset(
@@ -4933,14 +4944,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         LayoutMode::Timeline => "timeline",
         LayoutMode::Detail => "detail",
     };
-    let mut right_spans = Vec::new();
-    if app.copy_mode {
-        right_spans.push(Span::styled("COPY MODE", theme.accent));
-        right_spans.push(Span::styled(" (F6)   ", theme.muted));
-    } else {
-        right_spans.push(Span::styled("copy", theme.muted));
-        right_spans.push(Span::styled("(F6)   ", theme.accent));
-    }
+    let mut right_spans = vec![Span::styled("drag to copy   ", theme.muted)];
     if !app.status.is_empty() {
         right_spans.push(Span::styled("\u{25cf} ", theme.accent));
         right_spans.push(Span::styled(app.status.as_str(), theme.text));
@@ -5076,15 +5080,6 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
 }
 
 fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
-    if app.copy_mode {
-        return Line::from(vec![
-            Span::styled("drag", theme.accent),
-            Span::styled(" select  ", theme.muted),
-            Span::styled("F6", theme.accent),
-            Span::styled(" restore mouse", theme.muted),
-        ]);
-    }
-
     if app.layout_mode == LayoutMode::Home {
         if app.home_dropdown != HomeDropdown::None {
             return Line::from(vec![
@@ -6048,7 +6043,7 @@ fn run_external_command(app: &mut App, terminal: &mut TuiTerminal, command: &str
     }
     println!("press Enter to return to memex");
     let _ = std::io::stdin().read_line(&mut String::new());
-    *terminal = enter_terminal(!app.copy_mode)?;
+    *terminal = enter_terminal()?;
     app.suppress_stdio()?;
     Ok(())
 }
@@ -6063,29 +6058,10 @@ fn open_tty() -> Result<TuiWriter> {
     Ok(std::io::stdout())
 }
 
-fn set_mouse_capture(writer: &mut impl Write, enabled: bool) -> Result<()> {
-    if enabled {
-        execute!(writer, EnableMouseCapture)?;
-    } else {
-        execute!(writer, DisableMouseCapture)?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn toggle_copy_mode(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
-    let copy_mode = !app.copy_mode;
-    set_mouse_capture(terminal.backend_mut(), !copy_mode)?;
-    app.copy_mode = copy_mode;
-    app.dragging = false;
-    Ok(())
-}
-
-fn enter_terminal(mouse_capture: bool) -> Result<TuiTerminal> {
+fn enter_terminal() -> Result<TuiTerminal> {
     let mut writer = open_tty()?;
     terminal::enable_raw_mode()?;
-    execute!(writer, terminal::EnterAlternateScreen)?;
-    set_mouse_capture(&mut writer, mouse_capture)?;
+    execute!(writer, terminal::EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -6725,11 +6701,152 @@ fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result
     Ok(projects)
 }
 
+/// A snapshot keeps asynchronous search updates from changing text mid-drag.
+struct TextSelection {
+    buffer: ratatui::buffer::Buffer,
+    area: Rect,
+    anchor: ratatui::layout::Position,
+    end: ratatui::layout::Position,
+    press: MouseEvent,
+    dragged: bool,
+}
+
+impl TextSelection {
+    fn update(&mut self, column: u16, row: u16) {
+        self.end = ratatui::layout::Position::new(
+            column.clamp(self.area.x, self.area.right() - 1),
+            row.clamp(self.area.y, self.area.bottom() - 1),
+        );
+        self.dragged |= self.end != self.anchor;
+    }
+
+    fn selected(&self, x: u16, y: u16) -> bool {
+        let mut start = (self.anchor.y, self.anchor.x);
+        let mut end = (self.end.y, self.end.x);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        (y, x) >= start && (y, x) <= end
+    }
+
+    fn text(&self) -> String {
+        let mut lines = Vec::new();
+        for y in self.anchor.y.min(self.end.y)..=self.anchor.y.max(self.end.y) {
+            let mut line = String::new();
+            let mut x = self.area.x;
+            while x < self.area.right() {
+                let cell = &self.buffer[(x, y)];
+                let width = Span::raw(cell.symbol()).width().max(1) as u16;
+                // Include a wide glyph if either of its terminal cells is selected.
+                if (x..x.saturating_add(width).min(self.area.right()))
+                    .any(|column| self.selected(column, y))
+                {
+                    line.push_str(cell.symbol());
+                }
+                x = x.saturating_add(width);
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    fn render(&self, buffer: &mut ratatui::buffer::Buffer) {
+        for y in self.area.y..self.area.bottom().min(buffer.area.bottom()) {
+            for x in self.area.x..self.area.right().min(buffer.area.right()) {
+                buffer[(x, y)] = self.buffer[(x, y)].clone();
+                if self.dragged && self.selected(x, y) {
+                    buffer[(x, y)]
+                        .set_style(Style::default().fg(Color::Black).bg(Color::LightCyan));
+                }
+            }
+        }
+    }
+}
+
+fn handle_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.text_selection = None;
+            if !app.quick_popup && app.home_dropdown != HomeDropdown::None {
+                return handle_mouse_action(mouse, terminal, app);
+            }
+            let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if !app.quick_popup
+                && app.layout_mode == LayoutMode::Split
+                && app.body_area.contains(pos)
+                && near_divider(mouse.column, app.body_area, app.left_width.unwrap_or(0))
+            {
+                return handle_mouse_action(mouse, terminal, app);
+            }
+            let area = if app.quick_popup {
+                quick_popup_area(app.body_area)
+            } else if app.layout_mode == LayoutMode::Home {
+                app.home_list_area
+            } else {
+                [
+                    app.preview_area,
+                    app.list_area,
+                    app.project_area.unwrap_or_default(),
+                ]
+                .into_iter()
+                .find(|area| area.contains(pos))
+                .unwrap_or_default()
+            };
+            if area.contains(pos) && app.rendered.area.contains(pos) {
+                let area = area.intersection(app.rendered.area);
+                app.text_selection = Some(TextSelection {
+                    buffer: app.rendered.clone(),
+                    area,
+                    anchor: pos,
+                    end: pos,
+                    press: mouse,
+                    dragged: false,
+                });
+                return Ok(true);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(selection) = app.text_selection.as_mut() {
+                selection.update(mouse.column, mouse.row);
+                return Ok(true);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(mut selection) = app.text_selection.take() {
+                selection.update(mouse.column, mouse.row);
+                if selection.dragged {
+                    let text = selection.text();
+                    if !text.trim().is_empty() {
+                        match execute!(
+                            terminal.backend_mut(),
+                            crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+                        ) {
+                            Ok(()) => app.set_status("selection sent to terminal clipboard"),
+                            Err(err) => app.set_status(format!("copy failed: {err}")),
+                        }
+                    }
+                    return Ok(true);
+                }
+                return handle_mouse_action(selection.press, terminal, app);
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            app.text_selection = None;
+        }
+        _ => {}
+    }
+    handle_mouse_action(mouse, terminal, app)
+}
+
 const WHEEL_SCROLL_LINES: isize = 3;
 
 /// Returns whether the event changed any visible state; pure motion events
 /// return false so the caller can skip redrawing.
-fn handle_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut App) -> Result<bool> {
+fn handle_mouse_action(
+    mouse: MouseEvent,
+    terminal: &mut TuiTerminal,
+    app: &mut App,
+) -> Result<bool> {
     if app.quick_popup {
         return Ok(match mouse.kind {
             MouseEventKind::ScrollDown => {
@@ -7141,6 +7258,128 @@ mod tests {
     }
 
     #[test]
+    fn text_selection_handles_reverse_multiline_and_wide_glyphs() {
+        use ratatui::{buffer::Buffer, layout::Position};
+        let buffer = Buffer::with_lines(["hello   outside", "界e\u{301}nd   outside"]);
+        let mut selection = TextSelection {
+            buffer,
+            area: Rect::new(0, 0, 8, 2),
+            anchor: Position::new(3, 1),
+            end: Position::new(3, 1),
+            press: MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            },
+            dragged: false,
+        };
+        selection.update(1, 0);
+        assert_eq!(selection.text(), "ello\n界e\u{301}n");
+        selection.anchor = Position::new(1, 1);
+        selection.update(1, 1);
+        assert_eq!(selection.text(), "界");
+        selection.update(100, 100);
+        assert_eq!(selection.end, Position::new(7, 1));
+        assert_eq!(selection.text(), "界e\u{301}nd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_drag_copies_on_release_and_click_preserves_focus_behavior() {
+        use std::io::{Read, Seek, SeekFrom};
+        let (_tmp, mut app) = test_app();
+        let mut output = tempfile::tempfile().unwrap();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(output.try_clone().unwrap()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        app.layout_mode = LayoutMode::Detail;
+        app.preview_area = Rect::new(0, 0, 10, 1);
+        app.rendered = ratatui::buffer::Buffer::with_lines(["hello text"]);
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 0),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 4),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        assert!(app.text_selection.as_ref().unwrap().dragged);
+        let mut highlighted = app.rendered.clone();
+        app.text_selection
+            .as_ref()
+            .unwrap()
+            .render(&mut highlighted);
+        assert_eq!(highlighted[(2, 0)].bg, Color::LightCyan);
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 4),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut copied = String::new();
+        output.read_to_string(&mut copied).unwrap();
+        assert_eq!(copied, "\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(app.text_selection.is_none());
+        let length = output.metadata().unwrap().len();
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 1),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 1),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert!(matches!(app.focus, Focus::Preview));
+        assert_eq!(output.metadata().unwrap().len(), length);
+        app.layout_mode = LayoutMode::Split;
+        app.body_area = Rect::new(0, 0, 80, 24);
+        app.left_width = Some(30);
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 30),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert!(app.dragging);
+        assert!(app.text_selection.is_none());
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 40),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 40),
+            &mut terminal,
+            &mut app,
+        )
+        .unwrap();
+        assert!(!app.dragging);
+        assert_eq!(output.metadata().unwrap().len(), length);
+    }
+
+    #[test]
     fn resolve_session_cwd_reads_antigravity_tool_cwd() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("transcript.jsonl");
@@ -7490,66 +7729,6 @@ mod tests {
         let (_tmp, app) = test_app();
         assert_eq!(app.layout_mode, LayoutMode::Home);
         assert!(matches!(app.focus, Focus::Query));
-        assert!(!app.copy_mode);
-    }
-
-    #[test]
-    fn mouse_capture_commands_enable_and_disable_reporting() {
-        let mut output = Vec::new();
-        set_mouse_capture(&mut output, true).expect("enable mouse capture");
-        let enabled = String::from_utf8(output).expect("terminal sequence");
-        assert!(enabled.contains("\u{1b}[?1000h"));
-        assert!(enabled.contains("\u{1b}[?1006h"));
-
-        let mut output = Vec::new();
-        set_mouse_capture(&mut output, false).expect("disable mouse capture");
-        let disabled = String::from_utf8(output).expect("terminal sequence");
-        assert!(disabled.contains("\u{1b}[?1000l"));
-        assert!(disabled.contains("\u{1b}[?1006l"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn f6_toggles_copy_mode_before_focused_or_popup_keys() {
-        let (_tmp, mut app) = test_app();
-        let devnull = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .expect("devnull");
-        let mut terminal = Terminal::with_options(
-            CrosstermBackend::new(devnull),
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
-            },
-        )
-        .expect("terminal");
-        app.quick_popup = true;
-        app.dragging = true;
-
-        let key = KeyEvent::new(KeyCode::F(6), KeyModifiers::empty());
-        handle_key(key, &mut terminal, &mut app).expect("enter copy mode");
-        assert!(app.copy_mode);
-        assert!(!app.dragging);
-        assert!(app.quick_popup);
-        assert!(matches!(app.focus, Focus::Query));
-
-        handle_key(key, &mut terminal, &mut app).expect("restore mouse capture");
-        assert!(!app.copy_mode);
-    }
-
-    #[test]
-    fn copy_mode_footer_explains_selection_and_recovery() {
-        let (_tmp, mut app) = test_app();
-        app.copy_mode = true;
-        let theme = Theme::new();
-
-        let footer = footer_shortcuts(&app, &theme, 80)
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert_eq!(footer, "drag select  F6 restore mouse");
     }
 
     #[test]
