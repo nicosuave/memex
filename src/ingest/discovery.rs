@@ -834,10 +834,12 @@ pub(super) fn discover_zcode(
             || alias
                 .as_ref()
                 .is_some_and(|path| excluder.is_excluded(path));
-        let absent = database.metadata().is_err_and(|error| {
-            error.kind() == std::io::ErrorKind::NotFound
-                && database.parent().is_some_and(Path::is_dir)
-        });
+        let missing = database
+            .metadata()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let absent = missing
+            && (database.parent().is_some_and(Path::is_dir)
+                || !has_indexed_zcode_sessions(state, &database)?);
         let sessions = if excluded || absent {
             Vec::new()
         } else {
@@ -913,19 +915,28 @@ pub(super) fn discover_zcode(
             });
         }
         // Reconcile only after a successful inventory (or confirmed removal).
-        // The raw database key is the pre-session-scoped checkpoint; replace it once.
-        let database_key = database.to_string_lossy().into_owned();
         for key in state.file_keys()? {
-            let owned = key == database_key
-                || crate::sources::zcode::split_virtual_path(Path::new(&key))
-                    .is_some_and(|(owner, _)| owner == database);
-            if owned && !current.contains(&key) {
+            if zcode_database_owns(&database, &key) && !current.contains(&key) {
                 state.delete_file(&key);
                 result.missing_paths.push(key);
             }
         }
     }
     Ok(result)
+}
+
+fn has_indexed_zcode_sessions(state: &CheckpointSession, database: &Path) -> Result<bool> {
+    Ok(state
+        .file_keys()?
+        .iter()
+        .any(|key| zcode_database_owns(database, key)))
+}
+
+fn zcode_database_owns(database: &Path, key: &str) -> bool {
+    let is_legacy_database_checkpoint = Path::new(key) == database;
+    is_legacy_database_checkpoint
+        || crate::sources::zcode::split_virtual_path(Path::new(key))
+            .is_some_and(|(owner, _)| owner == database)
 }
 
 pub(super) fn discover_opencode(
