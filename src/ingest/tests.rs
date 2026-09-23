@@ -6157,6 +6157,53 @@ fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
 }
 
 #[test]
+fn zcode_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zcode");
+    let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_zcode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+}
+
+#[test]
+fn zcode_store_removed_with_its_directory_keeps_indexed_sessions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("zcode");
+    let database = root.join("cli/db/db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+    crate::sources::zcode::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_zcode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    full();
+    let indexed = indexed_texts(&paths);
+    assert!(!indexed.is_empty());
+
+    fs::remove_dir_all(&root).unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), indexed);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+}
+
+#[test]
 fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     let _guard = env_lock();
     let temp = tempfile::tempdir().unwrap();
