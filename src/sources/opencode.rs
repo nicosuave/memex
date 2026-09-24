@@ -502,8 +502,11 @@ fn current_session_cursors(
             .with_context(|| format!("query OpenCode event sequences in {}", path.display()))?;
         for row in rows {
             let (session_id, sequence) = row?;
-            let sequence = nonnegative_cursor(sequence)
-                .with_context(|| format!("session `{session_id}` has invalid event sequence"))?;
+            // OpenCode uses -1 before a session has emitted its first event.
+            // Keep the sentinel so the first event still changes this cursor.
+            if sequence < -1 {
+                bail!("session `{session_id}` has invalid event sequence: {sequence}");
+            }
             cursors.entry(session_id).or_default().event_sequence = Some(sequence);
         }
     }
@@ -2840,6 +2843,40 @@ mod tests {
         let empty = scan_database(&path, Some(&previous)).unwrap();
         assert_eq!(empty.dirty_session_ids, vec!["s_child"]);
         assert!(!empty.session_cursors.contains_key("s_child"));
+    }
+
+    #[test]
+    fn v2_empty_session_accepts_negative_one_event_sequence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(&connection, "s_empty", None, "/repo", 1, 1);
+        connection
+            .execute_batch(
+                "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+                 INSERT INTO event_sequence VALUES ('s_empty', -1);",
+            )
+            .unwrap();
+
+        let initial = scan_database(&path, None).unwrap();
+        assert_eq!(initial.session_cursors["s_empty"].event_sequence, Some(-1));
+        let previous = state_from_scan(&initial);
+        assert!(
+            scan_database(&path, Some(&previous))
+                .unwrap()
+                .dirty_session_ids
+                .is_empty()
+        );
+
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 's_empty'",
+                [],
+            )
+            .unwrap();
+        let updated = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(updated.dirty_session_ids, vec!["s_empty"]);
+        assert_eq!(updated.session_cursors["s_empty"].event_sequence, Some(0));
     }
 
     #[test]
