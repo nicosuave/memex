@@ -23,10 +23,11 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 
 const CONTENT_JSON_PREFIX: &str = "\0json:";
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Checkpoint {
     pub max_message_id: u64,
-    pub generation: u64,
+    pub generation: String,
+    pub previous_generation: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,24 +166,52 @@ fn is_state_db(path: &Path) -> bool {
     path.is_file() && path.file_name().and_then(|v| v.to_str()) == Some("state.db")
 }
 
-pub fn checkpoint(path: &Path) -> Result<Checkpoint> {
+pub fn checkpoint(path: &Path, previous_offset: Option<u64>) -> Result<Checkpoint> {
     let connection = open_read_only(path)?;
-    let message_columns = table_columns(&connection, "messages")?;
-    let columns = table_columns(&connection, "sessions")?;
+    let transaction = connection.unchecked_transaction()?;
+    let message_columns = table_columns(&transaction, "messages")?;
+    let columns = table_columns(&transaction, "sessions")?;
     let active = if message_columns.contains("active") {
-        " WHERE COALESCE(active, 1) != 0"
+        "COALESCE(active, 1) != 0"
     } else {
-        ""
+        "1"
     };
-    let max_message_id = connection
-        .query_row(
-            &format!("SELECT COALESCE(MAX(id), 0) FROM messages{active}"),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        .max(0) as u64;
-    let schema_version = connection
+    let active_identity = |through_id: Option<u64>| -> Result<(u64, u64, u64)> {
+        let sql = format!(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0)
+             FROM messages WHERE {active}{}",
+            if through_id.is_some() {
+                " AND id <= ?1"
+            } else {
+                ""
+            }
+        );
+        let values = match through_id {
+            Some(id) => {
+                transaction.query_row(&sql, params![id.min(i64::MAX as u64) as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+            }
+            None => transaction.query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?,
+        };
+        Ok((
+            values.0.max(0) as u64,
+            values.1.max(0) as u64,
+            values.2.max(0) as u64,
+        ))
+    };
+    let (active_count, max_message_id, active_id_sum) = active_identity(None)?;
+    let schema_version = transaction
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, Option<i64>>(0)
         })
@@ -193,7 +222,7 @@ pub fn checkpoint(path: &Path) -> Result<Checkpoint> {
         .unwrap_or(0)
         .max(0) as u64;
     let rewind_generation = if columns.contains("rewind_count") {
-        connection
+        transaction
             .query_row(
                 "SELECT COALESCE(SUM(rewind_count), 0) FROM sessions",
                 [],
@@ -204,9 +233,18 @@ pub fn checkpoint(path: &Path) -> Result<Checkpoint> {
     } else {
         0
     };
+    let generation = |active_count: u64, active_max: u64, active_id_sum: u64| {
+        format!("{schema_version}:{rewind_generation}:{active_count}:{active_max}:{active_id_sum}")
+    };
+    let previous_generation = previous_offset
+        .map(|offset| active_identity(Some(offset)))
+        .transpose()?
+        .map(|(count, max, sum)| generation(count, max, sum));
+    transaction.commit()?;
     Ok(Checkpoint {
         max_message_id,
-        generation: schema_version.rotate_left(32) ^ rewind_generation,
+        generation: generation(active_count, max_message_id, active_id_sum),
+        previous_generation,
     })
 }
 

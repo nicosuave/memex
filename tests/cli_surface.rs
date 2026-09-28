@@ -376,12 +376,13 @@ fn index_source_help_uses_positive_repeatable_filters() {
         let help = successful_stdout(&args);
         assert_help_has_options(
             &help,
-            &["--claude-path", "--only-source", "--exclude-source"],
+            &[
+                "--claude-path",
+                "--only-source",
+                "--exclude-source",
+                "hermes",
+            ],
             &["--source"],
-        );
-        assert!(
-            !help.contains("hermes"),
-            "unsupported ingest source shown in {args:?}"
         );
     }
 }

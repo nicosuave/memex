@@ -498,15 +498,16 @@ pub(super) fn prepare_file_task(
     }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
     if source == SourceKind::Hermes
-        && let Ok(checkpoint) = crate::sources::hermes::checkpoint(&path)
+        && let Ok(checkpoint) =
+            crate::sources::hermes::checkpoint(&path, previous.map(|state| state.offset))
     {
-        let generation = checkpoint.generation.to_string();
+        let generation = checkpoint.generation;
         identity.source_metadata_sha256 = Some(generation.clone());
         change = match previous {
             Some(previous)
                 if previous.parser_version == parser_version
                     && previous.identity.source_metadata_sha256.as_deref()
-                        == Some(generation.as_str())
+                        == checkpoint.previous_generation.as_deref()
                     && checkpoint.max_message_id >= previous.offset =>
             {
                 if checkpoint.max_message_id == previous.offset {

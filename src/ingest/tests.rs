@@ -3768,6 +3768,74 @@ fn ingest_grok_session_from_grok_home_override() {
 }
 
 #[test]
+fn ingest_hermes_deactivation_replaces_previously_indexed_records() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let hermes_root = tmp.path().join("hermes");
+    fs::create_dir_all(&hermes_root).expect("create Hermes root");
+    let database = hermes_root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).expect("open Hermes fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, cwd TEXT, parent_session_id TEXT,
+                 rewind_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                 role TEXT NOT NULL, content TEXT, tool_call_id TEXT,
+                 tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
+                 reasoning TEXT, reasoning_content TEXT,
+                 active INTEGER NOT NULL DEFAULT 1
+             );
+             INSERT INTO sessions(id, cwd) VALUES ('session', '/workspace/hermes');
+             INSERT INTO messages(session_id, role, content, timestamp)
+             VALUES ('session', 'user', 'obsolete hermes text', 1);",
+        )
+        .expect("seed Hermes fixture");
+
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(hermes_root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("initial ingest")
+            .records_added,
+        1
+    );
+    connection
+        .execute_batch(
+            "UPDATE messages SET active = 0 WHERE id = 1;
+             INSERT INTO messages(session_id, role, content, timestamp)
+             VALUES ('session', 'user', 'replacement hermes text', 2);",
+        )
+        .expect("deactivate and replace message");
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("replacement ingest")
+            .records_added,
+        1
+    );
+
+    let records = index
+        .records_by_session_id("session")
+        .expect("Hermes records");
+    assert_eq!(
+        records.len(),
+        1,
+        "inactive record must be removed: {records:?}"
+    );
+    assert_eq!(records[0].text, "replacement hermes text");
+}
+
+#[test]
 fn ingest_pi_incremental_records_keep_header_project() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let sessions_root = tmp
