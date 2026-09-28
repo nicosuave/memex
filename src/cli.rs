@@ -157,6 +157,12 @@ struct IndexArgs {
     /// Skip indexing Grok sessions
     #[arg(long = "no-grok", default_value_t = false, hide = true)]
     no_grok: bool,
+    /// Index Hermes sessions from state.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    hermes: bool,
+    /// Skip indexing Hermes sessions
+    #[arg(long = "no-hermes", default_value_t = false, hide = true)]
+    no_hermes: bool,
     /// Index Jcode sessions from ~/.jcode/sessions [default: true]
     #[arg(long, default_value_t = true, hide = true)]
     jcode: bool,
@@ -2680,6 +2686,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_openclaw: index.source_enabled(IndexSource::Openclaw),
         include_copilot: index.source_enabled(IndexSource::Copilot),
         include_grok: index.source_enabled(IndexSource::Grok),
+        include_hermes: index.source_enabled(IndexSource::Hermes),
         include_jcode: index.source_enabled(IndexSource::Jcode),
         include_muse: index.source_enabled(IndexSource::Muse),
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
@@ -7439,6 +7446,9 @@ fn build_index_command_args(
     if !index.jcode || index.no_jcode {
         args.push("--no-jcode".to_string());
     }
+    if !index.hermes || index.no_hermes {
+        args.push("--no-hermes".to_string());
+    }
     if !index.kiro || index.no_kiro {
         args.push("--no-kiro".to_string());
     }
@@ -8979,6 +8989,8 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
@@ -9047,6 +9059,8 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
@@ -9108,6 +9122,8 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,
@@ -9171,6 +9187,8 @@ mod tests {
             no_openclaw: false,
             no_copilot: false,
             no_grok: false,
+            hermes: true,
+            no_hermes: false,
             no_jcode: false,
             no_muse: false,
             no_antigravity: false,

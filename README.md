@@ -74,7 +74,7 @@ tool. **Import into** creates a conversation in another tool using the
 | ZCode | Yes | Yes | No | No | No |
 | KiloCode CLI | Yes | Yes | Yes | No | No |
 | Kiro CLI | Yes | Credits only | No | No | No |
-| Hermes | No | Yes | No | No | No |
+| Hermes | Yes | Yes | No | No | No |
 
 - **History coverage depends on the local records a tool saves.** Cursor history
   comes from agent transcripts; its usage data comes from local databases.
@@ -86,8 +86,9 @@ tool. **Import into** creates a conversation in another tool using the
   KiloCode CLI reads `~/.local/share/kilo/kilo.db` (`$XDG_DATA_HOME/kilo/kilo.db`);
   set `KILO_DATA_DIR` (comma-separated) to index extra stores.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
-  not subscription charges or quota balances. Hermes support reads usage counters
-  and metadata only, not message content. Copilot usage requires local OpenTelemetry
+  not subscription charges or quota balances. Hermes history and usage are read from
+  its local `state.db`; plaintext reasoning is indexed only with `--include-reasoning`.
+  Copilot usage requires local OpenTelemetry
   export files; session transcripts alone do not supply its usage data.
   Kiro reports credits separately because its records do not contain token counts or costs.
 - **Resume uses per-engine commands**, configurable in Memex. Cursor uses

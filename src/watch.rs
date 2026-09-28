@@ -122,8 +122,6 @@ pub(crate) struct WatchStats {
 /// Compute the exact directory set that transcript discovery walks, so the
 /// watcher covers every source `ingest_all` reads — and nothing else.
 ///
-/// Sources without an ingest discovery block (Hermes) are deliberately
-/// excluded; watching them could only trigger useless ingests.
 pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if !options.claude_sources.is_empty() {
@@ -153,6 +151,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     }
     if options.include_grok {
         roots.push(crate::sources::grok::root());
+    }
+    if options.include_hermes {
+        roots.extend(crate::sources::hermes::profile_roots());
     }
     if options.include_jcode {
         roots.push(crate::sources::jcode::sessions_root());
@@ -224,6 +225,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                     || crate::sources::bob::is_configured_database(&database)
                     || crate::sources::zcode::db_paths().contains(&database)
                     || crate::sources::kilocode::db_paths().contains(&database)
+                    || crate::sources::hermes::matches_path(&database.to_string_lossy())
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -818,6 +820,7 @@ mod tests {
             include_openclaw: true,
             include_copilot: true,
             include_grok: true,
+            include_hermes: true,
             include_jcode: true,
             include_muse: true,
             include_antigravity: true,
@@ -936,6 +939,7 @@ mod tests {
         options.include_openclaw = false;
         options.include_copilot = false;
         options.include_grok = false;
+        options.include_hermes = false;
         options.include_jcode = false;
         options.include_muse = false;
         options.include_antigravity = false;

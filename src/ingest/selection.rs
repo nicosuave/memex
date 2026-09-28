@@ -538,6 +538,7 @@ mod tests {
             include_openclaw: false,
             include_copilot: false,
             include_grok: false,
+            include_hermes: false,
             include_jcode: false,
             include_muse: false,
             include_antigravity: false,

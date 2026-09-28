@@ -63,6 +63,9 @@ pub(super) fn discover_transcripts(
     if options.include_grok && full_scan {
         files.extend(crate::sources::grok::discover_sessions());
     }
+    if options.include_hermes && full_scan {
+        files.extend(crate::sources::hermes::discover());
+    }
     if options.include_jcode && full_scan {
         files.extend(crate::sources::jcode::discover());
     }
@@ -483,8 +486,10 @@ pub(super) fn prepare_file_task(
         .map(|previous| previous.identity.clone())
         .unwrap_or_else(|| file_identity(&path, metadata, prefix_bytes));
     if (source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path))
-        || source == SourceKind::Zcode
-        || source == SourceKind::Kilocode
+        || matches!(
+            source,
+            SourceKind::Hermes | SourceKind::Zcode | SourceKind::Kilocode
+        )
     {
         identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
     }
@@ -492,6 +497,28 @@ pub(super) fn prepare_file_task(
         identity.source_metadata_sha256 = Some(crate::sources::kiro::metadata_fingerprint(&path));
     }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
+    if source == SourceKind::Hermes
+        && let Ok(checkpoint) = crate::sources::hermes::checkpoint(&path)
+    {
+        let generation = checkpoint.generation.to_string();
+        identity.source_metadata_sha256 = Some(generation.clone());
+        change = match previous {
+            Some(previous)
+                if previous.parser_version == parser_version
+                    && previous.identity.source_metadata_sha256.as_deref()
+                        == Some(generation.as_str())
+                    && checkpoint.max_message_id >= previous.offset =>
+            {
+                if checkpoint.max_message_id == previous.offset {
+                    FileChange::Unchanged
+                } else {
+                    FileChange::Append
+                }
+            }
+            Some(_) => FileChange::Replaced,
+            None => FileChange::New,
+        };
+    }
     let (mut offset, mut turn_id, mut pending_tool_calls) = match (change, previous) {
         (FileChange::Append | FileChange::Unchanged, Some(previous)) => (
             previous.offset,

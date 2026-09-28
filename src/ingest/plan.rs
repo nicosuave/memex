@@ -66,6 +66,7 @@ pub(super) fn classify_file(
         source,
         SourceKind::Jcode
             | SourceKind::Antigravity
+            | SourceKind::Hermes
             | SourceKind::Bob
             | SourceKind::Zcode
             | SourceKind::Kilocode

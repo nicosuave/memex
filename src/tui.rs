@@ -1174,6 +1174,7 @@ impl App {
                     include_openclaw: true,
                     include_copilot: true,
                     include_grok: true,
+                    include_hermes: true,
                     include_jcode: true,
                     include_muse: true,
                     include_antigravity: true,
