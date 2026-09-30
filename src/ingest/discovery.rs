@@ -926,9 +926,17 @@ pub(super) fn discover_zcode(
 }
 
 fn has_indexed_zcode_sessions(state: &CheckpointSession, database: &Path) -> Result<bool> {
+    // Recovery hides pending paths from the working checkpoint. A first
+    // interrupted publication may leave only the intent as ownership evidence.
     Ok(state
-        .file_keys()?
+        .persisted_file_keys()?
         .iter()
+        .chain(
+            state
+                .pending
+                .iter()
+                .flat_map(|pending| &pending.source_paths),
+        )
         .any(|key| zcode_database_owns(database, key)))
 }
 

@@ -6204,6 +6204,86 @@ fn zcode_store_removed_with_its_directory_keeps_indexed_sessions() {
 }
 
 #[test]
+fn zcode_pending_recovery_preserves_sessions_when_store_directory_is_missing() {
+    let _guard = env_lock();
+    for has_previous_checkpoint in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("zcode");
+        let database = root.join("cli/db/db.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let _env = EnvVarGuard::set_os(&[("ZCODE_HOME", Some(root.as_os_str()))]);
+        crate::sources::zcode::tests::fixture_db(&database);
+        let mut options = ingest_options(false, ModelChoice::default());
+        options.include_zcode = true;
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let state_path = paths.state.join("ingest.json");
+        IngestState::default()
+            .save_with_lease(&state_path, &lease)
+            .unwrap();
+        let refresh = || {
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            ingest_all(&paths, &index, &options, &lease)
+        };
+        if has_previous_checkpoint {
+            refresh().unwrap();
+            // Change every session so recovery hides all of the store's checkpoints.
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute("UPDATE session SET directory = '/work/replay'", [])
+                .unwrap();
+        }
+        let checkpoint =
+            rusqlite::Connection::open(paths.state.join("checkpoints.sqlite")).unwrap();
+        checkpoint
+            .execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE OF scancache_json ON metadata BEGIN SELECT RAISE(FAIL, 'checkpoint failure'); END;")
+            .unwrap();
+        let error = refresh().unwrap_err();
+        assert!(format!("{error:#}").contains("checkpoint failure"));
+        checkpoint
+            .execute_batch("DROP TRIGGER fail_checkpoint")
+            .unwrap();
+        let saved = IngestState::load(&state_path).unwrap();
+        assert_eq!(
+            saved.files.len(),
+            if has_previous_checkpoint { 2 } else { 0 }
+        );
+        let indexed = indexed_texts(&paths);
+        assert_eq!(indexed.len(), 5);
+        let pending = PendingIngest::load(&pending_ingest_path(&paths))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.source_paths.len(), 2);
+
+        let unavailable = temp.path().join("unavailable");
+        fs::rename(&root, &unavailable).unwrap();
+        let error = refresh().unwrap_err();
+        assert!(
+            error.to_string().contains("interrupted replay"),
+            "{error:#}"
+        );
+        assert_eq!(indexed_texts(&paths), indexed);
+        assert_eq!(IngestState::load(&state_path).unwrap().files, saved.files);
+        assert_eq!(
+            PendingIngest::load(&pending_ingest_path(&paths)).unwrap(),
+            Some(pending)
+        );
+
+        fs::rename(&unavailable, &root).unwrap();
+        assert_eq!(refresh().unwrap().records_added, 5);
+        assert_eq!(indexed_texts(&paths), indexed);
+        assert_eq!(IngestState::load(&state_path).unwrap().files.len(), 2);
+        assert!(
+            PendingIngest::load(&pending_ingest_path(&paths))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(refresh().unwrap().records_added, 0);
+    }
+}
+
+#[test]
 fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     let _guard = env_lock();
     let temp = tempfile::tempdir().unwrap();
