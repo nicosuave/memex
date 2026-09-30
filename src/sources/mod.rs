@@ -379,6 +379,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Jcode
                 | SourceKind::Muse
                 | SourceKind::Grok
+                | SourceKind::Hermes
                 | SourceKind::Antigravity
                 | SourceKind::Zcode
                 | SourceKind::Kiro

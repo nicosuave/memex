@@ -17,7 +17,7 @@ use std::time::Duration;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    index: 3,
     usage: 7,
 };
 
@@ -77,6 +77,52 @@ pub fn profile_roots() -> Vec<PathBuf> {
         state_dir.as_deref(),
         xdg_state_home.as_deref(),
     )
+}
+
+pub(crate) fn watch_roots() -> Vec<PathBuf> {
+    profile_roots()
+        .into_iter()
+        .map(|root| {
+            if root.is_file() {
+                root.parent().unwrap_or(&root).to_path_buf()
+            } else {
+                root
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn is_database_in_root(root: &Path, path: &Path) -> bool {
+    if root.is_file() {
+        return path == root;
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some("state.db") {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let parts = relative.iter().collect::<Vec<_>>();
+    if root.file_name().and_then(|name| name.to_str()) == Some("profiles") {
+        parts.len() == 2
+    } else {
+        parts.len() == 1 || (parts.len() == 3 && parts[0] == "profiles")
+    }
+}
+
+pub(crate) fn is_configured_database(path: &Path) -> bool {
+    profile_roots().iter().any(|root| {
+        if is_database_in_root(root, path) {
+            return true;
+        }
+        let Ok(canonical) = root.canonicalize() else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(&canonical) else {
+            return false;
+        };
+        is_database_in_root(root, &root.join(relative))
+    })
 }
 
 fn profile_roots_for(

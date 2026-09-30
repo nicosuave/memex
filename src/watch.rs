@@ -153,7 +153,7 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
         roots.push(crate::sources::grok::root());
     }
     if options.include_hermes {
-        roots.extend(crate::sources::hermes::profile_roots());
+        roots.extend(crate::sources::hermes::watch_roots());
     }
     if options.include_jcode {
         roots.push(crate::sources::jcode::sessions_root());
@@ -225,7 +225,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                     || crate::sources::bob::is_configured_database(&database)
                     || crate::sources::zcode::db_paths().contains(&database)
                     || crate::sources::kilocode::db_paths().contains(&database)
-                    || crate::sources::hermes::matches_path(&database.to_string_lossy())
+                    || crate::sources::hermes::is_configured_database(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -1005,6 +1005,54 @@ mod tests {
             &excluder,
         );
         assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn hermes_wal_events_use_configured_roots_and_exclusions() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("custom-hermes");
+        std::fs::create_dir_all(&root).unwrap();
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+        let mut options = test_options();
+        for relative in ["state.db", "profiles/work/state.db"] {
+            let database = root.join(relative);
+            let wal = database.with_file_name("state.db-wal");
+            let event = Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                paths: vec![wal.clone()],
+                attrs: Default::default(),
+            };
+            options.exclude_patterns.clear();
+            let excluder = watch_excluder(&options).unwrap();
+            assert_eq!(
+                interesting_event_paths(&event, &excluder).0,
+                vec![database.clone()]
+            );
+            for excluded in [&database, &wal] {
+                options.exclude_patterns = vec![excluded.to_string_lossy().into_owned()];
+                let excluder = watch_excluder(&options).unwrap();
+                assert!(interesting_event_paths(&event, &excluder).0.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn hermes_database_file_watch_root_covers_its_wal() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        std::fs::write(&database, b"").unwrap();
+        let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(database.as_os_str()))]);
+        let options = test_options();
+        assert!(watch_roots(&options).contains(&temp.path().to_path_buf()));
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![database.with_file_name("state.db-wal")],
+            attrs: Default::default(),
+        };
+        let excluder = watch_excluder(&options).unwrap();
+        assert_eq!(interesting_event_paths(&event, &excluder).0, vec![database]);
     }
 
     #[test]

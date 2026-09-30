@@ -506,6 +506,12 @@ pub(super) fn prepare_file_task(
         change = match previous {
             Some(previous)
                 if previous.parser_version == parser_version
+                    // SQLite checkpoints rewrite the header in place. Use the inode
+                    // when available, and the prefix identity on other platforms.
+                    && previous.identity.device == identity.device
+                    && previous.identity.inode == identity.inode
+                    && (identity.inode.is_some()
+                        || !plan::file_was_replaced(&previous.identity, &identity))
                     && previous.identity.source_metadata_sha256.as_deref()
                         == checkpoint.previous_generation.as_deref()
                     && checkpoint.max_message_id >= previous.offset =>
