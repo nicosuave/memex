@@ -305,7 +305,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             let sources = report["sources"].as_array().unwrap();
             assert!(sources.iter().any(|source| source == "kiro"));
             assert!(sources.iter().any(|source| source == "zcode"));
-            assert!(!sources.iter().any(|source| source == "hermes"));
+            assert!(sources.iter().any(|source| source == "hermes"));
         }
         let mut args = command;
         args.extend(["--root", root, "--no-update-check"]);
@@ -323,6 +323,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             "  model: minilm",
             "  execution-provider: cpu",
             "  - kiro",
+            "  - hermes",
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
