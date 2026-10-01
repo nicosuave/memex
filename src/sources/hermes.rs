@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::DateTime;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::Value as SqlValue};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use std::time::Duration;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    index: 4,
     usage: 7,
 };
 
@@ -30,7 +31,7 @@ pub struct Checkpoint {
     pub previous_generation: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct MessageRow {
     id: u64,
     session_id: String,
@@ -42,13 +43,17 @@ struct MessageRow {
     timestamp_ms: u64,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
+    codex_message_items: Option<String>,
+    tool_call_uids: Option<String>,
+    tool_call_uid: Option<String>,
     cwd: Option<String>,
     parent_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct ToolCall {
-    id: String,
+    id: Option<String>,
+    event_id: String,
     name: Option<String>,
     arguments: String,
 }
@@ -215,48 +220,7 @@ fn is_state_db(path: &Path) -> bool {
 pub fn checkpoint(path: &Path, previous_offset: Option<u64>) -> Result<Checkpoint> {
     let connection = open_read_only(path)?;
     let transaction = connection.unchecked_transaction()?;
-    let message_columns = table_columns(&transaction, "messages")?;
     let columns = table_columns(&transaction, "sessions")?;
-    let active = if message_columns.contains("active") {
-        "COALESCE(active, 1) != 0"
-    } else {
-        "1"
-    };
-    let active_identity = |through_id: Option<u64>| -> Result<(u64, u64, u64)> {
-        let sql = format!(
-            "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0)
-             FROM messages WHERE {active}{}",
-            if through_id.is_some() {
-                " AND id <= ?1"
-            } else {
-                ""
-            }
-        );
-        let values = match through_id {
-            Some(id) => {
-                transaction.query_row(&sql, params![id.min(i64::MAX as u64) as i64], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?
-            }
-            None => transaction.query_row(&sql, [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?,
-        };
-        Ok((
-            values.0.max(0) as u64,
-            values.1.max(0) as u64,
-            values.2.max(0) as u64,
-        ))
-    };
-    let (active_count, max_message_id, active_id_sum) = active_identity(None)?;
     let schema_version = transaction
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, Option<i64>>(0)
@@ -279,17 +243,28 @@ pub fn checkpoint(path: &Path, previous_offset: Option<u64>) -> Result<Checkpoin
     } else {
         0
     };
-    let generation = |active_count: u64, active_max: u64, active_id_sum: u64| {
-        format!("{schema_version}:{rewind_generation}:{active_count}:{active_max}:{active_id_sum}")
-    };
-    let previous_generation = previous_offset
-        .map(|offset| active_identity(Some(offset)))
-        .transpose()?
-        .map(|(count, max, sum)| generation(count, max, sum));
+    let mut digest = Sha256::new();
+    digest.update(schema_version.to_le_bytes());
+    digest.update(rewind_generation.to_le_bytes());
+    let mut previous_digest = previous_offset.map(|_| digest.clone());
+    let mut max_message_id = 0;
+    // Hash the same projection the parser reads, including mutable transcript fields
+    // and session metadata. A WAL commit is append-only only if the old prefix matches.
+    visit_rows(&transaction, 0, |row| {
+        let encoded = serde_json::to_vec(&row)?;
+        digest.update((encoded.len() as u64).to_le_bytes());
+        digest.update(encoded);
+        max_message_id = row.id;
+        if previous_offset.is_some_and(|offset| row.id <= offset) {
+            previous_digest = Some(digest.clone());
+        }
+        Ok(())
+    })?;
+    let previous_generation = previous_digest.map(|digest| format!("{:x}", digest.finalize()));
     transaction.commit()?;
     Ok(Checkpoint {
         max_message_id,
-        generation: generation(active_count, max_message_id, active_id_sum),
+        generation: format!("{:x}", digest.finalize()),
         previous_generation,
     })
 }
@@ -383,7 +358,7 @@ pub(crate) fn parse_index_records(
                     component += 1;
                 }
 
-                let text = content_text(row.content.as_deref());
+                let text = assistant_text(row, &mut diagnostics);
                 if !text.trim().is_empty() {
                     emit(Record {
                         source: SourceKind::Hermes,
@@ -405,14 +380,15 @@ pub(crate) fn parse_index_records(
 
                 for call in planned_calls.remove(&row.id).unwrap_or_default() {
                     let mut call_links = links.clone();
-                    call_links.event_id = Some(call.id.clone());
+                    call_links.event_id = Some(call.event_id.clone());
+                    call_links.source_tool_use_id = call.id.clone();
                     call_links.parent_event_id = Some(row.id.to_string());
                     let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                     let replaced = pending_tool_calls.insert(
-                        call.id.clone(),
+                        call.event_id.clone(),
                         super::common::pending_tool_call(
                             call.name.clone(),
-                            Some(call.id.clone()),
+                            Some(call.event_id.clone()),
                             doc_id,
                             row.timestamp_ms,
                             Some(&call.arguments),
@@ -443,20 +419,23 @@ pub(crate) fn parse_index_records(
             }
             "tool" => {
                 let native_call_id = row.tool_call_id.as_deref().filter(|id| !id.is_empty());
-                let matched_id = native_call_id
-                    .filter(|id| pending_tool_calls.contains_key(*id))
-                    .map(str::to_string)
-                    .or_else(|| {
-                        find_pending_call(
-                            &pending_tool_calls,
-                            &row.session_id,
-                            row.tool_name.as_deref(),
-                        )
-                    });
+                let occurrence_uid = row.tool_call_uid.as_deref().filter(|uid| !uid.is_empty());
+                let matched_id = match occurrence_uid {
+                    Some(uid) => pending_tool_calls
+                        .get(uid)
+                        .filter(|call| call.session_id.as_deref() == Some(&row.session_id))
+                        .map(|_| uid.to_string()),
+                    None => find_pending_call(
+                        &pending_tool_calls,
+                        &row.session_id,
+                        native_call_id,
+                        row.tool_name.as_deref(),
+                    ),
+                };
                 let pending = matched_id
                     .as_ref()
                     .and_then(|id| pending_tool_calls.remove(id));
-                if native_call_id.is_some() && pending.is_none() {
+                if (native_call_id.is_some() || occurrence_uid.is_some()) && pending.is_none() {
                     diagnostics.orphan_tool_results += 1;
                 }
                 let tool_name = row
@@ -465,7 +444,8 @@ pub(crate) fn parse_index_records(
                     .or_else(|| pending.as_ref().and_then(|call| call.tool_name.clone()));
                 let output = content_text(row.content.as_deref());
                 let mut result_links = links;
-                if let Some(parent_id) = matched_id.or_else(|| native_call_id.map(str::to_string)) {
+                result_links.source_tool_use_id = native_call_id.map(str::to_string);
+                if let Some(parent_id) = matched_id.or_else(|| occurrence_uid.map(str::to_string)) {
                     result_links.parent_event_id = Some(parent_id.clone());
                     result_links.parent_tool_use_id = Some(parent_id);
                 }
@@ -518,15 +498,28 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
         .map_err(Into::into)
 }
 
-fn optional_column(columns: &HashSet<String>, column: &str, fallback: &str) -> String {
+fn optional_column(columns: &HashSet<String>, table: &str, column: &str, fallback: &str) -> String {
     if columns.contains(column) {
-        column.to_string()
+        format!("{table}.{column}")
     } else {
         fallback.to_string()
     }
 }
 
 fn load_rows(connection: &Connection, after_id: u64) -> Result<Vec<MessageRow>> {
+    let mut rows = Vec::new();
+    visit_rows(connection, after_id, |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+fn visit_rows(
+    connection: &Connection,
+    after_id: u64,
+    mut visit: impl FnMut(MessageRow) -> Result<()>,
+) -> Result<()> {
     let message_columns = table_columns(connection, "messages")?;
     let session_columns = table_columns(connection, "sessions")?;
     let active = if message_columns.contains("active") {
@@ -537,15 +530,18 @@ fn load_rows(connection: &Connection, after_id: u64) -> Result<Vec<MessageRow>> 
     let sql = format!(
         "SELECT m.id, m.session_id, m.role, m.content, m.tool_call_id, m.tool_calls,
                 m.tool_name, m.timestamp,
-                {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}
          FROM messages m
          LEFT JOIN sessions s ON s.id = m.session_id
          WHERE m.id > ?1 AND {active}
          ORDER BY m.id",
-        optional_column(&message_columns, "reasoning", "NULL"),
-        optional_column(&message_columns, "reasoning_content", "NULL"),
-        optional_column(&session_columns, "cwd", "NULL"),
-        optional_column(&session_columns, "parent_session_id", "NULL"),
+        optional_column(&message_columns, "m", "reasoning", "NULL"),
+        optional_column(&message_columns, "m", "reasoning_content", "NULL"),
+        optional_column(&message_columns, "m", "codex_message_items", "NULL"),
+        optional_column(&message_columns, "m", "tool_call_uids", "NULL"),
+        optional_column(&message_columns, "m", "tool_call_uid", "NULL"),
+        optional_column(&session_columns, "s", "cwd", "NULL"),
+        optional_column(&session_columns, "s", "parent_session_id", "NULL"),
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params![after_id.min(i64::MAX as u64) as i64], |row| {
@@ -560,12 +556,17 @@ fn load_rows(connection: &Connection, after_id: u64) -> Result<Vec<MessageRow>> 
             timestamp_ms: timestamp_millis(row.get::<_, f64>(7)?),
             reasoning: row.get(8)?,
             reasoning_content: row.get(9)?,
-            cwd: row.get(10)?,
-            parent_session_id: row.get(11)?,
+            codex_message_items: row.get(10)?,
+            tool_call_uids: row.get(11)?,
+            tool_call_uid: row.get(12)?,
+            cwd: row.get(13)?,
+            parent_session_id: row.get(14)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    for row in rows {
+        visit(row?)?;
+    }
+    Ok(())
 }
 
 fn plan_tool_calls(
@@ -598,23 +599,49 @@ fn plan_tool_calls(
         let mut calls = entries
             .iter()
             .enumerate()
-            .filter_map(|(position, entry)| parse_tool_call(row.id, position, entry))
+            .filter_map(|(position, entry)| parse_tool_call(row, position, entry))
             .collect::<Vec<_>>();
         let idless_positions = calls
             .iter()
             .enumerate()
-            .filter_map(|(position, call)| call.id.starts_with("hermes:").then_some(position))
+            .filter_map(|(position, call)| call.id.is_none().then_some(position))
             .collect::<Vec<_>>();
         if !idless_positions.is_empty() {
             let available = rows[index + 1..]
                 .iter()
                 .take_while(|next| next.role == "tool")
+                .filter(|next| next.session_id == row.session_id)
                 .filter_map(|next| next.tool_call_id.clone())
                 .collect::<Vec<_>>();
             if available.len() == idless_positions.len() {
                 for (position, adopted) in idless_positions.into_iter().zip(available) {
-                    calls[position].id = adopted;
+                    calls[position].id = Some(adopted);
                 }
+            }
+        }
+        let uids = match row.tool_call_uids.as_deref() {
+            Some(raw) => match serde_json::from_str::<Value>(raw) {
+                Ok(value) => value,
+                Err(_) => {
+                    diagnostics.malformed_json_lines += 1;
+                    Value::Null
+                }
+            },
+            None => Value::Null,
+        };
+        let mut occurrences = HashMap::<&str, usize>::new();
+        for call in &mut calls {
+            let Some(id) = call.id.as_deref() else {
+                continue;
+            };
+            let position = occurrences.entry(id).or_default();
+            let uid = match uids.get(id) {
+                Some(Value::Array(values)) => values.get(*position).and_then(Value::as_str),
+                value => value.and_then(Value::as_str),
+            };
+            *position += 1;
+            if let Some(uid) = uid.filter(|uid| !uid.is_empty()) {
+                call.event_id = uid.to_string();
             }
         }
         if !calls.is_empty() {
@@ -624,7 +651,7 @@ fn plan_tool_calls(
     planned
 }
 
-fn parse_tool_call(row_id: u64, position: usize, value: &Value) -> Option<ToolCall> {
+fn parse_tool_call(row: &MessageRow, position: usize, value: &Value) -> Option<ToolCall> {
     let object = value.as_object()?;
     let function = object.get("function").and_then(Value::as_object);
     let name = function
@@ -644,9 +671,8 @@ fn parse_tool_call(row_id: u64, position: usize, value: &Value) -> Option<ToolCa
         .map(json_text)
         .unwrap_or_default();
     Some(ToolCall {
-        id: native_id
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("hermes:{row_id}:{position}")),
+        id: native_id.map(str::to_string),
+        event_id: format!("hermes:{}:{}:{position}", row.session_id, row.id),
         name,
         arguments,
     })
@@ -655,11 +681,15 @@ fn parse_tool_call(row_id: u64, position: usize, value: &Value) -> Option<ToolCa
 fn find_pending_call(
     pending: &HashMap<String, PendingToolCall>,
     session_id: &str,
+    native_call_id: Option<&str>,
     tool_name: Option<&str>,
 ) -> Option<String> {
     let matches = pending
         .iter()
         .filter(|(_, call)| call.session_id.as_deref() == Some(session_id))
+        .filter(|(_, call)| {
+            native_call_id.is_none_or(|id| call.source_tool_use_id.as_deref() == Some(id))
+        })
         .filter(|(_, call)| {
             tool_name.is_none_or(|name| call.tool_name.as_deref().is_none_or(|value| value == name))
         })
@@ -684,6 +714,45 @@ fn row_links(row: &MessageRow) -> RecordLinks {
         ),
         ..RecordLinks::default()
     }
+}
+
+fn assistant_text(row: &MessageRow, diagnostics: &mut ParseDiagnostics) -> String {
+    let content = content_text(row.content.as_deref());
+    if !content.trim().is_empty() {
+        return content;
+    }
+    let Some(raw) = row.codex_message_items.as_deref() else {
+        return content;
+    };
+    let items: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => {
+            diagnostics.malformed_json_lines += 1;
+            return content;
+        }
+    };
+    let Some(items) = items.as_array() else {
+        diagnostics.increment_unknown_semantic("codex_message_items_not_array");
+        return content;
+    };
+    items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("assistant")
+                && item
+                    .get("phase")
+                    .is_none_or(|phase| phase.is_null() || phase.as_str() == Some("final_answer"))
+                && item.get("channel").is_none_or(|channel| {
+                    channel.is_null() || matches!(channel.as_str(), Some("final" | "final_answer"))
+                })
+        })
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn reasoning_text(row: &MessageRow, diagnostics: &mut ParseDiagnostics) -> Option<String> {
@@ -1245,11 +1314,12 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.role == "tool_use"
                 && record.tool_name.as_deref() == Some("terminal")
-                && record.links.event_id.as_deref() == Some("call-hermes-1")
+                && record.links.event_id.as_deref() == Some("hermes:hermes-session:102:0")
+                && record.links.source_tool_use_id.as_deref() == Some("call-hermes-1")
         }));
         assert!(records.iter().any(|record| {
             record.role == "tool_result"
-                && record.links.parent_tool_use_id.as_deref() == Some("call-hermes-1")
+                && record.links.parent_tool_use_id.as_deref() == Some("hermes:hermes-session:102:0")
         }));
 
         let mut reasoning = Vec::new();
@@ -1268,6 +1338,267 @@ mod tests {
             record.role == "reasoning" && record.text == "Check the working directory."
         }));
         assert_eq!(parsed.diagnostics.encrypted_reasoning_dropped, 1);
+    }
+
+    fn transcript_db(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+            .unwrap();
+        connection.execute("DELETE FROM messages", []).unwrap();
+        connection
+    }
+
+    fn parse_transcript(path: &Path, state: IndexParseState) -> (Vec<Record>, IndexParseOutput) {
+        let mut records = Vec::new();
+        let parsed = parse_index_records(path, state, false, &AtomicU64::new(1), |record| {
+            records.push(record);
+            Ok(())
+        })
+        .unwrap();
+        (records, parsed)
+    }
+
+    #[test]
+    fn responses_sidecars_supply_only_final_assistant_replies() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let connection = transcript_db(&path);
+        connection
+            .execute_batch("ALTER TABLE messages ADD COLUMN codex_message_items TEXT")
+            .unwrap();
+        let sidecar = serde_json::json!([
+            {"type": "message", "role": "assistant", "phase": "analysis",
+             "content": [{"type": "output_text", "text": "private analysis"}]},
+            {"type": "message", "role": "assistant", "phase": "commentary",
+             "content": [{"type": "output_text", "text": "interim commentary"}]},
+            {"type": "reasoning", "encrypted_content": "secret ciphertext"},
+            {"type": "message", "role": "user", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": "foreign user text"}]},
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": "Final answer."},
+                         {"type": "output_text", "text": "Second paragraph."}]}
+        ]);
+        let interim = serde_json::json!([
+            {"type": "message", "role": "assistant", "phase": "commentary",
+             "content": [{"type": "output_text", "text": "interim only"}]},
+            {"type": "message", "role": "assistant", "channel": "analysis",
+             "content": [{"type": "output_text", "text": "analysis only"}]}
+        ]);
+        let legacy = serde_json::json!([
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Legacy final reply."}]}
+        ]);
+        for (id, content, items) in [
+            (1, Some("Canonical reply."), sidecar.to_string()),
+            (2, Some(""), sidecar.to_string()),
+            (3, None, interim.to_string()),
+            (4, None, legacy.to_string()),
+            (5, None, "malformed JSON".to_string()),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO messages(id, session_id, role, content, codex_message_items, timestamp)
+                     VALUES (?1, 'hermes-session', 'assistant', ?2, ?3, ?1)",
+                    params![id, content, items],
+                )
+                .unwrap();
+        }
+        for include_reasoning in [false, true] {
+            let mut records = Vec::new();
+            let parsed = parse_index_records(
+                &path,
+                IndexParseState::default(),
+                include_reasoning,
+                &AtomicU64::new(1),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.text.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Canonical reply.",
+                    "Final answer.\nSecond paragraph.",
+                    "Legacy final reply."
+                ]
+            );
+            assert!(records.iter().all(|record| record.role == "assistant"));
+            assert_eq!(parsed.diagnostics.malformed_json_lines, 1);
+        }
+    }
+
+    #[test]
+    fn occurrence_uids_match_repeated_tool_ids_across_incremental_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let connection = transcript_db(&path);
+        connection
+            .execute_batch(
+                "ALTER TABLE messages ADD COLUMN tool_call_uids TEXT;
+                 ALTER TABLE messages ADD COLUMN tool_call_uid TEXT;
+                 INSERT INTO sessions(id, source, started_at) VALUES ('other-session', 'cli', 1);",
+            )
+            .unwrap();
+        let call = |name: &str| {
+            serde_json::json!({
+                "id": "repeated-id", "function": {"name": name, "arguments": "{}"}
+            })
+        };
+        for (id, session, calls, uids) in [
+            (
+                1,
+                "hermes-session",
+                vec![call("read_file")],
+                serde_json::json!({"repeated-id": "uid-read"}),
+            ),
+            (
+                2,
+                "other-session",
+                vec![call("terminal")],
+                serde_json::json!({"repeated-id": "uid-terminal"}),
+            ),
+            (
+                3,
+                "hermes-session",
+                vec![call("write_file"), call("delete_file")],
+                serde_json::json!({"repeated-id": ["uid-write", "uid-delete"]}),
+            ),
+        ] {
+            connection.execute(
+                "INSERT INTO messages(id, session_id, role, tool_calls, tool_call_uids, timestamp)
+                 VALUES (?1, ?2, 'assistant', ?3, ?4, ?1)",
+                params![id, session, serde_json::to_string(&calls).unwrap(), uids.to_string()],
+            ).unwrap();
+        }
+        let (_, first) = parse_transcript(&path, IndexParseState::default());
+        assert_eq!(first.pending_tool_calls.len(), 4);
+        for (id, session, uid, output) in [
+            (4, "hermes-session", "unknown-uid", "unmatched result"),
+            (5, "hermes-session", "uid-read", "read result"),
+            (6, "other-session", "uid-terminal", "terminal result"),
+            (7, "hermes-session", "uid-write", "write result"),
+            (8, "hermes-session", "uid-delete", "delete result"),
+        ] {
+            connection.execute(
+                "INSERT INTO messages(id, session_id, role, content, tool_call_id, tool_call_uid, timestamp)
+                 VALUES (?1, ?2, 'tool', ?3, 'repeated-id', ?4, ?1)",
+                params![id, session, output, uid],
+            ).unwrap();
+        }
+        let (records, second) = parse_transcript(
+            &path,
+            IndexParseState {
+                offset: first.offset,
+                pending_tool_calls: serde_json::from_slice(
+                    &serde_json::to_vec(&first.pending_tool_calls).unwrap(),
+                )
+                .unwrap(),
+                ..IndexParseState::default()
+            },
+        );
+        assert_eq!(
+            records[0].tool_name, None,
+            "an unmatched UID must not steal another call"
+        );
+        for (output, name, uid, session) in [
+            ("read result", "read_file", "uid-read", "hermes-session"),
+            (
+                "terminal result",
+                "terminal",
+                "uid-terminal",
+                "other-session",
+            ),
+            ("write result", "write_file", "uid-write", "hermes-session"),
+            (
+                "delete result",
+                "delete_file",
+                "uid-delete",
+                "hermes-session",
+            ),
+        ] {
+            let record = records.iter().find(|record| record.text == output).unwrap();
+            assert_eq!(record.tool_name.as_deref(), Some(name));
+            assert_eq!(record.links.parent_tool_use_id.as_deref(), Some(uid));
+            assert_eq!(record.session_id, session);
+        }
+        assert!(second.pending_tool_calls.is_empty());
+        assert_eq!(second.diagnostics.orphan_tool_results, 1);
+    }
+
+    #[test]
+    fn legacy_tool_matching_is_session_scoped_and_preserves_ambiguous_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let connection = transcript_db(&path);
+        connection
+            .execute(
+                "INSERT INTO sessions(id, source, started_at) VALUES ('other-session', 'cli', 1)",
+                [],
+            )
+            .unwrap();
+        for (id, session, name) in [
+            (1, "hermes-session", "read_file"),
+            (2, "other-session", "terminal"),
+            (5, "hermes-session", "write_file"),
+            (6, "hermes-session", "delete_file"),
+        ] {
+            let calls = serde_json::json!([
+                {"id": "repeated-id", "function": {"name": name, "arguments": "{}"}}
+            ]);
+            connection
+                .execute(
+                    "INSERT INTO messages(id, session_id, role, tool_calls, timestamp)
+                 VALUES (?1, ?2, 'assistant', ?3, ?1)",
+                    params![id, session, calls.to_string()],
+                )
+                .unwrap();
+        }
+        for (id, session, output) in [
+            (3, "hermes-session", "read result"),
+            (4, "other-session", "terminal result"),
+            (7, "hermes-session", "ambiguous result"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO messages(id, session_id, role, content, tool_call_id, timestamp)
+                 VALUES (?1, ?2, 'tool', ?3, 'repeated-id', ?1)",
+                    params![id, session, output],
+                )
+                .unwrap();
+        }
+        let (records, parsed) = parse_transcript(&path, IndexParseState::default());
+        let read = records
+            .iter()
+            .find(|record| record.text == "read result")
+            .unwrap();
+        assert_eq!(read.tool_name.as_deref(), Some("read_file"));
+        assert_eq!(
+            read.links.parent_tool_use_id.as_deref(),
+            Some("hermes:hermes-session:1:0")
+        );
+        let terminal = records
+            .iter()
+            .find(|record| record.text == "terminal result")
+            .unwrap();
+        assert_eq!(terminal.tool_name.as_deref(), Some("terminal"));
+        assert_eq!(
+            terminal.links.parent_tool_use_id.as_deref(),
+            Some("hermes:other-session:2:0")
+        );
+        let ambiguous = records
+            .iter()
+            .find(|record| record.text == "ambiguous result")
+            .unwrap();
+        assert_eq!(ambiguous.tool_name, None);
+        assert_eq!(ambiguous.links.parent_tool_use_id, None);
+        assert_eq!(parsed.pending_tool_calls.len(), 2);
+        assert_eq!(parsed.diagnostics.orphan_tool_results, 1);
     }
 
     #[test]

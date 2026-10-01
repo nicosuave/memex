@@ -3768,6 +3768,162 @@ fn ingest_grok_session_from_grok_home_override() {
 }
 
 #[test]
+fn ingest_hermes_in_place_edits_replace_text_and_session_metadata() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    connection
+        .execute(
+            "update messages set content = 'expanded user prompt' where id = 101",
+            [],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "expanded user prompt")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "Check the current directory.")
+    );
+
+    connection
+        .execute_batch(
+            "update messages set content = 'revised user prompt' where id = 101;
+         insert into messages(session_id, role, content, timestamp)
+         values ('hermes-session', 'user', 'new tail message', 12);",
+        )
+        .unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(
+        report.records_added > 1,
+        "an edited prefix must be replaced, not appended"
+    );
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "revised user prompt")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "expanded user prompt")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.text == "new tail message")
+            .count(),
+        1
+    );
+
+    connection
+        .execute(
+            "update sessions set cwd = '/workspace/renamed-project', parent_session_id = 'parent'",
+            [],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.project == "renamed-project")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.links.parent_session_id.as_deref() == Some("parent"))
+    );
+}
+
+#[test]
+fn ingest_hermes_sidecar_edits_replace_existing_reply_text() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute_batch(
+            "alter table messages add column codex_message_items text;
+         update messages set content = '' where id = 104;",
+        )
+        .unwrap();
+    let reply = |text: &str| {
+        serde_json::json!([
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": text}]}
+        ])
+        .to_string()
+    };
+    connection
+        .execute(
+            "update messages set codex_message_items = ?1 where id = 104",
+            [reply("original sidecar reply")],
+        )
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(
+        index
+            .records_by_session_id("hermes-session")
+            .unwrap()
+            .iter()
+            .any(|record| record.text == "original sidecar reply")
+    );
+
+    connection
+        .execute(
+            "update messages set codex_message_items = ?1 where id = 104",
+            [reply("revised sidecar reply")],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "revised sidecar reply")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "original sidecar reply")
+    );
+}
+
+#[test]
 fn ingest_hermes_deactivation_replaces_previously_indexed_records() {
     let _guard = env_lock();
     let tmp = tempfile::tempdir().expect("tempdir");

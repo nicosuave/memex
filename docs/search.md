@@ -23,8 +23,11 @@ The main search, indexing, and maintenance commands are organized as follows:
 Index all supported sources by default. Use repeatable `--only-source <source>` or
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
 to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
-`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, `muse`,
-`antigravity`, `bob`, `zcode`, and `kilocode`. Hermes supports usage tracking only.
+`cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
+`muse`, `antigravity`, `bob`, `zcode`, and `kilocode`.
+Hermes transcripts and usage are read from `state.db` under `~/.hermes` and its
+named profiles; `HERMES_PROFILE_ROOTS` (comma-separated paths) selects alternate
+stores. Plaintext reasoning is indexed only with `--include-reasoning`.
 Bob tasks are read from `~/.bob/db/bob.db` (override with `MEMEX_BOB_DB`, a comma-separated
 list of database paths with any file name, `~/` expanded); each task is indexed under the
 virtual source path `<db>/<task_id>`, and sub-agent runs embedded in a task appear as their own
