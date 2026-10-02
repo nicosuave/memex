@@ -165,6 +165,8 @@ fn with_latest_meta(mut params: Value) -> Value {
     params
 }
 
+// `.last()` parses every SSE data event, so a malformed earlier event still fails the test.
+#[allow(clippy::double_ended_iterator_last)]
 fn response_payload(response: Response) -> Value {
     assert_eq!(response.status(), 200, "unexpected response: {response:?}");
     let content_type = response

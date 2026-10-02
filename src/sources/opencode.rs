@@ -1971,6 +1971,7 @@ mod tests {
             .unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_v2_message(
         connection: &Connection,
         id: &str,

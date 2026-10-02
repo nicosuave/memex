@@ -130,10 +130,7 @@ impl Drop for ChildGuard {
 fn drain(mut reader: impl Read + Send + 'static, logs: Arc<Mutex<Vec<u8>>>) {
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
-        loop {
-            let Ok(read) = reader.read(&mut buffer) else {
-                break;
-            };
+        while let Ok(read) = reader.read(&mut buffer) {
             if read == 0 {
                 break;
             }
@@ -639,7 +636,7 @@ fn spawn_index_daemon(dirs: &TestDirs, extra: &[&str]) -> ChildGuard {
         "--no-embeddings",
     ];
     args.extend_from_slice(extra);
-    ChildGuard::spawn(&dirs, &args)
+    ChildGuard::spawn(dirs, &args)
 }
 
 const MINIMAL_CLAUDE_LINE: &str = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"uuid\":\"u1\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n";

@@ -586,7 +586,7 @@ fn unresolved_codex_facts_retry_a_parent_whose_permissions_recover() {
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 600);
     let metadata = super::scan::usage_file_metadata(&parent).unwrap();
     let permissions = fs::metadata(&parent).unwrap().permissions();
-    fs::set_permissions(&parent, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o0)).unwrap();
     if fs::File::open(&parent).is_ok() {
         // Privileged test users can bypass Unix permissions.
         fs::set_permissions(&parent, permissions).unwrap();

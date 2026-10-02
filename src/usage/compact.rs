@@ -216,6 +216,41 @@ fn intern(dictionary: &mut HashMap<String, StringId>, text: String) -> StringId 
     *dictionary.entry(text).or_insert(next)
 }
 
+impl<S, P> UsageEventData<S, P> {
+    fn activity_point(&self) -> UsageActivityPoint {
+        UsageActivityPoint {
+            source: self.source,
+            timestamp_ms: self.timestamp_ms,
+            total_tokens: self.tokens.total(),
+        }
+    }
+    fn map_text<T, Q>(self, source_path: Q, mut map: impl FnMut(S) -> T) -> UsageEventData<T, Q> {
+        UsageEventData {
+            source: self.source,
+            source_path,
+            source_record_id: self.source_record_id.map(&mut map),
+            session_id: self.session_id.map(&mut map),
+            request_id: self.request_id.map(&mut map),
+            message_id: self.message_id.map(&mut map),
+            timestamp_ms: self.timestamp_ms,
+            project: self.project.map(&mut map),
+            provider: self.provider.map(&mut map),
+            model: self.model.map(&mut map),
+            tokens: self.tokens,
+            credits: self.credits,
+            token_usage_available: self.token_usage_available,
+            source_cost_usd: self.source_cost_usd,
+            cost_authoritative: self.cost_authoritative,
+            dedupe_confidence: self.dedupe_confidence,
+            conservative_undercount: self.conservative_undercount,
+            cache_chain_excluded: self.cache_chain_excluded,
+            sidechain: self.sidechain,
+            permission_review: self.permission_review,
+            source_order: self.source_order,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,40 +386,5 @@ mod tests {
         assert_eq!(tokens.uncached_input, 20);
         assert_eq!(tokens.cache_read, 80);
         assert_eq!(tokens.additive_total(), 110);
-    }
-}
-
-impl<S, P> UsageEventData<S, P> {
-    fn activity_point(&self) -> UsageActivityPoint {
-        UsageActivityPoint {
-            source: self.source,
-            timestamp_ms: self.timestamp_ms,
-            total_tokens: self.tokens.total(),
-        }
-    }
-    fn map_text<T, Q>(self, source_path: Q, mut map: impl FnMut(S) -> T) -> UsageEventData<T, Q> {
-        UsageEventData {
-            source: self.source,
-            source_path,
-            source_record_id: self.source_record_id.map(&mut map),
-            session_id: self.session_id.map(&mut map),
-            request_id: self.request_id.map(&mut map),
-            message_id: self.message_id.map(&mut map),
-            timestamp_ms: self.timestamp_ms,
-            project: self.project.map(&mut map),
-            provider: self.provider.map(&mut map),
-            model: self.model.map(&mut map),
-            tokens: self.tokens,
-            credits: self.credits,
-            token_usage_available: self.token_usage_available,
-            source_cost_usd: self.source_cost_usd,
-            cost_authoritative: self.cost_authoritative,
-            dedupe_confidence: self.dedupe_confidence,
-            conservative_undercount: self.conservative_undercount,
-            cache_chain_excluded: self.cache_chain_excluded,
-            sidechain: self.sidechain,
-            permission_review: self.permission_review,
-            source_order: self.source_order,
-        }
     }
 }

@@ -593,9 +593,9 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","timestamp":{timestamp_ms},"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("session.jsonl"), line("m-10", 1000, 10))
+        std::fs::write(projects.join("session.jsonl"), line("m-10", 1000, 10))
             .expect("write transcript");
-        std::fs::write(&projects.join("later.jsonl"), line("m-70", 3000, 70))
+        std::fs::write(projects.join("later.jsonl"), line("m-70", 3000, 70))
             .expect("write later transcript");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let cache = tmp.path().join("usage-cache.sqlite3");
@@ -669,10 +669,8 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","timestamp":{timestamp_ms},"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("a.jsonl"), line("m-10", 1000, 10))
-            .expect("write transcript");
-        std::fs::write(&projects.join("b.jsonl"), line("m-20", 2000, 20))
-            .expect("write transcript");
+        std::fs::write(projects.join("a.jsonl"), line("m-10", 1000, 10)).expect("write transcript");
+        std::fs::write(projects.join("b.jsonl"), line("m-20", 2000, 20)).expect("write transcript");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let query = UsageQuery {
             source: Some(SourceFilter::Claude),
@@ -689,7 +687,7 @@ mod tests {
         // Second scan finds a sync row and valid blobs: still legacy (facts path
         // needs no work), then an append forces a facts-backed refresh.
         std::fs::write(
-            &projects.join("a.jsonl"),
+            projects.join("a.jsonl"),
             format!("{}{}", line("m-10", 1000, 10), line("m-30", 3000, 30)),
         )
         .expect("grow transcript");
@@ -722,7 +720,7 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("a.jsonl"), line("m-10", 10)).expect("write transcript");
+        std::fs::write(projects.join("a.jsonl"), line("m-10", 10)).expect("write transcript");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let retaining = UsageQuery {
             source: Some(SourceFilter::Claude),
@@ -733,7 +731,7 @@ mod tests {
         };
         assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 10);
         std::fs::write(
-            &projects.join("a.jsonl"),
+            projects.join("a.jsonl"),
             format!("{}{}", line("m-10", 10), line("m-30", 30)),
         )
         .expect("grow transcript");
@@ -777,7 +775,7 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("a.jsonl"), line("m-10", 10)).expect("write transcript");
+        std::fs::write(projects.join("a.jsonl"), line("m-10", 10)).expect("write transcript");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let retaining = UsageQuery {
             source: Some(SourceFilter::Claude),
@@ -788,7 +786,7 @@ mod tests {
         };
         assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 10);
         std::fs::write(
-            &projects.join("a.jsonl"),
+            projects.join("a.jsonl"),
             format!("{}{}", line("m-10", 10), line("m-30", 30)),
         )
         .expect("grow transcript");
@@ -825,8 +823,8 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"shared","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("a.jsonl"), line(10)).expect("write loser");
-        std::fs::write(&projects.join("b.jsonl"), line(70)).expect("write winner");
+        std::fs::write(projects.join("a.jsonl"), line(10)).expect("write loser");
+        std::fs::write(projects.join("b.jsonl"), line(70)).expect("write winner");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let retaining = UsageQuery {
             source: Some(SourceFilter::Claude),
@@ -838,7 +836,7 @@ mod tests {
         assert_eq!(scan_usage(&retaining).expect("cold scan").total_tokens, 70);
         // Deleting the winner must resurrect the loser (which the facts never
         // stored), so the refresh has to fall back to the legacy full rebuild.
-        std::fs::remove_file(&projects.join("b.jsonl")).expect("delete winner");
+        std::fs::remove_file(projects.join("b.jsonl")).expect("delete winner");
         std::thread::sleep(std::time::Duration::from_millis(5));
         let refreshed = scan_usage(&retaining).expect("refresh after delete");
         assert_eq!(refreshed.total_tokens, 10);
@@ -867,7 +865,7 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":1000,"cwd":"/repo/memex","message":{{"id":"shared","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("a.jsonl"), line(10)).expect("write transcript");
+        std::fs::write(projects.join("a.jsonl"), line(10)).expect("write transcript");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let retaining = UsageQuery {
             source: Some(SourceFilter::Claude),
@@ -880,7 +878,7 @@ mod tests {
         // A new file claims the same (message, request) with more tokens: the
         // stored hit must lose, so per-file upsert cannot apply and the
         // refresh falls back to the legacy full rebuild (no double count).
-        std::fs::write(&projects.join("b.jsonl"), line(70)).expect("write challenger");
+        std::fs::write(projects.join("b.jsonl"), line(70)).expect("write challenger");
         std::thread::sleep(std::time::Duration::from_millis(5));
         let refreshed = scan_usage(&retaining).expect("refresh after steal");
         assert_eq!(refreshed.total_tokens, 70);
@@ -913,7 +911,7 @@ mod tests {
                 r#"{{"type":"assistant","sessionId":"session","requestId":"request","timestamp":{timestamp_ms},"cwd":"/repo/memex","message":{{"id":"{id}","model":"claude-sonnet-4-6","usage":{{"inputTokens":{input}}}}}}}"#
             ) + "\n"
         };
-        std::fs::write(&projects.join("z.jsonl"), line("shared", 2, 10)).expect("write transcript");
+        std::fs::write(projects.join("z.jsonl"), line("shared", 2, 10)).expect("write transcript");
         let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(tmp.path().as_os_str()))]);
         let retaining = UsageQuery {
             source: Some(SourceFilter::Claude),
@@ -928,7 +926,7 @@ mod tests {
         // The newcomer shares the reconcile key, so per-file upsert cannot
         // apply: re-running the reconcile over stored hits first would keep
         // the old winner instead of flipping to the discovery-earlier copy.
-        std::fs::write(&projects.join("a.jsonl"), line("shared", 1, 10)).expect("write challenger");
+        std::fs::write(projects.join("a.jsonl"), line("shared", 1, 10)).expect("write challenger");
         std::thread::sleep(std::time::Duration::from_millis(5));
         let refreshed = scan_usage(&retaining).expect("refresh");
         assert_eq!(refreshed.events, 1);
@@ -954,7 +952,7 @@ mod tests {
         let projects = tmp.path().join("projects/memex");
         std::fs::create_dir_all(&projects).expect("create projects");
         std::fs::write(
-            &projects.join("session.jsonl"),
+            projects.join("session.jsonl"),
             r#"{"type":"assistant","sessionId":"session","timestamp":1000,"cwd":"/repo/memex","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#
                 .to_string()
                 + "\n",

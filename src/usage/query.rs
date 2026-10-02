@@ -887,7 +887,7 @@ mod tests {
         let projects = tmp.path().join("projects/memex");
         std::fs::create_dir_all(&projects).expect("create projects");
         std::fs::write(
-            &projects.join("session.jsonl"),
+            projects.join("session.jsonl"),
             r#"{"type":"assistant","sessionId":"session","timestamp":1000,"cwd":"/repo/memex","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#
                 .to_string()
                 + "\n",
@@ -932,7 +932,7 @@ mod tests {
         let projects = tmp.path().join("projects/memex");
         std::fs::create_dir_all(&projects).expect("create projects");
         std::fs::write(
-            &projects.join("session.jsonl"),
+            projects.join("session.jsonl"),
             r#"{"type":"assistant","sessionId":"session","timestamp":1000,"cwd":"/repo/memex","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#
                 .to_string()
                 + "\n",
@@ -975,7 +975,7 @@ mod tests {
         let projects = tmp.path().join("projects/memex");
         std::fs::create_dir_all(&projects).expect("create projects");
         std::fs::write(
-            &projects.join("session.jsonl"),
+            projects.join("session.jsonl"),
             r#"{"type":"assistant","sessionId":"session","timestamp":1000,"cwd":"/repo/memex","message":{"id":"m","model":"claude-sonnet-4-6","usage":{"inputTokens":10}}}"#
                 .to_string()
                 + "\n",

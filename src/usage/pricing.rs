@@ -355,6 +355,63 @@ fn claude_rates(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64
     }
 }
 
+/// Shared per-event totals aggregation so single and merged reports cannot drift.
+pub(crate) fn accumulate_usage_event(
+    report: &mut UsageReport,
+    by_source: &mut HashMap<&'static str, UsageSummary>,
+    event: &UsageEventView<'_>,
+    cost_mode: CostMode,
+    rate_cache: &mut RateCache,
+) {
+    let total = event.tokens.additive_total();
+    report.events += 1;
+    if !event.token_usage_available {
+        report.unavailable_token_events += 1;
+        report.credits = Some(report.credits.unwrap_or(0.0) + event.credits.unwrap_or(0.0));
+        let row = by_source
+            .entry(event.source)
+            .or_insert_with(|| UsageSummary {
+                source: event.source.to_string(),
+                ..UsageSummary::default()
+            });
+        row.events += 1;
+        row.unavailable_token_events += 1;
+        row.credits = Some(row.credits.unwrap_or(0.0) + event.credits.unwrap_or(0.0));
+        return;
+    }
+    report.total_tokens = report.total_tokens.saturating_add(total);
+    report.unknown_model_events += u64::from(event.model.is_none());
+    report.conservative_events += u64::from(event.conservative_undercount);
+    let cost = event_cost_nanos_cached(event, cost_mode, rate_cache);
+    if let Some(cost) = cost {
+        report.priced_events += 1;
+        report.known_cost_usd += cost as f64 / 1_000_000_000.0;
+    } else {
+        report.unpriced_events += 1;
+    }
+    let row = by_source
+        .entry(event.source)
+        .or_insert_with(|| UsageSummary {
+            source: event.source.to_string(),
+            ..UsageSummary::default()
+        });
+    row.events += 1;
+    row.uncached_input = row
+        .uncached_input
+        .saturating_add(event.tokens.uncached_input);
+    row.cache_read = row.cache_read.saturating_add(event.tokens.cache_read);
+    row.cache_write = row.cache_write.saturating_add(event.tokens.cache_write);
+    row.output = row.output.saturating_add(event.tokens.output);
+    row.reasoning = row.reasoning.saturating_add(event.tokens.reasoning);
+    row.total_tokens = row.total_tokens.saturating_add(total);
+    if let Some(cost) = cost {
+        row.priced_events += 1;
+        row.known_cost_usd += cost as f64 / 1_000_000_000.0;
+    } else {
+        row.unpriced_events += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::cache_event;
@@ -604,61 +661,5 @@ mod tests {
         };
         assert_eq!(event_cost_nanos(&event, CostMode::Auto), Some(0));
         assert_eq!(event_cost_nanos(&event, CostMode::Reprice), Some(300_000));
-    }
-}
-/// Shared per-event totals aggregation so single and merged reports cannot drift.
-pub(crate) fn accumulate_usage_event(
-    report: &mut UsageReport,
-    by_source: &mut HashMap<&'static str, UsageSummary>,
-    event: &UsageEventView<'_>,
-    cost_mode: CostMode,
-    rate_cache: &mut RateCache,
-) {
-    let total = event.tokens.additive_total();
-    report.events += 1;
-    if !event.token_usage_available {
-        report.unavailable_token_events += 1;
-        report.credits = Some(report.credits.unwrap_or(0.0) + event.credits.unwrap_or(0.0));
-        let row = by_source
-            .entry(event.source)
-            .or_insert_with(|| UsageSummary {
-                source: event.source.to_string(),
-                ..UsageSummary::default()
-            });
-        row.events += 1;
-        row.unavailable_token_events += 1;
-        row.credits = Some(row.credits.unwrap_or(0.0) + event.credits.unwrap_or(0.0));
-        return;
-    }
-    report.total_tokens = report.total_tokens.saturating_add(total);
-    report.unknown_model_events += u64::from(event.model.is_none());
-    report.conservative_events += u64::from(event.conservative_undercount);
-    let cost = event_cost_nanos_cached(event, cost_mode, rate_cache);
-    if let Some(cost) = cost {
-        report.priced_events += 1;
-        report.known_cost_usd += cost as f64 / 1_000_000_000.0;
-    } else {
-        report.unpriced_events += 1;
-    }
-    let row = by_source
-        .entry(event.source)
-        .or_insert_with(|| UsageSummary {
-            source: event.source.to_string(),
-            ..UsageSummary::default()
-        });
-    row.events += 1;
-    row.uncached_input = row
-        .uncached_input
-        .saturating_add(event.tokens.uncached_input);
-    row.cache_read = row.cache_read.saturating_add(event.tokens.cache_read);
-    row.cache_write = row.cache_write.saturating_add(event.tokens.cache_write);
-    row.output = row.output.saturating_add(event.tokens.output);
-    row.reasoning = row.reasoning.saturating_add(event.tokens.reasoning);
-    row.total_tokens = row.total_tokens.saturating_add(total);
-    if let Some(cost) = cost {
-        row.priced_events += 1;
-        row.known_cost_usd += cost as f64 / 1_000_000_000.0;
-    } else {
-        row.unpriced_events += 1;
     }
 }

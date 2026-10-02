@@ -802,7 +802,6 @@ mod tests {
     use crate::config::UserConfig;
     use crate::state::{FileIdentity, FileState, IngestState};
     use crate::test_support::{EnvVarGuard, env_lock};
-    use crossbeam_channel::unbounded;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::Path;

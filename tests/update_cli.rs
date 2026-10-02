@@ -253,7 +253,7 @@ fn run_pty(command: &mut Command, input: &[u8]) -> PtyOutput {
 fn run_pty_with_tui_input(command: &mut Command, input: &[u8], tui_input: &[u8]) -> PtyOutput {
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: 30,
         ws_col: 120,
         ws_xpixel: 0,
@@ -265,7 +265,7 @@ fn run_pty_with_tui_input(command: &mut Command, input: &[u8], tui_input: &[u8])
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &size,
         )
     };
     assert_eq!(

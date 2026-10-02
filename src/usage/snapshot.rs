@@ -970,6 +970,19 @@ pub(crate) fn sort_usage_events(events: &mut [UsageEvent]) {
     usage_timing(permutation_start, || "sort event permutation".to_string());
 }
 
+/// Refresh/publication lock. Held only while revalidating or rebuilding a snapshot —
+/// never across filtering, aggregation, or visitor callbacks. Concurrent queries
+/// clone snapshot `Arc`s under the short store lock and run lock-free.
+pub(crate) static USAGE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+pub(crate) fn epoch_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod sort_tests {
     use super::*;
@@ -1056,17 +1069,4 @@ mod sort_tests {
         );
         sort_usage_events(&mut []);
     }
-}
-
-/// Refresh/publication lock. Held only while revalidating or rebuilding a snapshot —
-/// never across filtering, aggregation, or visitor callbacks. Concurrent queries
-/// clone snapshot `Arc`s under the short store lock and run lock-free.
-pub(crate) static USAGE_SCAN_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
-pub(crate) fn epoch_ms_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
 }

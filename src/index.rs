@@ -2798,7 +2798,7 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
     let source_path = get_str(fields.source_path).unwrap_or_default();
     let source = fields
         .source
-        .and_then(&get_str)
+        .and_then(get_str)
         .and_then(|label| crate::types::SourceKind::from_label(&label))
         .unwrap_or_else(|| crate::types::SourceKind::from_path(&source_path));
     Record {
@@ -2825,7 +2825,7 @@ fn record_from_doc(fields: &IndexFields, doc: &TantivyDocument) -> Record {
             source_tool_assistant_uuid: get_str(fields.source_tool_assistant_uuid),
             ..fields
                 .reader_metadata
-                .and_then(&get_str)
+                .and_then(get_str)
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default()
         },

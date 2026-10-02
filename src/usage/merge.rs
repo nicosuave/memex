@@ -229,9 +229,9 @@ mod tests {
             ) + "\n"
         };
         // Timestamps interleave with the codex event below: 1M, 3M vs 2M.
-        std::fs::write(&projects.join("session.jsonl"), line("m-10", 1000, 10))
+        std::fs::write(projects.join("session.jsonl"), line("m-10", 1000, 10))
             .expect("write transcript");
-        std::fs::write(&projects.join("later.jsonl"), line("m-70", 3000, 70))
+        std::fs::write(projects.join("later.jsonl"), line("m-70", 3000, 70))
             .expect("write later transcript");
         let sessions = tmp.path().join("codex/sessions/2026/07/14");
         std::fs::create_dir_all(&sessions).expect("create sessions");

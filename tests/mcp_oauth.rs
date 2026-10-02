@@ -429,6 +429,8 @@ fn redirect_params(response: Response) -> HashMap<String, String> {
     url.query_pairs().into_owned().collect()
 }
 
+// `.last()` parses every SSE data event, so a malformed earlier event still fails the test.
+#[allow(clippy::double_ended_iterator_last)]
 fn mcp_payload(response: Response) -> Value {
     let actual = response.status();
     let content_type = response
