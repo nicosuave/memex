@@ -110,6 +110,48 @@ locations and active `venv` / `conda` `site-packages/nvidia/*/lib` directories.
 If your system keeps CUDA or cuDNN in a nonstandard location, set
 `MEMEX_CUDA_LIBRARY_PATHS` and `MEMEX_CUDNN_LIBRARY_PATHS` or the matching config
 keys.
+## Reranking
+
+Reranking is off by default. With `rerank = "local"` (or `true`), memex rescores the top
+search results with a local cross-encoder model, which reads the query and each result
+together instead of comparing separately computed embeddings. It uses the same
+`execution_provider`, `compute_units`, and `cuda_*` settings as local embeddings.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `rerank` | `false` | `false`, or `true` / `"local"` |
+| `rerank_model` | none | Model to use; required when reranking is on. Falls back to `MEMEX_RERANK_MODEL` |
+| `rerank_candidates` | 30 | Top results to rerank (5 to 100) |
+| `rerank_doc_chars` | 1500 | Characters of each result sent to the model (200 to 8000) |
+
+| Model | Source | License | Size |
+|-------|--------|---------|------|
+| jina-turbo | jinaai/jina-reranker-v1-turbo-en | Apache-2.0 | ~150 MB |
+| bge-base | BAAI/bge-reranker-base | MIT | ~1.1 GB |
+| jina-v2 | jinaai/jina-reranker-v2-base-multilingual | CC-BY-NC-4.0 (non-commercial) | ~1.1 GB |
+| bge-v2-m3 | BAAI/bge-reranker-v2-m3 | Apache-2.0 | ~2.3 GB |
+
+Any fastembed reranker name also works. `bge-v2-m3` downloads a third-party ONNX export.
+
+How it works:
+- The rerank score, a probability from 0 to 1, replaces the fused score.
+- `--min-score` applies before reranking; `--recency-weight` applies afterwards, only when
+  it is above 0.
+- Reranking works in lexical, semantic, and hybrid modes.
+- On any reranker failure, the original order is kept and a warning is printed.
+
+When it runs: the daemon and MCP server load the model in the background and rerank once it
+is ready. A one-shot `memex search` reranks only with `--rerank`, which loads the model
+first; `--no-rerank` turns reranking off for one run. MCP `search` takes `rerank: true` or
+`false`. The TUI and web UI search never rerank.
+
+In our tests, hosted rerankers improved results more than these local models; local
+reranking is for privacy and offline use.
+
+```toml
+rerank = "local"
+rerank_model = "jina-turbo"
+```
 ## Config (optional)
 
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
@@ -132,6 +174,10 @@ cuda_device_id = 0  # optional, when execution_provider = "cuda"
 cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs
 cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional list of cuDNN library dirs
 compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
+rerank = false  # true or "local" to rerank results with a local cross-encoder
+# rerank_model = "jina-turbo"  # required when rerank is on
+rerank_candidates = 30  # 5 to 100
+rerank_doc_chars = 1500  # 200 to 8000
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 max_indexed_tool_input_bytes = 65536  # 64 KiB default
 max_indexed_tool_output_bytes = 262144  # 256 KiB default
@@ -177,7 +223,7 @@ new limits to records that are already indexed.
 matched transcripts never enter the index (a leading `~/` is expanded to your home directory).
 Adding a pattern also removes records previously indexed from matched paths — no rebuild
 required. For one-off runs, pass `--exclude GLOB` (repeatable) to `memex index`.
-`execution_provider` applies to local ONNX-backed models; `potion` uses the model2vec backend.
+`execution_provider` applies to local ONNX-backed models, including rerankers; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.
 

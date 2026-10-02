@@ -984,3 +984,56 @@ fn sessions_json_wraps_the_same_entries_as_jsonl() {
     assert!(rendered.contains("session"));
     assert!(rendered.contains("test"));
 }
+
+#[test]
+fn one_shot_search_skips_configured_reranking_with_one_notice() {
+    let (root, _) = fixture();
+    let notice =
+        "reranking is configured but skipped in one-shot searches; pass --rerank to load the model";
+    let base = [
+        "search",
+        "late_needle",
+        "--query",
+        "final outcome",
+        "--machine",
+        "local",
+    ];
+    let plain = values(root.path(), &base);
+    std::fs::write(
+        root.path().join("config.toml"),
+        "auto_index_on_search = false\nrerank = \"local\"\nrerank_model = \"jina-turbo\"\n",
+    )
+    .unwrap();
+
+    // Two query views run two local searches but print the notice once.
+    let out = run(root.path(), &base);
+    assert!(out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert_eq!(values(root.path(), &base), plain);
+
+    let mut disabled = base.to_vec();
+    disabled.push("--no-rerank");
+    let out = run(root.path(), &disabled);
+    assert!(out.status.success());
+    assert!(!String::from_utf8(out.stderr).unwrap().contains(notice));
+
+    let mut conflicting = disabled.clone();
+    conflicting.push("--rerank");
+    assert!(!run(root.path(), &conflicting).status.success());
+
+    std::fs::write(
+        root.path().join("config.toml"),
+        "auto_index_on_search = false\n",
+    )
+    .unwrap();
+    let mut explicit = base.to_vec();
+    explicit.push("--rerank");
+    let out = run(root.path(), &explicit);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("reranking was requested but is not configured"),
+        "{stderr}"
+    );
+}

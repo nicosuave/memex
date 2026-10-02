@@ -31,6 +31,7 @@ Use a sampling profiler separately for CPU stacks inside Tantivy, SQLite, embedd
 ## Cost boundaries
 
 - `cli.run`, `cli.search`, `search.local`: end-to-end command and local search.
+- `search.rerank`, `search.rerank.model_init`: reranking and reranker model loading.
 - `ingest.lease_wait`, `ingest.freshness`, `ingest.discovery`, `ingest.file_check`: synchronization and discovery.
 - `opencode.plan`, `opencode.hydrate`, `opencode.discover_legacy`: database and legacy-source work.
 - `memory.refresh`, `git.metadata`, `analytics.resolve_metadata`: memory and repository metadata.

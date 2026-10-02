@@ -70,6 +70,10 @@ in {
         - cuda_device_id (int): GPU index when using the CUDA execution provider
         - cuda_library_paths (list of strings): optional CUDA library directories
         - cudnn_library_paths (list of strings): optional cuDNN library directories
+        - rerank (bool or string): false, or true or "local" for local reranking
+        - rerank_model (string): "jina-turbo", "bge-base", "jina-v2", "bge-v2-m3"
+        - rerank_candidates (int): top results reranked, 5 to 100 (default 30)
+        - rerank_doc_chars (int): characters per result, 200 to 8000 (default 1500)
         - scan_cache_ttl (int): seconds
         - index_service_mode (string): "interval" or "continuous"
         - index_service_interval (int): seconds

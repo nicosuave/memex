@@ -124,7 +124,8 @@ Search accepts `query`, `additional_queries` (up to eight queries total), `mode`
 `session`, `origin`, `since`, `until`, `machines`, ranking controls, and `sort`
 (`score` or `ts`). It defaults to 20 hits and `unique_session: true`; set
 `top_n_per_session: 2` for two hits per session or `unique_session: false` for
-individual matches. Search and sessions accept at most 500 results.
+individual matches. Search and sessions accept at most 500 results. The optional boolean
+`rerank` turns the local [reranker](configuration.md#reranking) on or off for one call.
 
 Permission-review sessions are hidden by default. CLI search, session listing, usage,
 and MCP search/listing use `origin=regular`, which keeps ordinary subagents visible.

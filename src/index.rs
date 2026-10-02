@@ -152,6 +152,13 @@ impl std::fmt::Display for IndexCompatibilityError {
 
 impl std::error::Error for IndexCompatibilityError {}
 
+#[cfg(test)]
+impl IndexCompatibilityError {
+    pub(crate) fn for_test(message: &str) -> Self {
+        Self(message.to_string())
+    }
+}
+
 /// Tantivy normally takes a metadata lock every time it opens segment readers so its own
 /// garbage collector cannot remove a segment concurrently. Published generations are immutable,
 /// so Tantivy cannot remove their segments and the lock is unnecessary for sealed readers.
