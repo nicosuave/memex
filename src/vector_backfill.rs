@@ -13,7 +13,6 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const BATCH_SIZE: usize = 64;
 const NON_TTY_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const EMBED_MAX_CHARS: usize = 8192;
 const BACKFILL_DB: &str = "embed-backfill.sqlite3";
@@ -76,6 +75,9 @@ pub struct BackfillReport {
     pub embedded: usize,
     pub total: usize,
     pub resumed: usize,
+    /// Vector length of the published generation, confirmed by the embedder when the
+    /// model's size is not known statically.
+    pub dimensions: usize,
 }
 
 #[derive(Debug)]
@@ -383,7 +385,12 @@ pub(crate) fn checkpoint_exists(paths: &Paths) -> bool {
 /// This is intentionally separate from [`run`]: continuous indexing can make an exact decision
 /// before paying the cost of starting an embedding process. Callers should avoid invoking it on
 /// every idle poll because it inventories the embeddable lexical records.
-pub(crate) fn needs_work(paths: &Paths, index: &SearchIndex, model: ModelChoice) -> Result<bool> {
+pub(crate) fn needs_work(
+    paths: &Paths,
+    index: &SearchIndex,
+    model: &ModelChoice,
+    runtime: &EmbedRuntimeConfig,
+) -> Result<bool> {
     if checkpoint_exists(paths) {
         return Ok(true);
     }
@@ -395,9 +402,9 @@ pub(crate) fn needs_work(paths: &Paths, index: &SearchIndex, model: ModelChoice)
         Err(_) => return Ok(true),
     };
     if inventory.as_ref().is_some_and(|inventory| {
-        inventory.model.as_deref() != Some(model.as_str())
+        inventory.model.as_deref() != Some(model.identity().as_ref())
             || model
-                .known_dimensions()
+                .known_dimensions(runtime)
                 .is_some_and(|dimensions| inventory.dimensions != dimensions)
     }) {
         return Ok(true);
@@ -411,7 +418,7 @@ pub(crate) fn needs_work(paths: &Paths, index: &SearchIndex, model: ModelChoice)
 pub fn run(
     paths: &Paths,
     index: &SearchIndex,
-    model: ModelChoice,
+    model: &ModelChoice,
     runtime: &EmbedRuntimeConfig,
 ) -> Result<BackfillReport> {
     let lease = IngestLease::acquire_embedding(paths, "embed", INGEST_LEASE_TIMEOUT)?;
@@ -421,7 +428,7 @@ pub fn run(
 pub(crate) fn run_with_lease(
     paths: &Paths,
     index: &SearchIndex,
-    model: ModelChoice,
+    model: &ModelChoice,
     runtime: &EmbedRuntimeConfig,
     _lease: &IngestLease,
 ) -> Result<BackfillReport> {
@@ -432,8 +439,11 @@ pub(crate) fn run_with_lease(
             (None, true)
         }
     };
+    let identity = model.identity();
     let mut embedder = None;
-    let dimensions = match model.known_dimensions() {
+    // A stored identity does not pin the size a remote model now returns, so an unknown
+    // size is measured here and a changed one rebuilds the generation.
+    let dimensions = match model.known_dimensions(runtime) {
         Some(dimensions) => dimensions,
         None => {
             let handle = EmbedderHandle::with_model_and_runtime(model, runtime)?;
@@ -442,7 +452,7 @@ pub(crate) fn run_with_lease(
             dimensions
         }
     };
-    let active_ids = compatible_active_ids(inventory, dimensions, model.as_str());
+    let active_ids = compatible_active_ids(inventory, dimensions, &identity);
     let active_compatible = active_ids.is_some();
     let active_ids = active_ids.unwrap_or_default();
 
@@ -454,17 +464,13 @@ pub(crate) fn run_with_lease(
         }
         return Ok(BackfillReport {
             total: live_ids.len(),
+            dimensions,
             ..BackfillReport::default()
         });
     }
 
     let mut store = BackfillStore::open(backfill_path(paths))?;
-    store.prepare(
-        model.as_str(),
-        dimensions,
-        live_ids.len() as u64,
-        base_completed,
-    )?;
+    store.prepare(&identity, dimensions, live_ids.len() as u64, base_completed)?;
     store.retain_pending(&live_ids, &active_ids)?;
     let staged_ids = store.ids()?;
     let resumed = staged_ids.len();
@@ -489,7 +495,8 @@ pub(crate) fn run_with_lease(
     if completed_at_start < live_ids.len() as u64 && embedder.is_none() {
         embedder = Some(EmbedderHandle::with_model_and_runtime(model, runtime)?);
     }
-    let mut batch = Vec::<(u64, String)>::with_capacity(BATCH_SIZE);
+    let batch_size = runtime.batch_size();
+    let mut batch = Vec::<(u64, String)>::with_capacity(batch_size);
     let mut embedded_this_run = 0usize;
     let mut last_report = Instant::now();
     index.for_each_record(|record| {
@@ -504,7 +511,7 @@ pub(crate) fn run_with_lease(
             return Ok(());
         }
         batch.push((record.doc_id, text));
-        if batch.len() >= BATCH_SIZE {
+        if batch.len() >= batch_size {
             let pending = batch.len();
             let status = checkpoint_batch(
                 &mut batch,
@@ -546,9 +553,9 @@ pub(crate) fn run_with_lease(
 
     store.set_phase("finalizing")?;
     let mut vector = if rebuild_active {
-        VectorIndex::empty_replacement(&paths.vectors, dimensions, Some(model.as_str()))?
+        VectorIndex::empty_replacement(&paths.vectors, dimensions, Some(&identity))?
     } else {
-        VectorIndex::open_or_create(&paths.vectors, dimensions, Some(model.as_str()))?
+        VectorIndex::open_or_create(&paths.vectors, dimensions, Some(&identity))?
     };
     vector.retain_doc_ids(&live_ids)?;
     store.for_each_vector(dimensions, |doc_id, embedding| {
@@ -571,6 +578,7 @@ pub(crate) fn run_with_lease(
         embedded: embedded_this_run,
         total: live_ids.len(),
         resumed,
+        dimensions,
     })
 }
 
@@ -612,7 +620,20 @@ fn checkpoint_batch(
 }
 
 fn record_needs_embedding(role: &str, text: &str) -> bool {
-    (role == "user" || role == "assistant") && !text.is_empty()
+    (role == "user" || role == "assistant") && has_embeddable_text(text)
+}
+
+/// Whether the prefix of `text` that is embedded contains non-whitespace content.
+///
+/// Ingest, backfill, coverage checks, and vector transfer all use this test, so a record
+/// whose embedded prefix is blank is never sent to a model nor counted as missing a vector.
+pub(crate) fn has_embeddable_text(text: &str) -> bool {
+    let mut end = text.len().min(EMBED_MAX_CHARS);
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text.get(..end)
+        .is_some_and(|prefix| !prefix.trim().is_empty())
 }
 
 fn live_embeddable_ids(index: &SearchIndex) -> Result<HashSet<u64>> {
@@ -963,7 +984,15 @@ mod tests {
         paths.ensure_dirs().unwrap();
         let index = SearchIndex::open_or_create(&paths.index).unwrap();
 
-        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            !needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
 
         let mut writer = index.writer().unwrap();
         index
@@ -971,13 +1000,37 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
         writer.wait_merging_threads().unwrap();
-        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
 
         let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
         active.add(1, &vec![0.1; 384]).unwrap();
         active.save().unwrap();
-        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
-        assert!(needs_work(&paths, &index, ModelChoice::MiniLM).unwrap());
+        assert!(
+            !needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
+        assert!(
+            needs_work(
+                &paths,
+                &index,
+                &ModelChoice::minilm(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
 
         let mut writer = index.writer().unwrap();
         index
@@ -985,17 +1038,196 @@ mod tests {
             .unwrap();
         writer.commit().unwrap();
         writer.wait_merging_threads().unwrap();
-        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
 
         active.add(2, &vec![0.2; 384]).unwrap();
         active.save().unwrap();
-        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            !needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
 
         let mut writer = index.writer().unwrap();
         index.delete_by_source_path(&mut writer, "one.jsonl");
         writer.commit().unwrap();
         writer.wait_merging_threads().unwrap();
-        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
+    }
+
+    fn remote_runtime(base_url: &str) -> EmbedRuntimeConfig {
+        EmbedRuntimeConfig {
+            remote: Some(crate::embed::RemoteEmbedConfig {
+                endpoint: crate::remote_embed::RemoteEndpoint {
+                    base_url: base_url.to_string(),
+                    api_key: None,
+                    timeout: Duration::from_secs(5),
+                    max_retries: 0,
+                },
+                dimensions: None,
+            }),
+            ..EmbedRuntimeConfig::default()
+        }
+    }
+
+    /// Answers embedding requests with `width`-length vectors until 500 ms pass
+    /// without a request, then returns the number of requests served.
+    fn serve_embeddings(width: usize) -> (String, std::thread::JoinHandle<usize>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            while let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(500)) {
+                let mut body = String::new();
+                std::io::Read::read_to_string(request.as_reader(), &mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let count = body["input"].as_array().map_or(0, Vec::len);
+                let data = (0..count)
+                    .map(|index| serde_json::json!({"index": index, "embedding": vec![0.5; width]}))
+                    .collect::<Vec<_>>();
+                let response =
+                    tiny_http::Response::from_string(serde_json::json!({"data": data}).to_string())
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        );
+                request.respond(response).unwrap();
+                served += 1;
+            }
+            served
+        });
+        (format!("http://{address}/v1"), handle)
+    }
+
+    fn index_with_one_record(paths: &Paths) -> SearchIndex {
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "one.jsonl"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index
+    }
+
+    #[test]
+    fn complete_remote_generation_needs_no_embedder_on_poll() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = index_with_one_record(&paths);
+        let mut active =
+            VectorIndex::open_or_create(&paths.vectors, 8, Some("remote:embed-small")).unwrap();
+        active.add(1, &[0.1; 8]).unwrap();
+        active.save().unwrap();
+
+        // Any request to this endpoint fails, so a poll must decide from metadata alone.
+        let runtime = remote_runtime("http://127.0.0.1:9/v1");
+        let model = ModelChoice::Remote("embed-small".to_string());
+        assert!(!needs_work(&paths, &index, &model, &runtime).unwrap());
+        let other = ModelChoice::Remote("embed-large".to_string());
+        assert!(needs_work(&paths, &index, &other, &runtime).unwrap());
+        // An explicit run confirms the size with the server.
+        assert!(run(&paths, &index, &model, &runtime).is_err());
+    }
+
+    #[test]
+    fn remote_generation_with_a_changed_size_is_rebuilt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = index_with_one_record(&paths);
+        let mut active =
+            VectorIndex::open_or_create(&paths.vectors, 512, Some("remote:embed-small")).unwrap();
+        active.add(1, &[0.1; 512]).unwrap();
+        active.save().unwrap();
+        drop(active);
+
+        let (base_url, server) = serve_embeddings(1536);
+        let runtime = remote_runtime(&base_url);
+        let model = ModelChoice::Remote("embed-small".to_string());
+        let report = run(&paths, &index, &model, &runtime).unwrap();
+        let requests = server.join().unwrap();
+
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.dimensions, 1536);
+        // One size probe, then one batch.
+        assert_eq!(requests, 2);
+        let inventory = VectorIndex::inventory(&paths.vectors).unwrap().unwrap();
+        assert_eq!(inventory.dimensions, 1536);
+        assert_eq!(inventory.model.as_deref(), Some("remote:embed-small"));
+        assert_eq!(inventory.doc_ids, HashSet::from([1]));
+    }
+
+    // Without the `cuda` feature, constructing a CUDA embedder fails, which proves none is built.
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn vector_for_a_blank_prefix_record_is_pruned_once_without_an_embedder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "one.jsonl"))
+            .unwrap();
+        let mut blank = test_record(2, "two.jsonl");
+        blank.text = format!("{}tail", " ".repeat(EMBED_MAX_CHARS));
+        index.add_record(&mut writer, &blank).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut active = VectorIndex::open_or_create(&paths.vectors, 384, Some("bge")).unwrap();
+        active.add(1, &[0.1; 384]).unwrap();
+        active.add(2, &[0.2; 384]).unwrap();
+        active.save().unwrap();
+        drop(active);
+
+        let runtime = EmbedRuntimeConfig {
+            execution_provider: crate::embed::ExecutionProviderChoice::Cuda,
+            ..EmbedRuntimeConfig::default()
+        };
+        let model = ModelChoice::bge_small();
+        assert!(needs_work(&paths, &index, &model, &runtime).unwrap());
+        let report = run(&paths, &index, &model, &runtime).unwrap();
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.total, 1);
+        let inventory = VectorIndex::inventory(&paths.vectors).unwrap().unwrap();
+        assert_eq!(inventory.doc_ids, HashSet::from([1]));
+        assert!(!needs_work(&paths, &index, &model, &runtime).unwrap());
+    }
+
+    #[test]
+    fn whitespace_only_records_need_no_embedding() {
+        assert!(!record_needs_embedding("user", " \n\t "));
+        assert!(record_needs_embedding("user", " text "));
+        let blank_prefix = format!("{}text", " ".repeat(EMBED_MAX_CHARS));
+        assert!(!record_needs_embedding("user", &blank_prefix));
+        let text_at_limit = format!("{}x", " ".repeat(EMBED_MAX_CHARS - 1));
+        assert!(record_needs_embedding("user", &text_at_limit));
+        // A multi-byte character straddling the limit is outside the embedded prefix.
+        let straddling = format!("{}\u{e9}", " ".repeat(EMBED_MAX_CHARS - 1));
+        assert!(!record_needs_embedding("user", &straddling));
     }
 
     #[test]
@@ -1041,7 +1273,15 @@ mod tests {
             ids_before
         );
         assert!(VectorIndex::inventory(&paths.vectors).is_err());
-        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
 
         // A complete checkpoint lets this exercise repair without loading an embedding model.
         let mut store = BackfillStore::open(backfill_path(&paths)).unwrap();
@@ -1052,7 +1292,7 @@ mod tests {
         let report = run(
             &paths,
             &index,
-            ModelChoice::BGESmall,
+            &ModelChoice::bge_small(),
             &EmbedRuntimeConfig::default(),
         )
         .unwrap();
@@ -1063,7 +1303,15 @@ mod tests {
         let repaired = VectorIndex::open(&paths.vectors).unwrap();
         assert!(repaired.contains(1));
         drop(repaired);
-        assert!(!needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            !needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1075,7 +1323,15 @@ mod tests {
         let mut store = BackfillStore::open(backfill_path(&paths)).unwrap();
         store.prepare("bge", 384, 0, 0).unwrap();
 
-        assert!(needs_work(&paths, &index, ModelChoice::BGESmall).unwrap());
+        assert!(
+            needs_work(
+                &paths,
+                &index,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1105,7 +1361,7 @@ mod tests {
         let report = run(
             &paths,
             &index,
-            ModelChoice::BGESmall,
+            &ModelChoice::bge_small(),
             &EmbedRuntimeConfig::default(),
         )
         .unwrap();

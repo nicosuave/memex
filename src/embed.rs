@@ -1,7 +1,10 @@
-use anyhow::{Result, anyhow};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use crate::remote_embed::{RemoteEmbedder, RemoteEndpoint};
+use anyhow::{Context, Result, anyhow};
+use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
 use model2vec_rs::model::StaticModel;
+use std::borrow::Cow;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[cfg(feature = "cuda")]
 use std::path::Path;
@@ -54,62 +57,176 @@ const CUDNN_DYLIBS: &[&str] = &[
     "libcudnn.so.9",
 ];
 
-/// Supported embedding models
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ModelChoice {
-    /// AllMiniLML6V2 - 22M params, 384 dims, very fast
-    MiniLM,
-    /// BGESmallENV15 - 33M params, 384 dims, good balance
-    BGESmall,
-    /// NomicEmbedTextV15 - 137M params, 768 dims, good quality
-    Nomic,
-    /// EmbeddingGemma300M - 300M params, 768 dims, highest quality but slowest
-    #[default]
-    Gemma,
+/// Inputs per embedding call and per vector flush when `embedding_batch_size` is unset.
+pub const DEFAULT_EMBED_BATCH_SIZE: usize = 64;
+
+const REMOTE_MODEL_PREFIX: &str = "remote:";
+
+/// A model that runs in-process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalModel {
+    /// An ONNX model from the fastembed catalog.
+    Fastembed(EmbeddingModel),
     /// PotionBase8M - 8M params, model2vec backend, tiny and fast
     Potion,
 }
 
+/// Embedding model selection.
+///
+/// [`ModelChoice::identity`] is the name stored with vectors and caches; two choices
+/// with the same identity produce interchangeable vectors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelChoice {
+    Local(LocalModel),
+    /// A model served by an OpenAI-compatible endpoint, named verbatim.
+    Remote(String),
+}
+
+impl Default for ModelChoice {
+    fn default() -> Self {
+        Self::gemma()
+    }
+}
+
 impl ModelChoice {
-    fn fastembed_config(self) -> Option<(EmbeddingModel, usize)> {
-        match self {
-            ModelChoice::MiniLM => Some((EmbeddingModel::AllMiniLML6V2, 384)),
-            ModelChoice::BGESmall => Some((EmbeddingModel::BGESmallENV15, 384)),
-            ModelChoice::Nomic => Some((EmbeddingModel::NomicEmbedTextV15, 768)),
-            ModelChoice::Gemma => Some((EmbeddingModel::EmbeddingGemma300M, 768)),
-            ModelChoice::Potion => None,
-        }
+    /// EmbeddingGemma300M - 300M params, 768 dims, highest quality but slowest
+    pub fn gemma() -> Self {
+        Self::Local(LocalModel::Fastembed(EmbeddingModel::EmbeddingGemma300M))
     }
 
-    /// Parse from string (env var or config)
+    /// AllMiniLML6V2 - 22M params, 384 dims, very fast
+    pub fn minilm() -> Self {
+        Self::Local(LocalModel::Fastembed(EmbeddingModel::AllMiniLML6V2))
+    }
+
+    /// BGESmallENV15 - 33M params, 384 dims, good balance
+    pub fn bge_small() -> Self {
+        Self::Local(LocalModel::Fastembed(EmbeddingModel::BGESmallENV15))
+    }
+
+    /// NomicEmbedTextV15 - 137M params, 768 dims, good quality
+    pub fn nomic() -> Self {
+        Self::Local(LocalModel::Fastembed(EmbeddingModel::NomicEmbedTextV15))
+    }
+
+    pub fn potion() -> Self {
+        Self::Local(LocalModel::Potion)
+    }
+
+    /// Parse a legacy alias, a fastembed `EmbeddingModel` variant name (case-insensitive),
+    /// or `remote:<model>` (case-sensitive model name).
     pub fn parse(s: &str) -> Result<Self> {
+        if let Some(model) = s.strip_prefix(REMOTE_MODEL_PREFIX) {
+            return Self::remote(model);
+        }
         match s.to_lowercase().as_str() {
-            "minilm" | "mini" | "fast" => Ok(ModelChoice::MiniLM),
-            "bge" | "bge-small" | "bgesmall" => Ok(ModelChoice::BGESmall),
-            "nomic" => Ok(ModelChoice::Nomic),
-            "gemma" | "embeddinggemma" | "default" => Ok(ModelChoice::Gemma),
+            "minilm" | "mini" | "fast" => Ok(Self::minilm()),
+            "bge" | "bge-small" | "bgesmall" => Ok(Self::bge_small()),
+            "nomic" => Ok(Self::nomic()),
+            "gemma" | "embeddinggemma" | "default" => Ok(Self::gemma()),
             "potion" | "potion8m" | "potion-8m" | "potion-base-8m" | "model2vec" => {
-                Ok(ModelChoice::Potion)
+                Ok(Self::potion())
             }
-            _ => Err(anyhow!(
-                "unknown model '{s}', options: minilm, bge, nomic, gemma, potion"
-            )),
+            _ => match EmbeddingModel::from_str(s) {
+                Ok(model) if is_supported_fastembed_model(&model) => {
+                    Ok(Self::Local(LocalModel::Fastembed(model)))
+                }
+                Ok(_) => Err(anyhow!(
+                    "model '{s}' is not supported; options: {}",
+                    supported_model_names()
+                )),
+                Err(_) => Err(anyhow!(
+                    "unknown model '{s}', options: {}",
+                    supported_model_names()
+                )),
+            },
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    /// A remote model named verbatim (without the `remote:` prefix).
+    ///
+    /// Rejects an empty name and any control character or ASCII whitespace. The
+    /// resulting identity is stored in metadata and caches and must never be used as
+    /// a path component.
+    pub fn remote(model: &str) -> Result<Self> {
+        if model.is_empty() {
+            return Err(anyhow!("remote embedding model name must not be empty"));
+        }
+        if model
+            .chars()
+            .any(|c| c.is_control() || c.is_ascii_whitespace())
+        {
+            return Err(anyhow!(
+                "remote embedding model name {model:?} must not contain whitespace or control \
+                 characters"
+            ));
+        }
+        Ok(Self::Remote(model.to_string()))
+    }
+
+    /// Stable name stored with vectors: the legacy alias for the five original models,
+    /// the fastembed variant name for other local models, and `remote:<model>`.
+    pub fn identity(&self) -> Cow<'static, str> {
         match self {
-            ModelChoice::MiniLM => "minilm",
-            ModelChoice::BGESmall => "bge",
-            ModelChoice::Nomic => "nomic",
-            ModelChoice::Gemma => "gemma",
-            ModelChoice::Potion => "potion",
+            Self::Local(LocalModel::Potion) => Cow::Borrowed("potion"),
+            Self::Local(LocalModel::Fastembed(model)) => match model {
+                EmbeddingModel::AllMiniLML6V2 => Cow::Borrowed("minilm"),
+                EmbeddingModel::BGESmallENV15 => Cow::Borrowed("bge"),
+                EmbeddingModel::NomicEmbedTextV15 => Cow::Borrowed("nomic"),
+                EmbeddingModel::EmbeddingGemma300M => Cow::Borrowed("gemma"),
+                other => Cow::Owned(format!("{other:?}")),
+            },
+            Self::Remote(model) => Cow::Owned(format!("{REMOTE_MODEL_PREFIX}{model}")),
         }
     }
 
-    pub fn known_dimensions(self) -> Option<usize> {
-        self.fastembed_config().map(|(_, dimensions)| dimensions)
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
     }
+
+    /// Vector length known without loading the model or contacting a server: the
+    /// native size of a fastembed model, or the configured `embedding_dimensions`
+    /// for a remote model. `None` means only an embedder can tell.
+    pub fn known_dimensions(&self, runtime: &EmbedRuntimeConfig) -> Option<usize> {
+        match self {
+            Self::Local(LocalModel::Fastembed(model)) => TextEmbedding::get_model_info(model)
+                .ok()
+                .map(|info| info.dim),
+            Self::Local(LocalModel::Potion) => None,
+            Self::Remote(_) => runtime.remote.as_ref().and_then(|remote| remote.dimensions),
+        }
+    }
+
+    /// Reject querying vectors of a local model while remote embeddings are configured,
+    /// so a query never loads a local model in remote mode.
+    pub fn ensure_query_compatible(&self, runtime: &EmbedRuntimeConfig) -> Result<()> {
+        if runtime.remote.is_some() && !self.is_remote() {
+            return Err(anyhow!(
+                "vectors use local model {} but embeddings = \"remote\"; run `memex embed` to \
+                 rebuild with the remote model",
+                self.identity()
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_supported_fastembed_model(model: &EmbeddingModel) -> bool {
+    TextEmbedding::get_quantization_mode(model) != QuantizationMode::Dynamic
+}
+
+fn supported_model_names() -> String {
+    let mut catalog = TextEmbedding::list_supported_models()
+        .into_iter()
+        .map(|info| info.model)
+        .filter(is_supported_fastembed_model)
+        .map(|model| format!("{model:?}"))
+        .collect::<Vec<_>>();
+    catalog.sort_unstable();
+    format!(
+        "minilm, bge, nomic, gemma, potion, remote:<model>, or a fastembed model: {}",
+        catalog.join(", ")
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -169,6 +286,18 @@ pub struct EmbedRuntimeConfig {
     pub cuda_device_id: Option<i32>,
     pub cuda_library_paths: Vec<PathBuf>,
     pub cudnn_library_paths: Vec<PathBuf>,
+    /// Explicit `embedding_batch_size`; `None` uses [`DEFAULT_EMBED_BATCH_SIZE`].
+    pub batch_size: Option<usize>,
+    /// Endpoint for `remote:` models; `None` when remote embeddings are not configured.
+    pub remote: Option<RemoteEmbedConfig>,
+}
+
+/// Remote endpoint settings plus the requested output size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteEmbedConfig {
+    pub endpoint: RemoteEndpoint,
+    /// Sent as the API `dimensions` parameter; `None` keeps the model's native size.
+    pub dimensions: Option<usize>,
 }
 
 impl EmbedRuntimeConfig {
@@ -179,7 +308,14 @@ impl EmbedRuntimeConfig {
             cuda_device_id: resolve_cuda_device_id_from_env()?,
             cuda_library_paths: resolve_library_paths_from_env(MEMEX_CUDA_LIBRARY_PATHS_ENV),
             cudnn_library_paths: resolve_library_paths_from_env(MEMEX_CUDNN_LIBRARY_PATHS_ENV),
+            batch_size: None,
+            remote: None,
         })
+    }
+
+    /// Inputs per embedding call and per vector flush.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size.unwrap_or(DEFAULT_EMBED_BATCH_SIZE)
     }
 
     pub fn apply_env(&self) -> Result<()> {
@@ -594,57 +730,121 @@ fn init_options_with_cuda(
 enum EmbedBackend {
     Fastembed(TextEmbedding),
     Model2Vec(StaticModel),
+    Remote(RemoteEmbedder),
 }
 
 pub struct EmbedderHandle {
     backend: EmbedBackend,
     pub dims: usize,
+    batch_size: usize,
 }
 
 impl EmbedderHandle {
-    pub fn with_model(choice: ModelChoice) -> Result<Self> {
+    pub fn with_model(choice: &ModelChoice) -> Result<Self> {
         let runtime = EmbedRuntimeConfig::from_env()?;
         Self::with_model_and_runtime(choice, &runtime)
     }
 
+    /// Load a local model or connect to the remote endpoint in `runtime`.
+    ///
+    /// A remote model never initializes ONNX Runtime; it sends one probe request to
+    /// learn the vector length and fails when `runtime` has no remote endpoint.
     pub fn with_model_and_runtime(
-        choice: ModelChoice,
+        choice: &ModelChoice,
         runtime: &EmbedRuntimeConfig,
     ) -> Result<Self> {
         crate::profiling::span!("embeddings.model_init");
-        if let Some((model_type, dims)) = choice.fastembed_config() {
-            let requested_provider = runtime.execution_provider;
-            let effective_provider = requested_provider.effective();
-            let opts = init_options_for_model(model_type, runtime)?;
-            let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
-                ExecutionProviderChoice::Cuda => anyhow!(
-                    "failed to initialize CUDA execution provider: {err}. Ensure the binary was \
-                     built with `--features cuda` and the required CUDA 12/cuDNN libraries are \
-                     on the dynamic linker path (for example via LD_LIBRARY_PATH)"
-                ),
-                ExecutionProviderChoice::CoreML
-                    if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
-                {
-                    anyhow!("failed to initialize CoreML execution provider: {err}")
-                }
-                _ => err,
-            })?;
-            Ok(Self {
-                backend: EmbedBackend::Fastembed(model),
-                dims,
-            })
-        } else {
-            let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
-            let dims = model
-                .encode(&[String::from("dimension_check")])
-                .first()
-                .map(|vec| vec.len())
-                .ok_or_else(|| anyhow!("no embedding returned"))?;
-            Ok(Self {
-                backend: EmbedBackend::Model2Vec(model),
-                dims,
-            })
+        let batch_size = runtime.batch_size();
+        match choice {
+            ModelChoice::Remote(model) => {
+                let mut embedder = remote_embedder(model, runtime, batch_size)?;
+                let dims = embedder.probe_dimensions().with_context(|| {
+                    format!("failed to initialize remote embedding model `{model}`")
+                })?;
+                Ok(Self {
+                    backend: EmbedBackend::Remote(embedder),
+                    dims,
+                    batch_size,
+                })
+            }
+            ModelChoice::Local(LocalModel::Fastembed(model_type)) => {
+                let dims = TextEmbedding::get_model_info(model_type)?.dim;
+                let requested_provider = runtime.execution_provider;
+                let effective_provider = requested_provider.effective();
+                let opts = init_options_for_model(model_type.clone(), runtime)?;
+                let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
+                    ExecutionProviderChoice::Cuda => anyhow!(
+                        "failed to initialize CUDA execution provider: {err}. Ensure the binary was \
+                         built with `--features cuda` and the required CUDA 12/cuDNN libraries are \
+                         on the dynamic linker path (for example via LD_LIBRARY_PATH)"
+                    ),
+                    ExecutionProviderChoice::CoreML
+                        if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
+                    {
+                        anyhow!("failed to initialize CoreML execution provider: {err}")
+                    }
+                    _ => err,
+                })?;
+                Ok(Self {
+                    backend: EmbedBackend::Fastembed(model),
+                    dims,
+                    batch_size,
+                })
+            }
+            ModelChoice::Local(LocalModel::Potion) => {
+                let model =
+                    StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
+                let dims = model
+                    .encode(&[String::from("dimension_check")])
+                    .first()
+                    .map(|vec| vec.len())
+                    .ok_or_else(|| anyhow!("no embedding returned"))?;
+                Ok(Self {
+                    backend: EmbedBackend::Model2Vec(model),
+                    dims,
+                    batch_size,
+                })
+            }
         }
+    }
+
+    /// Build a query embedder for stored vectors of `stored` dimensions.
+    ///
+    /// Fails before any model load or request when `choice` cannot query in this
+    /// runtime or a configured remote size differs from `stored`. A remote model
+    /// sends no probe; each response must have `stored` dimensions.
+    pub fn for_stored_vectors(
+        choice: &ModelChoice,
+        runtime: &EmbedRuntimeConfig,
+        stored: usize,
+    ) -> Result<Self> {
+        choice.ensure_query_compatible(runtime)?;
+        let ModelChoice::Remote(model) = choice else {
+            let handle = Self::with_model_and_runtime(choice, runtime)?;
+            handle.ensure_dimensions(stored)?;
+            return Ok(handle);
+        };
+        if let Some(configured) = choice.known_dimensions(runtime) {
+            check_dimensions(configured, stored)?;
+        }
+        let batch_size = runtime.batch_size();
+        let mut embedder = remote_embedder(model, runtime, batch_size)?;
+        embedder.expect_dimensions(stored);
+        Ok(Self {
+            backend: EmbedBackend::Remote(embedder),
+            dims: stored,
+            batch_size,
+        })
+    }
+
+    /// Inputs per embedding call; callers also use it as their flush size.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Reject a query embedder whose vectors cannot be compared with `stored` dimensions.
+    pub fn ensure_dimensions(&self, stored: usize) -> Result<()> {
+        check_dimensions(self.dims, stored)
     }
 
     pub fn embed_texts(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -653,13 +853,44 @@ impl EmbedderHandle {
             return Ok(Vec::new());
         }
         match &mut self.backend {
-            EmbedBackend::Fastembed(model) => Ok(model.embed(texts, None)?),
+            EmbedBackend::Fastembed(model) => Ok(model.embed(texts, Some(self.batch_size))?),
             EmbedBackend::Model2Vec(model) => {
                 let input: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
-                Ok(model.encode_with_args(&input, Some(512), 64))
+                Ok(model.encode_with_args(&input, Some(512), self.batch_size))
             }
+            EmbedBackend::Remote(embedder) => embedder.embed(texts),
         }
     }
+}
+
+fn remote_embedder(
+    model: &str,
+    runtime: &EmbedRuntimeConfig,
+    batch_size: usize,
+) -> Result<RemoteEmbedder> {
+    let Some(remote) = runtime.remote.as_ref() else {
+        return Err(anyhow!(
+            "vectors use remote embedding model `{model}`, but no remote endpoint is \
+             configured; set embeddings = \"remote\" with embedding_base_url, or run \
+             `memex embed` to rebuild the vectors with the configured local model"
+        ));
+    };
+    RemoteEmbedder::new(
+        remote.endpoint.clone(),
+        model.to_string(),
+        remote.dimensions,
+        batch_size,
+    )
+}
+
+fn check_dimensions(produced: usize, stored: usize) -> Result<()> {
+    if produced == stored {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "the embedding model produces {produced} dimensions but the vector index stores \
+         {stored}; run `memex embed` to rebuild the vectors"
+    ))
 }
 
 #[cfg(test)]
@@ -676,7 +907,7 @@ mod tests {
             .transpose()
             .expect("parse MEMEX_MODEL")
             .unwrap_or_default();
-        EmbedderHandle::with_model(choice).expect("failed to init embedder")
+        EmbedderHandle::with_model(&choice).expect("failed to init embedder")
     }
 
     #[test]
@@ -795,11 +1026,240 @@ mod tests {
     #[test]
     fn test_parse_potion_model() {
         let choice = ModelChoice::parse("potion").expect("parse potion");
-        assert!(matches!(choice, ModelChoice::Potion));
+        assert_eq!(choice, ModelChoice::potion());
         let choice = ModelChoice::parse("potion-base-8m").expect("parse potion-base-8m");
-        assert!(matches!(choice, ModelChoice::Potion));
+        assert_eq!(choice, ModelChoice::potion());
         let choice = ModelChoice::parse("model2vec").expect("parse model2vec");
-        assert!(matches!(choice, ModelChoice::Potion));
+        assert_eq!(choice, ModelChoice::potion());
+    }
+
+    #[test]
+    fn legacy_identities_round_trip_byte_identical() {
+        for name in ["minilm", "bge", "nomic", "gemma", "potion"] {
+            let choice = ModelChoice::parse(name).expect("parse legacy name");
+            assert_eq!(choice.identity(), name);
+            assert_eq!(
+                ModelChoice::parse(&choice.identity()).expect("reparse identity"),
+                choice
+            );
+        }
+        assert_eq!(ModelChoice::default().identity(), "gemma");
+    }
+
+    #[test]
+    fn fastembed_names_equal_to_legacy_models_collapse_to_legacy_identity() {
+        let choice = ModelChoice::parse("AllMiniLML6V2").expect("parse fastembed name");
+        assert_eq!(choice, ModelChoice::minilm());
+        assert_eq!(choice.identity(), "minilm");
+        assert_eq!(
+            ModelChoice::parse("bgesmallenv15")
+                .expect("parse lowercase fastembed name")
+                .identity(),
+            "bge"
+        );
+    }
+
+    #[test]
+    fn fastembed_variant_names_parse_and_round_trip() {
+        let choice = ModelChoice::parse("bgelargeenv15").expect("parse fastembed name");
+        assert_eq!(
+            choice,
+            ModelChoice::Local(LocalModel::Fastembed(EmbeddingModel::BGELargeENV15))
+        );
+        assert_eq!(choice.identity(), "BGELargeENV15");
+        assert_eq!(
+            ModelChoice::parse(&choice.identity()).expect("reparse identity"),
+            choice
+        );
+        assert_eq!(
+            choice.known_dimensions(&EmbedRuntimeConfig::default()),
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn legacy_models_keep_their_native_dimensions() {
+        let runtime = EmbedRuntimeConfig::default();
+        assert_eq!(ModelChoice::minilm().known_dimensions(&runtime), Some(384));
+        assert_eq!(
+            ModelChoice::bge_small().known_dimensions(&runtime),
+            Some(384)
+        );
+        assert_eq!(ModelChoice::nomic().known_dimensions(&runtime), Some(768));
+        assert_eq!(ModelChoice::gemma().known_dimensions(&runtime), Some(768));
+        assert_eq!(ModelChoice::potion().known_dimensions(&runtime), None);
+    }
+
+    #[test]
+    fn remote_identity_round_trips_and_keeps_case() {
+        let choice = ModelChoice::parse("remote:Text-Embedding-3-Small").expect("parse remote");
+        assert_eq!(
+            choice,
+            ModelChoice::Remote("Text-Embedding-3-Small".to_string())
+        );
+        assert_eq!(choice.identity(), "remote:Text-Embedding-3-Small");
+        assert_eq!(
+            ModelChoice::parse(&choice.identity()).expect("reparse identity"),
+            choice
+        );
+        assert!(ModelChoice::parse("remote:").is_err());
+        assert!(ModelChoice::parse("remote: ").is_err());
+    }
+
+    #[test]
+    fn remote_model_names_reject_whitespace_and_control_characters() {
+        for name in [
+            "remote:a\nb",
+            "remote:a b",
+            "remote:a\tb",
+            "remote:a\u{7f}b",
+        ] {
+            let error = ModelChoice::parse(name)
+                .expect_err("reject remote model name")
+                .to_string();
+            assert!(
+                error.contains("whitespace or control characters"),
+                "{error}"
+            );
+        }
+        assert!(ModelChoice::remote("org/model-v1.5:latest").is_ok());
+    }
+
+    #[test]
+    fn query_embedder_for_remote_vectors_sends_no_probe() {
+        let runtime = EmbedRuntimeConfig {
+            remote: Some(RemoteEmbedConfig {
+                endpoint: unroutable_endpoint(),
+                dimensions: None,
+            }),
+            ..EmbedRuntimeConfig::default()
+        };
+        // A probe against this endpoint would fail construction.
+        let embedder = EmbedderHandle::for_stored_vectors(
+            &ModelChoice::Remote("m".to_string()),
+            &runtime,
+            1536,
+        )
+        .expect("build remote query embedder without a request");
+        assert_eq!(embedder.dims, 1536);
+
+        let runtime = EmbedRuntimeConfig {
+            remote: Some(RemoteEmbedConfig {
+                endpoint: unroutable_endpoint(),
+                dimensions: Some(512),
+            }),
+            ..EmbedRuntimeConfig::default()
+        };
+        let error = EmbedderHandle::for_stored_vectors(
+            &ModelChoice::Remote("m".to_string()),
+            &runtime,
+            1536,
+        )
+        .err()
+        .expect("reject configured size that differs from stored vectors")
+        .to_string();
+        assert!(error.contains("produces 512 dimensions"), "{error}");
+        assert!(error.contains("memex embed"), "{error}");
+    }
+
+    #[test]
+    fn remote_known_dimensions_come_from_runtime() {
+        let choice = ModelChoice::Remote("m".to_string());
+        assert_eq!(
+            choice.known_dimensions(&EmbedRuntimeConfig::default()),
+            None
+        );
+        let runtime = EmbedRuntimeConfig {
+            remote: Some(RemoteEmbedConfig {
+                endpoint: unroutable_endpoint(),
+                dimensions: Some(512),
+            }),
+            ..EmbedRuntimeConfig::default()
+        };
+        assert_eq!(choice.known_dimensions(&runtime), Some(512));
+    }
+
+    #[test]
+    fn rejects_unsupported_fastembed_models() {
+        let unsupported = TextEmbedding::list_supported_models()
+            .into_iter()
+            .map(|info| info.model)
+            .filter(|model| !is_supported_fastembed_model(model))
+            .collect::<Vec<_>>();
+        assert!(unsupported.contains(&EmbeddingModel::AllMiniLML6V2Q));
+        for model in unsupported {
+            let name = format!("{model:?}");
+            let error = ModelChoice::parse(&name)
+                .expect_err("reject unsupported model")
+                .to_string();
+            assert!(error.contains("is not supported"), "{error}");
+            assert!(!error.contains(&format!(" {name},")), "{error}");
+            assert!(!error.ends_with(&format!(" {name}")), "{error}");
+        }
+        assert_eq!(
+            ModelChoice::parse("BGESmallENV15Q").expect("parse supported variant"),
+            ModelChoice::Local(LocalModel::Fastembed(EmbeddingModel::BGESmallENV15Q))
+        );
+        assert!(ModelChoice::parse("EmbeddingGemma300MQ4").is_ok());
+    }
+
+    #[test]
+    fn unknown_model_error_lists_catalog() {
+        let error = ModelChoice::parse("no-such-model")
+            .expect_err("reject unknown model")
+            .to_string();
+        assert!(error.contains("no-such-model"));
+        assert!(error.contains("remote:<model>"));
+        assert!(error.contains("BGELargeENV15"));
+    }
+
+    #[test]
+    fn remote_model_without_endpoint_names_the_model() {
+        let error = EmbedderHandle::with_model_and_runtime(
+            &ModelChoice::Remote("text-embedding-3-small".to_string()),
+            &EmbedRuntimeConfig::default(),
+        )
+        .err()
+        .expect("reject remote model without endpoint")
+        .to_string();
+        assert!(error.contains("text-embedding-3-small"));
+        assert!(error.contains("embedding_base_url"));
+        assert!(error.contains("memex embed"));
+    }
+
+    #[test]
+    fn local_vectors_are_rejected_for_queries_in_remote_mode() {
+        let runtime = EmbedRuntimeConfig {
+            remote: Some(RemoteEmbedConfig {
+                endpoint: unroutable_endpoint(),
+                dimensions: None,
+            }),
+            ..EmbedRuntimeConfig::default()
+        };
+        let error = ModelChoice::gemma()
+            .ensure_query_compatible(&runtime)
+            .expect_err("reject local vectors in remote mode")
+            .to_string();
+        assert_eq!(
+            error,
+            "vectors use local model gemma but embeddings = \"remote\"; run `memex embed` to \
+             rebuild with the remote model"
+        );
+        ModelChoice::Remote("m".to_string())
+            .ensure_query_compatible(&runtime)
+            .expect("remote vectors in remote mode");
+        ModelChoice::gemma()
+            .ensure_query_compatible(&EmbedRuntimeConfig::default())
+            .expect("local vectors in local mode");
+    }
+
+    fn unroutable_endpoint() -> RemoteEndpoint {
+        RemoteEndpoint {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            api_key: None,
+            timeout: std::time::Duration::from_secs(1),
+            max_retries: 0,
+        }
     }
 
     #[test]
@@ -965,7 +1425,7 @@ mod tests {
             ("MEMEX_COMPUTE_UNITS", None),
         ]);
         let mut embedder =
-            EmbedderHandle::with_model(ModelChoice::Potion).expect("init potion embedder");
+            EmbedderHandle::with_model(&ModelChoice::potion()).expect("init potion embedder");
         let texts = vec!["potion model smoke test", "another short sentence"];
         let embeddings = embedder.embed_texts(&texts).expect("embed with potion");
         assert_eq!(embeddings.len(), 2);

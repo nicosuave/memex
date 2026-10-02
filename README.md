@@ -171,7 +171,10 @@ memex search "how we handled retries" --mode hybrid --format text
 
 See [search and reading](docs/search.md) for filters, output formats, pagination,
 reasoning inclusion, and memory retrieval; see [embeddings and configuration](docs/configuration.md)
-for models and CPU, CoreML, or CUDA execution.
+for models and CPU, CoreML, or CUDA execution. Embeddings can also come from an
+OpenAI-compatible API such as OpenAI or Ollama; see
+[remote embeddings](docs/configuration.md#remote-embeddings). Remote embeddings send
+transcript text and memory documents to that API.
 
 ## Agent integration
 

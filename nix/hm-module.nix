@@ -49,11 +49,23 @@ in {
         Configuration written to ~/.memex/config.toml.
 
         Supported keys:
-        - embeddings (bool)
+        - embeddings (bool or string): true or "local", "remote", false
         - auto_index_on_search (bool)
         - include_reasoning (bool): opt in to plaintext reasoning records
         - token_usage (bool): opt in to local token and cost tracking
-        - model (string): "minilm", "bge", "nomic", "gemma", "potion"
+        - model (string): local alias "minilm", "bge", "nomic", "gemma", "potion",
+          or a fastembed model name such as "BGELargeENV15"; with remote embeddings,
+          the model name sent to the API
+        - embedding_batch_size (int): texts per batch or request, 1 to 2048 (default 64)
+        - embedding_dimensions (int): remote only; requested output size
+        - embedding_base_url (string): remote only; OpenAI-compatible API base URL;
+          plain http to a non-loopback host is rejected when an API key is configured
+        - embedding_api_key_env (string): remote only; environment variable holding the API key;
+          preferred, set the variable on the daemon service
+        - embedding_api_key (string): remote only; literal API key; it ends up in the
+          world-readable Nix store, so use embedding_api_key_env instead
+        - embedding_timeout_secs (int): remote only; request timeout, 1 to 600 (default 60)
+        - embedding_max_retries (int): remote only; retry limit, 0 to 10 (default 3)
         - execution_provider (string): "auto", "cpu", "coreml", "cuda"
         - cuda_device_id (int): GPU index when using the CUDA execution provider
         - cuda_library_paths (list of strings): optional CUDA library directories

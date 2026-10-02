@@ -1,10 +1,15 @@
-use crate::embed::{EmbedRuntimeConfig, ExecutionProviderChoice, ModelChoice};
+use crate::embed::{
+    EmbedRuntimeConfig, ExecutionProviderChoice, LocalModel, ModelChoice, RemoteEmbedConfig,
+};
+use crate::remote_embed::{MAX_BATCH_SIZE, MAX_DIMENSIONS, RemoteEndpoint};
 use anyhow::{Result, anyhow};
 use directories::BaseDirs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -84,6 +89,98 @@ pub fn default_claude_source() -> PathBuf {
         .expect("default Claude sources are never empty")
 }
 
+const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
+const MAX_EMBEDDING_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_EMBEDDING_MAX_RETRIES: u32 = 3;
+const MAX_EMBEDDING_MAX_RETRIES: u32 = 10;
+/// Key variables consulted, in order, when neither `embedding_api_key` nor
+/// `embedding_api_key_env` is set.
+const DEFAULT_EMBEDDING_API_KEY_ENVS: [&str; 2] = ["MEMEX_EMBEDDING_API_KEY", "OPENAI_API_KEY"];
+
+/// Value of the `embeddings` key: `true`/`"local"`, `"remote"`, or `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmbeddingsMode {
+    #[default]
+    Off,
+    Local,
+    Remote,
+}
+
+impl EmbeddingsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EmbeddingsMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ModeVisitor;
+
+        impl serde::de::Visitor<'_> for ModeVisitor {
+            type Value = EmbeddingsMode;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("true, false, \"local\", or \"remote\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(if value {
+                    EmbeddingsMode::Local
+                } else {
+                    EmbeddingsMode::Off
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                match value {
+                    "local" => Ok(EmbeddingsMode::Local),
+                    "remote" => Ok(EmbeddingsMode::Remote),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ModeVisitor)
+    }
+}
+
+impl Serialize for EmbeddingsMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => serializer.serialize_bool(false),
+            Self::Local => serializer.serialize_bool(true),
+            Self::Remote => serializer.serialize_str("remote"),
+        }
+    }
+}
+
+/// A configured credential whose `Debug` output never contains the value.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 pub const DEFAULT_MAX_INDEXED_TOOL_INPUT_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_INDEXED_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 const MIN_INDEXED_TOOL_CONTENT_BYTES: usize = 1024;
@@ -105,14 +202,30 @@ impl Default for IndexedToolContentLimits {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UserConfig {
-    pub embeddings: Option<bool>,
+    /// Embedding mode: true or "local", "remote", or false (default).
+    pub embeddings: Option<EmbeddingsMode>,
     pub auto_index_on_search: Option<bool>,
     /// Index plaintext model reasoning. Encrypted/redacted reasoning is always excluded.
     pub include_reasoning: Option<bool>,
     /// Reconstruct token usage from local agent logs (disabled by default).
     pub token_usage: Option<bool>,
-    /// Embedding model: minilm, bge, nomic, gemma (default), potion
+    /// Embedding model. Local: minilm, bge, nomic, gemma (default), potion, or a
+    /// fastembed model name. Remote: the server's model name, passed verbatim.
     pub model: Option<String>,
+    /// Inputs per embedding call and per vector flush, 1..=2048 (default 64).
+    pub embedding_batch_size: Option<usize>,
+    /// Remote output size, 1..=65536, sent as the API `dimensions` parameter.
+    pub embedding_dimensions: Option<usize>,
+    /// Base URL of the OpenAI-compatible API; required for remote embeddings.
+    pub embedding_base_url: Option<String>,
+    /// Environment variable holding the remote API key.
+    pub embedding_api_key_env: Option<String>,
+    /// Literal remote API key; takes precedence over `embedding_api_key_env`.
+    pub embedding_api_key: Option<SecretString>,
+    /// Per-attempt remote request timeout in seconds, 1..=600 (default 60).
+    pub embedding_timeout_secs: Option<u64>,
+    /// Retries for transient remote failures, 0..=10 (default 3).
+    pub embedding_max_retries: Option<u32>,
     /// Execution provider: auto, cpu, coreml, cuda
     pub execution_provider: Option<String>,
     /// CUDA device index when execution_provider is "cuda"
@@ -293,8 +406,12 @@ impl UserConfig {
         Ok(config)
     }
 
+    pub fn embeddings_mode(&self) -> EmbeddingsMode {
+        self.embeddings.unwrap_or_default()
+    }
+
     pub fn embeddings_default(&self) -> bool {
-        self.embeddings.unwrap_or(false)
+        self.embeddings_mode() != EmbeddingsMode::Off
     }
 
     pub fn auto_index_on_search_default(&self) -> bool {
@@ -315,17 +432,37 @@ impl UserConfig {
         expand_exclude_patterns(self.exclude_paths.clone().unwrap_or_default())
     }
 
+    /// Resolve the model from the CLI flag, then config, then `MEMEX_MODEL`.
+    ///
+    /// In remote mode every source names a remote model (an optional `remote:` prefix is
+    /// accepted) and there is no default. With embeddings off, a name that is not a local
+    /// model resolves to a remote model when it is a valid remote name.
     pub fn resolve_model(&self, cli_model: Option<String>) -> Result<ModelChoice> {
-        if let Some(model) = cli_model {
-            return ModelChoice::parse(&model);
+        if self.embeddings_mode() == EmbeddingsMode::Remote {
+            let model = cli_model
+                .or_else(|| self.model.clone())
+                .or_else(|| std::env::var("MEMEX_MODEL").ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "embeddings = \"remote\" requires `model` to name the remote embedding model"
+                    )
+                })?;
+            return ModelChoice::remote(model.strip_prefix("remote:").unwrap_or(&model));
         }
-        if let Some(model) = self.model.as_deref() {
-            return ModelChoice::parse(model);
+        let Some(model) = cli_model
+            .or_else(|| self.model.clone())
+            .or_else(|| std::env::var("MEMEX_MODEL").ok())
+        else {
+            return Ok(ModelChoice::default());
+        };
+        match ModelChoice::parse(&model) {
+            // With embeddings off nothing is loaded, so a remote model name left in the
+            // config only identifies existing remote vectors.
+            Err(error) if self.embeddings_mode() == EmbeddingsMode::Off => {
+                ModelChoice::remote(&model).map_err(|_| error)
+            }
+            result => result,
         }
-        if let Ok(model) = std::env::var("MEMEX_MODEL") {
-            return ModelChoice::parse(&model);
-        }
-        Ok(ModelChoice::default())
     }
 
     pub fn resolve_execution_provider(&self) -> Result<ExecutionProviderChoice> {
@@ -386,14 +523,126 @@ impl UserConfig {
         std::env::var("MEMEX_COMPUTE_UNITS").ok()
     }
 
+    /// Validate the embedding settings and resolve the runtime for the configured mode.
+    ///
+    /// Remote mode ignores the ONNX Runtime keys; local mode ignores the remote keys
+    /// except `embedding_dimensions`, which is rejected because local models have a
+    /// fixed output size.
     pub fn resolve_embed_runtime(&self) -> Result<EmbedRuntimeConfig> {
+        let batch_size = self.resolve_embedding_batch_size()?;
+        if let Some(dimensions) = self.embedding_dimensions
+            && !(1..=MAX_DIMENSIONS).contains(&dimensions)
+        {
+            return Err(anyhow!(
+                "embedding_dimensions must be between 1 and {MAX_DIMENSIONS}, got {dimensions}"
+            ));
+        }
+        if self.embeddings_mode() == EmbeddingsMode::Remote {
+            self.resolve_model(None)?;
+            return Ok(EmbedRuntimeConfig {
+                batch_size,
+                remote: Some(self.resolve_remote_embed()?),
+                ..EmbedRuntimeConfig::default()
+            });
+        }
+        if self.embeddings_mode() == EmbeddingsMode::Local
+            && let Some(dimensions) = self.embedding_dimensions
+        {
+            return Err(local_dimensions_error(
+                &self.resolve_model(None)?,
+                dimensions,
+            ));
+        }
         Ok(EmbedRuntimeConfig {
             execution_provider: self.resolve_execution_provider()?,
             compute_units: self.resolve_compute_units(),
             cuda_device_id: self.resolve_cuda_device_id()?,
             cuda_library_paths: self.resolve_cuda_library_paths()?,
             cudnn_library_paths: self.resolve_cudnn_library_paths()?,
+            batch_size,
+            remote: None,
         })
+    }
+
+    fn resolve_embedding_batch_size(&self) -> Result<Option<usize>> {
+        match self.embedding_batch_size {
+            Some(size) if !(1..=MAX_BATCH_SIZE).contains(&size) => Err(anyhow!(
+                "embedding_batch_size must be between 1 and {MAX_BATCH_SIZE}, got {size}"
+            )),
+            size => Ok(size),
+        }
+    }
+
+    fn resolve_remote_embed(&self) -> Result<RemoteEmbedConfig> {
+        let base_url = self
+            .embedding_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "embeddings = \"remote\" requires embedding_base_url, for example \
+                     \"https://api.openai.com/v1\""
+                )
+            })?;
+        let scheme = base_url.split_once("://").map(|(scheme, _)| scheme);
+        if !scheme.is_some_and(|scheme| {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        }) {
+            return Err(anyhow!(
+                "embedding_base_url must start with http:// or https://"
+            ));
+        }
+        let timeout_secs = self
+            .embedding_timeout_secs
+            .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECS);
+        if !(1..=MAX_EMBEDDING_TIMEOUT_SECS).contains(&timeout_secs) {
+            return Err(anyhow!(
+                "embedding_timeout_secs must be between 1 and {MAX_EMBEDDING_TIMEOUT_SECS}, got \
+                 {timeout_secs}"
+            ));
+        }
+        let max_retries = self
+            .embedding_max_retries
+            .unwrap_or(DEFAULT_EMBEDDING_MAX_RETRIES);
+        if max_retries > MAX_EMBEDDING_MAX_RETRIES {
+            return Err(anyhow!(
+                "embedding_max_retries must be between 0 and {MAX_EMBEDDING_MAX_RETRIES}, got \
+                 {max_retries}"
+            ));
+        }
+        let endpoint = RemoteEndpoint {
+            base_url: base_url.to_string(),
+            api_key: self.resolve_embedding_api_key()?,
+            timeout: Duration::from_secs(timeout_secs),
+            max_retries,
+        };
+        endpoint.validate()?;
+        Ok(RemoteEmbedConfig {
+            endpoint,
+            dimensions: self.embedding_dimensions,
+        })
+    }
+
+    /// Resolve the remote API key: the literal `embedding_api_key`, else the variable
+    /// named by `embedding_api_key_env` (and only that one), else
+    /// `MEMEX_EMBEDDING_API_KEY`, then `OPENAI_API_KEY`, for every base URL. Empty values
+    /// count as unset.
+    pub fn resolve_embedding_api_key(&self) -> Result<Option<String>> {
+        if let Some(key) = &self.embedding_api_key
+            && !key.expose().is_empty()
+        {
+            return Ok(Some(key.expose().to_string()));
+        }
+        if let Some(var) = self.embedding_api_key_env.as_deref() {
+            return api_key_from_env(var);
+        }
+        for var in DEFAULT_EMBEDDING_API_KEY_ENVS {
+            if let Some(key) = api_key_from_env(var)? {
+                return Ok(Some(key));
+            }
+        }
+        Ok(None)
     }
 
     pub fn apply_embed_runtime_env(&self) -> Result<()> {
@@ -475,6 +724,29 @@ pub fn expand_exclude_patterns(patterns: Vec<String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn api_key_from_env(var: &str) -> Result<Option<String>> {
+    match std::env::var(var) {
+        Ok(key) if key.is_empty() => Ok(None),
+        Ok(key) => Ok(Some(key)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow!("{var} is not valid unicode")),
+    }
+}
+
+fn local_dimensions_error(model: &ModelChoice, dimensions: usize) -> anyhow::Error {
+    let size = match model {
+        ModelChoice::Local(LocalModel::Fastembed(_)) => model
+            .known_dimensions(&EmbedRuntimeConfig::default())
+            .map(|native| format!("always produces {native} dimensions")),
+        _ => None,
+    }
+    .unwrap_or_else(|| "has a fixed output size".to_string());
+    anyhow!(
+        "embedding_dimensions = {dimensions} applies only to remote embeddings; local model {} {size}",
+        model.identity()
+    )
 }
 
 fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -> Result<usize> {
@@ -889,5 +1161,416 @@ mod tests {
                 PathBuf::from("/env/cudnn/extras")
             ]
         );
+    }
+
+    #[test]
+    fn embeddings_accepts_bool_or_mode_name() {
+        for (value, mode) in [
+            ("true", EmbeddingsMode::Local),
+            ("false", EmbeddingsMode::Off),
+            ("\"local\"", EmbeddingsMode::Local),
+            ("\"remote\"", EmbeddingsMode::Remote),
+        ] {
+            let config: UserConfig =
+                toml::from_str(&format!("embeddings = {value}")).expect("parse embeddings");
+            assert_eq!(config.embeddings_mode(), mode, "{value}");
+            assert_eq!(config.embeddings_default(), mode != EmbeddingsMode::Off);
+        }
+        assert_eq!(UserConfig::default().embeddings_mode(), EmbeddingsMode::Off);
+        assert!(toml::from_str::<UserConfig>(r#"embeddings = "cloud""#).is_err());
+        assert!(toml::from_str::<UserConfig>("embeddings = 1").is_err());
+    }
+
+    fn remote_config() -> UserConfig {
+        toml::from_str(
+            r#"
+                embeddings = "remote"
+                model = "text-embedding-3-small"
+                embedding_base_url = "https://api.example.test/v1"
+                embedding_api_key = "sk-literal"
+                embedding_dimensions = 512
+                embedding_batch_size = 16
+                execution_provider = "not-a-provider"
+            "#,
+        )
+        .expect("parse remote config")
+    }
+
+    #[test]
+    fn remote_mode_resolves_endpoint_and_ignores_runtime_keys() {
+        let config = remote_config();
+        assert_eq!(
+            config.resolve_model(None).expect("resolve remote model"),
+            ModelChoice::Remote("text-embedding-3-small".to_string())
+        );
+        let runtime = config
+            .resolve_embed_runtime()
+            .expect("resolve remote runtime");
+        assert_eq!(runtime.batch_size, Some(16));
+        assert_eq!(runtime.execution_provider, ExecutionProviderChoice::Auto);
+        let remote = runtime.remote.expect("remote endpoint");
+        assert_eq!(remote.dimensions, Some(512));
+        assert_eq!(remote.endpoint.base_url, "https://api.example.test/v1");
+        assert_eq!(remote.endpoint.api_key.as_deref(), Some("sk-literal"));
+        assert_eq!(remote.endpoint.timeout, Duration::from_secs(60));
+        assert_eq!(remote.endpoint.max_retries, 3);
+        assert_eq!(
+            config
+                .resolve_model(Some("remote:other".to_string()))
+                .expect("resolve prefixed remote model"),
+            ModelChoice::Remote("other".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_mode_requires_model_and_http_base_url() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_MODEL", None)]);
+        let config = UserConfig {
+            model: None,
+            ..remote_config()
+        };
+        assert!(
+            config
+                .resolve_embed_runtime()
+                .expect_err("reject remote mode without model")
+                .to_string()
+                .contains("requires `model`")
+        );
+        let config = UserConfig {
+            embedding_base_url: None,
+            ..remote_config()
+        };
+        assert!(
+            config
+                .resolve_embed_runtime()
+                .expect_err("reject remote mode without base url")
+                .to_string()
+                .contains("embedding_base_url")
+        );
+        let config = UserConfig {
+            embedding_base_url: Some("ftp://api.example.test".to_string()),
+            ..remote_config()
+        };
+        assert!(
+            config
+                .resolve_embed_runtime()
+                .expect_err("reject non-http base url")
+                .to_string()
+                .contains("http://")
+        );
+        let config = UserConfig {
+            model: Some(String::new()),
+            ..remote_config()
+        };
+        assert!(config.resolve_embed_runtime().is_err());
+    }
+
+    #[test]
+    fn embedding_batch_size_and_dimensions_are_validated() {
+        for size in [0, MAX_BATCH_SIZE + 1] {
+            let config = UserConfig {
+                embedding_batch_size: Some(size),
+                ..UserConfig::default()
+            };
+            assert!(
+                config
+                    .resolve_embed_runtime()
+                    .expect_err("reject batch size")
+                    .to_string()
+                    .contains("embedding_batch_size")
+            );
+        }
+        let config = UserConfig {
+            embedding_batch_size: Some(MAX_BATCH_SIZE),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            config
+                .resolve_embed_runtime()
+                .expect("max batch")
+                .batch_size(),
+            MAX_BATCH_SIZE
+        );
+        assert_eq!(
+            UserConfig::default()
+                .resolve_embed_runtime()
+                .expect("default runtime")
+                .batch_size(),
+            crate::embed::DEFAULT_EMBED_BATCH_SIZE
+        );
+        for dimensions in [0, MAX_DIMENSIONS + 1] {
+            let config = UserConfig {
+                embedding_dimensions: Some(dimensions),
+                ..remote_config()
+            };
+            assert!(
+                config
+                    .resolve_embed_runtime()
+                    .expect_err("reject dimensions")
+                    .to_string()
+                    .contains("embedding_dimensions")
+            );
+        }
+    }
+
+    #[test]
+    fn remote_timeout_and_retries_are_bounded() {
+        for timeout in [0, 601] {
+            let config = UserConfig {
+                embedding_timeout_secs: Some(timeout),
+                ..remote_config()
+            };
+            let error = config
+                .resolve_embed_runtime()
+                .expect_err("reject timeout")
+                .to_string();
+            assert!(
+                error.contains("embedding_timeout_secs must be between 1 and 600"),
+                "{error}"
+            );
+        }
+        let config = UserConfig {
+            embedding_max_retries: Some(11),
+            ..remote_config()
+        };
+        let error = config
+            .resolve_embed_runtime()
+            .expect_err("reject retries")
+            .to_string();
+        assert!(
+            error.contains("embedding_max_retries must be between 0 and 10"),
+            "{error}"
+        );
+        let config = UserConfig {
+            embedding_timeout_secs: Some(600),
+            embedding_max_retries: Some(0),
+            ..remote_config()
+        };
+        let endpoint = config
+            .resolve_embed_runtime()
+            .expect("accept bounds")
+            .remote
+            .expect("remote endpoint")
+            .endpoint;
+        assert_eq!(endpoint.timeout, Duration::from_secs(600));
+        assert_eq!(endpoint.max_retries, 0);
+        let config = UserConfig {
+            embedding_timeout_secs: Some(1),
+            embedding_max_retries: Some(10),
+            ..remote_config()
+        };
+        assert!(config.resolve_embed_runtime().is_ok());
+    }
+
+    #[test]
+    fn unknown_model_name_is_remote_only_while_embeddings_are_off() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_MODEL", None)]);
+        let off: UserConfig = toml::from_str(
+            r#"
+                embeddings = false
+                model = "nomic-embed-text"
+            "#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            off.resolve_model(None)
+                .expect("resolve with embeddings off"),
+            ModelChoice::Remote("nomic-embed-text".to_string())
+        );
+        assert_eq!(
+            off.resolve_model(Some("bge".to_string()))
+                .expect("local alias"),
+            ModelChoice::bge_small()
+        );
+        assert!(off.resolve_model(Some("a b".to_string())).is_err());
+        let unset = UserConfig {
+            embeddings: None,
+            ..off.clone()
+        };
+        assert!(unset.resolve_model(None).is_ok());
+        {
+            let _env = EnvVarGuard::set(&[("MEMEX_MODEL", Some("nomic-embed-text"))]);
+            assert_eq!(
+                UserConfig::default()
+                    .resolve_model(None)
+                    .expect("resolve env model"),
+                ModelChoice::Remote("nomic-embed-text".to_string())
+            );
+        }
+
+        let local = UserConfig {
+            embeddings: Some(EmbeddingsMode::Local),
+            ..off
+        };
+        let error = local
+            .resolve_model(None)
+            .expect_err("reject unknown local model")
+            .to_string();
+        assert!(
+            error.starts_with("unknown model 'nomic-embed-text', options: minilm"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn remote_model_name_rejects_whitespace_and_control_characters() {
+        for model in ["a b", "remote:a\nb", "a\tb"] {
+            let config = UserConfig {
+                model: Some(model.to_string()),
+                ..remote_config()
+            };
+            assert!(config.resolve_model(None).is_err(), "{model:?}");
+        }
+    }
+
+    #[test]
+    fn embedding_dimensions_in_local_mode_names_native_size() {
+        let config: UserConfig = toml::from_str(
+            r#"
+                embeddings = true
+                model = "bge"
+                embedding_dimensions = 256
+            "#,
+        )
+        .expect("parse local config");
+        let error = config
+            .resolve_embed_runtime()
+            .expect_err("reject local dimensions")
+            .to_string();
+        assert!(
+            error.contains("applies only to remote embeddings"),
+            "{error}"
+        );
+        assert!(
+            error.contains("local model bge always produces 384 dimensions"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn local_mode_ignores_remote_only_keys() {
+        let _guard = env_lock();
+        let config: UserConfig = toml::from_str(
+            r#"
+                embeddings = "local"
+                model = "minilm"
+                embedding_base_url = "not a url"
+                embedding_timeout_secs = 0
+            "#,
+        )
+        .expect("parse local config");
+        let runtime = config
+            .resolve_embed_runtime()
+            .expect("resolve local runtime");
+        assert_eq!(runtime.remote, None);
+        assert_eq!(
+            config.resolve_model(None).expect("resolve local model"),
+            ModelChoice::minilm()
+        );
+    }
+
+    #[test]
+    fn embedding_api_key_lookup_precedence() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[
+            ("MEMEX_EMBEDDING_API_KEY", Some("memex-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            ("MEMEX_TEST_CUSTOM_KEY", Some("custom-key")),
+            ("MEMEX_TEST_MISSING_KEY", None),
+        ]);
+        let literal = UserConfig {
+            embedding_api_key: Some(SecretString("literal-key".to_string())),
+            embedding_api_key_env: Some("MEMEX_TEST_CUSTOM_KEY".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            literal
+                .resolve_embedding_api_key()
+                .expect("literal key")
+                .as_deref(),
+            Some("literal-key")
+        );
+        let named = UserConfig {
+            embedding_api_key_env: Some("MEMEX_TEST_CUSTOM_KEY".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            named
+                .resolve_embedding_api_key()
+                .expect("named key")
+                .as_deref(),
+            Some("custom-key")
+        );
+        let missing = UserConfig {
+            embedding_api_key_env: Some("MEMEX_TEST_MISSING_KEY".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            missing
+                .resolve_embedding_api_key()
+                .expect("missing named key"),
+            None
+        );
+        assert_eq!(
+            UserConfig::default()
+                .resolve_embedding_api_key()
+                .expect("memex key")
+                .as_deref(),
+            Some("memex-key")
+        );
+        let hosts = [
+            Some("https://api.openai.com/v1"),
+            Some("https://embeddings.example.test/v1"),
+            Some("http://127.0.0.1:8080/v1"),
+            None,
+        ]
+        .map(|base_url| UserConfig {
+            embedding_base_url: base_url.map(str::to_string),
+            ..UserConfig::default()
+        });
+        for config in &hosts {
+            assert_eq!(
+                config
+                    .resolve_embedding_api_key()
+                    .expect("memex key wins")
+                    .as_deref(),
+                Some("memex-key"),
+                "{:?}",
+                config.embedding_base_url
+            );
+        }
+        let _env = EnvVarGuard::set(&[("MEMEX_EMBEDDING_API_KEY", None)]);
+        for config in &hosts {
+            assert_eq!(
+                config
+                    .resolve_embedding_api_key()
+                    .expect("openai key")
+                    .as_deref(),
+                Some("openai-key"),
+                "{:?}",
+                config.embedding_base_url
+            );
+        }
+        let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", Some(""))]);
+        for config in &hosts {
+            assert_eq!(
+                config.resolve_embedding_api_key().expect("no key"),
+                None,
+                "{:?}",
+                config.embedding_base_url
+            );
+        }
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_api_key() {
+        let config = remote_config();
+        assert!(!format!("{config:?}").contains("sk-literal"));
+        let runtime = config
+            .resolve_embed_runtime()
+            .expect("resolve remote runtime");
+        assert!(!format!("{runtime:?}").contains("sk-literal"));
     }
 }

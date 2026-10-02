@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     }
     {
         let start = Instant::now();
-        let mut embedder = EmbedderHandle::with_model(ModelChoice::MiniLM)?;
+        let mut embedder = EmbedderHandle::with_model(&ModelChoice::minilm())?;
         println!("  Model init: {}ms", start.elapsed().as_millis());
 
         // Warmup
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
         }
 
         let start = Instant::now();
-        let mut embedder = match EmbedderHandle::with_model(ModelChoice::MiniLM) {
+        let mut embedder = match EmbedderHandle::with_model(&ModelChoice::minilm()) {
             Ok(e) => e,
             Err(e) => {
                 println!("  Failed to init: {e}");
@@ -90,7 +90,7 @@ fn main() -> Result<()> {
         }
 
         let start = Instant::now();
-        let mut embedder = match EmbedderHandle::with_model(ModelChoice::MiniLM) {
+        let mut embedder = match EmbedderHandle::with_model(&ModelChoice::minilm()) {
             Ok(e) => e,
             Err(e) => {
                 println!("  Failed to init: {e}");
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     }
     {
         let start = Instant::now();
-        let mut embedder = EmbedderHandle::with_model(ModelChoice::Gemma)?;
+        let mut embedder = EmbedderHandle::with_model(&ModelChoice::gemma())?;
         println!("  Model init: {}ms", start.elapsed().as_millis());
 
         let _ = embedder.embed_texts(&["warmup"])?;

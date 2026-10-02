@@ -347,7 +347,11 @@ fn search_memory_with_cache(
             None => config.resolve_model(None)?,
         };
         let runtime = config.resolve_embed_runtime()?;
-        embedder = Some(EmbedderHandle::with_model_and_runtime(model, &runtime)?);
+        embedder = Some(EmbedderHandle::for_stored_vectors(
+            &model,
+            &runtime,
+            loaded.dimensions(),
+        )?);
         vector = Some(loaded);
     }
 
@@ -641,13 +645,20 @@ pub fn read_memory(paths: &Paths, request: &MemoryReadRequest) -> Result<MemoryR
 ///
 /// The snapshot fingerprint is part of the vector directory name, so a search can never silently
 /// combine vectors from an older document version with the current snapshot.
+///
+/// `measured_dimensions` is the vector length the model currently produces, when the caller
+/// has confirmed it with the embedder. Without it the model's static size applies; when that
+/// is unknown too, a complete published index of the same identity is kept without loading
+/// the model, and otherwise the first embedded vector sets the length every cached vector
+/// must match.
 pub fn embed_memory(
     paths: &Paths,
-    model: ModelChoice,
+    model: &ModelChoice,
     runtime: &EmbedRuntimeConfig,
+    measured_dimensions: Option<usize>,
 ) -> Result<usize> {
     let mut embedder = None;
-    embed_memory_with(paths, model, |texts| {
+    embed_memory_with(paths, model, runtime, measured_dimensions, |texts| {
         if embedder.is_none() {
             embedder = Some(EmbedderHandle::with_model_and_runtime(model, runtime)?);
         }
@@ -660,7 +671,9 @@ pub fn embed_memory(
 
 fn embed_memory_with(
     paths: &Paths,
-    model: ModelChoice,
+    model: &ModelChoice,
+    runtime: &EmbedRuntimeConfig,
+    measured_dimensions: Option<usize>,
     mut embed: impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
 ) -> Result<usize> {
     let snapshot = MemoryStore::new(memory_snapshot_path(paths)).load()?;
@@ -682,16 +695,30 @@ fn embed_memory_with(
             PRIMARY KEY (model, content_sha256)
         ) WITHOUT ROWID",
     )?;
-    seed_memory_embedding_cache(&mut cache, paths, model, &snapshot, &candidates)?;
+    let identity = model.identity();
+    // Cached rows are keyed by identity alone, so a changed remote size must not
+    // reuse vectors of the old length.
+    let mut dimensions = measured_dimensions.or_else(|| model.known_dimensions(runtime));
+    seed_memory_embedding_cache(
+        &mut cache,
+        paths,
+        &identity,
+        dimensions,
+        &snapshot,
+        &candidates,
+    )?;
     if let Ok(existing) = VectorIndex::open(&vector_path)
-        && existing.model() == Some(model.as_str())
+        && existing.model() == Some(identity.as_ref())
+        && dimensions.is_none_or(|dimensions| existing.dimensions() == dimensions)
         && validate_vector_inventory(&existing, &candidates).is_ok()
     {
         return Ok(0);
     }
+    // Whether `dimensions` is known or came from a new vector rather than from cached rows.
+    let mut size_confirmed = dimensions.is_some();
     let mut vector = None;
     let mut embedded = 0;
-    for batch in candidates.chunks(64) {
+    for batch in candidates.chunks(runtime.batch_size()) {
         let texts = batch
             .iter()
             .map(|candidate| {
@@ -709,38 +736,63 @@ fn embed_memory_with(
                 .map(|key| -> Result<Option<Vec<f32>>> {
                     let bytes: Option<Vec<u8>> = cache.query_row(
                     "SELECT embedding FROM embeddings WHERE model = ?1 AND content_sha256 = ?2",
-                    params![model.as_str(), key],
+                    params![identity, key],
                     |row| row.get(0),
                 ).optional()?;
                     Ok(bytes
-                        .map(|bytes| serde_json::from_slice(&bytes))
-                        .transpose()?)
+                        .map(|bytes| serde_json::from_slice::<Vec<f32>>(&bytes))
+                        .transpose()?
+                        .filter(|embedding| {
+                            dimensions.is_none_or(|dimensions| embedding.len() == dimensions)
+                        }))
                 })
                 .collect::<Result<Vec<_>>>()?;
-        let missing = embeddings
+        let mut missing = embeddings
             .iter()
             .enumerate()
             .filter_map(|(index, embedding)| embedding.is_none().then_some(index))
             .collect::<Vec<_>>();
-        let new_embeddings = if missing.is_empty() {
-            Vec::new()
-        } else {
-            embed(
-                &missing
-                    .iter()
-                    .map(|&index| texts[index])
-                    .collect::<Vec<_>>(),
-            )?
-        };
-        if new_embeddings.len() != missing.len() {
-            bail!(
-                "memory embedder returned {} vectors for {} sections",
-                new_embeddings.len(),
-                missing.len()
-            );
+        let new_embeddings = embed_sections(&mut embed, &texts, &missing, None)?;
+        if let Some(produced) = new_embeddings.first().map(Vec::len)
+            && let Some(expected) = dimensions
+            && produced != expected
+        {
+            if size_confirmed {
+                bail!(
+                    "memory embedder returned vectors of {produced} dimensions, expected \
+                     {expected}; run `memex embed` to rebuild the vectors"
+                );
+            }
+            // The size taken from cached rows is stale; rebuild at the size the model returns.
+            drop(vector);
+            drop(cache);
+            return embed_memory_with(paths, model, runtime, Some(produced), embed);
         }
+        size_confirmed |= !new_embeddings.is_empty();
+        // An unknown size is set by the first embedded vector, else the first cached one.
+        let reference = dimensions
+            .or_else(|| new_embeddings.first().map(Vec::len))
+            .or_else(|| embeddings.iter().flatten().next().map(Vec::len));
         for (&index, embedding) in missing.iter().zip(new_embeddings) {
             embeddings[index] = Some(embedding);
+        }
+        if let Some(reference) = reference {
+            let stale = embeddings
+                .iter()
+                .enumerate()
+                .filter(|(_, embedding)| {
+                    embedding
+                        .as_ref()
+                        .is_some_and(|embedding| embedding.len() != reference)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let replaced = embed_sections(&mut embed, &texts, &stale, Some(reference))?;
+            for (&index, embedding) in stale.iter().zip(replaced) {
+                embeddings[index] = Some(embedding);
+            }
+            missing.extend(stale);
+            dimensions = Some(reference);
         }
         for (candidate, embedding) in batch.iter().zip(&embeddings) {
             let embedding = embedding.as_ref().expect("cached or embedded");
@@ -750,8 +802,8 @@ fn embed_memory_with(
             if vector.is_none() {
                 vector = Some(VectorIndex::empty_replacement(
                     &vector_path,
-                    model.known_dimensions().unwrap_or(embedding.len()),
-                    Some(model.as_str()),
+                    dimensions.unwrap_or(embedding.len()),
+                    Some(&identity),
                 )?);
             }
             vector
@@ -762,8 +814,8 @@ fn embed_memory_with(
         let transaction = cache.transaction()?;
         for &index in &missing {
             transaction.execute(
-                "INSERT OR IGNORE INTO embeddings (model, content_sha256, embedding) VALUES (?1, ?2, ?3)",
-                params![model.as_str(), keys[index], serde_json::to_vec(embeddings[index].as_ref().expect("embedded"))?],
+                "INSERT OR REPLACE INTO embeddings (model, content_sha256, embedding) VALUES (?1, ?2, ?3)",
+                params![identity, keys[index], serde_json::to_vec(embeddings[index].as_ref().expect("embedded"))?],
             )?;
         }
         transaction.commit()?;
@@ -773,17 +825,61 @@ fn embed_memory_with(
     Ok(embedded)
 }
 
+/// Embed the sections at `indices` of `texts`, requiring `dimensions` when known and one
+/// common length otherwise.
+fn embed_sections(
+    embed: &mut impl FnMut(&[&str]) -> Result<Vec<Vec<f32>>>,
+    texts: &[&str],
+    indices: &[usize],
+    dimensions: Option<usize>,
+) -> Result<Vec<Vec<f32>>> {
+    if indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inputs = indices
+        .iter()
+        .map(|&index| {
+            texts
+                .get(index)
+                .copied()
+                .ok_or_else(|| anyhow!("memory section {index} is out of range"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let embeddings = embed(&inputs)?;
+    if embeddings.len() != indices.len() {
+        bail!(
+            "memory embedder returned {} vectors for {} sections",
+            embeddings.len(),
+            indices.len()
+        );
+    }
+    let expected = dimensions.or_else(|| embeddings.first().map(Vec::len));
+    if let Some(embedding) = embeddings
+        .iter()
+        .find(|embedding| Some(embedding.len()) != expected)
+    {
+        bail!(
+            "memory embedder returned a vector of {} dimensions, expected {}; run `memex embed` \
+             to rebuild the vectors",
+            embedding.len(),
+            expected.unwrap_or_default()
+        );
+    }
+    Ok(embeddings)
+}
+
 /// Bootstrap older installations from saved vectors without running the model again.
 fn seed_memory_embedding_cache(
     cache: &mut Connection,
     paths: &Paths,
-    model: ModelChoice,
+    model: &str,
+    dimensions: Option<usize>,
     snapshot: &MemorySnapshot,
     candidates: &[SectionCandidate],
 ) -> Result<()> {
     let populated: bool = cache.query_row(
         "SELECT EXISTS(SELECT 1 FROM embeddings WHERE model = ?1)",
-        [model.as_str()],
+        [model],
         |row| row.get(0),
     )?;
     if populated {
@@ -804,7 +900,9 @@ fn seed_memory_embedding_cache(
         let Ok(vector) = VectorIndex::open(&entry.path()) else {
             continue;
         };
-        if vector.model() != Some(model.as_str()) {
+        if vector.model() != Some(model)
+            || dimensions.is_some_and(|dimensions| vector.dimensions() != dimensions)
+        {
             continue;
         }
         let mut missing = Vec::new();
@@ -814,7 +912,7 @@ fn seed_memory_embedding_cache(
                     &snapshot.documents[candidate.document].sections[candidate.section].content;
                 transaction.execute(
                     "INSERT OR IGNORE INTO embeddings (model, content_sha256, embedding) VALUES (?1, ?2, ?3)",
-                    params![model.as_str(), format!("{:x}", Sha256::digest(text.as_bytes())), serde_json::to_vec(&embedding)?],
+                    params![model, format!("{:x}", Sha256::digest(text.as_bytes())), serde_json::to_vec(&embedding)?],
                 )?;
             } else {
                 missing.push(candidate);
@@ -2045,6 +2143,222 @@ mod tests {
     }
 
     #[test]
+    fn memory_cache_rows_of_another_length_are_reembedded() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let model = ModelChoice::Remote("embed-small".to_string());
+        let runtime = EmbedRuntimeConfig::default();
+        let doc = document(
+            temp.path().join("one.md"),
+            "one",
+            "alpha",
+            100,
+            &[("first", "first text"), ("second", "second text")],
+        );
+        write_snapshot(&paths, vec![doc]);
+        let width = std::cell::Cell::new(512);
+        let mut seen = Vec::new();
+        let mut encode = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            seen.extend(texts.iter().map(|text| text.to_string()));
+            Ok(vec![vec![0.5; width.get()]; texts.len()])
+        };
+        assert_eq!(
+            embed_memory_with(&paths, &model, &runtime, None, &mut encode).unwrap(),
+            2
+        );
+
+        // With an unknown size, the first new vector sets the length cached rows must match.
+        width.set(1536);
+        let doc = document(
+            temp.path().join("one.md"),
+            "one",
+            "alpha",
+            100,
+            &[
+                ("first", "first text"),
+                ("second", "second text"),
+                ("third", "third text"),
+            ],
+        );
+        write_snapshot(&paths, vec![doc]);
+        assert_eq!(
+            embed_memory_with(&paths, &model, &runtime, None, &mut encode).unwrap(),
+            3
+        );
+        assert_eq!(
+            seen,
+            [
+                "first text",
+                "second text",
+                "third text",
+                "first text",
+                "second text"
+            ]
+        );
+        let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
+            .load()
+            .unwrap();
+        let vector_path = memory_vector_path(&paths, &snapshot_fingerprint(&snapshot));
+        assert_eq!(VectorIndex::open(&vector_path).unwrap().dimensions(), 1536);
+
+        // Replaced rows are reused at the new length.
+        fs::remove_dir_all(&vector_path).unwrap();
+        assert_eq!(
+            embed_memory_with(&paths, &model, &runtime, Some(1536), |_| panic!(
+                "reuse replaced rows"
+            ))
+            .unwrap(),
+            0
+        );
+
+        // A measured size rejects both the published index and cached rows of another length.
+        let mut calls = 0;
+        assert_eq!(
+            embed_memory_with(&paths, &model, &runtime, Some(768), |texts| {
+                calls += 1;
+                Ok(vec![vec![0.5; 768]; texts.len()])
+            })
+            .unwrap(),
+            3
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(VectorIndex::open(&vector_path).unwrap().dimensions(), 768);
+    }
+
+    #[test]
+    fn stale_cached_size_is_replaced_when_a_later_batch_embeds() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        let model = ModelChoice::Remote("embed-small".to_string());
+        let runtime = EmbedRuntimeConfig {
+            batch_size: Some(2),
+            ..EmbedRuntimeConfig::default()
+        };
+        let width = std::cell::Cell::new(512);
+        let mut seen = Vec::new();
+        let mut encode = |texts: &[&str]| -> Result<Vec<Vec<f32>>> {
+            seen.push(texts.join(","));
+            Ok(vec![vec![0.5; width.get()]; texts.len()])
+        };
+        write_snapshot(
+            &paths,
+            vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "alpha",
+                100,
+                &[("first", "first text"), ("second", "second text")],
+            )],
+        );
+        assert_eq!(
+            embed_memory_with(&paths, &model, &runtime, None, &mut encode).unwrap(),
+            2
+        );
+
+        // The first batch is all cached at the old size; the second batch reveals the new one.
+        width.set(1536);
+        write_snapshot(
+            &paths,
+            vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "alpha",
+                100,
+                &[
+                    ("first", "first text"),
+                    ("second", "second text"),
+                    ("third", "third text"),
+                    ("fourth", "fourth text"),
+                ],
+            )],
+        );
+        assert_eq!(
+            embed_memory_with(&paths, &model, &runtime, None, &mut encode).unwrap(),
+            4
+        );
+        assert_eq!(
+            seen,
+            [
+                "first text,second text",
+                "third text,fourth text",
+                "first text,second text",
+                "third text,fourth text"
+            ]
+        );
+        let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
+            .load()
+            .unwrap();
+        let vector = VectorIndex::open(&memory_vector_path(
+            &paths,
+            &snapshot_fingerprint(&snapshot),
+        ))
+        .unwrap();
+        assert_eq!(vector.dimensions(), 1536);
+        validate_vector_inventory(&vector, &all_searchable_sections(&snapshot).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn blank_semantic_memory_query_is_rejected_before_any_embedder() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        write_snapshot(
+            &paths,
+            vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "alpha",
+                100,
+                &[("first", "first text")],
+            )],
+        );
+        // No memory vectors exist, so reaching the embedder would fail differently.
+        for mode in [MemorySearchMode::Semantic, MemorySearchMode::Hybrid] {
+            let error = search_memory(
+                &paths,
+                &MemorySearchOptions {
+                    query: " \t\n".to_string(),
+                    additional_queries: vec!["  ".to_string()],
+                    mode,
+                    ..MemorySearchOptions::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(
+                error,
+                "at least one non-empty memory search query is required"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_size_mismatch_names_the_rebuild_command() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
+        write_snapshot(
+            &paths,
+            vec![document(
+                temp.path().join("one.md"),
+                "one",
+                "alpha",
+                100,
+                &[("first", "first text")],
+            )],
+        );
+        let error = embed_memory_with(
+            &paths,
+            &ModelChoice::Remote("embed-small".to_string()),
+            &EmbedRuntimeConfig::default(),
+            Some(1536),
+            |texts| Ok(vec![vec![0.5; 512]; texts.len()]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("expected 1536"), "{error}");
+        assert!(error.contains("memex embed"), "{error}");
+    }
+
+    #[test]
     fn memory_embeddings_reuse_text_across_snapshot_changes() {
         let temp = TempDir::new().unwrap();
         let paths = Paths::new(Some(temp.path().join("store"))).unwrap();
@@ -2070,7 +2384,14 @@ mod tests {
                 .collect())
         };
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::BGESmall, &mut encode).unwrap(),
+            embed_memory_with(
+                &paths,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                &mut encode
+            )
+            .unwrap(),
             2
         );
         let old_snapshot = MemoryStore::new(memory_snapshot_path(&paths))
@@ -2083,7 +2404,14 @@ mod tests {
         doc.sections[1].content = "new text".into();
         write_snapshot(&paths, vec![doc.clone()]);
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::BGESmall, &mut encode).unwrap(),
+            embed_memory_with(
+                &paths,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                &mut encode
+            )
+            .unwrap(),
             1
         );
         assert_eq!(seen, ["unchanged text", "old text", "new text"]);
@@ -2112,7 +2440,14 @@ mod tests {
         doc.sections.push(duplicate);
         write_snapshot(&paths, vec![doc]);
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::BGESmall, |_| panic!("cached text")).unwrap(),
+            embed_memory_with(
+                &paths,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                |_| panic!("cached text")
+            )
+            .unwrap(),
             0
         );
         let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
@@ -2132,16 +2467,28 @@ mod tests {
         // Reconstructing the published index also uses the persisted cache.
         fs::remove_dir_all(&vector_path).unwrap();
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::BGESmall, |_| panic!("persisted cache"))
-                .unwrap(),
+            embed_memory_with(
+                &paths,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                |_| panic!("persisted cache")
+            )
+            .unwrap(),
             0
         );
         let mut inputs = 0;
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::MiniLM, |texts| {
-                inputs += texts.len();
-                Ok(vec![query.clone(); texts.len()])
-            })
+            embed_memory_with(
+                &paths,
+                &ModelChoice::minilm(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                |texts| {
+                    inputs += texts.len();
+                    Ok(vec![query.clone(); texts.len()])
+                }
+            )
             .unwrap(),
             2
         );
@@ -2162,13 +2509,19 @@ mod tests {
         let doc = document(temp.path().join("one.md"), "one", "alpha", 100, &sections);
         write_snapshot(&paths, vec![doc]);
         let mut calls = 0;
-        let result = embed_memory_with(&paths, ModelChoice::BGESmall, |texts| {
-            calls += 1;
-            if calls == 2 {
-                bail!("interrupted");
-            }
-            Ok(vec![vec![1.0; 384]; texts.len()])
-        });
+        let result = embed_memory_with(
+            &paths,
+            &ModelChoice::bge_small(),
+            &EmbedRuntimeConfig::default(),
+            None,
+            |texts| {
+                calls += 1;
+                if calls == 2 {
+                    bail!("interrupted");
+                }
+                Ok(vec![vec![1.0; 384]; texts.len()])
+            },
+        );
         assert!(result.unwrap_err().to_string().contains("interrupted"));
         let snapshot = MemoryStore::new(memory_snapshot_path(&paths))
             .load()
@@ -2179,10 +2532,16 @@ mod tests {
             "partial snapshots must not be published"
         );
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::BGESmall, |texts| {
-                assert_eq!(texts, ["text-64"]);
-                Ok(vec![vec![1.0; 384]])
-            })
+            embed_memory_with(
+                &paths,
+                &ModelChoice::bge_small(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                |texts| {
+                    assert_eq!(texts, ["text-64"]);
+                    Ok(vec![vec![1.0; 384]])
+                }
+            )
             .unwrap(),
             1
         );
@@ -2215,16 +2574,26 @@ mod tests {
         vector.save().unwrap();
 
         assert_eq!(
-            embed_memory(&paths, ModelChoice::Potion, &EmbedRuntimeConfig::default()).unwrap(),
+            embed_memory(
+                &paths,
+                &ModelChoice::potion(),
+                &EmbedRuntimeConfig::default(),
+                None
+            )
+            .unwrap(),
             0
         );
         let mut updated = doc;
         updated.version_sha256 = "metadata-only change".into();
         write_snapshot(&paths, vec![updated]);
         assert_eq!(
-            embed_memory_with(&paths, ModelChoice::Potion, |_| panic!(
-                "reuse legacy vector"
-            ))
+            embed_memory_with(
+                &paths,
+                &ModelChoice::potion(),
+                &EmbedRuntimeConfig::default(),
+                None,
+                |_| panic!("reuse legacy vector")
+            )
             .unwrap(),
             0
         );

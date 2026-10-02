@@ -68,6 +68,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 hashbrown = "0.17.1"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "native-tls"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # sha2 0.10 gates ARM64's runtime-detected SHA instructions behind this feature.

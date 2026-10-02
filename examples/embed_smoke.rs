@@ -8,7 +8,7 @@ fn main() -> Result<()> {
         .map(|s| ModelChoice::parse(&s))
         .transpose()?
         .unwrap_or_default();
-    let mut embedder = EmbedderHandle::with_model(choice)?;
+    let mut embedder = EmbedderHandle::with_model(&choice)?;
     let embeddings = embedder.embed_texts(&input)?;
     if embeddings.is_empty() {
         anyhow::bail!("no embeddings returned");

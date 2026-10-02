@@ -211,7 +211,7 @@ struct IndexArgs {
     /// Skip embedding generation (overrides config default)
     #[arg(long, help_heading = "Embeddings")]
     no_embeddings: bool,
-    /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+    /// Embedding model: minilm, bge, nomic, gemma (default), potion, a fastembed model name, or remote:<model>
     #[arg(long, help_heading = "Embeddings")]
     model: Option<String>,
     /// Path to memex data directory [default: ~/.memex]
@@ -297,7 +297,7 @@ EXAMPLES:
     /// Generate embeddings for semantic search (requires existing index)
     #[command(hide = true)]
     Embed {
-        /// Embedding model: minilm (fast), bge, nomic, gemma (default, best quality), potion (tiny)
+        /// Embedding model: minilm, bge, nomic, gemma (default), potion, a fastembed model name, or remote:<model>
         #[arg(long)]
         model: Option<String>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2106,6 +2106,7 @@ fn service_embedding_worker(
         vector_work.verify = true;
         vector_work.memory_revision = None;
         vector_work.retry_after = None;
+        vector_work.consecutive_failures = 0;
     }
 
     let search_index = SearchIndex::open_or_create(&paths.index)?;
@@ -2131,7 +2132,7 @@ fn service_embedding_worker(
         let should_spawn = if vector_work.pending {
             true
         } else if vector_work.verify {
-            crate::vector_backfill::needs_work(paths, &search_index, spec.model)?
+            crate::vector_backfill::needs_work(paths, &search_index, &spec.model, &spec.runtime)?
         } else {
             false
         };
@@ -2155,15 +2156,34 @@ struct VectorWorkState {
     verify: bool,
     external_embedding_seen: bool,
     retry_after: Option<Instant>,
+    consecutive_failures: u32,
+}
+
+/// Delay before respawning after the first failed embedding worker.
+const EMBED_WORKER_RETRY_BASE: Duration = Duration::from_secs(5);
+/// Longest delay between respawns of a repeatedly failing embedding worker.
+const EMBED_WORKER_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Respawn delay after `failures` consecutive failed runs: the base delay doubled per
+/// earlier failure, capped at [`EMBED_WORKER_RETRY_MAX`].
+fn embed_worker_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(31);
+    EMBED_WORKER_RETRY_BASE
+        .saturating_mul(1 << doublings)
+        .min(EMBED_WORKER_RETRY_MAX)
 }
 
 impl VectorWorkState {
     fn worker_finished(&mut self, success: bool) {
         self.verify = true;
-        if !success {
+        if success {
+            self.consecutive_failures = 0;
+        } else {
             // Conversation publication can finish before memory embedding fails.
             self.pending = true;
-            self.retry_after = Some(Instant::now() + Duration::from_secs(5));
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            self.retry_after =
+                Some(Instant::now() + embed_worker_retry_delay(self.consecutive_failures));
         }
     }
 
@@ -2282,16 +2302,16 @@ fn retry_after_stopping_embedder<P: ChildProcess, T>(
 fn spawn_embedding_process(index: &IndexArgs, spec: &EmbedWorkerSpec) -> Result<SystemChild> {
     Ok(SystemChild(
         Command::new(std::env::current_exe()?)
-            .args(build_embed_command_args(index, spec.model))
+            .args(build_embed_command_args(index, &spec.model))
             .spawn()?,
     ))
 }
 
-fn build_embed_command_args(index: &IndexArgs, model: ModelChoice) -> Vec<String> {
+fn build_embed_command_args(index: &IndexArgs, model: &ModelChoice) -> Vec<String> {
     let mut args = vec![
         "embed".to_string(),
         "--model".to_string(),
-        model.as_str().to_string(),
+        model.identity().into_owned(),
     ];
     if let Some(root) = &index.root {
         args.push("--root".to_string());
@@ -2955,11 +2975,16 @@ fn run_embed(model: Option<String>, root: Option<PathBuf>) -> Result<()> {
     let report = crate::vector_backfill::run_with_lease(
         &paths,
         &index,
-        model_choice,
+        &model_choice,
         &embed_runtime,
         &lease,
     )?;
-    let memory_embedded = embed_memory(&paths, model_choice, &embed_runtime)?;
+    let memory_embedded = embed_memory(
+        &paths,
+        &model_choice,
+        &embed_runtime,
+        Some(report.dimensions),
+    )?;
     println!("embedded {memory_embedded} memory section vectors");
     println!(
         "embedded {} vectors ({} total, {} resumed from checkpoints)",
@@ -8469,7 +8494,6 @@ fn parse_version_parts(value: &str) -> Option<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
-    use crate::vector::VectorIndex;
     use tempfile::TempDir;
 
     #[test]
@@ -8484,6 +8508,32 @@ mod tests {
         assert!(completed.verify);
         assert!(!completed.pending);
         assert!(completed.retry_after.is_none());
+    }
+
+    #[test]
+    fn embed_worker_retry_delay_doubles_to_a_cap() {
+        let delays = (1..=8)
+            .map(|failures| embed_worker_retry_delay(failures).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [5, 10, 20, 40, 80, 160, 300, 300]);
+        assert_eq!(embed_worker_retry_delay(0), Duration::from_secs(5));
+        assert_eq!(embed_worker_retry_delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn successful_worker_resets_retry_backoff() {
+        let mut state = VectorWorkState::default();
+        for _ in 0..3 {
+            state.worker_finished(false);
+        }
+        assert_eq!(state.consecutive_failures, 3);
+        let deadline = state.retry_after.expect("retry deadline");
+        assert!(deadline > Instant::now() + Duration::from_secs(15));
+        state.worker_finished(true);
+        assert_eq!(state.consecutive_failures, 0);
+        state.worker_finished(false);
+        let deadline = state.retry_after.expect("retry deadline");
+        assert!(deadline <= Instant::now() + Duration::from_secs(5));
     }
 
     #[test]

@@ -23,7 +23,10 @@ struct StatsReport {
     scan_cache_ttl_seconds: u64,
     scan_cache: ScanCacheStats,
     embeddings: bool,
+    embeddings_mode: &'static str,
     model: String,
+    embedding_dimensions: Option<usize>,
+    embedding_batch_size: usize,
     execution_provider: String,
     compute_units: Option<String>,
     sources: Vec<String>,
@@ -96,7 +99,10 @@ fn build_report(paths: &Paths) -> Result<StatsReport> {
         scan_cache_ttl_seconds,
         scan_cache: read_scan_cache_stats(paths, scan_cache_ttl_seconds)?,
         embeddings: config.embeddings_default(),
-        model: config.resolve_model(None)?.as_str().to_string(),
+        embeddings_mode: config.embeddings_mode().as_str(),
+        model: config.resolve_model(None)?.identity().into_owned(),
+        embedding_dimensions: runtime.remote.as_ref().and_then(|remote| remote.dimensions),
+        embedding_batch_size: runtime.batch_size(),
         execution_provider: runtime.execution_provider.as_str().to_string(),
         compute_units: runtime.compute_units,
         // IndexSource owns the providers with local transcript discovery; usage-only
@@ -146,10 +152,17 @@ fn print_report(report: &StatsReport, out: &mut impl Write) -> Result<()> {
     writeln!(out, "  scanned-bytes: {}", report.scan_cache.total_bytes)?;
     writeln!(out, "\nembeddings:")?;
     writeln!(out, "  enabled: {}", enabled_label(report.embeddings))?;
+    writeln!(out, "  mode: {}", report.embeddings_mode)?;
     writeln!(out, "  model: {}", report.model)?;
-    writeln!(out, "  execution-provider: {}", report.execution_provider)?;
-    if let Some(compute_units) = &report.compute_units {
-        writeln!(out, "  compute-units: {compute_units}")?;
+    if let Some(dimensions) = report.embedding_dimensions {
+        writeln!(out, "  dimensions: {dimensions}")?;
+    }
+    writeln!(out, "  batch-size: {}", report.embedding_batch_size)?;
+    if report.embeddings_mode != "remote" {
+        writeln!(out, "  execution-provider: {}", report.execution_provider)?;
+        if let Some(compute_units) = &report.compute_units {
+            writeln!(out, "  compute-units: {compute_units}")?;
+        }
     }
     writeln!(out, "\nsources:")?;
     for source in &report.sources {

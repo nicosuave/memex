@@ -88,7 +88,7 @@ fn torn_jsonl_checkpoint_survives_completion_truncation_and_append() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![root];
     let ingest = || ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
     let saved_state = || {
@@ -160,7 +160,7 @@ fn exclusion_filters_new_and_previously_indexed_transcripts() {
     let index = open_search_index(&paths);
 
     // First run with no exclusions indexes both transcripts.
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![claude_root.clone()];
     let lease = ingest_lease(&paths);
     let report = ingest_all(&paths, &index, &options, &lease).expect("first ingest");
@@ -220,7 +220,7 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     .unwrap();
     let paths = Paths::new(Some(tmp.path().join("data"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![claude];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -280,7 +280,7 @@ fn ingest_discovers_claude_transcripts_across_multiple_roots() {
     let paths = Paths::new(Some(tmp.path().join("memex-root"))).expect("paths");
     paths.ensure_dirs().expect("ensure dirs");
     let index = open_search_index(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![first_root, second_root];
 
     let lease = ingest_lease(&paths);
@@ -491,7 +491,7 @@ fn assert_recovers_vector_crash(publish_interrupted_vectors: bool, embedding_pub
 
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
     paths.ensure_dirs().expect("ensure dirs");
-    let mut options = ingest_options(true, ModelChoice::Potion);
+    let mut options = ingest_options(true, ModelChoice::potion());
     options.claude_sources = vec![claude_root];
     {
         let index =
@@ -671,7 +671,7 @@ fn vector_only_pending_ingest_is_completed_when_embeddings_are_disabled() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let options = ingest_options(false, ModelChoice::Potion);
+    let options = ingest_options(false, ModelChoice::potion());
     ingest_all(&paths, &index, &options, &lease).expect("finish vector recovery");
 
     let vectors = VectorIndex::inventory(&paths.vectors)
@@ -729,7 +729,7 @@ fn vector_recovery_runs_when_pending_session_scopes_are_present() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let options = ingest_options(false, ModelChoice::Potion);
+    let options = ingest_options(false, ModelChoice::potion());
     ingest_all(&paths, &index, &options, &lease).expect("finish vector recovery");
 
     let vectors = VectorIndex::inventory(&paths.vectors)
@@ -1027,7 +1027,7 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
             vector_dir: paths.vectors.clone(),
             analytics_path: analytics_path(&paths.state),
             progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
-            model: ModelChoice::Gemma,
+            model: ModelChoice::gemma(),
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
             reconcile_vector_ids: false,
@@ -1053,7 +1053,7 @@ fn replacing_transcript_removes_its_old_vectors() {
     append_claude_message(&transcript, "original");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -1090,7 +1090,7 @@ fn enabling_embeddings_backfills_an_unchanged_lexical_index() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -1113,7 +1113,7 @@ fn progress_only_append_does_not_skip_missing_embeddings() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -1144,7 +1144,7 @@ fn parser_cancellation_preserves_active_vectors() {
 
     let index = open_search_index(&paths);
     let (tx_record, rx_record) = unbounded();
-    for offset in 0..EMBED_BATCH_SIZE {
+    for offset in 0..crate::embed::DEFAULT_EMBED_BATCH_SIZE {
         tx_record
             .send(record(100 + offset as u64, "user", "staged replacement"))
             .expect("send staged embedding record");
@@ -1165,7 +1165,7 @@ fn parser_cancellation_preserves_active_vectors() {
         vector_dir: paths.vectors.clone(),
         analytics_path: analytics_path(&paths.state),
         progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
-        model: ModelChoice::Potion,
+        model: ModelChoice::potion(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         reconcile_vector_ids: false,
@@ -1357,7 +1357,7 @@ fn no_publish_refresh_retains_deferred_scopes_and_updates_cache_atomically() {
     }
     .save_with_lease(&pending_ingest_path(&paths), &lease)
     .unwrap();
-    let options = ingest_options(false, ModelChoice::Gemma);
+    let options = ingest_options(false, ModelChoice::gemma());
     let index = open_search_index(&paths);
     let report = ingest_all(&paths, &index, &options, &lease).unwrap();
     assert_eq!(report.records_added, 0);
@@ -1491,7 +1491,7 @@ fn opencode_v2_discovery_persists_session_cursors() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = open_search_index(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
     let state_path = paths.state.join("ingest.json");
     let mut state = CheckpointSession::open(&state_path, &lease, true, None).unwrap();
@@ -1671,7 +1671,7 @@ fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
         .add(legacy_record.doc_id, &[1.0, 0.0, 0.0, 0.0])
         .expect("seed legacy vector");
     vectors.save().expect("save legacy vector");
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
 
     IngestState {
@@ -1943,7 +1943,7 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
     paths.ensure_dirs().expect("ensure paths");
     let index = open_search_index(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
 
     let first = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
@@ -2090,7 +2090,7 @@ fn opencode_shared_history_revert_and_session_deletion_remove_indexed_records() 
         let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
         paths.ensure_dirs().expect("ensure paths");
         let index = open_search_index(&paths);
-        let mut options = ingest_options(false, ModelChoice::Gemma);
+        let mut options = ingest_options(false, ModelChoice::gemma());
         options.include_opencode = true;
         ingest_all(&paths, &index, &options, &ingest_lease(&paths)).expect("initial ingest");
         assert_eq!(index.records_by_session_id("ses_shared").unwrap().len(), 3);
@@ -2827,10 +2827,10 @@ fn parser_version_migration_rebuilds_vectors_with_the_existing_model() {
     let mut task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
     task.change = FileChange::ParserChanged;
 
-    let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+    let migration = vector_migration(&paths.vectors, &[task], &ModelChoice::gemma());
 
     assert!(migration.rebuild);
-    assert_eq!(migration.model, ModelChoice::BGESmall);
+    assert_eq!(migration.model, ModelChoice::bge_small());
 }
 
 #[test]
@@ -2842,10 +2842,10 @@ fn ordinary_file_replacement_does_not_rebuild_the_vector_store() {
     fs::write(&transcript, "{}\n").expect("transcript");
     let task = incremental_task(&transcript, SourceKind::Claude, 0, 0, HashMap::new());
 
-    let migration = vector_migration(&paths.vectors, &[task], ModelChoice::Gemma);
+    let migration = vector_migration(&paths.vectors, &[task], &ModelChoice::gemma());
 
     assert!(!migration.rebuild);
-    assert_eq!(migration.model, ModelChoice::Gemma);
+    assert_eq!(migration.model, ModelChoice::gemma());
 }
 
 #[test]
@@ -2855,7 +2855,7 @@ fn parser_rebuild_keeps_published_vectors_until_replacement_is_saved() {
     save_vector_store(&paths, "bge", 384);
 
     let replacement =
-        open_vector_index_for_ingest(&paths.vectors, 384, ModelChoice::BGESmall, true)
+        open_vector_index_for_ingest(&paths.vectors, 384, &ModelChoice::bge_small(), true)
             .expect("start replacement");
 
     assert!(replacement.is_empty());
@@ -3050,7 +3050,7 @@ fn can_skip_noop_index_when_embeddings_are_disabled() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
 
     assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3060,7 +3060,7 @@ fn can_skip_fresh_scan_when_embeddings_are_disabled() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
 
@@ -3074,7 +3074,7 @@ fn can_skip_fresh_scan_with_compatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "bge", 384);
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
 
@@ -3087,7 +3087,7 @@ fn cannot_skip_fresh_scan_when_vectors_are_missing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
 
     cache.save(&paths.state.join("scan_cache.json")).unwrap();
@@ -3099,7 +3099,7 @@ fn cannot_skip_fresh_scan_with_pending_ingest() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
     mark_analytics_complete(&paths);
     PendingIngest {
@@ -3127,7 +3127,7 @@ fn freshness_uses_sqlite_pending_and_cache_without_sidecars() {
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -3214,7 +3214,7 @@ fn freshness_reads_legacy_and_sql_v1_sidecars_without_upgrade() {
         let marker = fs::read(&state_path).unwrap();
         let index = save_search_records(&paths, &[record(1, "user", "original")]);
         mark_analytics_complete(&paths);
-        let options = ingest_options(false, ModelChoice::Gemma);
+        let options = ingest_options(false, ModelChoice::gemma());
         fresh_scan_cache()
             .save(&paths.state.join("scan_cache.json"))
             .unwrap();
@@ -3247,7 +3247,7 @@ fn database_discovery_error_never_allows_fresh_scan_skip() {
     let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(bad_root.as_os_str()))]);
     let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let mut options = options;
     options.include_opencode = true;
     mark_analytics_complete(&paths);
@@ -3266,7 +3266,7 @@ fn cannot_skip_fresh_scan_with_incompatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "minilm", 384);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
     let cache = fresh_scan_cache();
 
     cache.save(&paths.state.join("scan_cache.json")).unwrap();
@@ -3278,7 +3278,7 @@ fn cannot_skip_fresh_scan_when_cache_is_stale() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(false, ModelChoice::BGESmall);
+    let options = ingest_options(false, ModelChoice::bge_small());
     let cache = ScanCache {
         last_scan_ts: 0,
         file_count: 0,
@@ -3316,7 +3316,7 @@ fn can_skip_noop_index_with_compatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "bge", 384);
     let index = save_search_records(&paths, &[record(1, "user", "hello")]);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3333,7 +3333,7 @@ fn cannot_skip_noop_index_with_partial_compatible_vectors() {
             record(2, "assistant", "missing vector"),
         ],
     );
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3351,7 +3351,7 @@ fn can_skip_noop_index_ignores_records_that_do_not_need_embeddings() {
             record(3, "assistant", ""),
         ],
     );
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3361,7 +3361,7 @@ fn cannot_skip_noop_index_when_vectors_are_missing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3372,7 +3372,7 @@ fn cannot_skip_noop_index_with_incompatible_vectors() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "minilm", 384);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
@@ -3383,20 +3383,162 @@ fn cannot_skip_noop_index_with_wrong_vector_dimensions() {
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "bge", 768);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::BGESmall);
+    let options = ingest_options(true, ModelChoice::bge_small());
 
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
 }
 
 #[test]
-fn cannot_skip_noop_index_when_model_dimensions_are_dynamic() {
+fn can_skip_noop_index_when_unknown_dimensions_match_stored_identity() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
     save_vector_store(&paths, "potion", 256);
     let index = open_search_index(&paths);
-    let options = ingest_options(true, ModelChoice::Potion);
 
+    assert!(
+        can_skip_noop_index(&paths, &index, &ingest_options(true, ModelChoice::potion())).unwrap()
+    );
+    assert!(
+        !can_skip_noop_index(&paths, &index, &ingest_options(true, ModelChoice::minilm())).unwrap()
+    );
+}
+
+fn unroutable_remote_runtime(dimensions: Option<usize>) -> EmbedRuntimeConfig {
+    EmbedRuntimeConfig {
+        remote: Some(crate::embed::RemoteEmbedConfig {
+            endpoint: crate::remote_embed::RemoteEndpoint {
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                api_key: None,
+                timeout: Duration::from_millis(100),
+                max_retries: 0,
+            },
+            dimensions,
+        }),
+        ..EmbedRuntimeConfig::default()
+    }
+}
+
+#[test]
+fn remote_noop_index_trusts_stored_identity_without_contacting_server() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+    save_vector_store(&paths, "remote:text-embedding-3-small", 1536);
+    let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+    let mut options = ingest_options(
+        true,
+        ModelChoice::Remote("text-embedding-3-small".to_string()),
+    );
+    options.embed_runtime = unroutable_remote_runtime(None);
+    assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
+
+    options.embed_runtime = unroutable_remote_runtime(Some(1536));
+    assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
+
+    options.embed_runtime = unroutable_remote_runtime(Some(512));
     assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+
+    options.embed_runtime = unroutable_remote_runtime(None);
+    options.model = ModelChoice::Remote("text-embedding-3-large".to_string());
+    assert!(!can_skip_noop_index(&paths, &index, &options).unwrap());
+}
+
+#[test]
+fn records_with_a_blank_embedded_prefix_are_not_counted_as_missing_vectors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::new(Some(tmp.path().to_path_buf())).expect("paths");
+    save_vector_store(&paths, "bge", 384);
+    let blank_prefix = format!("{}tail", " ".repeat(EMBED_MAX_CHARS));
+    let blank = record(2, "user", &blank_prefix);
+    assert!(!record_needs_embedding(&blank));
+    let index = save_search_records(&paths, &[record(1, "user", "hello"), blank]);
+
+    let options = ingest_options(true, ModelChoice::bge_small());
+    assert!(can_skip_noop_index(&paths, &index, &options).unwrap());
+}
+
+#[test]
+fn parser_migration_without_remote_endpoint_keeps_remote_vectors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude_root = tmp.path().join("claude-projects");
+    let project = claude_root.join("project");
+    fs::create_dir_all(&project).expect("create project dir");
+    let transcript = project.join("session.jsonl");
+    fs::write(
+        &transcript,
+        br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"uuid":"u1","timestamp":"2024-01-01T00:00:00Z"}
+"#,
+    )
+    .expect("write transcript");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = open_search_index(&paths);
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![claude_root];
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("first ingest")
+            .records_added,
+        1
+    );
+
+    let state_path = paths.state.join("ingest.json");
+    let mut state = IngestState::load(&state_path).expect("load state");
+    state
+        .files
+        .get_mut(&transcript.to_string_lossy().into_owned())
+        .expect("transcript state")
+        .parser_version = crate::sources::index_state_version(SourceKind::Claude) - 1;
+    state
+        .save_with_lease(&state_path, &lease)
+        .expect("save state");
+    let live_doc_ids = || {
+        let mut ids = Vec::new();
+        open_search_index(&paths)
+            .for_each_record(|record| {
+                ids.push(record.doc_id);
+                Ok(())
+            })
+            .expect("collect doc ids");
+        ids
+    };
+    let parsed_ids = live_doc_ids();
+    assert_eq!(parsed_ids.len(), 1);
+    // Vectors for the transcript's records plus one unrelated record that must survive.
+    let unrelated = 1_000_000;
+    let mut vectors =
+        VectorIndex::open_or_create(&paths.vectors, 8, Some("remote:text-embedding-3-small"))
+            .expect("open vector store");
+    for &doc_id in parsed_ids.iter().chain([&unrelated]) {
+        vectors.add(doc_id, &[0.5; 8]).expect("add vector");
+    }
+    vectors.save().expect("save vectors");
+    drop(vectors);
+
+    let report = ingest_all(&paths, &index, &options, &lease).expect("reparse without endpoint");
+    assert_eq!(report.records_added, 1);
+    assert_eq!(report.records_embedded, 0);
+    let reparsed_ids = live_doc_ids();
+    assert_eq!(reparsed_ids.len(), 1);
+    assert!(reparsed_ids.iter().all(|id| !parsed_ids.contains(id)));
+    let vectors = VectorIndex::open(&paths.vectors).expect("open vectors");
+    assert_eq!(vectors.model(), Some("remote:text-embedding-3-small"));
+    assert_eq!(vectors.dimensions(), 8);
+    // Neither the old nor the new doc IDs of the re-parsed transcript have a vector.
+    let hits = vectors.search(&[0.5; 8], 10).expect("search vectors");
+    assert_eq!(
+        hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [unrelated]
+    );
+    drop(vectors);
+
+    // The parser state is current again, so the next run neither re-parses nor warns.
+    let report = ingest_all(&paths, &index, &options, &lease).expect("steady ingest");
+    assert_eq!(report.records_added, 0);
+    assert_eq!(
+        PendingIngest::load(&pending_ingest_path(&paths)).expect("pending marker"),
+        None
+    );
 }
 #[test]
 fn collect_pi_files_recurses_under_sessions_root() {
@@ -4422,7 +4564,7 @@ fn targeted_ingest_only_updates_selected_files_until_reconciliation() {
     append_claude_message(&second, "second original");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -4506,7 +4648,7 @@ fn targeted_ingest_creates_and_replaces_files_without_unrelated_discovery() {
     append_claude_message(&first, "existing");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source.clone()];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -4552,7 +4694,7 @@ fn targeted_ingest_escalates_pending_publication_to_full_recovery() {
     append_claude_message(&second, "second original");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -4643,7 +4785,7 @@ fn targeted_ingest_preserves_unselected_database_ownership_and_wal_updates() {
     let first_writer = create(&first, "first");
     let second_writer = create(&second, "second");
     let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(source.as_os_str()))]);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_opencode = true;
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -4723,7 +4865,7 @@ fn targeted_ingest_codex_history_uses_known_rollouts_without_discovery() {
     )
     .unwrap();
     let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_codex = true;
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -4759,7 +4901,7 @@ fn full_reconciliation_removes_confirmed_missing_transcript_everywhere() {
     append_claude_message(&surviving, "keep this transcript");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
@@ -4863,7 +5005,7 @@ fn full_reconciliation_keeps_history_when_a_transcript_parent_is_unavailable() {
     append_claude_message(&transcript, "must survive unavailable parent");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![root];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -4893,7 +5035,7 @@ fn background_marker_completed_after_partial_ingest_reclassifies_session() {
     append_claude_message(&transcript, &"initial text ".repeat(500));
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -4949,7 +5091,7 @@ fn incremental_claude_background_marker_reclassifies_prior_records() {
     append_claude_message(&transcript, "before background marker");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -5012,7 +5154,7 @@ fn claude_parser_defers_background_marker_appended_after_task_boundary() {
     append_claude_message(&transcript, "initial record");
     let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let lease = ingest_lease(&paths);
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
@@ -5141,7 +5283,7 @@ fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
             .unwrap();
     };
     put("original");
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_antigravity = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -5196,7 +5338,7 @@ fn antigravity_cli_transcript_ingests_through_full_scan_and_dirty_selection() {
         r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-15T23:44:54Z","content":"<USER_REQUEST>\nfind the leak\n</USER_REQUEST>"}"#,
         r#"{"step_index":1,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-15T23:44:56Z","content":"patched it"}"#,
     ]);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.include_antigravity = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -5256,7 +5398,7 @@ fn antigravity_projection_changes_retire_all_published_state() {
         let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
         paths.ensure_dirs().unwrap();
         let lease = ingest_lease(&paths);
-        let mut options = ingest_options(false, ModelChoice::Gemma);
+        let mut options = ingest_options(false, ModelChoice::gemma());
         options.include_antigravity = true;
         let refresh = |hint: &Path| {
             let index = open_search_index(&paths);
@@ -5727,7 +5869,7 @@ fn cleanup_only_vector_recovery_reconciles_orphans_without_deletion_targets() {
 
     // A cleanup-only recovery must be able to use the existing vector
     // store even when the configured embedding model is unavailable.
-    let options = ingest_options(false, ModelChoice::Gemma);
+    let options = ingest_options(false, ModelChoice::gemma());
     ingest_all(
         &paths,
         &open_search_index(&paths),
@@ -5970,7 +6112,7 @@ fn full_single_source_reads_and_writes_only_discovered_checkpoint() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     ingest_all(&paths, &index, &options, &lease).unwrap();
     let state_path = paths.state.join("ingest.json");
@@ -6076,7 +6218,7 @@ fn checkpoint_failure_after_publication_keeps_pending_recoverable() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     ingest_all(&paths, &index, &options, &lease).unwrap();
     let state_path = paths.state.join("ingest.json");
@@ -6137,7 +6279,7 @@ fn early_intent_failure_cancels_publication_without_flushing_recovery_changes() 
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![source];
     let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
     ingest_all(&paths, &index, &options, &lease).unwrap();
@@ -6293,7 +6435,7 @@ fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename()
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
-    let mut options = ingest_options(false, ModelChoice::Gemma);
+    let mut options = ingest_options(false, ModelChoice::gemma());
     options.claude_sources = vec![root.clone()];
     let settle = || std::thread::sleep(Duration::from_millis(150));
     let refresh = || {
@@ -6360,7 +6502,7 @@ fn full_scan_preserves_the_cursor_captured_before_fallback() {
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
     let index = open_search_index(&paths);
-    let options = ingest_options(false, ModelChoice::Gemma);
+    let options = ingest_options(false, ModelChoice::gemma());
     let mut recovered = recover_checkpoint(&paths, &index, &lease, None).unwrap();
     let cursor = journal::JournalCursorUpdate {
         fingerprint: "captured-before-fallback".into(),
@@ -6446,7 +6588,7 @@ fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
     writer
         .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
         .unwrap();
-    let mut options = ingest_options(true, ModelChoice::Potion);
+    let mut options = ingest_options(true, ModelChoice::potion());
     options.include_zcode = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -6465,7 +6607,7 @@ fn zcode_refresh_preserves_other_session_ids_and_embeddings() {
     };
     let child_id = child_records()[0].doc_id;
     let mut embedder = crate::embed::EmbedderHandle::with_model_and_runtime(
-        ModelChoice::Potion,
+        &ModelChoice::potion(),
         &options.embed_runtime,
     )
     .unwrap();
@@ -6716,7 +6858,7 @@ fn zcode_migrates_database_checkpoint_and_honors_session_exclusions() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.include_zcode = true;
     let run = |options: &IngestOptions| {
         let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
@@ -6758,7 +6900,7 @@ fn kilocode_refresh_preserves_other_session_ids_and_embeddings() {
     writer
         .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
         .unwrap();
-    let mut options = ingest_options(true, ModelChoice::Potion);
+    let mut options = ingest_options(true, ModelChoice::potion());
     options.include_kilocode = true;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
@@ -6777,7 +6919,7 @@ fn kilocode_refresh_preserves_other_session_ids_and_embeddings() {
     };
     let child_id = child_records()[0].doc_id;
     let mut embedder = crate::embed::EmbedderHandle::with_model_and_runtime(
-        ModelChoice::Potion,
+        &ModelChoice::potion(),
         &options.embed_runtime,
     )
     .unwrap();
@@ -6936,7 +7078,7 @@ fn kilocode_migrates_database_checkpoint_and_honors_session_exclusions() {
     }
     .save_with_lease(&paths.state.join("ingest.json"), &lease)
     .unwrap();
-    let mut options = ingest_options(false, ModelChoice::Potion);
+    let mut options = ingest_options(false, ModelChoice::potion());
     options.include_kilocode = true;
     let run = |options: &IngestOptions| {
         let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();

@@ -2703,6 +2703,10 @@ fn search_local(
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let mut results = match spec.mode {
         SearchMode::Lexical => index.search(&options)?,
+        // A blank query has no meaning to embed.
+        SearchMode::Semantic | SearchMode::Hybrid if spec.query.trim().is_empty() => {
+            return lexical_results(&index, &options, spec, now_ms);
+        }
         SearchMode::Semantic => {
             let vector = match VectorIndex::open(&paths.vectors) {
                 Ok(vector) => vector,
@@ -2716,7 +2720,8 @@ fn search_local(
                 return lexical_results(&index, &options, spec, now_ms);
             };
             let runtime = config.resolve_embed_runtime()?;
-            let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
+            let mut embedder =
+                EmbedderHandle::for_stored_vectors(&model, &runtime, vector.dimensions())?;
             let embedding = embedder
                 .embed_texts(&[spec.query.as_str()])?
                 .into_iter()
@@ -2745,7 +2750,8 @@ fn search_local(
                 ..options.clone()
             })?;
             let runtime = config.resolve_embed_runtime()?;
-            let mut embedder = EmbedderHandle::with_model_and_runtime(model, &runtime)?;
+            let mut embedder =
+                EmbedderHandle::for_stored_vectors(&model, &runtime, vector.dimensions())?;
             let embedding = embedder
                 .embed_texts(&[spec.query.as_str()])?
                 .into_iter()
@@ -3916,6 +3922,86 @@ mod tests {
     }
 
     #[test]
+    fn remote_model_name_with_embeddings_off_keeps_indexing_and_search_working() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let config: UserConfig = toml::from_str(
+            r#"
+                embeddings = false
+                model = "nomic-embed-text"
+            "#,
+        )
+        .unwrap();
+        let options = local_ingest_options(&config).expect("auto-index options");
+        assert!(!options.embeddings);
+        assert_eq!(
+            options.model,
+            ModelChoice::Remote("nomic-embed-text".to_string())
+        );
+        search_local(&paths, &config, &search_spec(SearchMode::Lexical), false)
+            .expect("lexical search");
+    }
+
+    #[test]
+    fn blank_query_never_reaches_the_remote_embedder() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut vector =
+            VectorIndex::open_or_create(&paths.vectors, 8, Some("remote:text-embedding-3-small"))
+                .unwrap();
+        vector.add(1, &[0.1; 8]).unwrap();
+        vector.save().unwrap();
+        // Any request to this endpoint fails.
+        let config: UserConfig = toml::from_str(
+            r#"
+                embeddings = "remote"
+                model = "text-embedding-3-small"
+                embedding_base_url = "http://127.0.0.1:9/v1"
+                embedding_max_retries = 0
+            "#,
+        )
+        .unwrap();
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let spec = SearchSpec {
+                query: " \t\n".to_string(),
+                ..search_spec(mode)
+            };
+            search_local(&paths, &config, &spec, false).expect("blank query uses lexical search");
+        }
+    }
+
+    #[test]
+    fn remote_mode_rejects_local_vectors_before_loading_a_model() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut vector = VectorIndex::open_or_create(&paths.vectors, 768, Some("gemma")).unwrap();
+        vector.add(1, &[0.1; 768]).unwrap();
+        vector.save().unwrap();
+        // Loading gemma or contacting this endpoint would yield a different error.
+        let config: UserConfig = toml::from_str(
+            r#"
+                embeddings = "remote"
+                model = "text-embedding-3-small"
+                embedding_base_url = "http://127.0.0.1:9/v1"
+            "#,
+        )
+        .unwrap();
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let error = search_local(&paths, &config, &search_spec(mode), false)
+                .expect_err("reject local vectors in remote mode")
+                .to_string();
+            assert_eq!(
+                error,
+                "vectors use local model gemma but embeddings = \"remote\"; run `memex embed` \
+                 to rebuild with the remote model"
+            );
+        }
+    }
+
+    #[test]
     fn vector_query_model_prefers_metadata_and_uses_configured_fallback() {
         let tmp = TempDir::new().unwrap();
 
@@ -3927,14 +4013,14 @@ mod tests {
             Err(anyhow!("configured fallback should not be resolved"))
         })
         .unwrap();
-        assert_eq!(selected, Some(ModelChoice::BGESmall));
+        assert_eq!(selected, Some(ModelChoice::bge_small()));
 
         let mut without_metadata =
             VectorIndex::open_or_create(&tmp.path().join("without-metadata"), 64, None).unwrap();
         without_metadata.add(1, &[0.0; 64]).unwrap();
         let selected =
-            resolve_vector_query_model(&without_metadata, || Ok(ModelChoice::MiniLM)).unwrap();
-        assert_eq!(selected, Some(ModelChoice::MiniLM));
+            resolve_vector_query_model(&without_metadata, || Ok(ModelChoice::minilm())).unwrap();
+        assert_eq!(selected, Some(ModelChoice::minilm()));
     }
 
     #[test]

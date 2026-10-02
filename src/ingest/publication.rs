@@ -3,13 +3,14 @@ use super::*;
 pub(super) fn open_vector_index_for_ingest(
     vector_dir: &Path,
     dimensions: usize,
-    model: ModelChoice,
+    model: &ModelChoice,
     replace: bool,
 ) -> Result<crate::vector::VectorIndex> {
+    let identity = model.identity();
     if replace {
-        crate::vector::VectorIndex::empty_replacement(vector_dir, dimensions, Some(model.as_str()))
+        crate::vector::VectorIndex::empty_replacement(vector_dir, dimensions, Some(&identity))
     } else {
-        crate::vector::VectorIndex::open_or_create(vector_dir, dimensions, Some(model.as_str()))
+        crate::vector::VectorIndex::open_or_create(vector_dir, dimensions, Some(&identity))
     }
 }
 
@@ -104,12 +105,12 @@ pub(super) fn writer_loop(
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     let mut index_pending = [0u64; SOURCE_COUNT];
     if embeddings {
-        let handle = EmbedderHandle::with_model_and_runtime(model, &embed_runtime)?;
+        let handle = EmbedderHandle::with_model_and_runtime(&model, &embed_runtime)?;
         let dims = handle.dims;
         vector_index = Some(open_vector_index_for_ingest(
             &vector_dir,
             dims,
-            model,
+            &model,
             reset_vector_store,
         )?);
         embedder = Some(handle);
@@ -139,11 +140,8 @@ pub(super) fn writer_loop(
         analytics.record(&record)?;
         #[cfg(feature = "profiling")]
         stamp("writer.analytics_us", &mut last_stamp);
-        let embed_text = (embeddings
-            && !reset_vector_store
-            && is_embedding_role(&record.role)
-            && !record.text.is_empty())
-        .then(|| truncate_for_embedding(record.text.clone()));
+        let embed_text = (embeddings && !reset_vector_store && record_needs_embedding(&record))
+            .then(|| truncate_for_embedding(record.text.clone()));
         let (doc_id, source) = (record.doc_id, record.source);
         index.add_record_owned(&mut writer, record)?;
         #[cfg(feature = "profiling")]
@@ -163,7 +161,7 @@ pub(super) fn writer_loop(
                 embed_buffer.push((doc_id, text, source));
             }
             if let Some(emb) = embedder.as_mut()
-                && embed_buffer.len() >= EMBED_BATCH_SIZE
+                && embed_buffer.len() >= emb.batch_size()
             {
                 embedded_count += flush_embeddings(
                     &mut embed_buffer,
@@ -212,7 +210,7 @@ pub(super) fn writer_loop(
     if reconcile_vector_ids {
         let mut live_doc_ids = HashSet::new();
         index.for_each_record(|record| {
-            if is_embedding_role(&record.role) && !record.text.is_empty() {
+            if record_needs_embedding(&record) {
                 live_doc_ids.insert(record.doc_id);
             }
             Ok(())
@@ -280,9 +278,6 @@ fn writer_fast_path_needs_vectors(index: &SearchIndex, ctx: &WriterContext) -> R
     if !ctx.embeddings {
         return Ok(false);
     }
-    let Some(dimensions) = ctx.model.known_dimensions() else {
-        return Ok(true);
-    };
     if !crate::vector::VectorIndex::exists(&ctx.vector_dir) {
         // No vector store: work is outstanding iff some record could need one.
         let mut needs_embedding = false;
@@ -293,7 +288,14 @@ fn writer_fast_path_needs_vectors(index: &SearchIndex, ctx: &WriterContext) -> R
         return Ok(needs_embedding);
     }
     let vector_index = crate::vector::VectorIndex::open(&ctx.vector_dir)?;
-    if vector_index.model() != Some(ctx.model.as_str()) || vector_index.dimensions() != dimensions {
+    // Without a statically known size, a matching identity vouches for the stored
+    // dimensions, so the fast path never loads a model or contacts a server.
+    if vector_index.model() != Some(ctx.model.identity().as_ref())
+        || ctx
+            .model
+            .known_dimensions(&ctx.embed_runtime)
+            .is_some_and(|dimensions| vector_index.dimensions() != dimensions)
+    {
         return Ok(true);
     }
     Ok(vector_index.needs_backfill()
@@ -311,10 +313,7 @@ pub(super) fn backfill_embeddings(
     let embedded_count = Cell::new(0usize);
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     index.for_each_record(|record| {
-        if record.text.is_empty()
-            || !is_embedding_role(&record.role)
-            || vector_index.contains(record.doc_id)
-        {
+        if !record_needs_embedding(&record) || vector_index.contains(record.doc_id) {
             return Ok(());
         }
         progress.add_embed_total(record.source, 1);
@@ -324,7 +323,7 @@ pub(super) fn backfill_embeddings(
             truncate_for_embedding(record.text),
             record.source,
         ));
-        if embed_buffer.len() >= EMBED_BATCH_SIZE {
+        if embed_buffer.len() >= embedder.batch_size() {
             let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
             embedded_count.set(embedded_count.get() + n);
         }

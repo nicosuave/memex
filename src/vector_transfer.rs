@@ -19,7 +19,9 @@ pub struct Report {
 }
 
 fn key(record: &Record) -> Option<Vec<u8>> {
-    if !matches!(record.role.as_str(), "user" | "assistant") || record.text.is_empty() {
+    if !matches!(record.role.as_str(), "user" | "assistant")
+        || !crate::vector_backfill::has_embeddable_text(&record.text)
+    {
         return None;
     }
     let mut end = record.text.len().min(8192);

@@ -2122,15 +2122,17 @@ pub(super) fn can_skip_noop_index(
     if !options.embeddings {
         return Ok(true);
     }
-    let Some(dimensions) = options.model.known_dimensions() else {
-        return Ok(false);
-    };
     if !crate::vector::VectorIndex::exists(&paths.vectors) {
         return Ok(false);
     }
     let vector_index = crate::vector::VectorIndex::open(&paths.vectors)?;
-    if vector_index.model() != Some(options.model.as_str())
-        || vector_index.dimensions() != dimensions
+    // Without a statically known size, a matching identity vouches for the stored
+    // dimensions, so a no-op poll never loads a model or contacts a server.
+    if vector_index.model() != Some(options.model.identity().as_ref())
+        || options
+            .model
+            .known_dimensions(&options.embed_runtime)
+            .is_some_and(|dimensions| vector_index.dimensions() != dimensions)
     {
         return Ok(false);
     }
@@ -2153,13 +2155,13 @@ pub(super) fn vector_index_covers_embeddable_records(
 }
 
 pub(super) fn record_needs_embedding(record: &Record) -> bool {
-    is_embedding_role(&record.role) && !record.text.is_empty()
+    is_embedding_role(&record.role) && crate::vector_backfill::has_embeddable_text(&record.text)
 }
 
 pub(super) fn vector_migration(
     vector_dir: &Path,
     tasks: &[FileTask],
-    configured_model: ModelChoice,
+    configured_model: &ModelChoice,
 ) -> VectorMigration {
     let rebuild = tasks.iter().any(|task| task.parser_version_invalidated())
         && crate::vector::VectorIndex::exists(vector_dir);
@@ -2171,9 +2173,9 @@ pub(super) fn vector_migration(
                     .model()
                     .and_then(|model| ModelChoice::parse(model).ok())
             })
-            .unwrap_or(configured_model)
+            .unwrap_or_else(|| configured_model.clone())
     } else {
-        configured_model
+        configured_model.clone()
     };
     VectorMigration { rebuild, model }
 }
