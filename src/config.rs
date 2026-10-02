@@ -538,7 +538,6 @@ impl UserConfig {
             ));
         }
         if self.embeddings_mode() == EmbeddingsMode::Remote {
-            self.resolve_model(None)?;
             return Ok(EmbedRuntimeConfig {
                 batch_size,
                 remote: Some(self.resolve_remote_embed()?),
@@ -1232,7 +1231,7 @@ mod tests {
         };
         assert!(
             config
-                .resolve_embed_runtime()
+                .resolve_model(None)
                 .expect_err("reject remote mode without model")
                 .to_string()
                 .contains("requires `model`")
@@ -1263,7 +1262,7 @@ mod tests {
             model: Some(String::new()),
             ..remote_config()
         };
-        assert!(config.resolve_embed_runtime().is_err());
+        assert!(config.resolve_model(None).is_err());
     }
 
     #[test]

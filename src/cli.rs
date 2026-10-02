@@ -8497,6 +8497,56 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn remote_model_override_applies_to_embed_index_and_worker() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_MODEL", None)]);
+        for model_setting in ["", "model = \"\"\n"] {
+            let temp = TempDir::new().unwrap();
+            let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+            std::fs::write(
+                paths.root.join("config.toml"),
+                format!(
+                    "{model_setting}embeddings = \"remote\"\n\
+                     embedding_base_url = \"http://127.0.0.1:9/v1\"\n\
+                     embedding_dimensions = 8\n"
+                ),
+            )
+            .unwrap();
+            let model_name = "text-embedding-3-small";
+            let cli = Cli::try_parse_from([
+                "memex",
+                "index",
+                "--model",
+                model_name,
+                "--root",
+                paths.root.to_str().unwrap(),
+                "--only-source",
+                "claude",
+                "--claude-path",
+                paths.root.to_str().unwrap(),
+            ])
+            .unwrap();
+            let Some(Commands::Index { index, .. }) = cli.command else {
+                panic!("expected index command");
+            };
+            let config = UserConfig::load(&paths).unwrap();
+            let expected = ModelChoice::remote(model_name).unwrap();
+            let options = build_ingest_options(&index, &config).unwrap();
+            assert_eq!(options.model, expected);
+            assert!(options.embed_runtime.remote.is_some());
+            let worker = load_embed_worker_spec(&index, &paths).unwrap().unwrap();
+            assert_eq!(worker.model, expected);
+            assert_eq!(worker.runtime, options.embed_runtime);
+
+            // An empty corpus with a configured size needs no remote request.
+            run_embed(Some(model_name.to_string()), Some(paths.root.clone())).unwrap();
+            let vectors = crate::vector::VectorIndex::open(&paths.vectors).unwrap();
+            assert_eq!(vectors.model(), Some("remote:text-embedding-3-small"));
+            assert_eq!(vectors.dimensions(), 8);
+        }
+    }
+
+    #[test]
     fn failed_worker_requeues_memory_work_with_retry_delay() {
         let mut state = VectorWorkState::default();
         state.worker_finished(false);
