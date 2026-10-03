@@ -21,8 +21,8 @@ The `embeddings` config key selects the backend:
 | `true` or `"local"` | Local fastembed or model2vec model |
 | `"remote"` | OpenAI-compatible HTTP API (see [Remote embeddings](#remote-embeddings)) |
 
-Changing the model identity or `embedding_dimensions` re-embeds the index. Vectors from
-different models or sizes are never mixed.
+Changing the model (or, for remote, `embedding_dimensions`) re-embeds on the next `memex index`,
+`memex embed`, or daemon embed cycle. Vectors from different models or sizes are never mixed.
 ## Embedding model
 
 Select via `--model` flag or `MEMEX_MODEL` env var. For local embeddings, the value is one
@@ -49,97 +49,47 @@ for the catalog; an unknown name fails with the list of supported models. Each l
 produces its native vector size.
 ## Remote embeddings
 
-With `embeddings = "remote"`, memex sends text to an OpenAI-compatible
-`POST {embedding_base_url}/embeddings` endpoint, such as OpenAI, Ollama, vLLM, LM Studio,
-or LiteLLM. In remote mode, `model`, `MEMEX_MODEL`, and `--model` all name the remote model,
-which is passed to the API verbatim; a `remote:` prefix is optional.
+With `embeddings = "remote"`, memex computes embeddings with any OpenAI-compatible
+server (OpenAI, Ollama, vLLM, LM Studio, LiteLLM).
+`model`, `MEMEX_MODEL`, or `--model` names the remote model, passed verbatim.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `model` | none | Model name sent to the API; required |
-| `embedding_base_url` | none | API base URL with `http` or `https` scheme; required |
-| `embedding_api_key` | none | Literal API key; takes precedence over `embedding_api_key_env` |
-| `embedding_api_key_env` | none | Environment variable that holds the API key |
-| `embedding_dimensions` | model default | Output size, sent as the API `dimensions` parameter; remote only |
-| `embedding_batch_size` | 64 | Texts per request; also applies to local models (1 to 2048) |
-| `embedding_timeout_secs` | 60 | Request timeout in seconds (1 to 600) |
-| `embedding_max_retries` | 3 | Retries for 429, 5xx, timeouts, and connection errors (0 to 10) |
+| `model` | none | Remote model name; required |
+| `embedding_base_url` | none | `http` or `https` API base URL; required |
+| `embedding_api_key` | none | Literal API key |
+| `embedding_api_key_env` | none | Variable holding the API key |
+| `embedding_dimensions` | model default | API `dimensions` parameter (up to 65536); remote only |
+| `embedding_batch_size` | 64 | Texts per request (1 to 2048); local too |
+| `embedding_timeout_secs` | 60 | Per-attempt timeout in seconds (1 to 600) |
+| `embedding_max_retries` | 3 | Retries on 429, 5xx, timeouts, and connection errors (0 to 10) |
 
-Remote vectors may have up to 65536 dimensions.
-
-memex sends transcript text (user and assistant messages, each truncated to 8192 bytes) and
-memory documents to the remote endpoint.
-
-Use an `https` base URL. `http://` is accepted for loopback hosts (`localhost`,
-`127.0.0.0/8`, `::1`). For any other host, `http://` is rejected when an API key is
-configured, because the key would travel in clear text, and logs a warning when no key is
-set. The standard `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` environment variables are
-honored; with plain `http`, a proxy can read the traffic.
-
-memex looks up the API key in this order: `embedding_api_key`, then the variable named by
-`embedding_api_key_env`, then `MEMEX_EMBEDDING_API_KEY`, then `OPENAI_API_KEY`. When
-`embedding_api_key_env` is set, only that variable is read, with no fallback. Because the
-`OPENAI_API_KEY` fallback applies to every host, a shell `OPENAI_API_KEY` is sent to whatever
-`embedding_base_url` names; for a third-party endpoint, set `embedding_api_key_env` or
-`MEMEX_EMBEDDING_API_KEY`, or unset `OPENAI_API_KEY`. Empty values count as unset. When no
-key resolves, requests are sent without an `Authorization` header, so keyless local servers
-work. The key is never logged or shown by `memex stats`. Prefer `embedding_api_key_env` over
-the literal `embedding_api_key`; if you do put the key in `config.toml`, restrict the file
-with `chmod 600 ~/.memex/config.toml`.
-
-Each request makes at most `embedding_max_retries + 1` attempts of up to
-`embedding_timeout_secs` each, with up to 30 seconds of backoff before each retry: about
-4 minutes at the defaults. There is no overall deadline or cancellation, so an unreachable
-endpoint can delay indexing and search for that long.
-
-At startup memex sends one probe request. If `embedding_dimensions` is set and the server
-rejects it or returns a different size, startup fails with the server's message; without it,
-the probe determines the size. Every later response is checked against that size too.
-Setting `embedding_dimensions` with local embeddings is an error, because local models
-always produce their native size; with `embeddings = false` it is ignored.
-
-In remote mode, `execution_provider`, `compute_units`, and the `cuda_*` keys are ignored.
-In local mode, `embedding_base_url`, the API key settings, `embedding_timeout_secs`, and
-`embedding_max_retries` are ignored.
-
-The remote endpoint is used only when `embeddings = "remote"`. If `embeddings = false` while
-the index holds remote vectors, indexing continues and lexical indexing is unaffected, but
-vector updates are skipped with a warning, and semantic search fails and asks you to configure
-the endpoint or run `memex embed`. With `embeddings = "local"`, a rebuild replaces the remote
-vectors with the chosen local model's vectors. If embeddings are remote while the index
-holds local-model vectors, search asks you to run `memex embed`.
-
-`memex embed` detects a change in a remote model's vector size, such as removing or changing
-`embedding_dimensions` or a provider now serving a different size, and rebuilds the vector
-index. The model identity does not include the base URL, so switching to another provider
-that serves the same model name at the same size is not detected; run `memex embed` after
-such a switch.
-
-OpenAI:
+The key is `embedding_api_key`, else only the variable named by `embedding_api_key_env`, else
+`MEMEX_EMBEDDING_API_KEY`, then `OPENAI_API_KEY` (sent to any host); with no key, no
+`Authorization` header is sent. `execution_provider`, `compute_units`, and `cuda_*` are ignored
+in remote mode; the URL, key, timeout, and retry keys are ignored in local mode.
 
 ```toml
 embeddings = "remote"
 model = "text-embedding-3-small"
 embedding_base_url = "https://api.openai.com/v1"
-embedding_dimensions = 512  # optional
-# reads MEMEX_EMBEDDING_API_KEY, then OPENAI_API_KEY
 ```
-
-Ollama:
 
 ```toml
 embeddings = "remote"
 model = "nomic-embed-text"
-embedding_base_url = "http://localhost:11434/v1"
+embedding_base_url = "http://localhost:11434/v1"  # Ollama
 ```
 
-The background daemon runs as a systemd or launchd service and does not inherit your shell's
-environment variables. For a daemon, set the API key variable (the one named by
-`embedding_api_key_env`, or `MEMEX_EMBEDDING_API_KEY`) on the service yourself. With systemd,
-use an `EnvironmentFile=` with mode 0600 in a drop-in rather than `Environment=`, because
-values set with `Environment=` are readable by any local user through `systemctl show`. With
-launchd, use the `EnvironmentVariables` key. Alternatively set the literal `embedding_api_key`
-in a `config.toml` with mode 0600. memex never writes the API key into service units.
+A startup probe sets or checks the vector size, and every response is checked against it.
+A server that starts returning a different size is detected by `memex embed`, not by the
+daemon. Switching provider with the same model name and size is not detected; run
+`memex embed` after such a switch.
+
+memex sends transcript text (user and assistant messages, each truncated to 8192 bytes) and
+memory documents to the endpoint. Plain `http://` to a non-loopback host is rejected when a
+key is set and warned about otherwise; `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are
+honored.
 ## Execution provider
 
 Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:
