@@ -29,6 +29,19 @@ matches and tool evidence remain eligible. Explicit role/tool filters bypass the
 preferences; quoted phrases, Boolean operators and field syntax keep their match
 semantics. This applies to shared lexical retrieval used by CLI, TUI and web search.
 
+For plain queries with four or more terms, conversational matches containing the
+whole phrase come first, even when the phrase is inside a long message. Phrase
+matching uses the index tokenizer (including case folding and stemming), not byte
+equality. Four terms is an intent heuristic for remembered passages; shorter
+keyword searches retain BM25 ordering. Other matches keep the existing relevance
+bonuses and remain eligible after phrase matches. This priority is applied before
+the result limit and preserved when local results are grouped into conversations.
+Fallback scores remain on the BM25 scale; phrase scores receive an additive
+bonus based on the strongest fallback match, independent of the result limit.
+The TUI uses relevance ordering with or without configured machines. Explicit CLI
+recency boosts, hybrid search, multi-query fusion and multi-machine rank fusion
+can change the final order; they do not promise global phrase-first ordering.
+
 `debug eval-retrieval` evaluates the actual CLI result pipeline, including query
 fusion, filters, recency, conversation diversity and compact snippets. Evaluation
 never refreshes the index. The default is local lexical search with recency disabled

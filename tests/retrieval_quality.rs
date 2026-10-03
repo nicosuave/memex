@@ -30,6 +30,69 @@ fn report(output: &Output) -> Value {
 }
 
 #[test]
+fn remembered_phrase_wins_on_every_surface_even_inside_a_long_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let query = "prepare the amber gallery display and notify the curator";
+    let mut records = Vec::new();
+    for id in 1..=32 {
+        let text = if id == 1 {
+            format!(
+                "{query}. {}",
+                "Background catalog maintenance instructions. ".repeat(2000)
+            )
+        } else {
+            "notify the curator and prepare the display in the amber gallery".into()
+        };
+        // A competing hit in the same conversation must not replace the phrase
+        // as the representative record after grouping.
+        let session = if id == 2 { 1 } else { id };
+        records.push(serde_json::json!({
+            "source": "codex", "doc_id": id, "ts": 1700000000000u64 + id,
+            "project": "museum", "repo_project": "museum", "session_id": format!("gallery-{session}"),
+            "turn_id": id, "role": "user", "text": text,
+            "source_path": format!("/fixture/gallery-{session}.jsonl"),
+            "event_id": format!("gallery-{id}"), "conversation_kind": "main"
+        }));
+    }
+    let corpus = temp.path().join("records.jsonl");
+    let dataset = temp.path().join("cases.jsonl");
+    std::fs::write(
+        &corpus,
+        records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+    )
+    .unwrap();
+    std::fs::write(
+        &dataset,
+        serde_json::json!({
+            "id": "remembered-prompt", "query": query,
+            "relevant": [{"machine": "local", "source": "codex", "session_id": "gallery-1",
+                "source_path": "/fixture/gallery-1.jsonl", "doc_id": 1, "relevance": 3,
+                "evidence": [query]}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for surface in ["cli", "tui", "web"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_memex"))
+            .args(["--no-update-check", "debug", "eval-retrieval"])
+            .arg(&dataset)
+            .arg("--records")
+            .arg(&corpus)
+            .args(["--surface", surface])
+            .output()
+            .unwrap();
+        let result = report(&output);
+        let case = &result["per_case"][0];
+        assert_eq!(case["metrics"]["mrr_at_k"], 1.0, "{surface}: {case}");
+        assert_eq!(
+            case["metrics"]["snippet_evidence_coverage"], 1.0,
+            "{surface}: {case}"
+        );
+        assert_eq!(case["hits"][0]["doc_id"], 1, "{surface}: {case}");
+    }
+}
+
+#[test]
 fn lexical_quality_matches_versioned_baselines_for_actual_surfaces() {
     let temp = tempfile::tempdir().unwrap();
     // UI surfaces do not expose multi-query or session-scoped search. Preserve original

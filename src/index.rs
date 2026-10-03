@@ -1243,10 +1243,28 @@ impl SearchIndex {
 
     pub fn search(&self, options: &QueryOptions) -> Result<Vec<(f32, Record)>> {
         crate::profiling::span!("lexical.search");
+        if options.limit == 0 {
+            return Ok(Vec::new());
+        }
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let query = build_relevance_query(&self.fields, options, &self.index)?;
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(options.limit))?;
+        let queries = build_relevance_queries(&self.fields, options, &self.index)?;
+        let mut top_docs = if let Some(phrase) = queries.phrase {
+            searcher.search(&phrase, &TopDocs::with_limit(options.limit))?
+        } else {
+            Vec::new()
+        };
+        let remaining = options.limit - top_docs.len();
+        // Even when phrases fill the limit, read the strongest fallback to give
+        // phrase scores the same promotion regardless of the requested limit.
+        let fallback_docs =
+            searcher.search(&queries.fallback, &TopDocs::with_limit(remaining.max(1)))?;
+        if let Some((best_fallback, _)) = fallback_docs.first() {
+            for (score, _) in &mut top_docs {
+                *score = (*score + best_fallback).max(best_fallback.next_up());
+            }
+        }
+        top_docs.extend(fallback_docs.into_iter().take(remaining));
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
             let doc = searcher.doc::<TantivyDocument>(addr)?;
@@ -2713,17 +2731,25 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
     })
 }
 
-/// Prefer conversational evidence without removing useful tool results. Full-query
-/// coverage rewards conversational text, rather than echoed tool invocations.
-fn build_relevance_query(
+/// A relevance fallback and optional disjoint phrase query. Long phrases receive
+/// priority; other matches retain the conversational and full-query BM25 bonuses.
+struct RelevanceQueries {
+    fallback: Box<dyn Query>,
+    phrase: Option<Box<dyn Query>>,
+}
+
+fn build_relevance_queries(
     fields: &IndexFields,
     options: &QueryOptions,
     index: &Index,
-) -> Result<Box<dyn Query>> {
+) -> Result<RelevanceQueries> {
     use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
     let base = build_query(fields, options, index)?;
     if options.query.trim().is_empty() || options.role.is_some() || options.tool.is_some() {
-        return Ok(base);
+        return Ok(RelevanceQueries {
+            fallback: base,
+            phrase: None,
+        });
     }
     let conversation_roles = BooleanQuery::new(
         ["user", "assistant"]
@@ -2756,7 +2782,10 @@ fn build_relevance_query(
     ];
     let Ok(UserInputAst::Clause(children)) = tantivy::query_grammar::parse_query(&options.query)
     else {
-        return Ok(Box::new(BooleanQuery::new(clauses)));
+        return Ok(RelevanceQueries {
+            fallback: Box::new(BooleanQuery::new(clauses)),
+            phrase: None,
+        });
     };
     let plain_terms = children.len() > 1
         && children.iter().all(|(occur, child)| {
@@ -2775,21 +2804,67 @@ fn build_relevance_query(
                 && !literal.prefix
         });
     if !plain_terms {
-        return Ok(Box::new(BooleanQuery::new(clauses)));
+        return Ok(RelevanceQueries {
+            fallback: Box::new(BooleanQuery::new(clauses)),
+            phrase: None,
+        });
     }
     let mut parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
     parser.set_conjunction_by_default();
-    let all_terms = BooleanQuery::new(vec![
+    let all_terms: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
         (Occur::Must, parser.parse_query(&options.query)?),
+        (Occur::Must, role_filter.box_clone()),
+    ]));
+    clauses.push((Occur::Should, Box::new(BoostQuery::new(all_terms, 2.0))));
+    // Two or three words are commonly topic keywords, where an answer using
+    // different phrasing can be better than a verbatim echo of the question.
+    // Reserve strict phrase priority for longer remembered passages.
+    const MIN_PHRASE_PRIORITY_TERMS: usize = 4;
+    if children.len() < MIN_PHRASE_PRIORITY_TERMS {
+        return Ok(RelevanceQueries {
+            fallback: Box::new(BooleanQuery::new(clauses)),
+            phrase: None,
+        });
+    }
+    let phrase_text = children
+        .iter()
+        .map(|(_, child)| {
+            let UserInputAst::Leaf(leaf) = child else {
+                unreachable!()
+            };
+            let UserInputLeaf::Literal(literal) = leaf.as_ref() else {
+                unreachable!()
+            };
+            literal.phrase.as_str()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let phrase: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            parser.parse_query(&format!(
+                "\"{}\"",
+                phrase_text.replace('\\', "\\\\").replace('"', "\\\"")
+            ))?,
+        ),
         (Occur::Must, role_filter),
+    ]));
+    let relevance: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
+    // Retrieve disjoint tiers before applying the candidate limit. A finite BM25
+    // boost cannot keep a phrase in a long prompt ahead of short partial matches.
+    // Tool echoes remain in the fallback tier rather than displacing conversation.
+    let fallback = BooleanQuery::new(vec![
+        (Occur::Must, relevance.box_clone()),
+        (Occur::MustNot, phrase.box_clone()),
     ]);
-    // A full-query match gets its own BM25 contribution in addition to OR retrieval.
-    // This operates before TopDocs truncation, so grouping can see those candidates.
-    clauses.push((
-        Occur::Should,
-        Box::new(BoostQuery::new(Box::new(all_terms), 2.0)),
-    ));
-    Ok(Box::new(BooleanQuery::new(clauses)))
+    let exact = BooleanQuery::new(vec![
+        (Occur::Must, relevance),
+        (Occur::Must, Box::new(ConstScoreQuery::new(phrase, 0.0))),
+    ]);
+    Ok(RelevanceQueries {
+        fallback: Box::new(fallback),
+        phrase: Some(Box::new(exact)),
+    })
 }
 
 fn build_query(
@@ -4229,6 +4304,116 @@ mod tests {
         assert_eq!(search_text_count(&index, "migrated"), 1);
         assert_eq!(search_text_count(&index, "Databases"), 1);
         assert_eq!(search_text_count(&index, "rollback"), 0);
+    }
+
+    #[test]
+    fn relevance_prefers_a_phrase_in_a_long_message_over_short_partial_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        let query = "prepare the amber gallery display and notify the curator";
+        let long_message = format!(
+            "{query}. {}",
+            "Background instructions describe catalog maintenance and conservation procedures. "
+                .repeat(2000)
+        );
+        let mut tool = test_record(4, query);
+        tool.role = "tool_result".into();
+        tool.tool_name = Some("Bash".into());
+        let mut other_project = test_record(5, query);
+        other_project.project = "other".into();
+        for record in [
+            test_record(1, "prepare amber gallery display notify curator"),
+            test_record(
+                2,
+                "notify the curator and prepare the display in the amber gallery",
+            ),
+            test_record(3, &long_message),
+            tool,
+            other_project,
+        ] {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut options = QueryOptions {
+            query: query.into(),
+            project: Some("memex".into()),
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 1,
+        };
+        let best = index.search(&options).unwrap().remove(0);
+        assert_eq!(best.1.doc_id, 3);
+        options.limit = 20;
+        let hits = index.search(&options).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].1.doc_id, 3);
+        assert_eq!(
+            hits[0].0, best.0,
+            "phrase score must not depend on the result limit"
+        );
+        assert_eq!(hits[1].1.doc_id, 2);
+        assert!(hits.windows(2).all(|pair| pair[0].0 >= pair[1].0));
+        assert_eq!(
+            hits.iter()
+                .map(|(_, r)| r.doc_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let queries = build_relevance_queries(&index.fields, &options, &index.index).unwrap();
+        let raw_fallback = searcher
+            .search(&queries.fallback, &TopDocs::with_limit(20))
+            .unwrap();
+        assert_eq!(
+            hits[1].0, raw_fallback[0].0,
+            "fallback scores must retain their original scale"
+        );
+
+        // No phrase matches this order: full coverage must still beat short partials.
+        options.query = "curator conservation amber instructions".into();
+        options.limit = 1;
+        let no_phrase = index.search(&options).unwrap();
+        assert_eq!(no_phrase[0].1.doc_id, 3);
+        let queries = build_relevance_queries(&index.fields, &options, &index.index).unwrap();
+        let raw_fallback = searcher
+            .search(&queries.fallback, &TopDocs::with_limit(1))
+            .unwrap();
+        assert_eq!(
+            no_phrase[0].0, raw_fallback[0].0,
+            "no-phrase queries must keep BM25 scores for recency and min-score"
+        );
+        options.query = query.into();
+        options.role = Some("tool_result".into());
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 4);
+        options.role = None;
+        options.tool = Some("Bash".into());
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 4);
+        options.tool = None;
+        options.until = Some(2);
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 2);
+        options.until = None;
+        options.session_id = Some("missing-session".into());
+        assert!(index.search(&options).unwrap().is_empty());
+        options.session_id = None;
+        // Topic keywords keep BM25 ordering; four-word remembered wording gets
+        // phrase priority. The best short nonphrase answer wins the keyword case.
+        options.query = "prepare the amber".into();
+        options.limit = 1;
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 2);
+        options.query = "prepare the amber gallery".into();
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 3);
+        options.limit = 0;
+        assert!(index.search(&options).unwrap().is_empty());
     }
 
     #[test]

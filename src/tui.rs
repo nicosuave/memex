@@ -5838,7 +5838,7 @@ fn run_search_request(
                     until: None,
                     limit: RESULT_LIMIT * 5,
                     mode: SearchMode::Lexical,
-                    recency_weight: 1.0,
+                    recency_weight: 0.0,
                     recency_half_life_days: 30.0,
                     min_score: None,
                     project_grouping: Some(request.grouping),
@@ -7546,6 +7546,60 @@ mod tests {
             tool_output: None,
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn configured_local_search_keeps_relevance_order_instead_of_boosting_recency() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        let query = "prepare the amber gallery display";
+        for (id, text, ts) in [
+            (1, query.to_string(), 1),
+            (
+                2,
+                format!("{query}. Background instructions for catalog maintenance."),
+                chrono::Utc::now().timestamp_millis() as u64,
+            ),
+        ] {
+            let mut hit = record("user", &text);
+            hit.doc_id = id;
+            hit.ts = ts;
+            hit.session_id = format!("gallery-{id}");
+            index.add_record(&mut writer, &hit).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+        let index = open_tui_index(&paths, false).unwrap();
+        // A disabled peer takes the configured-machine path without remote I/O.
+        let configured: UserConfig = toml::from_str(
+            "auto_index_on_search = false\n[[machines]]\nid = 'unused'\nenabled = false\n",
+        )
+        .unwrap();
+        for config in [UserConfig::default(), configured] {
+            let (sessions, failures) = run_search_request(
+                &paths,
+                &config,
+                &index,
+                SearchRequest {
+                    request_id: 0,
+                    query: query.into(),
+                    project: String::new(),
+                    machines: Vec::new(),
+                    source: SourceChoice::Codex,
+                    since: None,
+                    grouping: ProjectDisplayMode::NestedWorktrees.grouping(),
+                    kind: crate::analytics::SessionKindFilter::All,
+                },
+            )
+            .unwrap();
+            assert!(failures.is_empty());
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions[0].session_id, "gallery-1");
         }
     }
 
