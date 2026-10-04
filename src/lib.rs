@@ -22,6 +22,7 @@ mod repository;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;
+mod search;
 pub mod sources;
 pub mod state;
 pub mod transfer;

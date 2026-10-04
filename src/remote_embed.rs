@@ -790,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_values() -> Result<()> {
+    fn rejects_out_of_range_json_values() -> Result<()> {
         let (base, server) = serve(|_, _| Reply {
             status: 200,
             body: r#"{"data":[{"index":0,"embedding":[1.0,1e39]}]}"#.to_owned(),
@@ -799,7 +799,24 @@ mod tests {
         let mut embedder = client(&base, None, None, 16, 0)?;
         let err = expect_err(embedder.probe_dimensions())?;
         join(server)?;
-        assert!(err.contains("non-finite"), "{err}");
+        // Precise f32 parsing rejects overflow before vector validation runs.
+        assert!(err.contains("invalid response body"), "{err}");
+        assert!(err.contains("number out of range"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_finite_values() -> Result<()> {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let response = EmbeddingResponse {
+                data: vec![EmbeddingItem {
+                    embedding: vec![1.0, value],
+                    index: Some(0),
+                }],
+            };
+            let err = expect_err(validate_response(response, 1))?;
+            assert!(err.contains("non-finite value at index 0"), "{err}");
+        }
         Ok(())
     }
 

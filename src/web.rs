@@ -1516,6 +1516,73 @@ pub(crate) fn evaluate_search(
 }
 
 fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload> {
+    if params.sort == SearchSort::Relevance {
+        let config = UserConfig::load(paths)?;
+        let target = params.offset.saturating_add(params.limit).saturating_add(1);
+        let found = crate::search::collect(
+            paths,
+            &config,
+            &[crate::machine::LOCAL_MACHINE_ID.to_string()],
+            std::slice::from_ref(&params.query),
+            &crate::machine::SearchSpec {
+                query: params.query.clone(),
+                project: params.project.clone(),
+                role: None,
+                tool: None,
+                session_id: None,
+                session_scope: None,
+                cwd: None,
+                source: params.source,
+                since: params
+                    .range
+                    .since_ms(Utc::now().timestamp_millis().max(0) as u64),
+                until: None,
+                limit: target,
+                mode: crate::machine::SearchMode::Lexical,
+                recency_weight: crate::search::DEFAULT_RECENCY_WEIGHT,
+                recency_half_life_days: 30.0,
+                min_score: None,
+                project_grouping: None,
+                text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+            },
+            &crate::search::Selection::conversations(target, params.origin),
+            false,
+        )?;
+        let has_more = found.items.len() > params.offset.saturating_add(params.limit);
+        let matchers = crate::cli::build_matchers(&params.query)?;
+        let results = found
+            .items
+            .into_iter()
+            .skip(params.offset)
+            .take(params.limit)
+            .map(|located| {
+                let record = located.record;
+                let snippet = if params.query.is_empty() {
+                    summarize(&record.text, 360)
+                } else {
+                    crate::cli::match_preview(&record.text, &matchers, 160)
+                };
+                SessionSummary {
+                    record_id: crate::retrieval::canonical_record_id(&record),
+                    session_id: record.session_id,
+                    source_path: record.source_path,
+                    project: record.project,
+                    source: record.source.label().to_string(),
+                    role: record.role,
+                    ts: record.ts,
+                    score: Some(located.score),
+                    snippet_matches: snippet_match_spans(&snippet, &matchers),
+                    snippet,
+                }
+            })
+            .collect();
+        return Ok(SearchPayload {
+            query: params.query.clone(),
+            offset: params.offset,
+            has_more,
+            results,
+        });
+    }
     let index = open_index(paths)?;
     let matchers = crate::cli::build_matchers(&params.query)?;
     let since = params
@@ -1539,11 +1606,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let mut main_scope_cache = HashMap::new();
     let summaries = loop {
         let records: Vec<(Option<f32>, crate::types::Record)> = match params.sort {
-            SearchSort::Relevance => index
-                .search(&query_options(candidate_limit))?
-                .into_iter()
-                .map(|(score, record)| (Some(score), record))
-                .collect(),
+            SearchSort::Relevance => unreachable!("relevance returns through shared search"),
             SearchSort::Newest if params.query.is_empty() => index
                 .recent_records_filtered_since(
                     candidate_limit,

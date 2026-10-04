@@ -596,7 +596,12 @@ pub fn federated_search(
     std::thread::scope(|scope| {
         for id in &ids {
             let tx = tx.clone();
-            let spec = spec.clone();
+            // Keep the pre-threshold count for deepening, but apply the threshold
+            // to each peer's relevance scores before reciprocal-rank fusion.
+            let spec = SearchSpec {
+                min_score: None,
+                ..spec.clone()
+            };
             if id == LOCAL_MACHINE_ID {
                 let paths = paths.clone();
                 let config = config.clone();
@@ -645,12 +650,18 @@ pub fn federated_search(
 
     let use_rrf = successes.len() > 1;
     let mut items = Vec::new();
+    let candidate_count = successes.iter().map(|(_, records)| records.len()).sum();
     for (machine, mut records) in successes {
+        if let Some(min_score) = spec.min_score {
+            records.retain(|(score, _)| *score >= min_score);
+        }
         records.sort_by(|left, right| {
             right
                 .0
                 .partial_cmp(&left.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.1.ts.cmp(&left.1.ts))
+                .then_with(|| left.1.doc_id.cmp(&right.1.doc_id))
         });
         items.extend(
             records
@@ -667,14 +678,7 @@ pub fn federated_search(
                 }),
         );
     }
-    items.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| right.record.ts.cmp(&left.record.ts))
-    });
-    let candidate_count = items.len();
+    items.sort_by(crate::search::compare_records);
     if items.len() > spec.limit {
         items.truncate(spec.limit);
     }
@@ -2697,8 +2701,25 @@ fn search_local(
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
-    if let Some(cwd) = spec.cwd.as_deref() {
-        options.session_scope = Some(session_scope_for_cwd(paths, cwd)?);
+    let repository_project = spec
+        .project
+        .as_deref()
+        .filter(|_| spec.project_grouping == Some(ProjectGrouping::Repository));
+    if repository_project.is_some() || spec.cwd.is_some() {
+        let db = analytics_path(&paths.state);
+        if db.exists() {
+            let store = AnalyticsStore::open_read_only(db)?;
+            let mut scope = store.query_search_scopes(repository_project, spec.cwd.as_deref())?;
+            if let Some(existing) = &options.session_scope {
+                scope.retain(|key| existing.contains(key));
+            }
+            options.session_scope = Some(scope);
+            if repository_project.is_some() {
+                options.project = None;
+            }
+        } else if spec.cwd.is_some() {
+            options.session_scope = Some(Vec::new());
+        }
     }
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let mut results = match spec.mode {
@@ -2801,23 +2822,6 @@ fn search_local(
     results.truncate(spec.limit);
     apply_project_grouping(paths, &mut results, spec.project_grouping);
     Ok(results)
-}
-
-fn session_scope_for_cwd(paths: &Paths, cwd: &str) -> Result<Vec<SessionScopeKey>> {
-    let db = analytics_path(&paths.state);
-    if !db.exists() {
-        return Ok(Vec::new());
-    }
-    let store = AnalyticsStore::open_read_only(db)?;
-    Ok(store
-        .query_sessions_detailed(None, None, Some(cwd), None, None)?
-        .into_iter()
-        .map(|row| SessionScopeKey {
-            source: row.source,
-            session_id: row.session_id,
-            source_path: row.source_path,
-        })
-        .collect())
 }
 
 fn lexical_results(
@@ -4360,6 +4364,70 @@ mod tests {
             next_offset: Some(2),
         };
         assert!(validate_session_page_context(&valid, &request).is_ok());
+    }
+
+    #[test]
+    fn search_intersects_repository_cwd_and_explicit_session_scopes() {
+        let _lock = crate::test_support::env_lock();
+        let root = TempDir::new().unwrap();
+        let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        let mut analytics =
+            crate::analytics::AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        let mut scopes = Vec::new();
+        for id in 1..=3 {
+            let mut record = test_record(id, &format!("s{id}"), &format!("/fixture/{id}.jsonl"), 1);
+            record.text = "query readiness".into();
+            scopes.push(SessionScopeKey {
+                source: record.source,
+                session_id: record.session_id.clone(),
+                source_path: record.source_path.clone(),
+            });
+            index.add_record(&mut writer, &record).unwrap();
+            analytics.record(&record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+        analytics.flush().unwrap();
+        drop(analytics);
+        let db = rusqlite::Connection::open(analytics_path(&paths.state)).unwrap();
+        db.execute("update sessions set repo_project = case when session_id = 's2' then 'other' else 'repository' end, cwd = case when session_id = 's3' then '/fixture/elsewhere' else '/fixture/repo' end", []).unwrap();
+        let mut spec = search_spec(SearchMode::Lexical);
+        spec.project = Some("repository".into());
+        spec.project_grouping = Some(ProjectGrouping::Repository);
+        spec.cwd = Some("/fixture/repo".into());
+        spec.session_scope = Some(scopes.clone());
+        let config = UserConfig::default();
+        let result =
+            federated_search(&paths, &config, &[LOCAL_MACHINE_ID.into()], &spec, false).unwrap();
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|hit| hit.record.doc_id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(result.items[0].record.project, "repository");
+        spec.session_scope = Some(vec![scopes[1].clone(), scopes[2].clone()]);
+        assert!(
+            federated_search(&paths, &config, &[LOCAL_MACHINE_ID.into()], &spec, false)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        spec.session_scope = None;
+        spec.min_score = Some(f32::MAX);
+        let filtered =
+            federated_search(&paths, &config, &[LOCAL_MACHINE_ID.into()], &spec, false).unwrap();
+        assert!(filtered.items.is_empty());
+        assert_eq!(
+            filtered.candidate_count, 1,
+            "thresholding must not hide candidate exhaustion information"
+        );
     }
 
     #[test]

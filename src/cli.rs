@@ -7,9 +7,9 @@ use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
-    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_search,
-    federated_sessions, federated_usage, read_context, read_memory, read_record,
-    read_session_pages, session_page_context,
+    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_sessions,
+    federated_usage, read_context, read_memory, read_record, read_session_pages,
+    session_page_context,
 };
 use crate::memory::MemoryStore;
 use crate::memory_search::{
@@ -19,9 +19,7 @@ use crate::memory_search::{
 use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
 use crate::retrieval::{ContextOptions, ContextSelector};
-use crate::retrieval_eval::{
-    RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace, fuse_ranked_queries,
-};
+use crate::retrieval_eval::{RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace};
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
     transfer_session,
@@ -39,7 +37,6 @@ use regex::RegexBuilder;
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -367,7 +364,7 @@ OUTPUT FIELDS (--fields):
         #[arg(long, help_heading = "Tuning")]
         min_score: Option<f32>,
         /// Weight for recency boost (0 = no boost, higher = more recent preferred)
-        #[arg(long, default_value_t = 1.0, help_heading = "Tuning")]
+        #[arg(long, default_value_t = crate::search::DEFAULT_RECENCY_WEIGHT, help_heading = "Tuning")]
         recency_weight: f32,
         /// Half-life in days for recency decay (lower = faster decay)
         #[arg(long, default_value_t = 30.0, help_heading = "Tuning")]
@@ -1066,7 +1063,7 @@ fn default_true() -> bool {
 }
 
 fn default_recency_weight() -> f32 {
-    1.0
+    crate::search::DEFAULT_RECENCY_WEIGHT
 }
 
 fn default_recency_half_life_days() -> f32 {
@@ -3381,11 +3378,6 @@ fn collect_search_with_memories(
                         matchers: build_matchers(&query)?,
                         format,
                         fields: fields.clone(),
-                        sort,
-                        min_score: None,
-                        top_n_per_session: None,
-                        limit: 1,
-                        kind_filter: crate::analytics::SessionKindFilter::All,
                     },
                 )?;
                 if content == SearchContent::All
@@ -3639,7 +3631,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     origin,
                     mode: SearchMode::Lexical,
                     min_score: None,
-                    recency_weight: 1.0,
+                    recency_weight: crate::search::DEFAULT_RECENCY_WEIGHT,
                     recency_half_life_days: 30.0,
                     since,
                     until: None,
@@ -3814,91 +3806,52 @@ fn collect_search_with_auto_index(
         matchers,
         format,
         fields,
-        sort,
-        min_score,
-        top_n_per_session,
-        limit,
-        kind_filter,
     };
 
-    // Origin filtering applies after retrieval, so a fixed overfetch can
-    // still starve when wanted-kind matches rank below the cap. Re-run with
-    // a wider cap (bounded) until the filtered list is full or retrieval
-    // stops offering more candidates.
-    let origin_filtered = kind_filter != crate::analytics::SessionKindFilter::All;
-    let mut candidate_limit = if queries.len() > 1
-        || top_n_per_session.is_some()
-        || options.source.is_some()
-        || cwd.is_some()
-        || origin_filtered
-    {
-        (limit * 5).max(limit + 10)
-    } else {
-        limit
-    };
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
-    let mut failures = Vec::new();
-    let mut seen_failures = HashSet::new();
-    let mut ranked_queries;
-    let mut query_candidate_counts;
-    let mut results;
-    let mut round = 0;
-    loop {
-        ranked_queries = Vec::with_capacity(queries.len());
-        query_candidate_counts = Vec::with_capacity(queries.len());
-        let mut round_capped = false;
-        for (query_index, query) in queries.iter().enumerate() {
-            let spec = SearchSpec {
-                query: query.clone(),
-                project: options.project.clone(),
-                role: options.role.clone(),
-                tool: options.tool.clone(),
-                session_id: options.session_id.clone(),
-                session_scope: None,
-                cwd: cwd.clone(),
-                source: options.source,
-                since: options.since,
-                until: options.until,
-                limit: candidate_limit,
-                mode,
-                recency_weight,
-                recency_half_life_days,
-                min_score,
-                project_grouping: None,
-                text_limit,
-            };
-            let federated = federated_search(
-                &paths,
-                &config,
-                &selected_machines,
-                &spec,
-                auto_index_local && query_index == 0,
-            )?;
-            round_capped = round_capped || federated.candidate_count > federated.items.len();
-            query_candidate_counts.push(federated.candidate_count);
-            for (machine, error) in federated.failures {
-                let message = format!("{machine}: {error}");
-                if seen_failures.insert(message.clone()) {
-                    failures.push(message);
-                }
-            }
-            ranked_queries.push(federated.items);
-        }
-        let fused = if ranked_queries.len() == 1 {
-            ranked_queries.pop().unwrap_or_default()
-        } else {
-            fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
-        };
-        let stored_kinds = stored_session_kinds(&paths, &fused, origin_filtered);
-        let mut merged_render = render.clone();
-        merged_render.min_score = None;
-        results = apply_post_processing_located(fused, &merged_render, &stored_kinds);
-        round += 1;
-        if !origin_filtered || results.len() >= render.limit || !round_capped || round >= 3 {
-            break;
-        }
-        candidate_limit = candidate_limit.saturating_mul(5);
-    }
+    let collected = crate::search::collect(
+        &paths,
+        &config,
+        &selected_machines,
+        &queries,
+        &SearchSpec {
+            query: options.query.clone(),
+            project: options.project,
+            role: options.role,
+            tool: options.tool,
+            session_id: options.session_id,
+            session_scope: None,
+            cwd: cwd.clone(),
+            source: options.source,
+            since: options.since,
+            until: options.until,
+            limit,
+            mode,
+            recency_weight,
+            recency_half_life_days,
+            min_score,
+            project_grouping: None,
+            text_limit,
+        },
+        &crate::search::Selection {
+            sort: if sort == SortBy::Score {
+                crate::search::Sort::Score
+            } else {
+                crate::search::Sort::Timestamp
+            },
+            top_n_per_session,
+            limit,
+            kind_filter,
+        },
+        auto_index_local,
+    )?;
+    let results = collected.items;
+    let query_candidate_counts = collected.query_candidate_counts;
+    let failures = collected
+        .failures
+        .into_iter()
+        .map(|(machine, error)| format!("{machine}: {error}"))
+        .collect();
     Ok(SearchCollection {
         paths,
         queries,
@@ -3926,11 +3879,6 @@ struct RenderOptions {
     matchers: Vec<regex::Regex>,
     format: SearchFormat,
     fields: Option<HashSet<String>>,
-    sort: SortBy,
-    min_score: Option<f32>,
-    top_n_per_session: Option<usize>,
-    limit: usize,
-    kind_filter: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Serialize)]
@@ -7743,129 +7691,6 @@ fn wants_field(fields: &Option<HashSet<String>>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Stored session kinds for the candidate groups, keyed by
-/// (machine, source label, session id) with prefer-main dominance. Remote
-/// machines and sessions missing from the analytics cache simply have no
-/// entry, and grouping falls back to the matched records. Empty unless an
-/// origin filter is active.
-fn stored_session_kinds(
-    paths: &Paths,
-    results: &[LocatedRecord],
-    origin_filtered: bool,
-) -> HashMap<(String, String, String), Option<String>> {
-    let mut out = HashMap::new();
-    if !origin_filtered {
-        return out;
-    }
-    let Ok(store) = open_analytics_read_only(paths) else {
-        return out;
-    };
-    for result in results {
-        let key = (
-            result.machine.clone(),
-            result.record.source.storage_label().to_string(),
-            result.record.session_id.clone(),
-        );
-        let stored = store.session_conversation_kind(
-            result.record.source.storage_label(),
-            &result.record.session_id,
-            &result.record.source_path,
-        );
-        let dominated = stored.as_deref() == Some("main");
-        out.entry(key)
-            .and_modify(|kind: &mut Option<String>| {
-                if dominated {
-                    *kind = Some("main".to_string());
-                }
-            })
-            .or_insert(stored);
-    }
-    out
-}
-
-fn apply_post_processing_located(
-    mut results: Vec<LocatedRecord>,
-    render: &RenderOptions,
-    stored_kinds: &HashMap<(String, String, String), Option<String>>,
-) -> Vec<LocatedRecord> {
-    if let Some(min_score) = render.min_score {
-        results.retain(|result| result.score >= min_score);
-    }
-
-    // Session-grouped origin filter with prefer-main: a sidechain hit inside
-    // a primary session must not hide the session (mirrors the TUI and the
-    // analytics accumulator). Groups resolve against the stored session kind
-    // first — complete-session truth — and only fall back to the matched
-    // records when the analytics cache has no row (remote machines, stale
-    // caches).
-    if render.kind_filter != crate::analytics::SessionKindFilter::All {
-        let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
-        for result in &results {
-            let key = (
-                result.machine.clone(),
-                result.record.source.storage_label().to_string(),
-                result.record.session_id.clone(),
-            );
-            let dominated = result.record.links.conversation_kind.as_deref() == Some("main");
-            group_kind
-                .entry(key)
-                .and_modify(|kind| {
-                    if dominated {
-                        *kind = Some("main".to_string());
-                    }
-                })
-                .or_insert_with(|| result.record.links.conversation_kind.clone());
-        }
-        results.retain(|result| {
-            let key = (
-                result.machine.clone(),
-                result.record.source.storage_label().to_string(),
-                result.record.session_id.clone(),
-            );
-            let kind = stored_kinds
-                .get(&key)
-                .and_then(|stored| stored.as_deref())
-                .or_else(|| group_kind.get(&key).and_then(|kind| kind.as_deref()));
-            render.kind_filter.matches_kind(kind)
-        });
-    }
-
-    match render.sort {
-        SortBy::Score => {
-            results.sort_by(|left, right| {
-                right
-                    .score
-                    .partial_cmp(&left.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        SortBy::Ts => {
-            results.sort_by_key(|result| std::cmp::Reverse(result.record.ts));
-        }
-    }
-
-    if let Some(k) = render.top_n_per_session {
-        let mut per_session: HashMap<(String, String, String), usize> = HashMap::new();
-        results.retain(|result| {
-            let count = per_session
-                .entry((
-                    result.machine.clone(),
-                    result.record.source.storage_label().to_string(),
-                    result.record.session_id.clone(),
-                ))
-                .or_default();
-            if *count >= k {
-                return false;
-            }
-            *count += 1;
-            true
-        });
-    }
-
-    results.truncate(render.limit);
-    results
-}
-
 fn format_ts(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
@@ -8688,7 +8513,7 @@ mod tests {
         assert!(request.unique_session);
         assert_eq!(request.mode, McpSearchMode::Lexical);
         assert_eq!(request.sort, McpSearchSort::Score);
-        assert_eq!(request.recency_weight, 1.0);
+        assert_eq!(request.recency_weight, 0.0);
         assert_eq!(request.recency_half_life_days, 30.0);
         assert!(request.additional_queries.is_empty());
         assert!(request.machines.is_empty());
@@ -10511,3 +10336,6 @@ mod rebuild_space_tests {
         assert!(available_bytes(temp.path()).unwrap() > 0);
     }
 }
+
+#[cfg(test)]
+mod search_tests;

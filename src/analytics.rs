@@ -553,6 +553,28 @@ impl AnalyticsStore {
         Ok(out)
     }
 
+    /// Resolve search scopes from cached metadata without opening source transcripts for titles.
+    pub(crate) fn query_search_scopes(
+        &self,
+        repository_project: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<Vec<crate::index::SessionScopeKey>> {
+        let (predicate, values) =
+            session_selection_sql(None, repository_project, cwd, None, None, None, None);
+        let mut statement = self.conn.prepare(&format!(
+            "select source, session_id, source_path from sessions{predicate}"
+        ))?;
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            let source: String = row.get(0)?;
+            Ok(crate::index::SessionScopeKey {
+                source: SourceKind::from_label(&source).unwrap_or(SourceKind::Claude),
+                session_id: row.get(1)?,
+                source_path: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Count exactly the same identities and predicates as session listing, without detail rows.
     #[allow(clippy::too_many_arguments)]
     pub fn count_sessions_selected(
