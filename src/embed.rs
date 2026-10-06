@@ -2,6 +2,7 @@ use crate::remote_embed::{RemoteEmbedder, RemoteEndpoint};
 use anyhow::{Context, Result, anyhow};
 use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
 use model2vec_rs::model::StaticModel;
+use ort::ep::ExecutionProviderDispatch;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -650,22 +651,34 @@ fn init_options_for_model(
     model_type: EmbeddingModel,
     runtime: &EmbedRuntimeConfig,
 ) -> Result<InitOptions> {
-    let effective_provider = runtime.execution_provider.effective();
     let opts = InitOptions::new(model_type).with_show_download_progress(false);
+    let providers = execution_providers(runtime)?;
+    if providers.is_empty() {
+        Ok(opts)
+    } else {
+        Ok(opts.with_execution_providers(providers))
+    }
+}
 
-    match effective_provider {
-        ExecutionProviderChoice::Auto => unreachable!("auto should resolve to a concrete provider"),
-        ExecutionProviderChoice::Cpu => Ok(opts),
-        ExecutionProviderChoice::CoreML => init_options_with_coreml(opts, runtime),
-        ExecutionProviderChoice::Cuda => init_options_with_cuda(opts, runtime),
+/// ONNX Runtime execution providers for `runtime`, shared by every local ONNX model.
+///
+/// `Auto` resolves to the platform default first. The CPU provider yields an empty list,
+/// which leaves ONNX Runtime on its built-in CPU provider. Fails when the selected
+/// provider is unavailable on this platform or in this build.
+pub(crate) fn execution_providers(
+    runtime: &EmbedRuntimeConfig,
+) -> Result<Vec<ExecutionProviderDispatch>> {
+    match runtime.execution_provider.effective() {
+        ExecutionProviderChoice::Auto | ExecutionProviderChoice::Cpu => Ok(Vec::new()),
+        ExecutionProviderChoice::CoreML => coreml_execution_providers(runtime),
+        ExecutionProviderChoice::Cuda => cuda_execution_providers(runtime),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn init_options_with_coreml(
-    opts: InitOptions,
+fn coreml_execution_providers(
     runtime: &EmbedRuntimeConfig,
-) -> Result<InitOptions> {
+) -> Result<Vec<ExecutionProviderDispatch>> {
     use ort::ep::coreml::{ComputeUnits, CoreML};
 
     let compute_units = runtime
@@ -686,21 +699,22 @@ fn init_options_with_coreml(
     } else {
         provider.build()
     };
-    Ok(opts.with_execution_providers(vec![dispatch]))
+    Ok(vec![dispatch])
 }
 
 #[cfg(not(target_os = "macos"))]
-fn init_options_with_coreml(
-    _opts: InitOptions,
+fn coreml_execution_providers(
     _runtime: &EmbedRuntimeConfig,
-) -> Result<InitOptions> {
+) -> Result<Vec<ExecutionProviderDispatch>> {
     Err(anyhow!(
         "execution_provider=coreml is only supported on macOS"
     ))
 }
 
 #[cfg(feature = "cuda")]
-fn init_options_with_cuda(opts: InitOptions, runtime: &EmbedRuntimeConfig) -> Result<InitOptions> {
+fn cuda_execution_providers(
+    runtime: &EmbedRuntimeConfig,
+) -> Result<Vec<ExecutionProviderDispatch>> {
     use ort::ep::{CUDA, ExecutionProvider};
 
     preload_cuda_dependencies(runtime)?;
@@ -714,17 +728,37 @@ fn init_options_with_cuda(opts: InitOptions, runtime: &EmbedRuntimeConfig) -> Re
              `--features cuda` and that the required CUDA 12/cuDNN runtime libraries are installed"
         ));
     }
-    Ok(opts.with_execution_providers(vec![provider.build().error_on_failure()]))
+    Ok(vec![provider.build().error_on_failure()])
 }
 
 #[cfg(not(feature = "cuda"))]
-fn init_options_with_cuda(
-    _opts: InitOptions,
+fn cuda_execution_providers(
     _runtime: &EmbedRuntimeConfig,
-) -> Result<InitOptions> {
+) -> Result<Vec<ExecutionProviderDispatch>> {
     Err(anyhow!(
         "execution_provider=cuda requires a memex binary built with cargo feature `cuda`"
     ))
+}
+
+/// Rewrite a model initialization error to name the execution provider that failed.
+pub(crate) fn provider_init_error(
+    runtime: &EmbedRuntimeConfig,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let requested_provider = runtime.execution_provider;
+    match requested_provider.effective() {
+        ExecutionProviderChoice::Cuda => anyhow!(
+            "failed to initialize CUDA execution provider: {err}. Ensure the binary was \
+             built with `--features cuda` and the required CUDA 12/cuDNN libraries are \
+             on the dynamic linker path (for example via LD_LIBRARY_PATH)"
+        ),
+        ExecutionProviderChoice::CoreML
+            if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
+        {
+            anyhow!("failed to initialize CoreML execution provider: {err}")
+        }
+        _ => err,
+    }
 }
 
 enum EmbedBackend {
@@ -769,22 +803,9 @@ impl EmbedderHandle {
             }
             ModelChoice::Local(LocalModel::Fastembed(model_type)) => {
                 let dims = TextEmbedding::get_model_info(model_type)?.dim;
-                let requested_provider = runtime.execution_provider;
-                let effective_provider = requested_provider.effective();
                 let opts = init_options_for_model(model_type.clone(), runtime)?;
-                let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
-                    ExecutionProviderChoice::Cuda => anyhow!(
-                        "failed to initialize CUDA execution provider: {err}. Ensure the binary was \
-                         built with `--features cuda` and the required CUDA 12/cuDNN libraries are \
-                         on the dynamic linker path (for example via LD_LIBRARY_PATH)"
-                    ),
-                    ExecutionProviderChoice::CoreML
-                        if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
-                    {
-                        anyhow!("failed to initialize CoreML execution provider: {err}")
-                    }
-                    _ => err,
-                })?;
+                let model = TextEmbedding::try_new(opts)
+                    .map_err(|err| provider_init_error(runtime, err))?;
                 Ok(Self {
                     backend: EmbedBackend::Fastembed(model),
                     dims,
@@ -1430,5 +1451,68 @@ mod tests {
         let embeddings = embedder.embed_texts(&texts).expect("embed with potion");
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0].len(), embedder.dims);
+    }
+    #[test]
+    fn execution_providers_resolve_auto_and_reject_unavailable_providers() {
+        let runtime = |execution_provider| EmbedRuntimeConfig {
+            execution_provider,
+            ..EmbedRuntimeConfig::default()
+        };
+        assert!(
+            execution_providers(&runtime(ExecutionProviderChoice::Cpu))
+                .expect("cpu")
+                .is_empty()
+        );
+        let auto = execution_providers(&runtime(ExecutionProviderChoice::Auto));
+        #[cfg(not(target_os = "macos"))]
+        assert!(auto.expect("auto is cpu").is_empty());
+        #[cfg(target_os = "macos")]
+        assert_eq!(auto.expect("auto is coreml").len(), 1);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            execution_providers(&runtime(ExecutionProviderChoice::CoreML))
+                .expect_err("coreml off macOS")
+                .to_string(),
+            "execution_provider=coreml is only supported on macOS"
+        );
+        #[cfg(not(feature = "cuda"))]
+        assert_eq!(
+            execution_providers(&runtime(ExecutionProviderChoice::Cuda))
+                .expect_err("cuda without the feature")
+                .to_string(),
+            "execution_provider=cuda requires a memex binary built with cargo feature `cuda`"
+        );
+        let options = init_options_for_model(
+            EmbeddingModel::AllMiniLML6V2,
+            &runtime(ExecutionProviderChoice::Cpu),
+        )
+        .expect("cpu options");
+        assert!(options.execution_providers.is_empty());
+        assert!(!options.show_download_progress);
+    }
+
+    #[test]
+    fn provider_init_errors_name_the_failed_provider() {
+        let runtime = |execution_provider| EmbedRuntimeConfig {
+            execution_provider,
+            ..EmbedRuntimeConfig::default()
+        };
+        let error = provider_init_error(&runtime(ExecutionProviderChoice::Cuda), anyhow!("boom"));
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to initialize CUDA execution provider: boom.")
+        );
+        let error = provider_init_error(&runtime(ExecutionProviderChoice::CoreML), anyhow!("boom"));
+        assert_eq!(
+            error.to_string(),
+            "failed to initialize CoreML execution provider: boom"
+        );
+        for provider in [ExecutionProviderChoice::Cpu, ExecutionProviderChoice::Auto] {
+            assert_eq!(
+                provider_init_error(&runtime(provider), anyhow!("boom")).to_string(),
+                "boom"
+            );
+        }
     }
 }

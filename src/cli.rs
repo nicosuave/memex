@@ -417,6 +417,8 @@ OUTPUT FIELDS (--fields):
         /// Persist a metadata-only retrieval trace and print its ID to stderr
         #[arg(long, help_heading = "Tuning")]
         trace: bool,
+        #[command(flatten)]
+        rerank: RerankArgs,
     },
     /// Interactive terminal UI for browsing sessions
     Tui {
@@ -1073,6 +1075,31 @@ fn default_recency_half_life_days() -> f32 {
     30.0
 }
 
+// A separate struct keeps these args out of the already large derived
+// `Commands::augment_subcommands` stack frame.
+#[derive(Debug, Clone, Copy, Default, Args)]
+pub struct RerankArgs {
+    /// Rerank the leading results with the configured local model, loading it in this process
+    #[arg(long, conflicts_with = "no_rerank", help_heading = "Tuning")]
+    rerank: bool,
+    /// Keep the retrieval order even when reranking is configured
+    #[arg(long, help_heading = "Tuning")]
+    no_rerank: bool,
+}
+
+impl RerankArgs {
+    /// The per-search reranking override; `None` follows the configuration.
+    fn selected(self) -> Option<bool> {
+        if self.rerank {
+            Some(true)
+        } else if self.no_rerank {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 /// Parameters for the MCP search tool. Results always use Memex's compact,
 /// bounded search projection; complete transcript text is available through
 /// the bounded read tools.
@@ -1131,6 +1158,11 @@ pub(crate) struct SearchRequest {
     /// Machine IDs to search. Empty uses the configured defaults.
     #[serde(default)]
     pub(crate) machines: Vec<String>,
+    /// Rerank the leading conversation results with the configured local cross-encoder.
+    /// Omit to follow the server configuration; false keeps the retrieval order, and true
+    /// fails when reranking is not configured.
+    #[serde(default)]
+    pub(crate) rerank: Option<bool>,
 }
 
 /// Parameters for the MCP session-listing tool.
@@ -1454,6 +1486,7 @@ pub fn run() -> Result<()> {
             root,
             machine,
             trace,
+            rerank,
         } => {
             run_search(
                 query,
@@ -1486,6 +1519,7 @@ pub fn run() -> Result<()> {
                 root,
                 machine,
                 trace,
+                rerank.selected(),
             )?;
         }
         Commands::Tui {
@@ -2093,15 +2127,13 @@ fn service_embedding_worker(
         vector_work.worker_finished(exit);
     }
 
-    let desired_spec = load_embed_worker_spec(index, paths)?;
-    if desired_spec != *active_spec {
-        worker.stop()?;
-        *active_spec = desired_spec;
-        vector_work.verify = true;
-        vector_work.memory_revision = None;
-        vector_work.retry_after = None;
-        vector_work.consecutive_failures = 0;
-    }
+    apply_spec_reload(
+        load_embed_worker_spec(index, paths),
+        worker,
+        active_spec,
+        vector_work,
+        Instant::now(),
+    )?;
 
     let search_index = SearchIndex::open_or_create(&paths.index)?;
     vector_work.observe_lexical_revision(search_index.revision()?);
@@ -2142,6 +2174,77 @@ fn service_embedding_worker(
     Ok(())
 }
 
+/// Apply a config reload at `now`: print its warning, and stop the worker and reset
+/// vector work when the spec to run changed.
+fn apply_spec_reload<P: ChildProcess>(
+    loaded: Result<Option<EmbedWorkerSpec>>,
+    worker: &mut EmbeddingWorker<P>,
+    active_spec: &mut Option<EmbedWorkerSpec>,
+    vector_work: &mut VectorWorkState,
+    now: Instant,
+) -> Result<()> {
+    let reload = vector_work.reload_spec(loaded, active_spec, now)?;
+    if let Some(warning) = &reload.warning {
+        eprintln!("{warning}");
+    }
+    if reload.spec != *active_spec {
+        worker.stop()?;
+        *active_spec = reload.spec;
+        vector_work.verify = true;
+        vector_work.memory_revision = None;
+        vector_work.retry_after = None;
+        vector_work.consecutive_failures = 0;
+    }
+    Ok(())
+}
+
+/// How often the same daemon warning is printed again while it persists.
+const WARNING_REPEAT: Duration = Duration::from_secs(15 * 60);
+/// Most distinct warnings [`RepeatGuard`] remembers.
+const WARNING_MEMORY: usize = 32;
+
+/// Rate limit for repeated daemon warnings: each distinct message is printed at most
+/// once per [`WARNING_REPEAT`], even when several messages alternate.
+#[derive(Debug, Default)]
+struct RepeatGuard {
+    printed: HashMap<String, Instant>,
+}
+
+impl RepeatGuard {
+    /// Whether `message` should be printed at `now`, recording it when it should.
+    ///
+    /// Beyond [`WARNING_MEMORY`] messages, expired entries are dropped first, then the
+    /// oldest, so a forgotten message may print again early but memory stays bounded.
+    fn admit(&mut self, message: &str, now: Instant) -> bool {
+        if self
+            .printed
+            .get(message)
+            .is_some_and(|at| now.saturating_duration_since(*at) < WARNING_REPEAT)
+        {
+            return false;
+        }
+        if !self.printed.contains_key(message) && self.printed.len() >= WARNING_MEMORY {
+            self.printed
+                .retain(|_, at| now.saturating_duration_since(*at) < WARNING_REPEAT);
+            if self.printed.len() >= WARNING_MEMORY
+                && let Some(oldest) = self
+                    .printed
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(message, _)| message.clone())
+            {
+                self.printed.remove(&oldest);
+            }
+        }
+        self.printed.insert(message.to_string(), now);
+        true
+    }
+
+    fn clear(&mut self) {
+        self.printed.clear();
+    }
+}
+
 #[derive(Debug, Default)]
 struct VectorWorkState {
     lexical_revision: Option<IndexRevision>,
@@ -2151,6 +2254,26 @@ struct VectorWorkState {
     external_embedding_seen: bool,
     retry_after: Option<Instant>,
     consecutive_failures: u32,
+    /// Whether a worker spec has loaded from config since the daemon started.
+    spec_loaded: bool,
+    /// Config reload warnings already printed.
+    spec_warnings: RepeatGuard,
+    /// Whether embedding stopped because the last valid spec used a remote endpoint.
+    remote_paused: bool,
+}
+
+/// The worker spec chosen after a config reload, and a warning to print.
+#[derive(Debug, PartialEq)]
+struct SpecReload {
+    spec: Option<EmbedWorkerSpec>,
+    warning: Option<String>,
+}
+
+impl EmbedWorkerSpec {
+    /// Whether the worker sends text to a remote embeddings endpoint.
+    fn is_remote(&self) -> bool {
+        self.runtime.remote.is_some() || matches!(self.model, ModelChoice::Remote(_))
+    }
 }
 
 /// Delay before respawning after the first failed embedding worker.
@@ -2168,6 +2291,47 @@ fn embed_worker_retry_delay(failures: u32) -> Duration {
 }
 
 impl VectorWorkState {
+    /// The spec to run after a config reload at `now`.
+    ///
+    /// Before any spec has loaded, a load error is returned. Afterwards a local `active`
+    /// spec keeps running, while a remote one stops so no text reaches an endpoint the
+    /// current config no longer names. Each distinct warning is returned at most once
+    /// per [`WARNING_REPEAT`].
+    fn reload_spec(
+        &mut self,
+        loaded: Result<Option<EmbedWorkerSpec>>,
+        active: &Option<EmbedWorkerSpec>,
+        now: Instant,
+    ) -> Result<SpecReload> {
+        let error = match loaded {
+            Ok(spec) => {
+                self.spec_loaded = true;
+                self.spec_warnings.clear();
+                self.remote_paused = false;
+                return Ok(SpecReload {
+                    spec,
+                    warning: None,
+                });
+            }
+            Err(error) if !self.spec_loaded => return Err(error),
+            Err(error) => error,
+        };
+        self.remote_paused |= active.as_ref().is_some_and(EmbedWorkerSpec::is_remote);
+        let spec = if self.remote_paused {
+            None
+        } else {
+            active.clone()
+        };
+        let action = if self.remote_paused {
+            "remote embedding is paused until the config is valid"
+        } else {
+            "keeping the previous embedding settings"
+        };
+        let warning = format!("daemon: config reload failed; {action}: {error:#}");
+        let warning = self.spec_warnings.admit(&warning, now).then_some(warning);
+        Ok(SpecReload { spec, warning })
+    }
+
     fn worker_finished(&mut self, success: bool) {
         self.verify = true;
         if success {
@@ -2343,6 +2507,7 @@ fn run_index_loop(
 ) -> Result<()> {
     // Keep the native listener alive for every daemon watch mode, including
     // the default event loop, and release it when that loop exits or fails.
+    crate::rerank::enable_background_loading();
     let paths = Paths::new(index.root.clone())?;
     let mut runtime = crate::daemon_runtime::DaemonRuntime::start(&paths)?;
     let mut upgrade = daemon_upgrade::Replacement::new()?;
@@ -2412,6 +2577,7 @@ fn run_poll_loop(
     let mut worker = EmbeddingWorker::default();
     let mut worker_spec = None;
     let mut vector_work = VectorWorkState::default();
+    let mut ingest_failures = IngestFailures::default();
 
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
@@ -2438,6 +2604,19 @@ fn run_poll_loop(
         let deadline = Instant::now() + Duration::from_secs(interval_secs);
         while Instant::now() < deadline && !shutdown.load(AtomicOrdering::Relaxed) {
             upgrade.check(|| worker.stop());
+            // A remote worker stops as soon as the config turns invalid, not a cycle later.
+            if worker.is_running() && worker_spec.as_ref().is_some_and(EmbedWorkerSpec::is_remote) {
+                let loaded = load_embed_worker_spec(embedding_index, &paths);
+                if loaded.is_err() {
+                    apply_spec_reload(
+                        loaded,
+                        &mut worker,
+                        &mut worker_spec,
+                        &mut vector_work,
+                        Instant::now(),
+                    )?;
+                }
+            }
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(1));
@@ -2452,18 +2631,62 @@ fn run_poll_loop(
         if shutdown.load(AtomicOrdering::Relaxed) {
             break;
         }
-        if let Err(error) =
-            retry_after_stopping_embedder(&mut worker, || run_index_args(index, false))
-        {
-            if !error.is::<crate::lease::EmbeddingBusy>() {
-                return Err(error);
-            }
-            eprintln!("index deferred while another embedding writer is active");
+        let outcome = retry_after_stopping_embedder(&mut worker, || run_index_args(index, false));
+        if let Some(warning) = poll_ingest_outcome(outcome, &mut ingest_failures, Instant::now())? {
+            eprintln!("{warning}");
         }
         std::io::stdout().flush().ok();
     }
     worker.stop()?;
     Ok(())
+}
+
+/// Consecutive poll-loop ingest failures after which the daemon exits, so its service
+/// manager restarts it.
+const MAX_CONSECUTIVE_INGEST_FAILURES: u32 = 10;
+
+/// Poll-loop ingest failure state: warnings already printed and the current run of
+/// consecutive failures.
+#[derive(Debug, Default)]
+struct IngestFailures {
+    warnings: RepeatGuard,
+    consecutive: u32,
+}
+
+/// Handle one poll-loop ingest result at `now`, returning a warning to print.
+///
+/// An incompatible index stops the daemon, and so does the
+/// [`MAX_CONSECUTIVE_INGEST_FAILURES`]th failure in a row. A busy embedder defers the
+/// ingest without counting as a failure. Any other failure, such as an invalid config,
+/// is retried next cycle and reported at most once per [`WARNING_REPEAT`].
+fn poll_ingest_outcome(
+    result: Result<()>,
+    failures: &mut IngestFailures,
+    now: Instant,
+) -> Result<Option<String>> {
+    let error = match result {
+        Ok(()) => {
+            failures.warnings.clear();
+            failures.consecutive = 0;
+            return Ok(None);
+        }
+        Err(error) if error.is::<crate::index::IndexCompatibilityError>() => return Err(error),
+        Err(error) if error.is::<crate::lease::EmbeddingBusy>() => {
+            return Ok(Some(
+                "index deferred while another embedding writer is active".to_string(),
+            ));
+        }
+        Err(error) => error,
+    };
+    failures.consecutive = failures.consecutive.saturating_add(1);
+    if failures.consecutive >= MAX_CONSECUTIVE_INGEST_FAILURES {
+        return Err(error.context(format!(
+            "index failed {} times in a row; stopping the daemon",
+            failures.consecutive
+        )));
+    }
+    let warning = format!("index failed, retrying next cycle: {error:#}");
+    Ok(failures.warnings.admit(&warning, now).then_some(warning))
 }
 
 fn initialize_index_loop<T>(
@@ -3019,6 +3242,7 @@ fn run_search(
     root: Option<PathBuf>,
     machines: Vec<String>,
     trace: bool,
+    rerank: Option<bool>,
 ) -> Result<()> {
     crate::profiling::span!("cli.search");
     let format = if json_array && !verbose {
@@ -3066,6 +3290,7 @@ fn run_search(
             machines,
             content,
             trace,
+            rerank,
         });
     }
     let mut collected = collect_search(SearchCollectRequest {
@@ -3097,6 +3322,7 @@ fn run_search(
         },
         root,
         machines,
+        rerank,
     })?;
     collected.render.pretty = pretty;
     for failure in &collected.failures {
@@ -3158,6 +3384,7 @@ struct MemorySurfaceSearchArgs {
     machines: Vec<String>,
     content: SearchContent,
     trace: bool,
+    rerank: Option<bool>,
 }
 
 enum UnifiedSearchResult {
@@ -3235,6 +3462,7 @@ fn collect_search_with_memories(
         machines,
         content,
         trace,
+        rerank,
     } = args;
     if limit == 0 || limit > 500 {
         return Err(anyhow!("limit must be between 1 and 500"));
@@ -3251,6 +3479,11 @@ fn collect_search_with_memories(
     if trace {
         return Err(anyhow!(
             "retrieval traces currently record conversation searches only"
+        ));
+    }
+    if content == SearchContent::Memories && rerank == Some(true) {
+        return Err(anyhow!(
+            "reranking applies to conversation search; use --content conversations or all"
         ));
     }
 
@@ -3287,6 +3520,7 @@ fn collect_search_with_memories(
             format: SearchFormat::Json,
             root: root.clone(),
             machines: machines.clone(),
+            rerank,
         })?;
         failures.extend(collected.failures);
         conversation_results = collected.results;
@@ -3494,6 +3728,8 @@ struct SearchCollectRequest {
     format: SearchFormat,
     root: Option<PathBuf>,
     machines: Vec<String>,
+    /// Per-search reranking override; see [`SearchSpec::rerank`].
+    rerank: Option<bool>,
 }
 
 struct SearchCollection {
@@ -3658,6 +3894,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     format: SearchFormat::Json,
                     root: Some(paths.root.clone()),
                     machines: vec![machine],
+                    rerank: None,
                 },
                 false,
             )?;
@@ -3766,6 +4003,7 @@ fn collect_search_with_auto_index(
         format,
         root,
         machines,
+        rerank,
     } = request;
     let mut queries = vec![query];
     queries.extend(additional_queries);
@@ -3781,6 +4019,9 @@ fn collect_search_with_auto_index(
     let cwd = canonical_cwd_filter(cwd);
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    if rerank == Some(true) {
+        validate_rerank_request(&config)?;
+    }
     let options = QueryOptions {
         query,
         project,
@@ -3866,6 +4107,7 @@ fn collect_search_with_auto_index(
                 min_score,
                 project_grouping: None,
                 text_limit,
+                rerank,
             };
             let federated = federated_search(
                 &paths,
@@ -4175,6 +4417,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
                 machines: request.machines,
                 content: request.content,
                 trace: false,
+                rerank: request.rerank,
             })?;
         return Ok(serde_json::json!({
             "results": results,
@@ -4207,6 +4450,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
         format: SearchFormat::Json,
         root,
         machines: request.machines,
+        rerank: request.rerank,
     })?;
     let SearchCollection {
         results,
@@ -4225,6 +4469,11 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
 
 fn validate_mcp_search_request(request: &SearchRequest) -> Result<()> {
     validate_mcp_limit(request.limit)?;
+    if request.content == SearchContent::Memories && request.rerank == Some(true) {
+        return Err(anyhow!(
+            "rerank applies to conversation search; set content to conversations or all"
+        ));
+    }
     let query_count = 1usize.saturating_add(request.additional_queries.len());
     if query_count > 8 {
         return Err(anyhow!("search accepts at most 8 queries"));
@@ -4255,6 +4504,18 @@ fn validate_mcp_search_request(request: &SearchRequest) -> Result<()> {
             "recency_half_life_days must be finite and greater than zero"
         ));
     }
+    Ok(())
+}
+
+/// Reject an explicit reranking request that this machine's configuration cannot serve.
+fn validate_rerank_request(config: &UserConfig) -> Result<()> {
+    if config.rerank_mode() == crate::config::RerankMode::Off {
+        return Err(anyhow!(
+            "reranking was requested but is not configured; set rerank = \"local\" and \
+             rerank_model in config.toml"
+        ));
+    }
+    config.resolve_rerank()?;
     Ok(())
 }
 
@@ -8479,6 +8740,222 @@ mod tests {
     }
 
     #[test]
+    fn config_reload_errors_keep_a_local_worker_spec_after_startup() {
+        let spec = Some(EmbedWorkerSpec {
+            model: ModelChoice::default(),
+            runtime: EmbedRuntimeConfig::default(),
+        });
+        let start = Instant::now();
+        let mut state = VectorWorkState::default();
+        let error = state
+            .reload_spec(Err(anyhow!("invalid config")), &None, start)
+            .expect_err("startup error is fatal");
+        assert_eq!(error.to_string(), "invalid config");
+
+        let loaded = state.reload_spec(Ok(spec.clone()), &None, start).unwrap();
+        assert_eq!(loaded.spec, spec);
+        assert_eq!(loaded.warning, None);
+
+        let first = state
+            .reload_spec(Err(anyhow!("invalid config")), &spec, start)
+            .unwrap();
+        assert_eq!(first.spec, spec);
+        assert_eq!(
+            first.warning.as_deref(),
+            Some(
+                "daemon: config reload failed; keeping the previous embedding settings: \
+                 invalid config"
+            )
+        );
+        let soon = start + WARNING_REPEAT - Duration::from_secs(1);
+        let repeated = state
+            .reload_spec(Err(anyhow!("invalid config")), &spec, soon)
+            .unwrap();
+        assert_eq!(repeated.spec, spec);
+        assert_eq!(repeated.warning, None);
+        let changed = state
+            .reload_spec(Err(anyhow!("other error")), &spec, soon)
+            .unwrap();
+        assert!(
+            changed
+                .warning
+                .is_some_and(|warning| warning.ends_with("other error"))
+        );
+        // Alternating errors are each still limited to one print per interval.
+        let alternated = state
+            .reload_spec(Err(anyhow!("invalid config")), &spec, soon)
+            .unwrap();
+        assert_eq!(alternated.warning, None);
+        let later = soon + WARNING_REPEAT;
+        assert!(
+            state
+                .reload_spec(Err(anyhow!("other error")), &spec, later)
+                .unwrap()
+                .warning
+                .is_some()
+        );
+
+        let fixed = state.reload_spec(Ok(None), &spec, later).unwrap();
+        assert_eq!(fixed.spec, None);
+        assert!(state.spec_warnings.printed.is_empty());
+    }
+
+    #[test]
+    fn config_reload_errors_stop_a_remote_worker_until_the_config_is_fixed() {
+        let remote = Some(EmbedWorkerSpec {
+            model: ModelChoice::Remote("text-embedding-3-small".to_string()),
+            runtime: EmbedRuntimeConfig::default(),
+        });
+        let now = Instant::now();
+        let mut state = VectorWorkState::default();
+        state.reload_spec(Ok(remote.clone()), &None, now).unwrap();
+
+        let failed = state
+            .reload_spec(Err(anyhow!("invalid embedding_base_url")), &remote, now)
+            .unwrap();
+        assert_eq!(failed.spec, None);
+        assert_eq!(
+            failed.warning.as_deref(),
+            Some(
+                "daemon: config reload failed; remote embedding is paused until the config \
+                 is valid: invalid embedding_base_url"
+            )
+        );
+        // The worker is stopped now, and stays stopped while the error persists.
+        let still = state
+            .reload_spec(Err(anyhow!("invalid embedding_base_url")), &None, now)
+            .unwrap();
+        assert_eq!(still.spec, None);
+        assert_eq!(still.warning, None);
+        let changed = state
+            .reload_spec(Err(anyhow!("invalid embedding_timeout_secs")), &None, now)
+            .unwrap();
+        assert!(
+            changed
+                .warning
+                .is_some_and(|warning| warning.contains("remote embedding is paused"))
+        );
+
+        let fixed = state.reload_spec(Ok(remote.clone()), &None, now).unwrap();
+        assert_eq!(fixed.spec, remote);
+        assert_eq!(fixed.warning, None);
+    }
+
+    #[test]
+    fn poll_loop_reports_ingest_failures_and_keeps_running() {
+        let now = Instant::now();
+        let mut failures = IngestFailures::default();
+        let message = "config.toml: invalid TOML at line 1, column 1: expected newline";
+        let failure = || Err(anyhow!(message));
+        assert_eq!(
+            poll_ingest_outcome(failure(), &mut failures, now)
+                .expect("invalid config is retried")
+                .as_deref(),
+            Some(format!("index failed, retrying next cycle: {message}").as_str())
+        );
+        let soon = now + WARNING_REPEAT - Duration::from_secs(1);
+        assert_eq!(
+            poll_ingest_outcome(failure(), &mut failures, soon).unwrap(),
+            None
+        );
+        assert!(
+            poll_ingest_outcome(failure(), &mut failures, now + WARNING_REPEAT)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            poll_ingest_outcome(Err(crate::lease::EmbeddingBusy.into()), &mut failures, now)
+                .expect("busy embedder is deferred")
+                .is_some()
+        );
+        assert_eq!(failures.consecutive, 3, "a busy embedder is not a failure");
+        assert_eq!(
+            poll_ingest_outcome(Ok(()), &mut failures, now).unwrap(),
+            None
+        );
+        assert!(failures.warnings.printed.is_empty());
+        assert_eq!(failures.consecutive, 0);
+        let error = poll_ingest_outcome(
+            Err(crate::index::IndexCompatibilityError::for_test("old schema").into()),
+            &mut failures,
+            now,
+        )
+        .expect_err("an incompatible index stops the daemon");
+        assert!(error.is::<crate::index::IndexCompatibilityError>());
+    }
+
+    #[test]
+    fn repeated_ingest_failures_stop_the_poll_loop() {
+        let now = Instant::now();
+        let mut failures = IngestFailures::default();
+        for _ in 1..MAX_CONSECUTIVE_INGEST_FAILURES {
+            poll_ingest_outcome(Err(anyhow!("disk full")), &mut failures, now)
+                .expect("retried below the limit");
+        }
+        poll_ingest_outcome(Ok(()), &mut failures, now).expect("success");
+        for _ in 1..MAX_CONSECUTIVE_INGEST_FAILURES {
+            poll_ingest_outcome(Err(anyhow!("disk full")), &mut failures, now)
+                .expect("a success restarted the count");
+        }
+        let error = poll_ingest_outcome(Err(anyhow!("disk full")), &mut failures, now)
+            .expect_err("the tenth failure in a row stops the daemon");
+        assert_eq!(
+            format!("{error:#}"),
+            "index failed 10 times in a row; stopping the daemon: disk full"
+        );
+    }
+
+    #[test]
+    fn repeat_guard_memory_is_bounded() {
+        let now = Instant::now();
+        let mut guard = RepeatGuard::default();
+        for index in 0..WARNING_MEMORY * 3 {
+            assert!(guard.admit(&format!("warning {index}"), now));
+            assert!(guard.printed.len() <= WARNING_MEMORY);
+        }
+        assert!(!guard.admit(&format!("warning {}", WARNING_MEMORY * 3 - 1), now));
+    }
+
+    #[test]
+    fn a_config_error_stops_a_running_remote_worker_immediately() {
+        let remote = Some(EmbedWorkerSpec {
+            model: ModelChoice::Remote("text-embedding-3-small".to_string()),
+            runtime: EmbedRuntimeConfig::default(),
+        });
+        let mut worker = EmbeddingWorker::default();
+        let mut active = None;
+        let mut vector_work = VectorWorkState::default();
+        let now = Instant::now();
+        apply_spec_reload(
+            Ok(remote.clone()),
+            &mut worker,
+            &mut active,
+            &mut vector_work,
+            now,
+        )
+        .unwrap();
+        assert_eq!(active, remote);
+        let process = std::rc::Rc::new(std::cell::RefCell::new(FakeProcessState {
+            running: true,
+            ..FakeProcessState::default()
+        }));
+        worker.start(FakeProcess {
+            state: process.clone(),
+        });
+        apply_spec_reload(
+            Err(anyhow!("invalid embedding_base_url")),
+            &mut worker,
+            &mut active,
+            &mut vector_work,
+            now,
+        )
+        .unwrap();
+        assert_eq!(active, None);
+        assert!(!worker.is_running());
+        assert_eq!(process.borrow().terminate_and_wait_calls, 1);
+    }
+
+    #[test]
     fn failed_worker_requeues_memory_work_with_retry_delay() {
         let mut state = VectorWorkState::default();
         state.worker_finished(false);
@@ -8674,6 +9151,75 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn search_rerank_flags_select_a_per_search_override() {
+        for (flags, expected) in [
+            (&[][..], None),
+            (&["--rerank"][..], Some(true)),
+            (&["--no-rerank"][..], Some(false)),
+        ] {
+            let cli = Cli::try_parse_from(["memex", "search", "needle"].iter().chain(flags))
+                .expect("parse search");
+            let Some(Commands::Search { rerank, .. }) = cli.command else {
+                panic!("expected search");
+            };
+            assert_eq!(rerank.selected(), expected, "{flags:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["memex", "search", "needle", "--rerank", "--no-rerank"]).is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_rerank_requires_local_configuration() {
+        let _guard = crate::test_support::env_lock();
+        let _env = crate::test_support::EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+        let error = validate_rerank_request(&UserConfig::default())
+            .expect_err("rerank off")
+            .to_string();
+        assert!(error.contains("not configured"), "{error}");
+        let mut config = UserConfig {
+            rerank: Some(crate::config::RerankMode::Local),
+            ..UserConfig::default()
+        };
+        assert!(validate_rerank_request(&config).is_err());
+        config.rerank_model = Some("jina-turbo".to_string());
+        validate_rerank_request(&config).expect("configured");
+    }
+
+    #[test]
+    fn mcp_search_rerank_is_optional_and_validated() {
+        let request: SearchRequest =
+            serde_json::from_value(serde_json::json!({"query": "needle"})).unwrap();
+        assert_eq!(request.rerank, None);
+        let request: SearchRequest =
+            serde_json::from_value(serde_json::json!({"query": "needle", "rerank": false}))
+                .unwrap();
+        assert_eq!(request.rerank, Some(false));
+        assert!(
+            serde_json::from_value::<SearchRequest>(
+                serde_json::json!({"query": "needle", "rerank": "yes"})
+            )
+            .is_err()
+        );
+        for (content, rerank, valid) in [
+            ("memories", true, false),
+            ("memories", false, true),
+            ("all", true, true),
+            ("conversations", true, true),
+        ] {
+            let request: SearchRequest = serde_json::from_value(
+                serde_json::json!({"query": "needle", "content": content, "rerank": rerank}),
+            )
+            .unwrap();
+            assert_eq!(
+                validate_mcp_search_request(&request).is_ok(),
+                valid,
+                "{content} {rerank}"
+            );
+        }
     }
 
     #[test]

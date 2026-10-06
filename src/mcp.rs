@@ -661,6 +661,7 @@ pub fn spawn_http(root: Option<PathBuf>, options: HttpOptions) -> Result<Backgro
 
 /// Start MCP without running an index refresh or opening a UI during handshake.
 pub fn run(root: Option<PathBuf>, http: Option<HttpOptions>) -> Result<()> {
+    crate::rerank::enable_background_loading();
     let runtime = runtime()?;
     let result = runtime.block_on(async {
         if let Some(options) = http {

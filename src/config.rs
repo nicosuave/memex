@@ -2,13 +2,17 @@ use crate::embed::{
     EmbedRuntimeConfig, ExecutionProviderChoice, LocalModel, ModelChoice, RemoteEmbedConfig,
 };
 use crate::remote_embed::{MAX_BATCH_SIZE, MAX_DIMENSIONS, RemoteEndpoint};
-use anyhow::{Result, anyhow};
+use crate::rerank::{
+    DEFAULT_RERANK_CANDIDATES, DEFAULT_RERANK_DOC_CHARS, RERANK_CANDIDATES, RERANK_DOC_CHARS,
+    RerankSettings,
+};
+use anyhow::{Context, Result, anyhow};
 use directories::BaseDirs;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -164,6 +168,69 @@ impl Serialize for EmbeddingsMode {
     }
 }
 
+/// Value of the `rerank` key: `false` (default), or `true`/`"local"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RerankMode {
+    #[default]
+    Off,
+    Local,
+}
+
+impl RerankMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Local => "local",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RerankMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ModeVisitor;
+
+        impl serde::de::Visitor<'_> for ModeVisitor {
+            type Value = RerankMode;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("true, false, or \"local\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                value: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(if value {
+                    RerankMode::Local
+                } else {
+                    RerankMode::Off
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                match value {
+                    "local" => Ok(RerankMode::Local),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ModeVisitor)
+    }
+}
+
+impl Serialize for RerankMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => serializer.serialize_bool(false),
+            Self::Local => serializer.serialize_str("local"),
+        }
+    }
+}
+
 /// A configured credential whose `Debug` output never contains the value.
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -236,6 +303,15 @@ pub struct UserConfig {
     pub cudnn_library_paths: Option<Vec<PathBuf>>,
     /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
     pub compute_units: Option<String>,
+    /// Search reranking: true or "local", or false (default).
+    pub rerank: Option<RerankMode>,
+    /// Local cross-encoder: jina-turbo, bge-v2-m3, bge-base, or jina-v2; required when
+    /// reranking is on.
+    pub rerank_model: Option<String>,
+    /// Leading results rescored per search, 5..=100 (default 30).
+    pub rerank_candidates: Option<usize>,
+    /// Characters of each result sent to the reranker, 200..=8000 (default 1500).
+    pub rerank_doc_chars: Option<usize>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
     /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
@@ -398,12 +474,26 @@ pub struct IndexBackendConfig {
 impl UserConfig {
     pub fn load(paths: &Paths) -> Result<Self> {
         let path = paths.root.join("config.toml");
-        if !path.exists() {
+        let Some(contents) = read_config_file(&path)? else {
             return Ok(Self::default());
-        }
-        let contents = std::fs::read_to_string(path)?;
-        let config: UserConfig = toml::from_str(&contents)?;
-        Ok(config)
+        };
+        Self::parse_file(&contents, &path)
+    }
+
+    /// Parse `config.toml` contents.
+    ///
+    /// Unknown top-level keys are ignored; a near miss of a known key also prints a warning.
+    /// Errors name a line and column but never quote the source, which may hold a key.
+    pub fn parse(contents: &str) -> Result<Self> {
+        Self::parse_file(contents, Path::new("config.toml"))
+    }
+
+    fn parse_file(contents: &str, path: &Path) -> Result<Self> {
+        let table: toml::Table = toml::from_str(contents)
+            .map_err(|error| toml_error(path, contents, error.message(), error.span()))?;
+        warn_key_typos(&table, path);
+        toml::from_str(contents)
+            .map_err(|error| toml_error(path, contents, error.message(), error.span()))
     }
 
     pub fn embeddings_mode(&self) -> EmbeddingsMode {
@@ -553,14 +643,82 @@ impl UserConfig {
             ));
         }
         Ok(EmbedRuntimeConfig {
+            batch_size,
+            ..self.resolve_onnx_runtime()?
+        })
+    }
+
+    /// The ONNX Runtime keys (`execution_provider`, `compute_units`, and the CUDA keys) with
+    /// their environment fallbacks, shared by local embedding and local reranking.
+    fn resolve_onnx_runtime(&self) -> Result<EmbedRuntimeConfig> {
+        Ok(EmbedRuntimeConfig {
             execution_provider: self.resolve_execution_provider()?,
             compute_units: self.resolve_compute_units(),
             cuda_device_id: self.resolve_cuda_device_id()?,
             cuda_library_paths: self.resolve_cuda_library_paths()?,
             cudnn_library_paths: self.resolve_cudnn_library_paths()?,
-            batch_size,
+            batch_size: None,
             remote: None,
         })
+    }
+
+    pub fn rerank_mode(&self) -> RerankMode {
+        self.rerank.unwrap_or_default()
+    }
+
+    /// Validate the reranking keys and resolve them; `None` when reranking is off.
+    ///
+    /// `rerank_candidates`, `rerank_doc_chars`, and a configured `rerank_model` are checked
+    /// in every mode. Local reranking requires a model from `rerank_model`, else
+    /// `MEMEX_RERANK_MODEL`, and runs on the same ONNX Runtime settings as local embeddings.
+    pub fn resolve_rerank(&self) -> Result<Option<RerankSettings>> {
+        let candidates = self.rerank_candidates.unwrap_or(DEFAULT_RERANK_CANDIDATES);
+        if !RERANK_CANDIDATES.contains(&candidates) {
+            return Err(anyhow!(
+                "rerank_candidates must be between {} and {}, got {candidates}",
+                RERANK_CANDIDATES.start(),
+                RERANK_CANDIDATES.end()
+            ));
+        }
+        let doc_chars = self.rerank_doc_chars.unwrap_or(DEFAULT_RERANK_DOC_CHARS);
+        if !RERANK_DOC_CHARS.contains(&doc_chars) {
+            return Err(anyhow!(
+                "rerank_doc_chars must be between {} and {}, got {doc_chars}",
+                RERANK_DOC_CHARS.start(),
+                RERANK_DOC_CHARS.end()
+            ));
+        }
+        let configured_model = self
+            .rerank_model
+            .as_deref()
+            .map(|name| crate::rerank::parse_model(name).context("invalid rerank_model"))
+            .transpose()?;
+        if self.rerank_mode() == RerankMode::Off {
+            return Ok(None);
+        }
+        let model = match configured_model {
+            Some(model) => model,
+            None => match std::env::var("MEMEX_RERANK_MODEL") {
+                Ok(name) => {
+                    crate::rerank::parse_model(&name).context("invalid MEMEX_RERANK_MODEL")?
+                }
+                Err(std::env::VarError::NotPresent) => {
+                    return Err(anyhow!(
+                        "rerank = \"local\" requires rerank_model, one of: {}",
+                        crate::rerank::SUPPORTED_MODEL_NAMES
+                    ));
+                }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(anyhow!("MEMEX_RERANK_MODEL is not valid unicode"));
+                }
+            },
+        };
+        Ok(Some(RerankSettings {
+            model,
+            candidates,
+            doc_chars,
+            runtime: self.resolve_onnx_runtime()?,
+        }))
     }
 
     fn resolve_embedding_batch_size(&self) -> Result<Option<usize>> {
@@ -702,6 +860,399 @@ impl UserConfig {
     }
 }
 
+/// Largest `config.toml` accepted, in bytes.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Read a config file, following symlinks; `None` when it does not exist.
+///
+/// Anything other than a regular file of at most [`MAX_CONFIG_BYTES`] is rejected before
+/// it is read. On Unix the file is opened non-blocking and inspected through the open
+/// handle, so a FIFO never blocks the reader and a swapped path is never read unchecked.
+fn read_config_file(path: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    let too_large = || anyhow!("{} is larger than {MAX_CONFIG_BYTES} bytes", path.display());
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(too_large());
+    }
+    let mut contents = String::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut contents)
+        .with_context(|| format!("read {}", path.display()))?;
+    if contents.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(too_large());
+    }
+    Ok(Some(contents))
+}
+
+/// Top-level keys `UserConfig` reads, including serde aliases.
+const USER_CONFIG_KEYS: &[&str] = &[
+    "embeddings",
+    "auto_index_on_search",
+    "include_reasoning",
+    "token_usage",
+    "model",
+    "embedding_batch_size",
+    "embedding_dimensions",
+    "embedding_base_url",
+    "embedding_api_key_env",
+    "embedding_api_key",
+    "embedding_timeout_secs",
+    "embedding_max_retries",
+    "execution_provider",
+    "cuda_device_id",
+    "cuda_library_paths",
+    "cudnn_library_paths",
+    "compute_units",
+    "rerank",
+    "rerank_model",
+    "rerank_candidates",
+    "rerank_doc_chars",
+    "scan_cache_ttl",
+    "max_indexed_tool_input_bytes",
+    "max_indexed_tool_output_bytes",
+    "index_service_mode",
+    "index_service_continuous",
+    "index_service_watch",
+    "index_service_interval",
+    "index_service_poll_interval",
+    "index_service_watch_interval",
+    "index_service_watch_mode",
+    "index_service_resync_interval",
+    "index_service_web_ui",
+    "index_service_mcp",
+    "index_service_web_listen",
+    "index_service_label",
+    "index_service_stdout",
+    "index_service_stderr",
+    "index_service_plist",
+    "index_service_systemd_dir",
+    "claude_resume_cmd",
+    "codex_resume_cmd",
+    "opencode_resume_cmd",
+    "cursor_resume_cmd",
+    "pi_resume_cmd",
+    "omp_resume_cmd",
+    "copilot_resume_cmd",
+    "jcode_resume_cmd",
+    "muse_resume_cmd",
+    "grok_resume_cmd",
+    "antigravity_resume_cmd",
+    "bob_resume_cmd",
+    "kilocode_resume_cmd",
+    "herdr_resume",
+    "exclude_paths",
+    "multi_machine",
+    "machines",
+    "mcp",
+];
+
+/// Most distinct key typo warnings printed by one process.
+const MAX_KEY_TYPO_WARNINGS: usize = 64;
+
+/// Key typo warnings already printed by this process.
+static WARNED_KEY_TYPOS: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Warnings for unknown top-level keys that are a near miss of a known key, such as
+/// `embedding_base_ulr`; other unknown keys are ignored, as is a key that is not a bare
+/// key of at most [`MAX_ECHOED_KEY_LEN`] bytes.
+fn key_typo_warnings(table: &toml::Table, path: &Path) -> Vec<String> {
+    table
+        .keys()
+        .filter(|key| !USER_CONFIG_KEYS.contains(&key.as_str()) && is_echoable_key(key))
+        .filter_map(|key| {
+            closest_name(key, USER_CONFIG_KEYS).map(|known| {
+                format!(
+                    "{}: unknown key `{key}` (did you mean `{known}`?)",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
+/// Record `warning` in `warned`; `false` when it was printed before or the set is full.
+fn admit_key_typo_warning(warned: &mut HashSet<String>, warning: &str) -> bool {
+    if warned.contains(warning) || warned.len() >= MAX_KEY_TYPO_WARNINGS {
+        return false;
+    }
+    warned.insert(warning.to_string())
+}
+
+/// Print each key typo warning once per process.
+fn warn_key_typos(table: &toml::Table, path: &Path) {
+    let warnings = key_typo_warnings(table, path);
+    if warnings.is_empty() {
+        return;
+    }
+    let mut warned = WARNED_KEY_TYPOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for warning in warnings {
+        if admit_key_typo_warning(&mut warned, &warning) {
+            eprintln!("warning: {warning}");
+        }
+    }
+}
+
+/// A TOML error reduced to its message and position, so the offending source line,
+/// which may hold a secret, never reaches output.
+///
+/// Type and value errors keep only what was expected, plus the key whose value holds
+/// the error; unknown variants keep only the accepted names, and unknown fields name
+/// the offending key only when it is a near miss of an accepted one. No offending value
+/// is ever included.
+fn toml_error(
+    path: &Path,
+    contents: &str,
+    message: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> anyhow::Error {
+    let before = span.as_ref().and_then(|span| contents.get(..span.start));
+    let location = before
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let column = before
+                .rsplit('\n')
+                .next()
+                .map_or(0, |line| line.chars().count())
+                + 1;
+            format!(" at line {line}, column {column}")
+        })
+        .unwrap_or_default();
+    let key = span.and_then(|span| key_at(contents, span.start));
+    anyhow!(
+        "{}: invalid TOML{location}: {}",
+        path.display(),
+        scrub_toml_message(message.trim_end(), key.as_deref())
+    )
+}
+
+/// Separator serde places before the description of what a value should be.
+const EXPECTED_SEPARATOR: &str = ", expected ";
+
+/// Largest edit distance at which an unknown field is named as a typo of a valid one.
+const MAX_FIELD_TYPO_DISTANCE: usize = 2;
+
+/// Drop the offending value or token from a serde message; parser messages pass through.
+fn scrub_toml_message(message: &str, key: Option<&str>) -> String {
+    let key = key.map(|key| format!("{key}: ")).unwrap_or_default();
+    for (prefix, summary) in [
+        ("invalid type: ", "wrong value type"),
+        ("invalid value: ", "invalid value"),
+    ] {
+        if message.starts_with(prefix) {
+            // What follows the last separator is the static expectation of the visitor.
+            return match message.rsplit_once(EXPECTED_SEPARATOR) {
+                Some((_, expected)) if !expected.contains('`') => {
+                    format!("{key}{summary}, expected {expected}")
+                }
+                _ => format!("{key}{summary}"),
+            };
+        }
+    }
+    for (prefix, summary, none) in [
+        (
+            "unknown variant ",
+            "unknown variant",
+            "there are no variants",
+        ),
+        ("unknown field ", "unknown field", "there are no fields"),
+    ] {
+        if !message.starts_with(prefix) {
+            continue;
+        }
+        if message.ends_with(none) {
+            return summary.to_string();
+        }
+        let Some((offending, names)) = message
+            .rsplit_once(EXPECTED_SEPARATOR)
+            .and_then(|(offending, expected)| Some((offending, static_names(expected)?)))
+        else {
+            return summary.to_string();
+        };
+        // Only a key close to a static name is echoed; a value never is.
+        if summary == "unknown field"
+            && let Some(field) = offending
+                .strip_prefix("unknown field `")
+                .and_then(|field| field.strip_suffix('`'))
+                .filter(|field| is_echoable_key(field))
+            && let Some(suggestion) = closest_name(field, &names.names)
+        {
+            return format!("unknown field `{field}` (did you mean `{suggestion}`?)");
+        }
+        return format!("{summary}, expected {names}");
+    }
+    redact_quoted_segments(message)
+}
+
+/// Replace each backtick-delimited segment of a parser message with `…` unless it is
+/// an echoable key or a short run of TOML punctuation such as `` `"` ``; an unpaired
+/// backtick hides the rest of the message.
+fn redact_quoted_segments(message: &str) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some((before, after)) = rest.split_once('`') {
+        output.push_str(before);
+        let Some((segment, after)) = after.split_once('`') else {
+            output.push('…');
+            return output;
+        };
+        let punctuation =
+            segment.chars().count() <= 3 && segment.chars().all(|c| "\"'[]{}=#,.".contains(c));
+        if !segment.is_empty() && (is_echoable_key(segment) || punctuation) {
+            output.push('`');
+            output.push_str(segment);
+            output.push('`');
+        } else {
+            output.push('…');
+        }
+        rest = after;
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Accepted names parsed from a serde expectation, kept with its wording.
+struct StaticNames<'a> {
+    lead: &'static str,
+    separator: &'static str,
+    names: Vec<&'a str>,
+}
+
+impl fmt::Display for StaticNames<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}", self.lead, self.names.join(self.separator))
+    }
+}
+
+/// Serde's list of accepted names (`` `a` ``, `` `a` or `b` ``, or `` one of `a`, `b`, `c` ``)
+/// without the backticks; `None` for any other shape.
+fn static_names(expected: &str) -> Option<StaticNames<'_>> {
+    let (lead, list, separator) = match expected.strip_prefix("one of ") {
+        Some(list) => ("one of ", list, ", "),
+        None => ("", expected, " or "),
+    };
+    let names = list
+        .split(separator)
+        .map(|name| {
+            name.strip_prefix('`')
+                .and_then(|name| name.strip_suffix('`'))
+                .filter(|name| !name.is_empty() && !name.contains(['`', '"']))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(StaticNames {
+        lead,
+        separator,
+        names,
+    })
+}
+
+/// The accepted name nearest to `field`, when within [`MAX_FIELD_TYPO_DISTANCE`] edits.
+fn closest_name<'a>(field: &str, names: &[&'a str]) -> Option<&'a str> {
+    names
+        .iter()
+        .map(|name| (edit_distance(field, name, MAX_FIELD_TYPO_DISTANCE), *name))
+        .filter_map(|(distance, name)| distance.map(|distance| (distance, name)))
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, name)| name)
+}
+
+/// Levenshtein distance between `a` and `b` in characters, or `None` above `limit`.
+fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > limit {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, left) in a.iter().enumerate() {
+        let mut current = Vec::with_capacity(b.len() + 1);
+        current.push(i + 1);
+        for (j, right) in b.iter().enumerate() {
+            let substitute = previous.get(j)? + usize::from(left != right);
+            let delete = previous.get(j + 1)? + 1;
+            let insert = current.get(j)? + 1;
+            current.push(substitute.min(delete).min(insert));
+        }
+        previous = current;
+    }
+    previous
+        .last()
+        .copied()
+        .filter(|distance| *distance <= limit)
+}
+
+/// Longest key name echoed in an error.
+const MAX_ECHOED_KEY_LEN: usize = 64;
+
+/// The innermost key whose value contains byte `offset` of `contents`, when it is a
+/// bare key; keys come from the parsed document, never from scanning the text.
+fn key_at(contents: &str, offset: usize) -> Option<String> {
+    let document = toml_edit::ImDocument::parse(contents).ok()?;
+    key_in_table(document.as_table(), offset).filter(|key| is_echoable_key(key))
+}
+
+/// Whether a key from the config may appear in an error: a bare key of at most
+/// [`MAX_ECHOED_KEY_LEN`] bytes, so no control character or long token is printed.
+fn is_echoable_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_ECHOED_KEY_LEN
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn key_in_table(table: &toml_edit::Table, offset: usize) -> Option<String> {
+    table.iter().find_map(|(key, item)| match item {
+        toml_edit::Item::Value(value) => key_in_value(key, value, offset),
+        toml_edit::Item::Table(table) => key_in_table(table, offset),
+        toml_edit::Item::ArrayOfTables(tables) => {
+            tables.iter().find_map(|table| key_in_table(table, offset))
+        }
+        toml_edit::Item::None => None,
+    })
+}
+
+fn key_in_value(key: &str, value: &toml_edit::Value, offset: usize) -> Option<String> {
+    if !value.span().is_some_and(|span| span.contains(&offset)) {
+        return None;
+    }
+    let nested = |table: &toml_edit::InlineTable| {
+        table
+            .iter()
+            .find_map(|(key, value)| key_in_value(key, value, offset))
+    };
+    let inner = match value {
+        toml_edit::Value::InlineTable(table) => nested(table),
+        toml_edit::Value::Array(array) => array.iter().find_map(|element| match element {
+            toml_edit::Value::InlineTable(table) => nested(table),
+            _ => None,
+        }),
+        _ => None,
+    };
+    Some(inner.unwrap_or_else(|| key.to_string()))
+}
+
 /// Expand a leading `~/` (or bare `~`) in exclusion patterns to the current
 /// home directory. Other patterns are returned unchanged.
 pub fn expand_exclude_patterns(patterns: Vec<String>) -> Vec<String> {
@@ -762,6 +1313,390 @@ fn indexed_tool_content_limit(value: Option<usize>, default: usize, key: &str) -
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, env_lock};
+
+    #[test]
+    fn type_and_value_errors_name_the_key_but_never_the_value() {
+        for (contents, secret, expected) in [
+            (
+                "embedding_api_key = 12345678\n",
+                "12345678",
+                "line 1, column 21: embedding_api_key: wrong value type, expected a string",
+            ),
+            (
+                "cuda_device_id = \"x-secret\"\n",
+                "x-secret",
+                "cuda_device_id: wrong value type, expected i32",
+            ),
+            (
+                "embeddings = \"sk-secret\"\n",
+                "sk-secret",
+                "embeddings: invalid value, expected true, false, \"local\", or \"remote\"",
+            ),
+            (
+                "embedding_batch_size = -7\n",
+                "-7",
+                "embedding_batch_size: invalid value, expected usize",
+            ),
+            (
+                "embeddings = \"sk-x, expected leak\"\n",
+                "leak",
+                "embeddings: invalid value, expected true, false",
+            ),
+            (
+                "rerank = \"sk-secret\"\n",
+                "sk-secret",
+                "rerank: invalid value, expected true, false, or \"local\"",
+            ),
+            (
+                "rerank_candidates = -3\n",
+                "-3",
+                "rerank_candidates: invalid value, expected usize",
+            ),
+        ] {
+            let error = UserConfig::parse(contents)
+                .expect_err("reject mistyped value")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains(secret), "{error}");
+            assert!(!error.contains('`'), "{error}");
+        }
+    }
+
+    #[test]
+    fn serde_messages_keep_only_static_expectations() {
+        for (message, key, scrubbed) in [
+            (
+                "invalid type: string \"a, expected b\", expected u64",
+                Some("x"),
+                "x: wrong value type, expected u64",
+            ),
+            (
+                "unknown variant `s`, expected `a` or `b`",
+                None,
+                "unknown variant, expected a or b",
+            ),
+            (
+                "unknown variant `s, expected `leak``, there are no variants",
+                None,
+                "unknown variant",
+            ),
+            (
+                "unknown field `s`, expected `only`",
+                None,
+                "unknown field, expected only",
+            ),
+            (
+                "unknown field `onl`, expected `only`",
+                None,
+                "unknown field `onl` (did you mean `only`?)",
+            ),
+            (
+                "unknown field `\u{1b}only`, expected `only`",
+                None,
+                "unknown field, expected only",
+            ),
+            (
+                "unknown variant `locl`, expected `local` or `remote`",
+                None,
+                "unknown variant, expected local or remote",
+            ),
+            (
+                "invalid table header\nduplicate key `t` in document root",
+                None,
+                "invalid table header\nduplicate key `t` in document root",
+            ),
+        ] {
+            assert_eq!(scrub_toml_message(message, key), scrubbed);
+        }
+        assert_eq!(edit_distance("modle", "model", 2), Some(2));
+        assert_eq!(edit_distance("cuda_device", "cuda_device_id", 2), None);
+    }
+
+    #[test]
+    fn errors_inside_arrays_and_tables_name_the_innermost_key() {
+        for (contents, expected) in [
+            (
+                "cuda_library_paths = [1]\n",
+                "line 1, column 23: cuda_library_paths: wrong value type, expected ",
+            ),
+            (
+                "cudnn_library_paths = [\n  \"/ok\",\n  2,\n]\n",
+                "line 3, column 3: cudnn_library_paths: wrong value type, expected ",
+            ),
+            (
+                "cuda_library_paths = [\n  \"\"\"\ntoken = [\n\"\"\", 3]\n",
+                "cuda_library_paths: wrong value type, expected ",
+            ),
+            (
+                "multi_machine.timeout_seconds = \"x\"\n",
+                "timeout_seconds: wrong value type, expected u64",
+            ),
+        ] {
+            let error = UserConfig::parse(contents)
+                .expect_err("reject mistyped element")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("token"), "{error}");
+        }
+        assert_eq!(key_at("\"quoted key\" = 5\n", 15), None);
+        assert_eq!(
+            key_at("x = [\n{ inner = 5 }]\n", 16).as_deref(),
+            Some("inner")
+        );
+    }
+
+    #[test]
+    fn oversized_and_non_regular_config_files_are_rejected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(root.path().to_path_buf())).expect("paths");
+        let path = paths.root.join("config.toml");
+        let oversized = usize::try_from(MAX_CONFIG_BYTES).expect("size") + 1;
+        std::fs::write(&path, "#".repeat(oversized)).expect("write");
+        let error = UserConfig::load(&paths)
+            .expect_err("reject oversized")
+            .to_string();
+        assert!(error.contains("is larger than 1048576 bytes"), "{error}");
+        std::fs::remove_file(&path).expect("remove");
+
+        std::fs::create_dir(&path).expect("directory in place of the file");
+        let error = UserConfig::load(&paths)
+            .expect_err("reject directory")
+            .to_string();
+        assert!(error.contains("is not a regular file"), "{error}");
+        std::fs::remove_dir(&path).expect("remove directory");
+
+        #[cfg(unix)]
+        {
+            let status = std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success());
+            let error = UserConfig::load(&paths)
+                .expect_err("reject fifo")
+                .to_string();
+            assert!(error.contains("is not a regular file"), "{error}");
+            std::fs::remove_file(&path).expect("remove fifo");
+        }
+
+        assert!(
+            UserConfig::load(&paths).is_ok(),
+            "a missing file is the default"
+        );
+    }
+
+    #[test]
+    fn parse_errors_report_a_position_but_never_the_offending_line() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(root.path().to_path_buf())).expect("paths");
+        let path = paths.root.join("config.toml");
+        for (contents, secret) in [
+            ("embedding_api_key = sk-abc123secret\n", "sk-abc123secret"),
+            (
+                "embedding_api_key = \"sk-unterminated-secret\n",
+                "sk-unterminated-secret",
+            ),
+            ("embeddings = \"cloud-secret\"\n", "cloud-secret"),
+        ] {
+            std::fs::write(&path, contents).expect("write");
+            for error in [
+                UserConfig::load(&paths)
+                    .expect_err("reject from load")
+                    .to_string(),
+                UserConfig::parse(contents)
+                    .expect_err("reject from parse")
+                    .to_string(),
+            ] {
+                assert!(!error.contains(secret), "{error}");
+            }
+        }
+        std::fs::write(
+            &path,
+            "auto_index_on_search = false\nembedding_api_key = sk-abc\n",
+        )
+        .expect("write");
+        let error = UserConfig::load(&paths).expect_err("reject").to_string();
+        assert!(
+            error.starts_with(&format!(
+                "{}: invalid TOML at line 2, column ",
+                path.display()
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn near_miss_top_level_keys_warn_and_still_load() {
+        let path = Path::new("config.toml");
+        for (contents, typo, known) in [
+            (
+                "embedding_base_ulr = \"https://x\"\n",
+                "embedding_base_ulr",
+                "embedding_base_url",
+            ),
+            ("modle = \"bge\"\n", "modle", "model"),
+            ("embedings = true\n", "embedings", "embeddings"),
+            (
+                "execution_providr = \"cpu\"\n",
+                "execution_providr",
+                "execution_provider",
+            ),
+        ] {
+            let table: toml::Table = toml::from_str(contents).expect("parse table");
+            assert_eq!(
+                key_typo_warnings(&table, path),
+                [format!(
+                    "config.toml: unknown key `{typo}` (did you mean `{known}`?)"
+                )]
+            );
+            assert!(UserConfig::parse(contents).is_ok(), "{contents:?}");
+        }
+        for contents in [
+            "foo = 1\n",
+            "future_setting = 1\n",
+            "sk-live-0123456789abcdef = 1\n",
+            // Not bare keys, so never echoed.
+            "\"modl\\u0007\" = 1\n",
+            "\"mod el\" = 1\n",
+            "index_service_watch = true\nindex_service_watch_interval = 5\n",
+        ] {
+            let table: toml::Table = toml::from_str(contents).expect("parse table");
+            assert!(key_typo_warnings(&table, path).is_empty(), "{contents:?}");
+            assert!(UserConfig::parse(contents).is_ok(), "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn key_typo_warnings_print_once_and_stay_bounded() {
+        let mut warned = HashSet::new();
+        assert!(admit_key_typo_warning(&mut warned, "a"));
+        assert!(!admit_key_typo_warning(&mut warned, "a"));
+        for index in 0..MAX_KEY_TYPO_WARNINGS * 2 {
+            admit_key_typo_warning(&mut warned, &format!("warning {index}"));
+        }
+        assert_eq!(warned.len(), MAX_KEY_TYPO_WARNINGS);
+        assert!(!admit_key_typo_warning(&mut warned, "new"));
+    }
+
+    #[test]
+    fn parser_messages_hide_quoted_tokens_that_are_not_keys() {
+        for (message, redacted) in [
+            (
+                "duplicate key `sk-live-0123456789abcdef0123456789abcdef0123456789abcdef0123456789` in document root",
+                "duplicate key … in document root",
+            ),
+            (
+                "duplicate key `api key=sk-abc` in document root",
+                "duplicate key … in document root",
+            ),
+            (
+                "duplicate key `\u{1b}[31mmodel` in document root",
+                "duplicate key … in document root",
+            ),
+            (
+                "duplicate key `model` in document root",
+                "duplicate key `model` in document root",
+            ),
+            (
+                "invalid string\nexpected `\"`, `'`",
+                "invalid string\nexpected `\"`, `'`",
+            ),
+            ("unpaired `tail secret", "unpaired …"),
+        ] {
+            assert_eq!(scrub_toml_message(message, None), redacted);
+        }
+        let error = UserConfig::parse("\"sk-pasted token\" = 1\n\"sk-pasted token\" = 2\n")
+            .expect_err("reject duplicate key")
+            .to_string();
+        assert!(!error.contains("sk-pasted"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_config_file_is_an_error_not_the_default() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // Root reads the file regardless of its mode.
+        if std::fs::metadata(root.path()).expect("inspect").uid() == 0 {
+            return;
+        }
+        let paths = Paths::new(Some(root.path().to_path_buf())).expect("paths");
+        let path = paths.root.join("config.toml");
+        std::fs::write(&path, "embeddings = true\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("make unreadable");
+        let error = format!(
+            "{:#}",
+            UserConfig::load(&paths).expect_err("reject unreadable file")
+        );
+        assert!(
+            error.starts_with(&format!("open {}: ", path.display())),
+            "{error}"
+        );
+        assert!(error.contains("ermission denied"), "{error}");
+    }
+
+    /// Captures the field names serde derives for a struct.
+    struct FieldNames<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("only structs are inspected"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(serde::de::Error::custom("fields captured"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+
+    #[test]
+    fn known_key_list_matches_the_config_struct() {
+        let mut fields: &'static [&'static str] = &[];
+        let _ = UserConfig::deserialize(FieldNames(&mut fields));
+        let mut derived: Vec<&str> = fields.to_vec();
+        let aliases = ["index_service_watch", "index_service_watch_interval"];
+        // Every alias on the struct must be in the list, or a near miss of it would warn.
+        let source = include_str!("config.rs");
+        let start = source
+            .find("pub struct UserConfig {")
+            .expect("UserConfig definition");
+        let end = start
+            + source
+                .get(start..)
+                .and_then(|definition| definition.find("\n}\n"))
+                .expect("end of UserConfig");
+        let declared: Vec<&str> = source
+            .get(start..end)
+            .expect("definition")
+            .split("serde(alias = \"")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"').map(|(alias, _)| alias))
+            .collect();
+        assert_eq!(declared, aliases);
+        derived.extend(aliases.iter().filter(|alias| !fields.contains(alias)));
+        derived.sort_unstable();
+        let mut listed = USER_CONFIG_KEYS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, derived);
+    }
 
     #[test]
     fn claude_sources_honor_config_dir_and_multiple_roots() {
@@ -1178,6 +2113,153 @@ mod tests {
         assert_eq!(UserConfig::default().embeddings_mode(), EmbeddingsMode::Off);
         assert!(toml::from_str::<UserConfig>(r#"embeddings = "cloud""#).is_err());
         assert!(toml::from_str::<UserConfig>("embeddings = 1").is_err());
+    }
+
+    #[test]
+    fn rerank_accepts_bool_or_local() {
+        for (value, mode) in [
+            ("true", RerankMode::Local),
+            ("false", RerankMode::Off),
+            ("\"local\"", RerankMode::Local),
+        ] {
+            let config: UserConfig =
+                toml::from_str(&format!("rerank = {value}")).expect("parse rerank");
+            assert_eq!(config.rerank_mode(), mode, "{value}");
+        }
+        assert_eq!(UserConfig::default().rerank_mode(), RerankMode::Off);
+        assert!(toml::from_str::<UserConfig>(r#"rerank = "remote""#).is_err());
+        assert!(toml::from_str::<UserConfig>("rerank = 1").is_err());
+    }
+
+    #[test]
+    fn rerank_resolves_model_defaults_and_the_shared_onnx_runtime() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[
+            ("MEMEX_RERANK_MODEL", None),
+            ("MEMEX_EXECUTION_PROVIDER", None),
+        ]);
+        assert_eq!(UserConfig::default().resolve_rerank().expect("off"), None);
+        let config: UserConfig = toml::from_str(
+            r#"
+                embeddings = "remote"
+                model = "text-embedding-3-small"
+                embedding_base_url = "https://api.example.test/v1"
+                rerank = true
+                rerank_model = "BGE-V2-M3"
+                execution_provider = "cpu"
+                cuda_device_id = 2
+            "#,
+        )
+        .expect("parse rerank config");
+        let settings = config
+            .resolve_rerank()
+            .expect("resolve rerank")
+            .expect("rerank on");
+        assert_eq!(settings.model, fastembed::RerankerModel::BGERerankerV2M3);
+        assert_eq!(settings.candidates, DEFAULT_RERANK_CANDIDATES);
+        assert_eq!(settings.doc_chars, DEFAULT_RERANK_DOC_CHARS);
+        // Remote embeddings ignore the ONNX keys; the local reranker still uses them.
+        assert_eq!(
+            settings.runtime.execution_provider,
+            ExecutionProviderChoice::Cpu
+        );
+        assert_eq!(settings.runtime.cuda_device_id, Some(2));
+        assert_eq!(settings.runtime.remote, None);
+        let local = UserConfig {
+            embeddings: Some(EmbeddingsMode::Local),
+            embedding_base_url: None,
+            ..config.clone()
+        };
+        let embed_runtime = local.resolve_embed_runtime().expect("embed runtime");
+        assert_eq!(
+            settings.runtime,
+            EmbedRuntimeConfig {
+                batch_size: None,
+                ..embed_runtime
+            }
+        );
+    }
+
+    #[test]
+    fn rerank_requires_a_known_model_and_bounded_sizes() {
+        let _guard = env_lock();
+        let local = UserConfig {
+            rerank: Some(RerankMode::Local),
+            ..UserConfig::default()
+        };
+        {
+            let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+            let error = local
+                .resolve_rerank()
+                .expect_err("model required")
+                .to_string();
+            assert!(error.contains("requires rerank_model"), "{error}");
+            assert!(
+                error.contains("jina-turbo, bge-v2-m3, bge-base, jina-v2"),
+                "{error}"
+            );
+        }
+        {
+            let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", Some("jina-turbo"))]);
+            let settings = local.resolve_rerank().expect("env model").expect("on");
+            assert_eq!(
+                settings.model,
+                fastembed::RerankerModel::JINARerankerV1TurboEn
+            );
+            let configured = UserConfig {
+                rerank_model: Some("bge-base".to_string()),
+                ..local.clone()
+            };
+            assert_eq!(
+                configured
+                    .resolve_rerank()
+                    .expect("config model")
+                    .expect("on")
+                    .model,
+                fastembed::RerankerModel::BGERerankerBase
+            );
+        }
+        {
+            let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", Some("ms-marco"))]);
+            let error = format!("{:#}", local.resolve_rerank().expect_err("bad env model"));
+            assert!(error.contains("MEMEX_RERANK_MODEL"), "{error}");
+            assert!(error.contains("'ms-marco'"), "{error}");
+            // Off never reads the variable.
+            assert_eq!(UserConfig::default().resolve_rerank().expect("off"), None);
+        }
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+        let unknown = UserConfig {
+            rerank_model: Some("ms-marco".to_string()),
+            ..UserConfig::default()
+        };
+        let error = format!(
+            "{:#}",
+            unknown.resolve_rerank().expect_err("checked when off")
+        );
+        assert!(error.contains("rerank_model"), "{error}");
+        for (candidates, doc_chars, key) in [
+            (Some(4), None, "rerank_candidates"),
+            (Some(101), None, "rerank_candidates"),
+            (None, Some(199), "rerank_doc_chars"),
+            (None, Some(8001), "rerank_doc_chars"),
+        ] {
+            let config = UserConfig {
+                rerank_model: Some("jina-turbo".to_string()),
+                rerank_candidates: candidates,
+                rerank_doc_chars: doc_chars,
+                ..local.clone()
+            };
+            let error = config.resolve_rerank().expect_err(key).to_string();
+            assert!(error.starts_with(key), "{error}");
+        }
+        let bounds = UserConfig {
+            rerank_model: Some("jina-turbo".to_string()),
+            rerank_candidates: Some(100),
+            rerank_doc_chars: Some(200),
+            ..local
+        };
+        let settings = bounds.resolve_rerank().expect("bounds").expect("on");
+        assert_eq!((settings.candidates, settings.doc_chars), (100, 200));
     }
 
     fn remote_config() -> UserConfig {

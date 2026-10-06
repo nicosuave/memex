@@ -19,6 +19,7 @@ pub mod progress;
 pub mod read_budget;
 pub mod remote_embed;
 mod repository;
+pub mod rerank;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;
