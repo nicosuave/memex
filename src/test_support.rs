@@ -93,3 +93,102 @@ pub fn pin_source_roots(base: &std::path::Path) -> EnvVarGuard {
         .collect();
     EnvVarGuard::set_os(&vars)
 }
+
+/// Local HTTP server and fixtures for the remote model client tests.
+pub mod remote_server {
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use anyhow::{Result, anyhow, bail};
+    use serde_json::Value;
+    use tiny_http::{Header, Response, Server};
+
+    use crate::remote_http::RemoteEndpoint;
+
+    pub const KEY: &str = "sk-memex-SECRET-7f3a9c41";
+
+    pub struct Captured {
+        pub path: String,
+        pub auth: Option<String>,
+        pub body: Value,
+    }
+
+    pub struct Reply {
+        pub status: u16,
+        pub body: String,
+        pub retry_after: Option<&'static str>,
+    }
+
+    pub fn reply(status: u16, body: Value) -> Reply {
+        Reply {
+            status,
+            body: body.to_string(),
+            retry_after: None,
+        }
+    }
+
+    /// Serves requests until 500ms pass without one, returning what was received.
+    ///
+    /// The returned base URL is `http://127.0.0.1:{port}/v1`.
+    pub fn serve<F>(mut handler: F) -> Result<(String, JoinHandle<Vec<Captured>>)>
+    where
+        F: FnMut(usize, &Value) -> Reply + Send + 'static,
+    {
+        let server = Server::http("127.0.0.1:0").map_err(|e| anyhow!("bind: {e}"))?;
+        let addr = server
+            .server_addr()
+            .to_ip()
+            .ok_or_else(|| anyhow!("no ip address"))?;
+        let handle = thread::spawn(move || {
+            let mut captured = Vec::new();
+            while let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(500)) {
+                let mut raw = String::new();
+                let _ = request.as_reader().read_to_string(&mut raw);
+                let body: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                let auth = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.as_str().to_owned());
+                let out = handler(captured.len(), &body);
+                let mut response = Response::from_string(out.body).with_status_code(out.status);
+                if let Ok(h) = Header::from_bytes("Content-Type", "application/json") {
+                    response = response.with_header(h);
+                }
+                if let Some(value) = out.retry_after
+                    && let Ok(h) = Header::from_bytes("Retry-After", value)
+                {
+                    response = response.with_header(h);
+                }
+                captured.push(Captured {
+                    path: request.url().to_owned(),
+                    auth,
+                    body,
+                });
+                let _ = request.respond(response);
+            }
+            captured
+        });
+        Ok((format!("http://{addr}/v1"), handle))
+    }
+
+    pub fn join(handle: JoinHandle<Vec<Captured>>) -> Result<Vec<Captured>> {
+        handle.join().map_err(|_| anyhow!("server thread panicked"))
+    }
+
+    pub fn endpoint(base: &str, key: Option<&str>, max_retries: u32) -> RemoteEndpoint {
+        RemoteEndpoint {
+            base_url: base.to_owned(),
+            api_key: key.map(str::to_owned),
+            timeout: Duration::from_secs(5),
+            max_retries,
+        }
+    }
+
+    pub fn expect_err<T>(result: Result<T>) -> Result<String> {
+        match result {
+            Ok(_) => bail!("expected an error"),
+            Err(e) => Ok(format!("{e:#}")),
+        }
+    }
+}

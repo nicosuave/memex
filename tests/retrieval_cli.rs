@@ -984,3 +984,215 @@ fn sessions_json_wraps_the_same_entries_as_jsonl() {
     assert!(rendered.contains("session"));
     assert!(rendered.contains("test"));
 }
+
+#[test]
+fn one_shot_search_skips_configured_reranking_with_one_notice() {
+    let (root, _) = fixture();
+    let notice =
+        "reranking is configured but skipped in one-shot searches; pass --rerank to load the model";
+    let base = [
+        "search",
+        "late_needle",
+        "--query",
+        "final outcome",
+        "--machine",
+        "local",
+    ];
+    let plain = values(root.path(), &base);
+    std::fs::write(
+        root.path().join("config.toml"),
+        "auto_index_on_search = false\nrerank = \"local\"\nrerank_model = \"jina-turbo\"\n",
+    )
+    .unwrap();
+
+    // Two query views run two local searches but print the notice once.
+    let out = run(root.path(), &base);
+    assert!(out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert_eq!(values(root.path(), &base), plain);
+
+    let mut disabled = base.to_vec();
+    disabled.push("--no-rerank");
+    let out = run(root.path(), &disabled);
+    assert!(out.status.success());
+    assert!(!String::from_utf8(out.stderr).unwrap().contains(notice));
+
+    let mut conflicting = disabled.clone();
+    conflicting.push("--rerank");
+    assert!(!run(root.path(), &conflicting).status.success());
+
+    std::fs::write(
+        root.path().join("config.toml"),
+        "auto_index_on_search = false\n",
+    )
+    .unwrap();
+    let mut explicit = base.to_vec();
+    explicit.push("--rerank");
+    let out = run(root.path(), &explicit);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("reranking was requested but is not configured"),
+        "{stderr}"
+    );
+}
+
+/// Rerank request bodies with their Authorization headers.
+type RerankRequests = Vec<(Value, Option<String>)>;
+
+/// A loopback rerank server that answers every request with `status`; a 200 scores the
+/// documents in ascending input order, which reverses them. Stops when `stop` is set and
+/// returns each request body with its Authorization header.
+fn rerank_server(
+    status: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (String, std::thread::JoinHandle<RerankRequests>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok(Some(mut request)) = server.recv_timeout(std::time::Duration::from_millis(50))
+            else {
+                continue;
+            };
+            let mut raw = String::new();
+            request.as_reader().read_to_string(&mut raw).unwrap();
+            let body: Value = serde_json::from_str(&raw).unwrap();
+            let auth = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Authorization"))
+                .map(|header| header.value.as_str().to_owned());
+            let count = body["documents"].as_array().map_or(0, Vec::len);
+            let reply = if status == 200 {
+                let results: Vec<Value> = (0..count)
+                    .map(|index| {
+                        json!({
+                            "index": index,
+                            "relevance_score": (index + 1) as f64 / (count + 1) as f64
+                        })
+                    })
+                    .collect();
+                json!({"results": results})
+            } else {
+                json!({"error": {"message": "reranker unavailable"}})
+            };
+            captured.push((body, auth));
+            request
+                .respond(
+                    tiny_http::Response::from_string(reply.to_string()).with_status_code(status),
+                )
+                .unwrap();
+        }
+        captured
+    });
+    (format!("http://{addr}/v1/rerank"), handle)
+}
+
+#[test]
+fn one_shot_search_reranks_with_a_remote_server_and_fails_open() {
+    let (root, _) = fixture();
+    let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut writer = index.writer().unwrap();
+    for (offset, text) in [
+        "remote_rank_term alpha",
+        "remote_rank_term remote_rank_term beta",
+        "remote_rank_term remote_rank_term remote_rank_term gamma",
+        "remote_rank_term delta with a longer tail of words",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut record = record(10 + offset as u64, text.into());
+        record.session_id = format!("rerank-session-{offset}");
+        index.add_record(&mut writer, &record).unwrap();
+    }
+    writer.commit().unwrap();
+    writer.wait_merging_threads().unwrap();
+    let key = "sk-e2e-rerank-secret";
+    let search = [
+        "search",
+        "remote_rank_term",
+        "--machine",
+        "local",
+        "--recency-weight",
+        "0",
+    ];
+    let ids = |values: &[Value]| -> Vec<String> {
+        values
+            .iter()
+            .map(|value| value["record_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    for status in [200, 500, 404] {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (url, server) = rerank_server(status, std::sync::Arc::clone(&stop));
+        std::fs::write(
+            root.path().join("config.toml"),
+            format!(
+                "auto_index_on_search = false\nrerank = \"remote\"\nrerank_url = \"{url}\"\n\
+                 rerank_model = \"e2e-reranker\"\nrerank_api_key = \"{key}\"\n\
+                 rerank_max_retries = 0\nrerank_extra_body = \
+                 '{{\"provider\": {{\"data_collection\": \"deny\", \"zdr\": true}}}}'\n"
+            ),
+        )
+        .unwrap();
+        let mut disabled = search.to_vec();
+        disabled.push("--no-rerank");
+        let baseline = values(root.path(), &disabled);
+        assert_eq!(baseline.len(), 4, "{baseline:?}");
+
+        let out = run(root.path(), &search);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let captured = server.join().unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "{stderr}");
+        let results: Vec<Value> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!stderr.contains("one-shot"), "{stderr}");
+        assert!(!stderr.contains(key), "{stderr}");
+        // The --no-rerank search sent nothing; the one-shot search sent one request.
+        assert_eq!(captured.len(), 1);
+        let (body, auth) = &captured[0];
+        assert_eq!(auth.as_deref(), Some(format!("Bearer {key}").as_str()));
+        assert_eq!(body["model"], "e2e-reranker");
+        assert_eq!(body["query"], "remote_rank_term");
+        assert!(body.get("top_n").is_none(), "{body}");
+        assert_eq!(body["documents"].as_array().map(Vec::len), Some(4));
+        assert_eq!(
+            body["provider"],
+            json!({"data_collection": "deny", "zdr": true})
+        );
+
+        if status == 200 {
+            let mut reversed = ids(&baseline);
+            reversed.reverse();
+            assert_eq!(ids(&results), reversed);
+            assert!(!stderr.contains("warning"), "{stderr}");
+        } else {
+            assert_eq!(ids(&results), ids(&baseline));
+            assert!(
+                stderr.contains("warning: reranking failed, keeping the original order: ")
+                    && stderr.contains(&format!(
+                        "rerank server returned HTTP {status}: reranker unavailable"
+                    )),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("data_collection"), "{stderr}");
+            if status == 404 {
+                assert!(
+                    stderr.contains("provider policy in rerank_extra_body"),
+                    "{stderr}"
+                );
+            }
+            assert_eq!(stderr.matches("warning").count(), 1, "{stderr}");
+        }
+    }
+}

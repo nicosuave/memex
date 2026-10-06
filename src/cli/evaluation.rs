@@ -264,6 +264,7 @@ fn search(
             format: SearchFormat::Json,
             root: Some(paths.root.clone()),
             machines: vec!["local".into()],
+            rerank: Some(false),
         },
         false,
     )?;

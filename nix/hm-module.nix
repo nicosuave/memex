@@ -70,6 +70,19 @@ in {
         - cuda_device_id (int): GPU index when using the CUDA execution provider
         - cuda_library_paths (list of strings): optional CUDA library directories
         - cudnn_library_paths (list of strings): optional cuDNN library directories
+        - rerank (bool or string): false, true or "local" for local reranking, or "remote"
+        - rerank_model (string): local "jina-turbo", "bge-base", "jina-v2", "bge-v2-m3";
+          remote, the provider's model name (optional with rerank_dialect "texts")
+        - rerank_url (string): remote only; full /rerank endpoint URL
+        - rerank_api_key_env (string): remote only; environment variable holding the API key
+        - rerank_api_key (string): remote only; literal API key; it ends up in the
+          world-readable Nix store, so use rerank_api_key_env instead
+        - rerank_timeout_secs (int): remote only; request timeout, 1 to 30 (default 10)
+        - rerank_max_retries (int): remote only; retry limit, 0 to 3 (default 1)
+        - rerank_dialect (string): remote only; "documents" (default) or "texts"
+        - rerank_extra_body (string): remote only; JSON object added to every request
+        - rerank_candidates (int): top results reranked, 5 to 100 (default 30)
+        - rerank_doc_chars (int): characters per result, 200 to 8000 (default 1500)
         - scan_cache_ttl (int): seconds
         - index_service_mode (string): "interval" or "continuous"
         - index_service_interval (int): seconds

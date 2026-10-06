@@ -338,6 +338,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--fields score,ts,doc_id,record_id,session_id,snippet`
 - `--full` (all legacy search fields; conflicts with `--fields`)
 - `--mode lexical|semantic|hybrid`
+- `--rerank` / `--no-rerank` (run or skip the [reranker](configuration.md#reranking))
 - `--format jsonl|json|text|toon`
 - `--pretty` (pretty-print JSON output)
 

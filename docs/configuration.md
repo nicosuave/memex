@@ -110,6 +110,79 @@ locations and active `venv` / `conda` `site-packages/nvidia/*/lib` directories.
 If your system keeps CUDA or cuDNN in a nonstandard location, set
 `MEMEX_CUDA_LIBRARY_PATHS` and `MEMEX_CUDNN_LIBRARY_PATHS` or the matching config
 keys.
+## Reranking
+
+Reranking is off by default. With `rerank = "local"` (or `true`), memex rescores the top
+search results with a local cross-encoder model, which reads the query and each result
+together instead of comparing separately computed embeddings. It uses the same
+`execution_provider`, `compute_units`, and `cuda_*` settings as local embeddings.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `rerank` | `false` | `false`, `true` / `"local"`, or `"remote"` ([hosted](#hosted-reranking)) |
+| `rerank_model` | none | Model to use; required for local reranking. Falls back to `MEMEX_RERANK_MODEL` |
+| `rerank_candidates` | 30 | Top results to rerank (5 to 100) |
+| `rerank_doc_chars` | 1500 | Characters of each result sent to the model (200 to 8000) |
+
+| Model | Source | License | Size |
+|-------|--------|---------|------|
+| jina-turbo | jinaai/jina-reranker-v1-turbo-en | Apache-2.0 | ~150 MB |
+| bge-base | BAAI/bge-reranker-base | MIT | ~1.1 GB |
+| jina-v2 | jinaai/jina-reranker-v2-base-multilingual | CC-BY-NC-4.0 (non-commercial) | ~1.1 GB |
+| bge-v2-m3 | BAAI/bge-reranker-v2-m3 | Apache-2.0 | ~2.3 GB |
+
+Any fastembed reranker name also works. `bge-v2-m3` downloads a third-party ONNX export.
+
+How it works:
+- The rerank score, a probability from 0 to 1, replaces the fused score.
+- `--min-score` applies before reranking; `--recency-weight` applies afterwards, only when
+  it is above 0.
+- Reranking works in lexical, semantic, and hybrid modes.
+- On any reranker failure, the original order is kept and a warning is printed.
+
+When it runs: the daemon and MCP server load the model in the background and rerank once it
+is ready. A one-shot `memex search` reranks locally only with `--rerank`, which loads the
+model first; remote reranking loads no model and runs in every search, including one-shot
+ones. `--no-rerank` turns reranking off for one run. MCP `search` takes `rerank: true` or
+`false`. The TUI and web UI search never rerank.
+
+Local reranking runs on your machine; no result text is sent anywhere.
+
+```toml
+rerank = "local"
+rerank_model = "jina-turbo"
+```
+
+### Hosted reranking
+
+`rerank = "remote"` loads no model and calls a Cohere-style `/rerank` API: OpenRouter, Cohere, Voyage,
+Jina, vLLM, llama.cpp (`--reranking`), or text-embeddings-inference (not Ollama).
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `rerank_url` | none | Full endpoint URL; nothing is appended. No `top_n` is sent |
+| `rerank_model` | none | Provider model name, such as `cohere/rerank-v3.5`; optional with `"texts"`. `MEMEX_RERANK_MODEL` is not read |
+| `rerank_api_key` / `rerank_api_key_env` | none | Literal key, or the only variable read for it; else `MEMEX_RERANK_API_KEY`. Optional for local servers |
+| `rerank_timeout_secs` / `rerank_max_retries` | 10 / 1 | Request timeout in seconds (1 to 30) / retries (0 to 3); attempts stop at the 30 s budget |
+| `rerank_dialect` | `"documents"` | `"texts"` for text-embeddings-inference (sends `truncate: true`); such servers cap the batch, often at 32, so lower `rerank_candidates` if requests are rejected |
+| `rerank_extra_body` | none | JSON object (at most 1 KiB, 4 levels) added to every request, such as `'{"provider": {"data_collection": "deny", "zdr": true}}'` for OpenRouter; it cannot set `model`, `query`, `documents`, `texts`, `top_n`, or `truncate`. Ignored with `rerank = "local"` |
+
+Every search that reranks, one-shot CLI and native app included, sends the query and up to
+`rerank_candidates` × `rerank_doc_chars` characters of result text to `rerank_url`; plain `http://`
+is rejected for non-loopback hosts when a key is set. On OpenRouter, `rerank_extra_body` can set
+`provider.data_collection` and `provider.zdr`; with `"zdr": true` a request fails (HTTP 404) when no
+endpoint qualifies. The extra body is sent as is to the server at `rerank_url`, which interprets
+it; it is not a secret store. Scores outside 0 to 1 are treated as logits
+(sigmoid; order unchanged). A search spends at most about 30 s reranking. On failure the order is
+kept with a warning; the daemon and MCP server then pause it for 60 s, and one-shot runs retry.
+
+```toml
+rerank = "remote"
+rerank_url = "https://openrouter.ai/api/v1/rerank"
+rerank_model = "cohere/rerank-v3.5"
+rerank_api_key_env = "OPENROUTER_API_KEY"
+```
+
 ## Config (optional)
 
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
@@ -132,6 +205,10 @@ cuda_device_id = 0  # optional, when execution_provider = "cuda"
 cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs
 cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional list of cuDNN library dirs
 compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
+rerank = false  # true or "local" for a local cross-encoder, "remote" for a hosted /rerank API
+# rerank_model = "jina-turbo"  # required for local reranking
+rerank_candidates = 30  # 5 to 100
+rerank_doc_chars = 1500  # 200 to 8000
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 max_indexed_tool_input_bytes = 65536  # 64 KiB default
 max_indexed_tool_output_bytes = 262144  # 256 KiB default
@@ -177,7 +254,7 @@ new limits to records that are already indexed.
 matched transcripts never enter the index (a leading `~/` is expanded to your home directory).
 Adding a pattern also removes records previously indexed from matched paths — no rebuild
 required. For one-off runs, pass `--exclude GLOB` (repeatable) to `memex index`.
-`execution_provider` applies to local ONNX-backed models; `potion` uses the model2vec backend.
+`execution_provider` applies to local ONNX-backed models, including rerankers; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.
 
