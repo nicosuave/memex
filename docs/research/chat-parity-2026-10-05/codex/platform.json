@@ -1,0 +1,647 @@
+{
+  "sourceVersions": [
+    {
+      "product": "Codex",
+      "version": "26.930.51102 (13100)",
+      "root": "/Applications/ChatGPT.app",
+      "provenance": "Info.plist CFBundleIdentifier com.openai.codex; readArchive/readEntry extraction only",
+      "appAsarSHA256": "a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+      "headerSHA256": "8141a629ce6ef3a72fe2b5c602104946fe9de2393d3b5b464940d16523571b7f",
+      "extractedRoot": "/tmp/codex-parity-20261005"
+    },
+    {
+      "product": "Memex",
+      "commit": "17e958778a7398db8238cc9c8415ca12649067e5",
+      "root": "/Users/nico/Code/memex-chat-capabilities",
+      "provenance": "Contract pinned source baseline"
+    },
+    {
+      "product": "Memex runtime",
+      "commit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+      "root": "/Users/nico/Code/memex-chat-runtime",
+      "provenance": "Contract pinned optional SQACPHost source; availability gated by Memex Package.swift build configuration"
+    }
+  ],
+  "coverage": [
+    {
+      "facets": [
+        "providers/models/configuration",
+        "schedules/automation",
+        "plugins/MCP/skills",
+        "app-control tools",
+        "organization/notifications/settings",
+        "accessibility/keybindings/performance"
+      ],
+      "examinedBoundaries": "Codex settings applicability map -> settings implementations/app-server calls and desktop tool schemas. Memex native Settings/menus/sidebar/library, composer catalogs/runtime connection, host request allowlist/schedule runtime, notification state machine. Read-only; no runtime claims.",
+      "disposition": "Seven findings; performance and accessibility quality unknown; sidebar snooze intentionally excluded; Work/Pages/cloud-only capabilities excluded from coding parity."
+    }
+  ],
+  "findings": [
+    {
+      "id": "CX-P01",
+      "category": "plugins/tools",
+      "capability": "Install, configure, authenticate and remove plugins/custom MCP servers",
+      "userWorkflow": "Install, configure, authenticate and remove plugins/custom MCP servers",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Codex-local/work-local settings route exposes plugin management subject to capability gates; custom MCP editor supports stdio and streamable HTTP, saves/uninstalls, and dispatches OAuth login. Plugin installation dispatch reaches app-server plugin/install.",
+      "memexState": "Memex discovers local skill/command files and uses native provider runtimes, but has no plugin/MCP management UI. Optional runtime plugin startup support is not passed by Memex resume connection. This does not mean native provider-configured tools cannot run.",
+      "status": "partial",
+      "priority": "P1",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/use-visible-settings-sections-dc3bbd6366c8.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "\"mcp-settings\":`codexOrWorkLocal`",
+          "anchor": "\"mcp-settings\":`codexOrWorkLocal`",
+          "byteOffset": 40168,
+          "claim": "Routes bind MCP management to Codex or local Work; skills-settings standalone route explicitly hidden.",
+          "archivePath": "webview/assets/use-visible-settings-sections-dc3bbd6366c8.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/plugins-settings-146885f88b18.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "Ui",
+          "anchor": "function Ui(e)",
+          "byteOffset": 10489,
+          "claim": "Custom MCP form Ui validates transport fields and delegates onSave/onUninstall; includes STDIO/streamable_http fields.",
+          "archivePath": "webview/assets/plugins-settings-146885f88b18.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/plugins-settings-146885f88b18.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "sendRequest(`mcpServer/oauth/login`",
+          "anchor": "sendRequest(`mcpServer/oauth/login`",
+          "byteOffset": 26146,
+          "claim": "Per-host authenticate action executes MCP OAuth login, validates URL then opens external browser.",
+          "archivePath": "webview/assets/plugins-settings-146885f88b18.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 1592,
+          "lineEnd": 1592,
+          "symbol": "pun",
+          "anchor": "sendRequest(`plugin/install`",
+          "byteOffset": 1933382,
+          "claim": "Installation helper pun sends plugin/install to host app-server.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposerCatalog.swift",
+          "lineStart": 56,
+          "lineEnd": 56,
+          "symbol": "let skills = [",
+          "anchor": "let skills = [",
+          "byteOffset": 2894,
+          "claim": "Catalog implements local skills/commands discovery, not installation/authentication."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/InAppAgentRuntime.swift",
+          "lineStart": 131,
+          "lineEnd": 131,
+          "symbol": "try service.connectCodex(binding",
+          "anchor": "try service.connectCodex(binding",
+          "byteOffset": 6104,
+          "claim": "Memex existing Codex connection passes executable/environment only."
+        },
+        {
+          "product": "Memex runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "/Users/nico/Code/memex-chat-runtime/packages/sq-acp/Sources/SQACPHost/AgentConversationService.swift",
+          "lineStart": 391,
+          "lineEnd": 391,
+          "symbol": "pluginStartupOptions: AcpClient.Configuration.StartupOptions? = nil",
+          "anchor": "pluginStartupOptions: AcpClient.Configuration.StartupOptions? = nil",
+          "byteOffset": 15552,
+          "claim": "Runtime capability exists but defaults to nil; no native Memex management caller."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 9,
+          "lineEnd": 9,
+          "symbol": "Settings { EmptyView() }",
+          "anchor": "Settings { EmptyView() }",
+          "byteOffset": 181,
+          "claim": "Native Settings scene is empty; native menus route execution hosts/schedules and workspace controls. App source inventory has no plugin manager."
+        }
+      ],
+      "implication": "Users must manage tools through provider configuration or other apps even though local skills can be selected in Memex.",
+      "recommendation": "Prioritize a bounded per-provider MCP inventory/configuration/OAuth surface; do not invent one universal provider plugin contract.",
+      "caveats": [
+        "Codex plugin marketplace access depends on host/account capabilities. Installed UI confirmation belongs to root.",
+        "Absence is native Memex management UI, not absence of MCP execution in its providers."
+      ]
+    },
+    {
+      "id": "CX-P02",
+      "category": "automation",
+      "capability": "Create recurring work and inspect its runs",
+      "userWorkflow": "Create recurring work and inspect its runs",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Codex automation source supports heartbeat linked to a thread, cron project targets, run-now/pause, run history and per-automation notification policy.",
+      "memexState": "Memex already supports durable host schedules on existing conversations, interval or timezone+weekday wall-clock recurrence, edit/pause/run/delete and held-queue recovery. It lacks the standalone new-chat-per-run target and dedicated run inbox/per-schedule notification policy in inspected host model/UI.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/automations-page-abd560996342.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "s.kind===`heartbeat`",
+          "anchor": "s.kind===`heartbeat`",
+          "byteOffset": 18702,
+          "claim": "Automation page handles thread-linked heartbeats distinctly; later create/run-now dispatches and history actions are wired.",
+          "archivePath": "webview/assets/automations-page-abd560996342.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/automation-detail-panel-59709a145853.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "notificationPolicy",
+          "anchor": "notificationPolicy",
+          "byteOffset": 9307,
+          "claim": "Draft editor exposes per-automation notification policy including failed_runs_only; kind heartbeat and model/reasoning are separate draft fields.",
+          "archivePath": "webview/assets/automation-detail-panel-59709a145853.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/automations-page-abd560996342.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "t.pluginTemplateId:null,target:r.projectI",
+          "anchor": "t.pluginTemplateId:null,target:r.projectI",
+          "byteOffset": 62433,
+          "claim": "Cron-specific target/project and template state separated from heartbeat.",
+          "archivePath": "webview/assets/automations-page-abd560996342.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ExecutionHostConnectionsView.swift",
+          "lineStart": 114,
+          "lineEnd": 114,
+          "symbol": "Section(\"Schedules\")",
+          "anchor": "Section(\"Schedules\")",
+          "byteOffset": 6773,
+          "claim": "Reachable host sheet supports schedules and explicit recurrence, run, edit, pause and delete controls."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 328,
+          "lineEnd": 328,
+          "symbol": "case \"schedule.upsert\":",
+          "anchor": "case \"schedule.upsert\":",
+          "byteOffset": 21389,
+          "claim": "Schedule schema validates conversation ID and interval/wall-clock recurrence; saves metadata."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 422,
+          "lineEnd": 422,
+          "symbol": "private func enqueueSchedule",
+          "anchor": "private func enqueueSchedule",
+          "byteOffset": 27485,
+          "claim": "Runs enqueue prompt into same schedule.conversationID; no new-thread target or per-run inbox target in this path."
+        }
+      ],
+      "implication": "Basic scheduling is present. Codex offers more workflow separation and run triage, especially independent recurring tasks.",
+      "recommendation": "If wanted, extend existing durable host scheduler with explicit new-conversation targets and observable run records before building a separate scheduler.",
+      "caveats": [
+        "Codex cloud automation and ChatGPT scheduled tasks are excluded from the parity claim.",
+        "Heartbeat naming alone is not a gap: Memex can recur on an existing conversation."
+      ]
+    },
+    {
+      "id": "CX-P03",
+      "category": "organization",
+      "capability": "Organize conversations with custom sections and read/unread state",
+      "userWorkflow": "Organize conversations with custom sections and read/unread state",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Codex sidebar custom-section create/move and local-thread read/unread actions are wired; command palette includes markThreadUnread.",
+      "memexState": "Memex has pinned, archive, removed/restore, rename, manual reorder and project grouping. Its persistent Entry schema and sidebar actions have no custom section or read/unread state.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 3788,
+          "lineEnd": 3788,
+          "symbol": "id:`move-to-custom-section`",
+          "anchor": "id:`move-to-custom-section`",
+          "byteOffset": 6913254,
+          "claim": "Custom-section submenu maps selected items to section membership.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 3939,
+          "lineEnd": 3939,
+          "symbol": "case`mark-thread-read`:case`mark-thread-unread`:return",
+          "anchor": "case`mark-thread-read`:case`mark-thread-unread`:return",
+          "byteOffset": 6989310,
+          "claim": "Local-thread read/unread action dispatches conversationId/hostId, not just label text.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationLibrary.swift",
+          "lineStart": 21,
+          "lineEnd": 21,
+          "symbol": "struct Entry: Codable",
+          "anchor": "struct Entry: Codable",
+          "byteOffset": 592,
+          "claim": "Persistent library Entry stores session/title/pinned/archived/removed/order only."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/SidebarConversations.swift",
+          "lineStart": 206,
+          "lineEnd": 206,
+          "symbol": "private func managementActions",
+          "anchor": "private func managementActions",
+          "byteOffset": 10424,
+          "claim": "Native management actions expose rename/pin/archive/remove/restore; no custom-section/read-state action."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/SidebarConversations.swift",
+          "lineStart": 15,
+          "lineEnd": 15,
+          "symbol": "var sidebarGroups:",
+          "anchor": "var sidebarGroups:",
+          "byteOffset": 380,
+          "claim": "Project grouping and sort already implemented."
+        }
+      ],
+      "implication": "Memex covers the baseline organization workflow but cannot form cross-project custom sections or manually triage unread chats.",
+      "recommendation": "Extend the existing library metadata and sidebar rather than replacing organization.",
+      "caveats": [
+        "Sidebar snooze is intentionally excluded."
+      ]
+    },
+    {
+      "id": "CX-P04",
+      "category": "settings/accessibility",
+      "capability": "Customize keyboard shortcuts and application appearance",
+      "userWorkflow": "Customize keyboard shortcuts and application appearance",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Codex keyboard editor captures/replaces/removes bindings with conflict checks; appearance settings expose fonts, UI/code sizing, contrast and reduced motion.",
+      "memexState": "Memex supplies native keyboard shortcuts and accessibility labels; Settings scene is empty, so no equivalent app-level keymap editor. Native system behavior must not be confused with absence of accessibility.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/use-visible-settings-sections-dc3bbd6366c8.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "\"keyboard-shortcuts\":`codex`",
+          "anchor": "\"keyboard-shortcuts\":`codex`",
+          "byteOffset": 40105,
+          "claim": "Keyboard-shortcuts settings are in Codex applicability map.",
+          "archivePath": "webview/assets/use-visible-settings-sections-dc3bbd6366c8.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/keyboard-shortcuts-settings-ef4c455aeec6.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "onCapture:t=>{B(t,e)}",
+          "anchor": "onCapture:t=>{B(t,e)}",
+          "byteOffset": 9255,
+          "claim": "Editor capture persists mutation through B; neighboring handlers remove/reset and conflict validation.",
+          "archivePath": "webview/assets/keyboard-shortcuts-settings-ef4c455aeec6.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/general-settings-4f1402fc1fbd.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "settings.general.appearance.reducedMotion.label",
+          "anchor": "settings.general.appearance.reducedMotion.label",
+          "byteOffset": 36857,
+          "claim": "Appearance controls include reduced motion, fonts and UI/code sizes; source presence only for unobserved controls.",
+          "archivePath": "webview/assets/general-settings-4f1402fc1fbd.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 9,
+          "lineEnd": 9,
+          "symbol": "Settings { EmptyView() }",
+          "anchor": "Settings { EmptyView() }",
+          "byteOffset": 181,
+          "claim": "No native settings preference editor."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 32,
+          "lineEnd": 32,
+          "symbol": ".keyboardShortcut(\"j\")",
+          "anchor": ".keyboardShortcut(\"j\")",
+          "byteOffset": 1586,
+          "claim": "Application commands have fixed shortcuts including Cmd-J terminal."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/SidebarConversations.swift",
+          "lineStart": 306,
+          "lineEnd": 306,
+          "symbol": ".accessibilityElement(children: .combine)",
+          "anchor": ".accessibilityElement(children: .combine)",
+          "byteOffset": 15906,
+          "claim": "Native row accessibility implemented; no accessibility quality deficit inferred."
+        }
+      ],
+      "implication": "Advanced users cannot remap shortcuts inside Memex; broader accessibility quality requires runtime checks.",
+      "recommendation": "Prioritize a small keymap editor if demand warrants. Do not claim general accessibility or performance inferiority from source.",
+      "caveats": [
+        "Appearance controls may inherit OS settings; app-specific overrides are the bounded comparison.",
+        "No VoiceOver, reduced-motion, keyboard traversal, responsiveness or memory benchmark was run."
+      ]
+    },
+    {
+      "id": "CX-P05",
+      "category": "notifications",
+      "capability": "Receive completion, approval and question notifications",
+      "userWorkflow": "Receive completion, approval and question notifications",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Codex settings include agent turn, permission and question notifications.",
+      "memexState": "Memex has persistent per-event notification/sound preferences, suppresses viewed conversations unless opted in, deduplicates approval/question requests, and opens the selected conversation from notification.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/notifications-settings-9ccd12da7ea7.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "notifications.permissions.label",
+          "anchor": "notifications.permissions.label",
+          "byteOffset": 5935,
+          "claim": "Codex local agent permissions and question notification settings live with agent controls.",
+          "archivePath": "webview/assets/notifications-settings-9ccd12da7ea7.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationNotifications.swift",
+          "lineStart": 110,
+          "lineEnd": 110,
+          "symbol": "func receive(_ session: Session",
+          "anchor": "func receive(_ session: Session",
+          "byteOffset": 4730,
+          "claim": "State transition logic emits completion/approval/question events and applies preferences."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationNotifications.swift",
+          "lineStart": 182,
+          "lineEnd": 182,
+          "symbol": "struct ConversationNotificationSettingsView",
+          "anchor": "struct ConversationNotificationSettingsView",
+          "byteOffset": 8620,
+          "claim": "User-facing controls configure delivery, completion/input and while-viewing behavior."
+        }
+      ],
+      "implication": "Notification support is not a missing capability.",
+      "recommendation": "Preserve current behavior; only compare finer policy differences after UI/runtime inspection.",
+      "caveats": [
+        "Codex labels alone do not prove notifications enabled or OS authorization granted."
+      ]
+    },
+    {
+      "id": "CX-P06",
+      "category": "providers/configuration",
+      "capability": "Choose models, reasoning and provider-specific permissions",
+      "userWorkflow": "Choose models, reasoning and provider-specific permissions",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Codex model picker derives choices from supportedReasoningEfforts and handles configured/custom model providers and hidden/gated models.",
+      "memexState": "Memex supports native Codex, Claude Code and explicitly configured ACP executables. Model/configuration controls are negotiated and applied through the runtime; ACP resume/configuration are negotiated and native steer unavailable.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 1679,
+          "lineEnd": 1679,
+          "symbol": "V9r",
+          "anchor": "function V9r(e",
+          "byteOffset": 4095535,
+          "claim": "Model/effort menu derives choices from runtime supportedReasoningEfforts.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 1679,
+          "lineEnd": 1679,
+          "symbol": "isCustomModelProvider:s=!1",
+          "anchor": "isCustomModelProvider:s=!1",
+          "byteOffset": 4116669,
+          "claim": "Picker handles custom provider catalog flags; no claim that Codex is restricted to OpenAI-compatible defaults.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationProviderCatalog.swift",
+          "lineStart": 62,
+          "lineEnd": 62,
+          "symbol": "static let builtins:",
+          "anchor": "static let builtins:",
+          "byteOffset": 2865,
+          "claim": "Codex/Claude builtin descriptors; configured ACP catalogs appended."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationProviderSetupView.swift",
+          "lineStart": 17,
+          "lineEnd": 17,
+          "symbol": "Text(\"Conversation providers\")",
+          "anchor": "Text(\"Conversation providers\")",
+          "byteOffset": 600,
+          "claim": "Native view adds/removes ACP executables with explicit home identity and negotiated capability explanation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 149,
+          "lineEnd": 149,
+          "symbol": "ForEach(settings.configurations.filter",
+          "anchor": "ForEach(settings.configurations.filter",
+          "byteOffset": 8581,
+          "claim": "Composer exposes negotiated configuration fields with nonempty choices."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationControls.swift",
+          "lineStart": 37,
+          "lineEnd": 37,
+          "symbol": "var reasoning: Configuration?",
+          "anchor": "var reasoning: Configuration?",
+          "byteOffset": 1171,
+          "claim": "Reasoning is identified from thought_level/reasoning_effort fields."
+        }
+      ],
+      "implication": "Basic model and reasoning selection is present with provider-specific limits; do not treat provider history import as executable provider support.",
+      "recommendation": "Preserve negotiated capability boundaries and distinguish native Codex from ACP transport behavior.",
+      "caveats": [
+        "Exact available models and authentication state were not queried."
+      ]
+    },
+    {
+      "id": "CX-P07",
+      "category": "app-control tools",
+      "capability": "Let agents organize/open/manage desktop chats and panels",
+      "userWorkflow": "Let agents organize/open/manage desktop chats and panels",
+      "comparator": "Installed ChatGPT Codex surface",
+      "comparatorState": "Installed Codex source has desktop tool schemas for thread create/read/list/wait/send, sidebar sections and open_in_codex; tools are host/context gated.",
+      "memexState": "Memex already supplies a separate opt-in memex-control stdio MCP server forwarding durable conversation/queue/schedule/worktree/browser operations to the execution host. The explicit host allowlist lacks sidebar organization/read state and desktop panel/preferences operations. The gap is desktop-shell integration, not lack of an app-control MCP.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "inspected source; no runtime action or UI verification",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 4604,
+          "lineEnd": 4604,
+          "symbol": "B0s",
+          "anchor": "b0s=`create_sidebar_section`",
+          "byteOffset": 9456423,
+          "claim": "Desktop sidebar tool schemas and siblings are declared in B0s.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 4604,
+          "lineEnd": 4604,
+          "symbol": "D2s",
+          "anchor": "X0s=`list_threads`",
+          "byteOffset": 9461411,
+          "claim": "Desktop thread tools and schema declarations include list/wait/create/read/send.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/app-initial-f9b16fbf8fc7.js",
+          "lineStart": 3695,
+          "lineEnd": 3695,
+          "symbol": "xda=`open_in_codex`",
+          "anchor": "xda=`open_in_codex`",
+          "byteOffset": 5474284,
+          "claim": "Panel opening tool schema supports files, browser, terminal, review and pages; Pages-specific capabilities excluded from recommendation.",
+          "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 137,
+          "lineEnd": 137,
+          "symbol": "let allowed: Set<String>",
+          "anchor": "let allowed: Set<String>",
+          "byteOffset": 7162,
+          "claim": "Explicit mutation allowlist shows supported Memex host controls and bounds negative claim."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 101,
+          "lineEnd": 101,
+          "symbol": "case \"host.info\":",
+          "anchor": "case \"host.info\":",
+          "byteOffset": 4823,
+          "claim": "Capability announcement covers conversations, queues, schedules, workspace/worktree/context fork and browser availability."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/src/control_mcp.rs",
+          "lineStart": 44,
+          "lineEnd": 66,
+          "symbol": "ControlServer.control",
+          "anchor": "async fn control",
+          "claim": "Opt-in MCP forwards method+params to execution_host::request; existing tool describes full execution controls."
+        }
+      ],
+      "implication": "Memex already exposes execution control as MCP; agents have narrower access to desktop shell organization and panel presentation.",
+      "recommendation": "If needed, expose a small authenticated app-control adapter over existing native organization/panel operations, with explicit user authorization for cross-chat messaging.",
+      "caveats": [
+        "Codex schema presence is source evidence, not proof every tool is exposed in every thread or account.",
+        "No claim that Pages/Work/ChatGPT-only integrations must be copied into a coding client."
+      ]
+    }
+  ],
+  "unresolved": [
+    "Codex account/feature-gate resolution and actual UI reachability remain root UI work.",
+    "No performance benchmarks or accessibility assistive-technology verification.",
+    "Memex native provider configuration may supply tools outside native management UI; not enumerated and no credential/state files inspected."
+  ]
+}

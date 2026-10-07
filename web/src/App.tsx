@@ -54,6 +54,7 @@ import {
   type SessionTarget,
 } from "@/session"
 import { Transcript } from "@/Transcript"
+import { ExecutionSurface } from "@/ExecutionSurface"
 import { useSidebar } from "@/components/ui/sidebar"
 
 type SearchResult = {
@@ -77,7 +78,7 @@ type SearchPayload = {
 }
 
 type PreviewMode = "matches" | "history"
-type ShellView = "home" | "transcript"
+type ShellView = "home" | "transcript" | "execution"
 type TimeRange = "24h" | "7d" | "30d" | "all"
 type SearchSort = "relevance" | "newest" | "oldest"
 
@@ -163,7 +164,7 @@ const initialMode: PreviewMode =
     : localStorage.getItem("memex-preview-mode") === "history"
       ? "history"
       : "matches"
-const initialShellView: ShellView = paramsAtLoad.has("session")
+const initialShellView: ShellView = paramsAtLoad.get("view") === "execution" ? "execution" : paramsAtLoad.has("session")
   ? "transcript"
   : "home"
 
@@ -711,7 +712,7 @@ function App() {
             }
           : null,
       )
-      setShellView(params.has("session") ? "transcript" : "home")
+      setShellView(params.get("view") === "execution" ? "execution" : params.has("session") ? "transcript" : "home")
     }
     window.addEventListener("popstate", restore)
     return () => window.removeEventListener("popstate", restore)
@@ -849,7 +850,9 @@ function App() {
     }
   }, [hasMoreResults, intent, results, searchParamsFor, searchStatus])
 
-  useEffect(() => updateLocation(target), [target, updateLocation])
+  useEffect(() => {
+    if (shellView !== "execution") updateLocation(target)
+  }, [shellView, target, updateLocation])
 
   const homeResults = useMemo(() => {
     const unique = new Map<string, SearchResult>()
@@ -1006,6 +1009,9 @@ function App() {
   const homeSurface = (
     <main className="home-surface">
       <div className="home-column">
+        <div className="flex justify-end">
+          <Button variant="ghost" size="sm" onClick={() => { history.pushState({}, "", "?view=execution"); setShellView("execution") }}>Active conversations</Button>
+        </div>
         <HomeActivityChart
           query={query}
           active={shellView === "home"}
@@ -1209,7 +1215,7 @@ function App() {
   )
 
   if (
-    [error, pageError, resource.error].includes(authenticationRequiredMessage)
+    shellView !== "execution" && [error, pageError, resource.error].includes(authenticationRequiredMessage)
   ) {
     return (
       <main className="transcript-surface">
@@ -1218,6 +1224,7 @@ function App() {
           <p>
             Run <code>memex web open</code> to create a new browser session.
           </p>
+          <Button variant="outline" onClick={() => { history.pushState({}, "", "?view=execution"); setShellView("execution") }}>Pair an execution host</Button>
         </div>
       </main>
     )
@@ -1324,7 +1331,9 @@ function App() {
       </Sidebar>
 
       <SidebarInset className="min-h-0 min-w-0 gap-2 overflow-hidden bg-transparent p-2 shadow-none">
-        {shellView === "home" ? (
+        {shellView === "execution" ? (
+          <ExecutionSurface onBack={returnHome} />
+        ) : shellView === "home" ? (
           homeSurface
         ) : (
           <Tabs

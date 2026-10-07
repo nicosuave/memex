@@ -1,6 +1,6 @@
 import Foundation
 
-struct Session: Decodable, Identifiable, Hashable, Sendable {
+struct Session: Codable, Identifiable, Hashable, Sendable {
     let source: String
     let sessionID: String
     let sourcePath: String
@@ -105,15 +105,18 @@ struct TranscriptRecord: Decodable, Identifiable, Equatable, Sendable {
     let record: Message
     var sourceRecordID: String? = nil
     var rawJSON: String? = nil
+    // Provider evidence without a readable message stays available in Raw transcript.
+    var isRawOnly = false
     var sourceID: String { sourceRecordID ?? recordID }
     var id: String { recordID }
     enum CodingKeys: String, CodingKey { case recordID = "record_id", record }
 
-    init(recordID: String, record: Message, sourceRecordID: String? = nil, rawJSON: String? = nil) {
+    init(recordID: String, record: Message, sourceRecordID: String? = nil, rawJSON: String? = nil, isRawOnly: Bool = false) {
         self.recordID = recordID
         self.record = record
         self.sourceRecordID = sourceRecordID
         self.rawJSON = rawJSON
+        self.isRawOnly = isRawOnly
     }
 
     init(from decoder: Decoder) throws {
@@ -130,7 +133,8 @@ struct TranscriptRecord: Decodable, Identifiable, Equatable, Sendable {
                              ("tool_output", record.toolOutput), ("event_id", record.eventID),
                              ("parent_tool_use_id", record.parentToolUseID), ("source_turn_id", record.sourceTurnID),
                              ("assistant_phase", record.assistantPhase), ("lifecycle_event", record.lifecycleEvent),
-                             ("source_record_type", record.sourceRecordType)] {
+                             ("source_record_type", record.sourceRecordType), ("structured_activity", record.structuredActivity),
+                             ("activity_status", record.activityStatus), ("output_completeness", record.outputCompleteness)] {
             if let value { fields[key] = .string(value) }
         }
         if let content = record.sourceContent { fields["source_content"] = .string(content) }
@@ -153,6 +157,10 @@ struct Message: Decodable, Equatable, Sendable {
     var sourceRecordType: String? = nil
     var sourceContent: String? = nil
     var toolResultIsError: Bool? = nil
+    var mcpAppJSON: String? = nil
+    var structuredActivity: String? = nil
+    var activityStatus: String? = nil
+    var outputCompleteness: String? = nil
     // Display-only classification; source records and serialized content stay intact.
     var contextLabel: String? = nil
 
@@ -163,7 +171,10 @@ struct Message: Decodable, Equatable, Sendable {
         case sourceTurnID = "source_turn_id", assistantPhase = "assistant_phase"
         case lifecycleEvent = "lifecycle_event", sourceRecordType = "source_record_type"
         case sourceContent = "source_content"
+        case mcpAppJSON = "mcp_app"
         case toolResultIsError = "tool_result_is_error"
+        case structuredActivity = "structured_activity", activityStatus = "activity_status"
+        case outputCompleteness = "output_completeness"
     }
 
     var isActivity: Bool { ["tool_use", "tool_result", "tool", "reasoning"].contains(role) }

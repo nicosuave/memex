@@ -1,0 +1,213 @@
+{
+  "checkedAt": "2026-10-05",
+  "sourceVersions": [
+    {
+      "product": "Codex",
+      "version": "26.930.51102 (13100)",
+      "root": "/Applications/ChatGPT.app",
+      "provenance": "Info.plist CFBundleIdentifier com.openai.codex; readArchive/readEntry extraction only",
+      "appAsarSHA256": "a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+      "headerSHA256": "8141a629ce6ef3a72fe2b5c602104946fe9de2393d3b5b464940d16523571b7f",
+      "extractedRoot": "/tmp/codex-parity-20261005"
+    },
+    {
+      "product": "Memex",
+      "commit": "17e958778a7398db8238cc9c8415ca12649067e5",
+      "root": "/Users/nico/Code/memex-chat-capabilities",
+      "provenance": "Contract pinned source baseline"
+    },
+    {
+      "product": "Memex runtime",
+      "commit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+      "root": "/Users/nico/Code/memex-chat-runtime",
+      "provenance": "Contract pinned optional SQACPHost source; availability gated by Memex Package.swift build configuration"
+    }
+  ],
+  "sourceUnchangedAfterResearch": true,
+  "extraction": {
+    "method": "Read-only Modex readArchive/readEntry; extracted packed JS/JSON/HTML to owned /tmp scratch. No installed app write, launch, stop or prompt.",
+    "archiveReader": "/Users/nico/Code/modex/lib/asar.mjs",
+    "modexCommit": "3fda386bce49d563a52e9fc09683c4589561d90e",
+    "discovery": "Read Modex AGENTS.md, README.md and lib/README.md; inspected worktrees/current-source lazy facade resolver. Followed actual installed facade imports into app-initial/app-shared and implementation assets; did not apply transformations.",
+    "extractedRoot": "/tmp/codex-parity-20261005",
+    "extractedPackedTextCount": 15499
+  },
+  "referencedAssets": [
+    {
+      "archivePath": "webview/assets/app-initial-f9b16fbf8fc7.js",
+      "sha256": "22f3ea455585cfc0508e3d3627eac161c80c849c0aace3d76d09fdebaa0aeca3",
+      "bytes": 11173718
+    },
+    {
+      "archivePath": "webview/assets/app-primary-c0280d43ce72.js",
+      "sha256": "234429db84d9319850ff0766a4a5052a9e898bfa0611883633f80018080dd6c0",
+      "bytes": 2328172
+    },
+    {
+      "archivePath": "webview/assets/app-shared-9d148924be0b.js",
+      "sha256": "eb2500c5398279d4fbf5c71d7ce982d54631660907761740199f6c22591d71ab",
+      "bytes": 7778898
+    },
+    {
+      "archivePath": "webview/assets/automatic-approval-review-details-4ade28f5c96a.js",
+      "sha256": "47ab4b167125e6c391493c60ce092d6ebe79946471b43b0f20c72c42855667fa",
+      "bytes": 4561
+    },
+    {
+      "archivePath": "webview/assets/automation-detail-panel-59709a145853.js",
+      "sha256": "f247b714c9cc579db80bdf423cf340b0b94c6da5a8041c4b7160b3856e707d62",
+      "bytes": 13904
+    },
+    {
+      "archivePath": "webview/assets/automations-page-abd560996342.js",
+      "sha256": "31422790868ee7a46d97712dc7024aa7c5c9c048340cda21cb44a81f4bd84c20",
+      "bytes": 102608
+    },
+    {
+      "archivePath": "webview/assets/browser-use-settings-visibility-a47f5656ea55.js",
+      "sha256": "f38ecd8dfd51b87e71871ce375dffe4c6ff4179a2e79ba53af666f677105f673",
+      "bytes": 1973
+    },
+    {
+      "archivePath": "webview/assets/cloud-browser-preview-6a5c057f3897.js",
+      "sha256": "22106a955f6798be9b0fdadf0f2aafcfa4baa563ce4407d52c67438a1335cb6b",
+      "bytes": 9938
+    },
+    {
+      "archivePath": "webview/assets/computer-use-app-approvals-query-a8b3c61a321c.js",
+      "sha256": "b52aee0f3bf5cfca455af0c5dcd4a114a036b492ae3c21cb9c01580b2152d86e",
+      "bytes": 2691
+    },
+    {
+      "archivePath": "webview/assets/computer-use-settings-8cfbd3f42052.js",
+      "sha256": "7de8551f6908a9c69a072029f909ffcee53bd514edc53e4221bc48fd520be2f4",
+      "bytes": 72266
+    },
+    {
+      "archivePath": "webview/assets/editable-review-file-source-tab-content.electron-3af1b5dc3d31.js",
+      "sha256": "388c9d123cefdab2f7527afd6e0e165fa8372e3867fec07b2c81b2400ef68eca",
+      "bytes": 12174
+    },
+    {
+      "archivePath": "webview/assets/general-settings-4f1402fc1fbd.js",
+      "sha256": "91ef510e7631785df4c62c25f3b9018a0ca3c15ce3fa1b208f3cf8394abdf535",
+      "bytes": 152954
+    },
+    {
+      "archivePath": "webview/assets/keyboard-shortcuts-settings-ef4c455aeec6.js",
+      "sha256": "f31de7f3b3c6b2449870be9f0fbc8259cd5f494d06105b619a26560976892328",
+      "bytes": 35742
+    },
+    {
+      "archivePath": "webview/assets/local-conversation-git-actions-290387202be8.js",
+      "sha256": "89ea20656e5609c2fbed87f9926537dd6516cb61217fc4c873f4bd8ad4f27346",
+      "bytes": 24624
+    },
+    {
+      "archivePath": "webview/assets/local-conversation-plan-model-5c6fbe48a2a4.js",
+      "sha256": "298cb8445882d01a2af8cd607daa7a0d211e99b933b6df049619c7cf29d46386",
+      "bytes": 592
+    },
+    {
+      "archivePath": "webview/assets/local-conversation-subagents-panel-tab-797735e5898b.js",
+      "sha256": "d87313d9ce52d9e65f0d5886c84648b6f59ea8af806a176214d5b8d16a2b4c19",
+      "bytes": 7668
+    },
+    {
+      "archivePath": "webview/assets/local-conversation-thread-604c26084272.js",
+      "sha256": "7b6df941fcb572d046d60a93695af704309b899dce346887bc301484fbef9879",
+      "bytes": 353104
+    },
+    {
+      "archivePath": "webview/assets/local-conversation-turn-ccc9d0fc20e5.js",
+      "sha256": "0319cf6508b693232800baee3dc5f8642468c260ae870b4304715bf3abeaa61e",
+      "bytes": 93395
+    },
+    {
+      "archivePath": "webview/assets/mcp-server-elicitation-request-panel-15e9f832a59b.js",
+      "sha256": "15f178962c0ced0609a53b502c79ccb1f4110e50fc2cc8f9f4fa4295547a8385",
+      "bytes": 14821
+    },
+    {
+      "archivePath": "webview/assets/mcp-tool-item-content-a7c9d903249d.js",
+      "sha256": "22f08427983004be66b5d358b9c5a0f72a5276612c59dba653226a4ca322a5db",
+      "bytes": 56030
+    },
+    {
+      "archivePath": "webview/assets/notifications-settings-9ccd12da7ea7.js",
+      "sha256": "7528b99262ae8427453725aab295972502e8d5541c55df7ef3501f5aa1db3a3f",
+      "bytes": 31343
+    },
+    {
+      "archivePath": "webview/assets/pending-request-item-panel-f0363294db8b.js",
+      "sha256": "ebeba4e61951e938bf514daa1ec024a85854ce938929b4766e61cb51cc37fe10",
+      "bytes": 86123
+    },
+    {
+      "archivePath": "webview/assets/plan-side-panel-2f427e3e9737.js",
+      "sha256": "c405475a794ae0649663be62ccbaafa7c55326f9c16db27b1fa5485addc2c030",
+      "bytes": 2184
+    },
+    {
+      "archivePath": "webview/assets/plugins-settings-146885f88b18.js",
+      "sha256": "e6a475adb3408d8e93a07caad7d442b3944bd5d80c4c9a2d44f369001b64a537",
+      "bytes": 82343
+    },
+    {
+      "archivePath": "webview/assets/pull-request-code-review-28722845bd32.js",
+      "sha256": "a01870c72d7c38425602f42ee236bbe4197c1799b3af224868eb1dd4be2e7de2",
+      "bytes": 48406
+    },
+    {
+      "archivePath": "webview/assets/queued-message-list-e1e037c82f46.js",
+      "sha256": "6387ca194a268297d5218098906dba8894858dbfdc61a786c9325a0cf7243bed",
+      "bytes": 19971
+    },
+    {
+      "archivePath": "webview/assets/remote-connection-editor-dialog-1d8f37e9e898.js",
+      "sha256": "c86f8821b9c18069ee8bdde46a378b6ea24d2df469007a70666fa7260ab1390d",
+      "bytes": 13314
+    },
+    {
+      "archivePath": "webview/assets/remote-connections-settings-d2dabff157cf.js",
+      "sha256": "68026dcc3268fdc3aca4c70286f3b28a1a2fc13836c9789e91fcceadb6417a66",
+      "bytes": 169928
+    },
+    {
+      "archivePath": "webview/assets/request-panel-49ba9fe401fd.js",
+      "sha256": "1ded037b6b95456d619c6ac7b505333269c2dd426946702d887bfbc30a58caf4",
+      "bytes": 69862
+    },
+    {
+      "archivePath": "webview/assets/terminal-tab-e527a3db0b81.js",
+      "sha256": "16bd204b78343ec7d1b31f061f4c9b71d4d5abe729d7392a010c4af4e3bb9b5c",
+      "bytes": 16473
+    },
+    {
+      "archivePath": "webview/assets/thread-handoff-modal-63cd776f0ead.js",
+      "sha256": "0a7c11d658f5be9d8faed89fc6059fa04fc1bec396383f1172c55fcbf3ace177",
+      "bytes": 42821
+    },
+    {
+      "archivePath": "webview/assets/threads-fork-d7fba758d383.js",
+      "sha256": "d6bceb516c7c25dd17e58f1074bc1f256b28f701e4997e8d1357ff397ea0b4a9",
+      "bytes": 2417
+    },
+    {
+      "archivePath": "webview/assets/use-codex-worktrees-3c6a69cec5c9.js",
+      "sha256": "b9348e02bb5dfd0dc7680dcdb30a510871c71dd5afdf21c01f92ffb3dd27a97a",
+      "bytes": 998
+    },
+    {
+      "archivePath": "webview/assets/use-visible-settings-sections-dc3bbd6366c8.js",
+      "sha256": "cfaa4b3d5c2a82400a350e73d0f2d4a4e86cf805300aa5f1d8e5e4760f8be5a1",
+      "bytes": 40563
+    },
+    {
+      "archivePath": "webview/assets/worktrees-settings-page-21ceeff5dac4.js",
+      "sha256": "6fd750ee851b7b6dec7923506dd007f16f21dc3e2a3f56b53a4f3fb8835c7a2f",
+      "bytes": 31534
+    }
+  ],
+  "scope": "Codex desktop/local side. ChatGPT consumer/Work/Pages-specific surface is excluded unless Codex reachability explicitly inspected. No proprietary bundle copied into research directory."
+}

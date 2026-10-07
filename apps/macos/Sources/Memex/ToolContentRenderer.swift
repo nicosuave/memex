@@ -40,7 +40,7 @@ import AppKit
     /// values keep their original attributed presentation and exact ordering.
     static func richBlocks(_ records: [TranscriptRecord], rendered: NSAttributedString? = nil) -> [RichContentBlock] {
         let rendered = rendered ?? render(records)
-        var blocks: [RichContentBlock] = []
+        var blocks: [RichContentBlock] = mcpApps(records).map { .mcpApp($0) }
         rendered.enumerateAttribute(ToolPresentationSupport.codeLanguageAttribute, in: NSRange(location: 0, length: rendered.length)) { language, range, _ in
             let part = rendered.attributedSubstring(from: range)
             if let language = language as? String { blocks.append(.code(part.string, language: language)) }
@@ -67,10 +67,29 @@ import AppKit
             }
         }
         for source in imageSources(records) { blocks.append(.attachment(label: "", source: source, image: true)) }
+        // Canonical tool parts carry typed media separately from output text.
+        // This also handles Claude's nested source/base64 image representation.
+        for record in records { blocks += SourceContent.blocks(record.record) }
+        if records.contains(where: { $0.record.outputCompleteness == "partial" }) {
+            blocks.append(.attachmentNotice(label: "Partial output",
+                detail: "Only part of this result was captured. Any full output reference is a provider location and may no longer be available."))
+        }
         return blocks
     }
 
-    static func render(_ records: [TranscriptRecord], raw: Bool = false) -> NSAttributedString {
+    static func mcpApps(_ records: [TranscriptRecord]) -> [NativeMcpAppDescriptor] {
+        var seen = Set<String>()
+        return records.compactMap { record in
+            let message = record.record
+            guard let json = message.mcpAppJSON,
+                  let app = NativeMcpAppDescriptor.decode(json, expectedCallID: message.eventID ?? message.parentToolUseID),
+                  seen.insert(app.toolCallID).inserted else { return nil }
+            return app
+        }
+    }
+
+    static func render(_ records: [TranscriptRecord], raw: Bool = false,
+                       replacing hit: ConversationFindHit? = nil, with replacement: String = "") -> NSAttributedString {
         let result = NSMutableAttributedString(string: "")
         for record in records {
             let message = record.record
@@ -79,7 +98,16 @@ import AppKit
             for value in [message.toolInput, message.toolOutput, message.text] {
                 if let value, value.nilIfBlank != nil, !parts.contains(value) { parts.append(value) }
             }
-            for (index, part) in parts.enumerated() {
+            var sourceOffset = 0
+            for (index, original) in parts.enumerated() {
+                var part = original
+                let length = (original as NSString).length
+                if let hit, hit.recordID == record.id, hit.range.location >= sourceOffset,
+                   NSMaxRange(hit.range) <= sourceOffset + length {
+                    part = (original as NSString).replacingCharacters(in: NSRange(
+                        location: hit.range.location - sourceOffset, length: hit.range.length), with: replacement)
+                }
+                sourceOffset += length + 2 // ConversationMatcher.body joins distinct fields with two newlines.
                 if index > 0 { append(raw ? "\n\n" : "\n", to: result) }
                 if raw { append(part, to: result, code: true) }
                 else { content(part, to: result, code: message.role == "tool_use", toolName: message.toolName ?? records.first?.record.toolName ?? "") }
@@ -92,7 +120,7 @@ import AppKit
         return result
     }
 
-    private static func content(_ text: String, to result: NSMutableAttributedString, code: Bool, toolName: String) {
+    private static func content(_ text: String, to result: NSMutableAttributedString, code: Bool, toolName: String, prose: Bool = false) {
         let text = text.trimmingCharacters(in: .newlines)
         if let value = json(text) {
             valueBlocks(value, to: result, toolName: toolName)
@@ -139,6 +167,7 @@ import AppKit
         }
         if isOpaque(text) { opaque(text, to: result) }
         else if let decorated = ToolPresentationSupport.decorate(text, path: "", toolName: toolName, code: code) { result.append(decorated) }
+        else if prose { result.append(RichTextRenderer.render(text, font: .systemFont(ofSize: 14))) }
         else { append(text, to: result, code: code) }
     }
 
@@ -153,11 +182,47 @@ import AppKit
 
     private static func valueBlocks(_ value: Any, to result: NSMutableAttributedString, path: String = "", toolName: String) {
         if let object = value as? [String: Any], !object.isEmpty {
-            for key in object.keys.sorted() {
+            // Provider/MCP text blocks are transport containers, not field names
+            // readers need before the result. Unknown fields still follow the text.
+            if let type = object["type"] as? String, ["text", "input_text", "output_text"].contains(type),
+               let text = object["text"] as? String {
+                content(text, to: result, code: false, toolName: toolName, prose: true)
+                if !result.string.hasSuffix("\n") { append("\n", to: result) }
+                for key in object.keys.sorted() where key != "type" && key != "text" {
+                    valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName)
+                }
+                return
+            }
+            if object["type"] as? String == "resource", let resource = object["resource"] as? [String: Any],
+               let text = resource["text"] as? String {
+                content(text, to: result, code: false, toolName: toolName, prose: true)
+                if !result.string.hasSuffix("\n") { append("\n", to: result) }
+                for key in resource.keys.sorted() where key != "text" {
+                    valueBlocks(resource[key]!, to: result, path: "resource.\(key)", toolName: toolName)
+                }
+                for key in object.keys.sorted() where key != "type" && key != "resource" {
+                    valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName)
+                }
+                return
+            }
+            let name = toolName.components(separatedBy: "__").last?.components(separatedBy: ".").last?.lowercased() ?? ""
+            let execution = ["bash", "shell", "shell_command", "exec_command", "run_command", "terminal", "exec", "write_stdin"].contains(name)
+                || (object["exit_code"] is NSNumber && ["output", "stdout", "stderr"].contains { object[$0] is String })
+            let priority = execution ? ["cmd", "command", "code", "script", "output", "stdout", "stderr", "exit_code", "status", "content"] : ["content"]
+            // Only prioritize recognized execution fields and MCP content. Every
+            // other field retains the generic walk and is also available raw.
+            let keys = priority.filter { object[$0] != nil } + object.keys.sorted().filter { !priority.contains($0) }
+            for key in keys {
                 valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName)
             }
         } else if let array = value as? [Any], !array.isEmpty {
-            for (index, entry) in array.enumerated() { valueBlocks(entry, to: result, path: "\(path)[\(index)]", toolName: toolName) }
+            // functions.exec emits a separate text block for its timing banner.
+            // Keep it after useful output while preserving original array indexes
+            // for any fields the generic renderer still needs to label.
+            let entries = Array(array.enumerated())
+            for (index, entry) in entries.filter({ !isExecutionBanner($0.element) }) + entries.filter({ isExecutionBanner($0.element) }) {
+                valueBlocks(entry, to: result, path: "\(path)[\(index)]", toolName: toolName)
+            }
         } else {
             if result.length > 0, !result.string.hasSuffix("\n") { append("\n", to: result) }
             if !path.isEmpty { label(path, to: result) }
@@ -172,8 +237,16 @@ import AppKit
                       let text = String(data: data, encoding: .utf8) {
                 append(text, to: result)
             }
-            append("\n", to: result)
+            if !result.string.hasSuffix("\n") { append("\n", to: result) }
         }
+    }
+
+    private static func isExecutionBanner(_ value: Any) -> Bool {
+        guard let object = value as? [String: Any], let type = object["type"] as? String,
+              ["text", "input_text", "output_text"].contains(type), let text = object["text"] as? String else { return false }
+        let lines = text.split(separator: "\n").map(String.init)
+        return lines.first == "Script completed" && lines.last == "Output:"
+            && lines.dropFirst().dropLast().allSatisfy { $0.hasPrefix("Wall time ") && $0.hasSuffix(" seconds") }
     }
 
     static func isOpaque(_ text: String) -> Bool {

@@ -162,7 +162,7 @@ struct ResumeError: LocalizedError {
                            enabled: reason == nil && !isLaunching,
                            menuEnabled: !isLaunching,
                            canOpen: { $0 == .chatgpt || (metadataHelp == nil && ResumeLaunchPlan.unavailableReason(for: session) == nil) },
-                           help: reason ?? "Resume in \(preferred?.title ?? "terminal")") { [weak self] destination in
+                           help: reason ?? "Open in \(preferred?.title ?? "terminal")") { [weak self] destination in
             self?.open(session, in: destination)
         }.update(control, coordinator: coordinator)
     }
@@ -209,14 +209,14 @@ struct ResumeError: LocalizedError {
         control.segmentCount = 2
         control.trackingMode = .momentary
         control.segmentStyle = .separated
-        control.setLabel("Resume", forSegment: 0)
+        control.setLabel("Open in", forSegment: 0)
         control.setWidth(0, forSegment: 0)
         control.setWidth(22, forSegment: 1)
         control.setShowsMenuIndicator(true, forSegment: 1)
         control.setImageScaling(.scaleProportionallyDown, forSegment: 0)
         control.target = coordinator
         control.action = #selector(Coordinator.openPreferred(_:))
-        control.setAccessibilityLabel("Resume conversation")
+        control.setAccessibilityLabel("Open conversation in another app")
         return control
     }
     func update(_ control: NSSegmentedControl, coordinator: Coordinator) {

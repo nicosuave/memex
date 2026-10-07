@@ -139,6 +139,11 @@ private func isMainThread() -> Bool { Thread.isMainThread }
     let catalog = ProjectCatalog(client: client, cacheDirectory: directory, fetch: { rows })
     let store = Store(client: client, projectCatalog: catalog)
     await store.loadProjects()
+    // The sidebar groups loaded conversations; catalog entries alone are not rows.
+    store.sessions = rows.map { project in
+        Session(source: "codex", sessionID: project.project, sourcePath: "/fixture/\(project.project)",
+                project: project.project)
+    }
     _ = NSApplication.shared
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 700),
         styleMask: [.titled, .resizable], backing: .buffered, defer: false)

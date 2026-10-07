@@ -1,0 +1,713 @@
+{
+  "sourceVersions": [
+    {
+      "product": "Codex",
+      "version": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+      "root": "/tmp/codex-parity-20261005",
+      "provenance": "Read-only extracted installed /Applications/ChatGPT.app app.asar; parent supplied version/hash."
+    },
+    {
+      "product": "Memex",
+      "commit": "17e958778a7398db8238cc9c8415ca12649067e5",
+      "root": "/Users/nico/Code/memex-chat-capabilities",
+      "provenance": "Pinned native source baseline."
+    },
+    {
+      "product": "Memex runtime",
+      "commit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+      "root": "/Users/nico/Code/memex-chat-runtime",
+      "provenance": "Pinned sidequery-workspace runtime; inspected package manifest and generated protocol boundary; no claims of native capability from schemas."
+    }
+  ],
+  "coverage": [
+    {
+      "facets": [
+        "projects/worktrees/Git/review/files",
+        "terminal/browser/computer use",
+        "remote/cloud/multi-host"
+      ],
+      "examinedBoundaries": [
+        "Memex WorkspacePanelView and Store.canAccessLocalFiles",
+        "Memex LocalProjects / ProjectCreation / ManagedWorkspaceLifecycle",
+        "Memex WorkspaceGit / WorkspaceReview / WorkspaceChangesView / WorkspaceFilesView",
+        "Memex WorkspaceTerminalSession / Group / View",
+        "Memex WorkspaceBrowserTabView / Automation",
+        "Memex ExecutionHostConnection / ConnectionsView / RemoteConversationRuntime",
+        "MemexExecutionHostCore ExecutionHost complete operation dispatch",
+        "Codex local thread, handoff, worktree settings/query, Git actions, PR review, file editor, terminal, remote connections and computer-use settings chunks"
+      ],
+      "reachability": "Memex native panes and connection sheet are wired in MemexApp.swift lines150-155. Codex local thread directly imports handoff modal; settings and terminal chunks are loaded by app-initial. Feature/policy conditions exist; installed-account visibility is not established by bundle presence.",
+      "negativeClaimBoundary": "Native Memex UI and ExecutionHostCore dispatch only; does not exclude provider shell commands or user-installed external MCP capabilities."
+    }
+  ],
+  "findings": [
+    {
+      "id": "codex-workspace-01",
+      "category": "projects/worktrees",
+      "capability": "Projects and managed checkout creation",
+      "userWorkflow": "Save a project and start work in its directory or an isolated worktree.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Shipped host-aware worktree query and worktree settings.",
+      "memexState": "Saved local projects support existingDirectory/newWorktree, default base ref and setup command; managed lifecycle UI exists.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/use-codex-worktrees-3c6a69cec5c9.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "method:`codex-worktrees`",
+          "claim": "Worktree inventory requests include hostConfig and worktreesRoot."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LocalProjects.swift",
+          "lineStart": 4,
+          "lineEnd": 16,
+          "symbol": "ConversationWorkspaceMode / LocalProject",
+          "claim": "Project workspace modes, base ref and setup command."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceLifecycleView.swift",
+          "lineStart": 25,
+          "lineEnd": 43,
+          "symbol": "WorkspaceLifecycleView",
+          "claim": "Checkout attach/archive/reattach actions."
+        }
+      ],
+      "implication": "Do not count basic project or worktree support as missing.",
+      "recommendation": "Retain existing implementation; compare ergonomics separately.",
+      "caveats": ""
+    },
+    {
+      "id": "codex-workspace-02",
+      "category": "projects/worktrees",
+      "capability": "Automatic pruning with recoverable snapshots",
+      "userWorkflow": "Reclaim disk from old worktrees without losing unfinished changes.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Worktree settings expose automatic deletion, retention limit and snapshot-before-delete recovery; actual native snapshot implementation not in extracted renderer.",
+      "memexState": "Archive retains all files. Cleanup refuses dirty, untracked or ignored files; reattach recreates from retained branch.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/worktrees-settings-page-21ceeff5dac4.js",
+          "lineStart": 2,
+          "lineEnd": 2,
+          "symbol": "ChatGPT snapshots worktrees before deleting",
+          "claim": "Installed UI describes recoverable snapshot-before-prune semantics."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/worktrees-settings-page-21ceeff5dac4.js",
+          "lineStart": 2,
+          "lineEnd": 2,
+          "symbol": "await ne(`worktree-delete`",
+          "claim": "Delete handler calls native worktree-delete after archiving linked conversations."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ManagedWorkspaceLifecycle.swift",
+          "lineStart": 76,
+          "lineEnd": 121,
+          "symbol": "setArchived / removeCleanCheckout / reattach",
+          "claim": "Archive only changes lifecycle metadata; cleanup requires empty status; reattach uses git worktree add from branch."
+        }
+      ],
+      "implication": "Memex protects dirty work by retaining disk usage; it does not implement the compared snapshot-and-prune lifecycle.",
+      "recommendation": "Consider explicit snapshot recovery before optional pruning. Preserve ignored-file safety guarantees.",
+      "caveats": "Codex snapshot coverage and recovery correctness are UI/native-contract evidence, not runtime verification. This is an optional disk-management enhancement, not a data-loss defect."
+    },
+    {
+      "id": "codex-workspace-03",
+      "category": "Git",
+      "capability": "Commit, push, draft PR and local diffs",
+      "userWorkflow": "Inspect changes, stage files, commit and publish a draft PR.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Git actions expose commit/push/create PR and branch actions.",
+      "memexState": "Changes view has stage/unstage, split diffs and branch comparison; Git actions execute commit/push/gh draft PR.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/local-conversation-git-actions-290387202be8.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "defaultMessage:`Git actions`",
+          "claim": "Reachable checkout action menu."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceGitActionsView.swift",
+          "lineStart": 19,
+          "lineEnd": 28,
+          "symbol": "Action",
+          "claim": "Commit, push and draft pull-request actions."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceGit.swift",
+          "lineStart": 54,
+          "lineEnd": 100,
+          "symbol": "commit / push / createPullRequest",
+          "claim": "Actual Git and gh execution implementation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceChangesView.swift",
+          "lineStart": 64,
+          "lineEnd": 70,
+          "symbol": "scope / splitDiff",
+          "claim": "Current/branch and split-diff controls."
+        }
+      ],
+      "implication": "Core Git workflow is present; lack of Git support is an incorrect gap claim.",
+      "recommendation": "Keep focused improvements scoped to concrete review or branch UX differences.",
+      "caveats": ""
+    },
+    {
+      "id": "codex-workspace-04",
+      "category": "review",
+      "capability": "GitHub PR review threads and richer diff controls",
+      "userWorkflow": "Open a PR, inspect its files and respond to a review thread in the app.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "PR renderer has reply/resolved threads and diff options: hide whitespace/imports, word diffs and full-file loading.",
+      "memexState": "Workspace review is local current/branch/checkpoint comparison plus file-level comment context added to chat; PR action creates a draft using gh.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/pull-request-code-review-28722845bd32.js",
+          "lineStart": 2,
+          "lineEnd": 2,
+          "symbol": "defaultMessage:`Reply`",
+          "claim": "PR review thread reply UI."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/pull-request-code-review-28722845bd32.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "defaultMessage:`Hide white space`",
+          "claim": "PR diff filtering controls."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceReview.swift",
+          "lineStart": 3,
+          "lineEnd": 26,
+          "symbol": "WorkspaceDiffScope / WorkspaceReviewContext",
+          "claim": "Local scopes and review context contract."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceChangesView.swift",
+          "lineStart": 149,
+          "lineEnd": 156,
+          "symbol": "Add review to chat",
+          "claim": "Review comment adds local diff context to the active chat."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceGitActionsView.swift",
+          "lineStart": 19,
+          "lineEnd": 28,
+          "symbol": "Action",
+          "claim": "Git action boundary includes create PR but no open/reply PR workflow."
+        }
+      ],
+      "implication": "Local review is implemented, but the inspected native workspace surface has no equivalent first-class PR thread workflow.",
+      "recommendation": "Prioritize PR reading and linked review context before adding external posting actions.",
+      "caveats": "No GitHub write action was performed. Provider shell/MCP access can offer PR operations without native product UI. Native workspace UI boundary, not a claim that all provider tools lack GitHub."
+    },
+    {
+      "id": "codex-workspace-05",
+      "category": "files",
+      "capability": "Local file browsing/editing",
+      "userWorkflow": "Browse a workspace file, edit it, save safely and add context to chat.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Installed file-source editor component exists, including executor-aware file availability.",
+      "memexState": "Mounted Files pane supports browsing, create, edit/save, conflict handling, previews and adding to chat.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/editable-review-file-source-tab-content.electron-3af1b5dc3d31.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "Files will be available when the task has an environment",
+          "claim": "File editor handles environment-dependent file access."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspacePanelView.swift",
+          "lineStart": 38,
+          "lineEnd": 46,
+          "symbol": "WorkspaceFilesView",
+          "claim": "Files pane is wired into workspace panel."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceFilesView.swift",
+          "lineStart": 62,
+          "lineEnd": 89,
+          "symbol": "Save / Keep my edits / Use disk",
+          "claim": "Editor and conflict UI."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceFilesView.swift",
+          "lineStart": 224,
+          "lineEnd": 240,
+          "symbol": "save",
+          "claim": "Write/conflict path."
+        }
+      ],
+      "implication": "Native file editing is already present.",
+      "recommendation": "Retain existing implementation; remote availability is tracked separately.",
+      "caveats": ""
+    },
+    {
+      "id": "codex-workspace-06",
+      "category": "terminal",
+      "capability": "Persistent local workspace terminals",
+      "userWorkflow": "Open shells alongside chat, switch layouts and send selected output back as context.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Terminal tab tracks session/environment, reconnect states and fresh-shell semantics.",
+      "memexState": "Ghostty-backed per-worktree sessions survive pane/chat switches; tabs and split layouts, scrollback capture, save and context actions.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/terminal-tab-e527a3db0b81.js",
+          "lineStart": 2,
+          "lineEnd": 2,
+          "symbol": "Opening a fresh shell. Previous commands won’t be rerun",
+          "claim": "Terminal UI distinguishes reconnection from replay."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceTerminalGroup.swift",
+          "lineStart": 5,
+          "lineEnd": 8,
+          "symbol": "WorkspaceTerminalGroup",
+          "claim": "Process ownership and retained sessions; snapshots are never replayed."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceTerminalView.swift",
+          "lineStart": 86,
+          "lineEnd": 106,
+          "symbol": "WorkspaceTerminalGroupView",
+          "claim": "New shell, layouts, selection/scrollback context, restart/close."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceTerminalSession.swift",
+          "lineStart": 91,
+          "lineEnd": 97,
+          "symbol": "TerminalSurfaceOptions",
+          "claim": "Actual Ghostty surface configured with working directory."
+        }
+      ],
+      "implication": "Basic integrated/persistent terminal is not a missing capability.",
+      "recommendation": "Do not reimplement local terminal; remote scope is separate.",
+      "caveats": "Process retention within app lifetime differs from saved scrollback after restart; no claim of immortal shell sessions."
+    },
+    {
+      "id": "codex-workspace-07",
+      "category": "browser",
+      "capability": "In-app tabs and bounded agent browser interaction",
+      "userWorkflow": "Browse signed-in sites in chat tabs, then grant agents read/interaction access.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Browser settings and native computer/browser bridge are shipped; policy/gate checks exist.",
+      "memexState": "Chat-owned browser tabs explicitly grant snapshot/click/type/scroll and optional JS evaluation; revoke is exposed.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/browser-use-settings-visibility-a47f5656ea55.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "enabled:p,isLoading:m",
+          "claim": "Browser settings visibility is gated."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserTabView.swift",
+          "lineStart": 15,
+          "lineEnd": 44,
+          "symbol": "WorkspaceBrowserTabView",
+          "claim": "Tabs plus explicit agent automation grant/revoke UI."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserAutomation.swift",
+          "lineStart": 85,
+          "lineEnd": 124,
+          "symbol": "dispatch",
+          "claim": "Dispatches allowed snapshot/click/type/scroll/evaluate operations."
+        }
+      ],
+      "implication": "Memex has real app-owned browser control, not just static web previews.",
+      "recommendation": "Preserve per-chat explicit grants. Assess external-browser/native-app control separately.",
+      "caveats": "No signed-in browser interaction was performed; actual provider invocation depends on execution bridge and grant."
+    },
+    {
+      "id": "codex-workspace-08",
+      "category": "computer-use",
+      "capability": "Native apps and external browser control",
+      "userWorkflow": "Allow an agent to interact with native desktop apps or a browser outside app-owned tabs.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Shipped Computer use settings include Any App, Chrome, Edge, Safari and per-app approvals; native settings bridge and policy checks are present.",
+      "memexState": "Inspected desktop execution API exposes browser.describe/browser.dispatch into chat-owned tabs; grant text explicitly excludes other apps and conversations.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "medium",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/computer-use-settings-8cfbd3f42052.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "defaultMessage:`Any App`",
+          "claim": "Native/external app computer-use settings."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/computer-use-app-approvals-query-a8b3c61a321c.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "n.computerUseSettings.getAppApprovals()",
+          "claim": "Native bridge reads app approval policy."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/computer-use-app-approvals-query-a8b3c61a321c.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "allowLockedComputerUse!==!1",
+          "claim": "Computer-use requirements restrict locked-computer capability."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserTabView.swift",
+          "lineStart": 35,
+          "lineEnd": 44,
+          "symbol": "automation grant message",
+          "claim": "Control is explicitly limited to app-owned tabs."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 137,
+          "lineEnd": 142,
+          "symbol": "allowed",
+          "claim": "Native execution mutation boundary exposes browser.dispatch, not desktop-app control."
+        }
+      ],
+      "implication": "The native Memex control surface stops at its own browser tabs.",
+      "recommendation": "Treat broader desktop control as an explicitly permissioned integration, if desired.",
+      "caveats": "Codex feature visibility is policy/plugin/platform dependent; no live enablement asserted. External provider-installed MCP tools are outside the native inventory boundary. Runtime generated computer_use protocol types alone do not implement this UI."
+    },
+    {
+      "id": "codex-workspace-09",
+      "category": "remote/multi-host",
+      "capability": "Remote execution and integrated SSH onboarding",
+      "userWorkflow": "Connect another machine and create/resume work there.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Connections UI includes manual SSH host/port/identity and remote CLI sign-in; account-device connection paths are also bundled.",
+      "memexState": "Paired execution hosts are implemented via explicit HTTPS or loopback-tunnel URL plus token; verify host identity, list/create/resume conversations and manage remote worktrees.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/remote-connection-editor-dialog-1d8f37e9e898.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "defaultMessage:`SSH authentication method`",
+          "claim": "SSH configuration form."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/remote-connections-settings-d2dabff157cf.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "Authenticate the Codex CLI on this remote machine to continue",
+          "claim": "Remote CLI authentication workflow."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ExecutionHostConnectionsView.swift",
+          "lineStart": 42,
+          "lineEnd": 77,
+          "symbol": "Execution hosts",
+          "claim": "Explicit endpoint/token pairing workflow."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ExecutionHostConnection.swift",
+          "lineStart": 67,
+          "lineEnd": 79,
+          "symbol": "validatedEndpoint",
+          "claim": "HTTPS or loopback HTTP endpoint validation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/RemoteConversationRuntime.swift",
+          "lineStart": 20,
+          "lineEnd": 52,
+          "symbol": "connect",
+          "claim": "Imports/resumes exact host-native conversation identity."
+        }
+      ],
+      "implication": "Multi-host execution already exists; the difference is integrated SSH/account discovery and setup ergonomics.",
+      "recommendation": "Improve onboarding if required without replacing the execution-host ownership protocol.",
+      "caveats": "Codex device discovery availability is gate/account dependent; no connectivity test performed."
+    },
+    {
+      "id": "codex-workspace-10",
+      "category": "remote/workspace",
+      "capability": "Files, review and terminals for remote conversations",
+      "userWorkflow": "Keep using workspace panels after opening a paired-host chat.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Non-durable terminal and editable-file branches pass explicit hostId to their implementations; local-conversation Git action queries include hostConfig/cwd. Durable cloud-specific branches are separate and are not the evidence for SSH host parity.",
+      "memexState": "selectedWorkspace is nil for any paired-host or server-owned conversation. Files/changes/terminal panes require selectedWorkspace and terminal implementation requires a local directory.",
+      "status": "missing",
+      "priority": "P1",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/terminal-tab-e527a3db0b81.js",
+          "lineStart": 2,
+          "lineEnd": 2,
+          "symbol": "conversationTitle:i,cwd:a,hostId:o,initialPromptHint:k",
+          "anchor": "conversationTitle:i,cwd:a,hostId:o,initialPromptHint:k",
+          "byteOffset": 15395,
+          "claim": "Non-durable terminal qe passes explicit hostId through to terminal component; durable-specific je is a separate branch."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/editable-review-file-source-tab-content.electron-3af1b5dc3d31.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "commentProps:N,conversationId:k,cwd:n,editor:L,headerActions:r,hideFileNavigation:a,hostId:o",
+          "anchor": "commentProps:N,conversationId:k,cwd:n,editor:L,headerActions:r,hideFileNavigation:a,hostId:o",
+          "byteOffset": 10313,
+          "claim": "Non-durable file/editor branch De passes explicit hostId to editor; cloud environment branch is separate."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100)",
+          "path": "/tmp/codex-parity-20261005/webview/assets/local-conversation-git-actions-290387202be8.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "hostConfig:g,includeUnstaged:!0",
+          "anchor": "hostConfig:g,includeUnstaged:!0",
+          "byteOffset": 3603,
+          "claim": "Local-conversation Git action state requests include hostConfig with cwd, including unstaged inspection."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/Store.swift",
+          "lineStart": 216,
+          "lineEnd": 225,
+          "symbol": "selectedWorkspace / canAccessLocalFiles",
+          "claim": "Explicitly excludes server-owned and paired-host sessions from local file access."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspacePanelView.swift",
+          "lineStart": 17,
+          "lineEnd": 46,
+          "symbol": "WorkspacePanelView",
+          "claim": "Changes and files require selectedWorkspace."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceTerminalView.swift",
+          "lineStart": 20,
+          "lineEnd": 37,
+          "symbol": "WorkspaceTerminalView",
+          "claim": "Terminal requires selectedWorkspace; otherwise unavailable."
+        }
+      ],
+      "implication": "A remote chat can execute, but native workspace inspection and shell UX disappear rather than switching to host-aware APIs.",
+      "recommendation": "Add host-scoped files/diff/terminal transport and bind the existing panels to verified remote workspace identity.",
+      "caveats": "Codex backend terminal/file operation correctness is not runtime-tested. Memex absence is established at the exact UI gating boundary, not inferred from search."
+    },
+    {
+      "id": "codex-workspace-11",
+      "category": "remote/worktrees",
+      "capability": "Move an existing chat and Git state between checkout/worktree/host",
+      "userWorkflow": "Continue the same task in a worktree, bring it back to main checkout, or move to another host.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Local-thread environment menu exposes Move to main checkout/Move to worktree; handoff dialog has remote destinations and dirty-workspace checks.",
+      "memexState": "Execution API has context fork/delegate and worktree create/archive/reattach/cleanup; no same-chat workspace/host migration mutation. Native forks explicitly create context handoffs.",
+      "status": "missing",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/local-conversation-thread-604c26084272.js",
+          "lineStart": 8,
+          "lineEnd": 8,
+          "symbol": "defaultMessage:`Move to main checkout`",
+          "claim": "Reachable thread environment action."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/local-conversation-thread-604c26084272.js",
+          "lineStart": 8,
+          "lineEnd": 8,
+          "symbol": "to-host-worktree",
+          "claim": "Cross-host handoff state in local thread UI."
+        },
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/thread-handoff-modal-63cd776f0ead.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "Stash or commit your local changes to hand off",
+          "claim": "Handoff checks destination cleanliness."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 137,
+          "lineEnd": 142,
+          "symbol": "allowed",
+          "claim": "Complete mutation inventory lacks move/transfer operation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 218,
+          "lineEnd": 250,
+          "symbol": "conversation.fork / context_handoff",
+          "claim": "Fork/delegate creates new conversation with explicit context handoff rather than moving same task."
+        }
+      ],
+      "implication": "Context sharing and worktree management do not provide identity-preserving task-and-Git migration.",
+      "recommendation": "If needed, design explicit handoff preserving native session, repo state and host ownership; do not label context forks equivalent.",
+      "caveats": "Cross-host Codex handler backend is not included in renderer inventory; UI/workflow wiring is observed, not end-to-end migration."
+    },
+    {
+      "id": "codex-workspace-12",
+      "category": "cloud",
+      "capability": "Hosted cloud task and browser surface",
+      "userWorkflow": "Run work in a hosted environment and inspect browser activity.",
+      "comparator": "Installed ChatGPT Codex desktop",
+      "comparatorState": "Bundled cloud browser preview has screenshot timeline, live panel and ChatGPT Work labels.",
+      "memexState": "Native app has server-owned/paired execution. Separate runtime repository contains hosted infrastructure, but account provisioning and this native app’s cloud workflow were not fully traced here.",
+      "status": "unknown",
+      "priority": "none",
+      "confidence": "medium",
+      "validationLevel": "source inspection; no runtime/UI test",
+      "evidence": [
+        {
+          "product": "Codex",
+          "sourceVersion": "26.930.51102 (13100); app.asar sha256 a159b8f5b78ed1ba89fc70d5c8448d822a46c4fc2a4a9f18ec348f3cc2f6b8c9",
+          "path": "/tmp/codex-parity-20261005/webview/assets/cloud-browser-preview-6a5c057f3897.js",
+          "lineStart": 1,
+          "lineEnd": 1,
+          "symbol": "Cloud browser activity timeline",
+          "claim": "Cloud browser replay/live surface in installed bundle."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/Store.swift",
+          "lineStart": 216,
+          "lineEnd": 225,
+          "symbol": "canAccessLocalFiles",
+          "claim": "Native app distinguishes server-owned execution."
+        }
+      ],
+      "implication": "Do not treat bundled ChatGPT Work cloud UI as universal Codex capability or infer hosted Memex absence.",
+      "recommendation": "Keep as an explicit unresolved deployment/product-boundary comparison.",
+      "caveats": "ChatGPT Work-specific chunk; gate/entitlement and Codex applicability unverified. No cloud runtime observation."
+    }
+  ],
+  "unresolved": [
+    "Actual Codex account/feature-gate visibility and remote native backend behavior were not runtime-tested.",
+    "Codex worktree snapshot retention/exclusion details are asserted by UI/native request contract; native implementation was not extracted.",
+    "Cloud Work versus Codex and Memex server/runtime provisioning are not equivalent product boundaries; leave cloud parity unknown."
+  ]
+}

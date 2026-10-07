@@ -10,6 +10,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -127,7 +128,7 @@ fn serve_requests(
 }
 
 fn handle_request(
-    request: Request,
+    mut request: Request,
     paths: &Paths,
     restrict_hosts: bool,
     cookie_name: &str,
@@ -171,6 +172,55 @@ fn handle_request(
         );
     }
 
+    if parsed.path() == "/api/control" {
+        if request.method() != &Method::Post {
+            return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
+        }
+        let configured_origin = std::env::var("MEMEX_CONTROL_PUBLIC_ORIGIN").ok();
+        let public_origin_allowed = request_header(&request, "Sec-Fetch-Site")
+            .is_none_or(|site| matches!(site, "same-origin" | "none"))
+            && request_header(&request, "Origin").is_some_and(|origin| {
+                crate::execution_host::allows_public_origin(origin, configured_origin.as_deref())
+            });
+        if !browser_request_is_same_origin(&request) && !public_origin_allowed {
+            return respond_text(
+                request,
+                StatusCode(403),
+                "cross-origin request denied",
+                "text/plain",
+            );
+        }
+        let authorization_count = request
+            .headers()
+            .iter()
+            .filter(|header| header.field.equiv("Authorization"))
+            .count();
+        let authorized = authorization_count == 1
+            && bearer_token(&request).is_some_and(|token| {
+                crate::execution_host::authorize(paths, token).unwrap_or(false)
+            });
+        if !authorized {
+            return respond_json_error(
+                request,
+                StatusCode(401),
+                "execution pairing required; retrieval sessions cannot control agents",
+            );
+        }
+        let mut body = Vec::new();
+        std::io::Read::take(
+            request.as_reader(),
+            (crate::execution_host::MAX_REQUEST_BYTES + 1) as u64,
+        )
+        .read_to_end(&mut body)?;
+        let command = match crate::execution_host::decode_request(&body) {
+            Ok(value) => value,
+            Err(error) => return respond_json_error(request, StatusCode(400), &error.to_string()),
+        };
+        return match crate::execution_host::request(paths, &command) {
+            Ok(value) => respond_json(request, StatusCode(200), &value),
+            Err(error) => respond_json_error(request, StatusCode(503), &error.to_string()),
+        };
+    }
     if request.method() != &Method::Get && request.method() != &Method::Head {
         return respond_text(request, StatusCode(405), "method not allowed", "text/plain");
     }
@@ -3990,6 +4040,93 @@ mod tests {
                 .unwrap()
                 .starts_with("http://[::1]:6363/#bootstrap=")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn control_http_requires_separate_pairing_and_preserves_exact_command() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let auth = WebAuth::load_or_create(&paths).unwrap();
+        let retrieval = auth
+            .exchange_bootstrap_token(&auth.create_bootstrap_token().unwrap())
+            .unwrap();
+        let cookie_name = session_cookie_name(&paths, DEFAULT_LISTEN).unwrap();
+        let directory = paths.state.join("execution");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let execution_token = "a".repeat(64);
+        let token_path = directory.join("control-token");
+        std::fs::write(&token_path, &execution_token).unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let endpoint = directory.join("control.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let command = serde_json::json!({"id":"request", "method":"conversation.send", "params":{
+            "hostId":"exact-host", "conversationId":"original-native-binding", "commandId":"stable-command",
+            "issuedAt":"2026-10-05T12:00:00Z", "text":"Run exactly once"}});
+        let body = serde_json::to_string(&command).unwrap();
+        let request = |headers: &str| {
+            format!(
+                "POST /api/control HTTP/1.1\r\nHost: localhost:6363\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        for headers in [
+            format!("Authorization: Bearer {retrieval}\r\n"),
+            format!("Cookie: {cookie_name}={retrieval}\r\n"),
+            format!("Authorization: Bearer {retrieval}\r\nCookie: {cookie_name}={retrieval}\r\n"),
+            format!(
+                "Authorization: Bearer {execution_token}\r\nAuthorization: Bearer {retrieval}\r\n"
+            ),
+        ] {
+            let response = http_round_trip(&paths, &auth, request(&headers));
+            assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        }
+        let cross_origin = http_round_trip(
+            &paths,
+            &auth,
+            request(&format!(
+                "Authorization: Bearer {execution_token}\r\nOrigin: https://untrusted.example\r\nSec-Fetch-Site: cross-site\r\n"
+            )),
+        );
+        assert!(cross_origin.starts_with("HTTP/1.1 403"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        listener.set_nonblocking(false).unwrap();
+        let expected = command.clone();
+        let host = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                expected
+            );
+            stream
+                .write_all(b"{\"id\":\"request\",\"result\":{\"accepted\":true}}\n")
+                .unwrap();
+        });
+        let response = http_round_trip(
+            &paths,
+            &auth,
+            request(&format!("Authorization: Bearer {execution_token}\r\n")),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"accepted\":true"));
+        host.join().unwrap();
     }
 
     #[test]

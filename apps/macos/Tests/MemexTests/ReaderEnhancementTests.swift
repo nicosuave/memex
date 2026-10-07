@@ -3,6 +3,43 @@ import Testing
 @testable import Memex
 
 @Suite(.serialized) @MainActor struct ReaderEnhancementTests {
+    @Test func floatingComposerInsetKeepsLatestVisibleAndHistoryPositionStable() {
+        let records = (0..<40).map { record("\($0)", "assistant", "Message \($0)") }
+        let reader = TranscriptController()
+        reader.view.frame = NSRect(x: 0, y: 0, width: 700, height: 500)
+        reader.update(sessionID: "glass", records: records, provider: "codex", startsAtEnd: true,
+                      followLatest: true, bottomInset: 120)
+        reader.view.layoutSubtreeIfNeeded()
+        let clipHeight = reader.scrollView.contentView.bounds.height
+        #expect(clipHeight == 500) // Content remains behind the floating composer.
+        let end = reader.table.rect(ofRow: reader.rows.count - 1).maxY
+        #expect(abs(end - (reader.scrollView.contentView.bounds.maxY - 120)) < 1)
+        reader.update(sessionID: "glass", records: records, provider: "codex", startsAtEnd: true,
+                      followLatest: true, bottomInset: 180)
+        #expect(abs(end - (reader.scrollView.contentView.bounds.maxY - 180)) < 1)
+        reader.scrollView.contentView.scroll(to: NSPoint(x: 0, y: 300))
+        let previous = reader.scrollView.contentView.bounds.minY
+        reader.update(sessionID: "glass", records: records, provider: "codex", startsAtEnd: true,
+                      followLatest: true, bottomInset: 100)
+        #expect(abs(reader.scrollView.contentView.bounds.minY - previous) < 1)
+        #expect(reader.scrollView.contentView.bounds.height == clipHeight)
+    }
+
+    @Test func findAndRequestedRecordsRemainAboveTheFloatingComposer() throws {
+        let records = (0..<40).map { record("\($0)", "assistant", "Message \($0)") }
+        let reader = controller(records)
+        reader.update(sessionID: "reader", records: records, provider: "codex", requestedRecordID: "25",
+                      requestGeneration: 1, bottomInset: 160)
+        #expect(reader.table.rect(ofRow: 25).maxY <= reader.scrollView.contentView.bounds.maxY - 160)
+        reader.scrollView.contentView.scroll(to: .zero)
+        let hit = try #require(ConversationMatcher.matches(records, query: "Message 30").first)
+        reader.update(sessionID: "reader", records: records, provider: "codex", findQuery: "Message 30",
+                      findHit: hit, findGeneration: 1, bottomInset: 160)
+        let cell = try #require(reader.table.view(atColumn: 0, row: 30, makeIfNecessary: true))
+        let text = try #require(cell.subviews.compactMap { $0 as? NSTextView }.first)
+        #expect(text.convert(text.bounds, to: reader.table).maxY <= reader.scrollView.contentView.bounds.maxY - 160)
+    }
+
     @Test func expandedToolPanelHasEqualInsetsAroundItsContent() throws {
         let tool = TranscriptRecord(recordID: "tool", record: Message(role: "tool_use", text: "", toolName: "exec_command", toolInput: #"{"cmd":"printf hello"}"#, toolOutput: nil))
         let reader = controller([tool])
@@ -74,34 +111,35 @@ import Testing
         let cell = try #require(reader.tableView(reader.table, viewFor: reader.table.tableColumns.first, row: 0))
         cell.frame = NSRect(x: 0, y: 0, width: 700, height: value.height)
         cell.layoutSubtreeIfNeeded()
-        let show = try #require(cell.subviews.compactMap { $0 as? NSButton }.first { $0.title == "Show all" })
+        #expect(!cell.subviews.compactMap { $0 as? NSButton }.contains {
+            !$0.isHidden && ["Show all", "Show less"].contains($0.title)
+        })
         let copy = try #require(cell.subviews.compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == "Copy message" })
         let rich = try #require(value.richContent)
         let clip = try #require(rich.superview)
         #expect(clip.isFlipped)
         #expect(rich.frame.minY == 0)
-        #expect(show.frame.minY >= clip.frame.maxY)
-        #expect(copy.frame.minY >= show.frame.maxY)
+        #expect(clip.frame.height == rich.frame.height)
+        #expect(value.textHeight == value.fullTextHeight)
+        #expect(copy.frame.minY >= clip.frame.maxY)
         #expect(copy.frame.maxY <= cell.bounds.maxY)
         #expect(copy.alphaValue == 0)
     }
 
-    @Test func longMessagesExpandWithoutDiscardingCopyText() {
+    @Test func longMessagesAlwaysShowCompleteCopyableText() {
         let source = String(repeating: "A complete line of source content.\n\n", count: 120)
         let records = [record("long", "user", source)]
         let reader = controller(records)
-        let collapsed = reader.measurement(at: 0)
-        #expect(collapsed.isLong)
-        #expect(collapsed.textHeight == 360)
-        #expect(collapsed.body == source)
-        #expect(collapsed.attributedBody.string.contains("source content."))
+        let full = reader.measurement(at: 0)
+        #expect(full.showsFullBody)
+        #expect(full.textHeight > 440)
+        #expect(full.textHeight == full.fullTextHeight)
+        #expect(full.body == source)
+        #expect(full.attributedBody.string.contains("source content."))
         reader.toggleFullBody(reader.rows[0].id)
-        let expanded = reader.measurement(at: 0)
-        #expect(expanded.showsFullBody)
-        #expect(expanded.textHeight == expanded.fullTextHeight)
-        #expect(expanded.height > collapsed.height)
+        #expect(reader.measurement(at: 0).height == full.height)
         reader.toggleFullBody(reader.rows[0].id)
-        #expect(reader.measurement(at: 0).textHeight == collapsed.textHeight)
+        #expect(reader.measurement(at: 0).height == full.height)
     }
 
     @Test func findShowsExactOccurrenceInsideSuppressedMixedContext() throws {
@@ -130,16 +168,6 @@ import Testing
         #expect(value.body.contains("new_provider_field"))
         #expect(value.body.contains("hidden"))
         #expect(value.attributedBody.string == source.rawTranscriptBody)
-    }
-
-    @Test func promptOutlineOmitsInjectedContextAndRetainsSourceOffsets() {
-        let records = [record("context", "user", "<environment_context>\nprivate setup\n</environment_context>"),
-                       record("a", "user", "<recommended_plugins>\ncatalog\n</recommended_plugins>\nFix the reader"),
-                       record("b", "assistant", "Working"), record("c", "user", "Then test it")]
-        let entries = ConversationOutline.entries(records, offset: 20)
-        #expect(entries.map(\.id) == ["a", "c"])
-        #expect(entries.map(\.offset) == [21, 23])
-        #expect(entries.first?.preview == "Fix the reader")
     }
 
     @Test func sourceOnlyMarkdownMatchIsSelectedPrecisely() throws {

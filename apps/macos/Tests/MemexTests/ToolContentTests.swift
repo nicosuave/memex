@@ -4,6 +4,34 @@ import Testing
 
 @Suite(.serialized) @MainActor
 struct ToolContentTests {
+    @Test func providerTextEnvelopeShowsUsefulResultBeforeTransportMetadata() throws {
+        // Shape of the recorded MEMEX_UI_TOOL_OK functions.exec result.
+        let source = #"[{"type":"input_text","text":"Script completed\nWall time 0.2 seconds\nOutput:\n"},{"type":"input_text","text":"{\"chunk_id\":\"002b9f\",\"wall_time_seconds\":0.000012292,\"exit_code\":0,\"original_token_count\":5,\"output\":\"MEMEX_UI_TOOL_OK\\n\"}"}]"#
+        let record = entry("result", output: source)
+        let rendered = ToolContentRenderer.render([record]).string
+        #expect(rendered.hasPrefix("output\nMEMEX_UI_TOOL_OK\nexit_code\n0\n"))
+        #expect(rendered.contains("chunk_id\n002b9f"))
+        #expect(rendered.contains("Script completed\nWall time 0.2 seconds\nOutput:"))
+        #expect(!rendered.contains("input_text"))
+        #expect(ToolContentRenderer.render([record], raw: true).string == source)
+        let controller = TranscriptController()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 500)
+        controller.update(sessionID: "provider-output", records: [record], provider: "codex")
+        controller.toggle(controller.rows[0].id)
+        #expect(controller.measurement(at: 0).attributedBody.string.hasPrefix("output\nMEMEX_UI_TOOL_OK"))
+    }
+
+    @Test func mcpTextAndResourceEnvelopesRetainUnknownFieldsAndRawData() {
+        let source = #"{"content":[{"type":"text","text":"{\"stdout\":\"useful output\",\"stderr\":\"warning\",\"exit_code\":2}","vendor_note":"retained"},{"type":"resource","resource":{"uri":"file:///tmp/log","mimeType":"text/plain","text":"resource body"}},{"type":"future_block","opaque":{"keep":"all"}}],"isError":true,"vendor":{"extra":7}}"#
+        let record = entry("mcp", output: source)
+        let rendered = ToolContentRenderer.render([record]).string
+        #expect(rendered.hasPrefix("stdout\nuseful output\nstderr\nwarning\nexit_code\n2\n"))
+        for text in ["retained", "resource body", "file:///tmp/log", "text/plain", "future_block", "all", "vendor.extra\n7", "isError\ntrue"] {
+            #expect(rendered.contains(text))
+        }
+        #expect(ToolContentRenderer.render([record], raw: true).string == source)
+    }
+
     @Test func jsonFieldsRenderProseAndHideOpaquePayloadWithoutLosingSource() throws {
         let payload = "gAAAAA" + String(repeating: "Az19_-", count: 100)
         let data = try JSONSerialization.data(withJSONObject: ["target": "packaging", "message": payload])
@@ -48,7 +76,8 @@ struct ToolContentTests {
         controller.update(sessionID: "spacing", records: [entry("result", output: source)], provider: "codex")
         controller.toggle(controller.rows[0].id)
         let formatted = controller.measurement(at: 0).attributedBody
-        #expect(formatted.string.hasSuffix("done"))
+        #expect(formatted.string.hasPrefix("output\ndone"))
+        #expect(!formatted.string.hasSuffix("\n"))
         #expect(formatted.string.contains("chunk_id\nsample"))
         let key = (formatted.string as NSString).range(of: "exit_code")
         let style = formatted.attribute(.paragraphStyle, at: key.location, effectiveRange: nil) as? NSParagraphStyle
@@ -60,7 +89,7 @@ struct ToolContentTests {
     @Test func formattedSectionSpacingDoesNotAccumulateBlankParagraphs() throws {
         let records = [entry("call", input: "echo hello\n\n\n"), entry("result", output: #"{"exit_code":0,"output":"hello"}"#)]
         let rendered = ToolContentRenderer.render(records)
-        #expect(rendered.string == "Input\necho hello\nOutput\nexit_code\n0\noutput\nhello\n")
+        #expect(rendered.string == "Input\necho hello\nOutput\noutput\nhello\nexit_code\n0\n")
         let source = rendered.string as NSString
         let range = source.range(of: "echo hello")
         let style = try #require(rendered.attribute(.paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle)

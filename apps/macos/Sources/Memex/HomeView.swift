@@ -11,6 +11,7 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if InAppAgentRuntime.isAvailable { HomeConversationComposer(store: store) }
                 HomeActivityView(store: store)
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -18,7 +19,7 @@ struct HomeView: View {
                         .textFieldStyle(.plain).font(.title3)
                         .focused($searchFocused)
                         .onSubmit {
-                            if let first = store.sessions.first { store.openConversation(first) }
+                            if let first = store.librarySessions.first { store.openConversation(first) }
                         }
                     if !store.query.isEmpty {
                         Button { store.query = "" } label: { Image(systemName: "xmark.circle.fill") }
@@ -38,27 +39,37 @@ struct HomeView: View {
                             Image(systemName: "line.3.horizontal.decrease")
                                 .frame(width: 20, height: 20)
                         }
-                        .modifier(HomeFilterButtonStyle())
+                        .modifier(HomeActionButtonStyle())
                         .foregroundStyle(filtersHighlighted ? Color.accentColor : Color.primary)
                         .accessibilityLabel("Filter conversations")
                         .help("Filter conversations")
                         .popover(isPresented: $showingFilters, arrowEdge: .bottom) {
                             ConversationFilterControls(store: store, includesProject: true) { showingFilters = false }
                         }
+                        if InAppAgentRuntime.isAvailable {
+                            Button { store.beginNewConversation() } label: {
+                                Image(systemName: "plus")
+                                    .frame(width: 20, height: 20)
+                            }
+                            .modifier(HomeActionButtonStyle())
+                            .accessibilityLabel("New conversation")
+                            .help("New conversation")
+                        }
                     }
                     if let error = store.listError {
                         ErrorBanner(message: error) { Task { await store.loadSessions() } }
                     }
-                    if store.sessions.isEmpty && !store.loadingSessions {
+                    if store.librarySessions.isEmpty && !store.loadingSessions {
                         ContentUnavailableView("No conversations", systemImage: "bubble.left.and.bubble.right",
                             description: Text("Try another search or change your filters."))
                     }
                     LazyVStack(spacing: 0) {
-                        ForEach(store.sessions) { session in
+                        ForEach(store.librarySessions) { session in
                             Button { store.openConversation(session) } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     HStack(alignment: .firstTextBaseline) {
                                         Text(session.title).font(.headline).lineLimit(1)
+                                        ConversationStateLabel(state: store.liveConversations.listState(for: session))
                                         Spacer()
                                         if let date = session.date {
                                             TimelineView(.periodic(from: .now, by: 60)) { context in
@@ -68,7 +79,7 @@ struct HomeView: View {
                                         }
                                     }
                                     HStack(spacing: 6) {
-                                        Text([session.projectName, session.source, session.machineID].joined(separator: " · "))
+                                        Text([store.projectName(for: session), session.source, session.machineID].joined(separator: " · "))
                                         if session.isSubagent {
                                             Text("·")
                                             Text("Subagent")
@@ -76,7 +87,8 @@ struct HomeView: View {
                                     }
                                     .font(.caption).foregroundStyle(.secondary)
                                     if let snippet = session.snippet?.nilIfBlank {
-                                        Text(snippet).font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                                        Text(ConversationExcerpt.text(snippet, query: store.query))
+                                            .font(.callout).foregroundStyle(.secondary).lineLimit(2).help(snippet)
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -103,7 +115,10 @@ struct HomeView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { searchFocused = true }
+        .onAppear {
+            if InAppAgentRuntime.isAvailable { store.newConversationDraft.focusRequest += 1 }
+            else { searchFocused = true }
+        }
         .onChange(of: store.loadingSessions) { _, loading in
             if !loading { loadNextPageIfNeeded() }
         }
@@ -137,7 +152,9 @@ struct HomeView: View {
 
 private struct HomeConversationSkeletonRow: View {
     let index: Int
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.memexReduceMotion) private var appReduceMotion
+    private var reduceMotion: Bool { systemReduceMotion || appReduceMotion }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.8)) { context in
@@ -175,7 +192,7 @@ func homeRelativeTimestamp(_ date: Date, now: Date) -> String {
     }
 }
 
-private struct HomeFilterButtonStyle: ViewModifier {
+private struct HomeActionButtonStyle: ViewModifier {
     @State private var hovering = false
 
     func body(content: Content) -> some View {

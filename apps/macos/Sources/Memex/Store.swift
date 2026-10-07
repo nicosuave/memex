@@ -3,6 +3,23 @@ import Observation
 
 @MainActor @Observable
 final class Store {
+    let liveConversations: LiveConversations
+    let createdConversations: CreatedConversationCatalog
+    let conversationLibrary: ConversationLibrary
+    let conversationNotifications: ConversationNotifications
+    let conversationRelationships: ConversationRelationships
+    let executionHosts: ExecutionHostConnections
+    var historyActionInProgress = false
+    var historyActionError: String?
+    var workspaceCheckpointWarning: String?
+    var conversationLibraryScope: ConversationLibrary.Scope = .active
+    let localProjects: LocalProjects
+    let newConversationDraft: NewConversationDraft
+    let workspaceClient: ConversationWorkspaceClient
+    @ObservationIgnored let workspaceBrowser = WorkspaceBrowserStore()
+    @ObservationIgnored let workspaceBrowserExecution = WorkspaceBrowserExecutionBridge()
+    @ObservationIgnored let workspaceTerminals = WorkspaceTerminalStore()
+    @ObservationIgnored let makeConversation: @Sendable (NewConversationRequest) async throws -> CreatedConversation
     var sessions: [Session] = []
     var catalog: [Session] = []
     private(set) var projects: [ProjectSummary] = []
@@ -24,6 +41,35 @@ final class Store {
     var machineError: String?
     var loadingMachines = false
     var findConversationRequest = 0
+    var showingProjectSetup = false
+    var showingExecutionHosts = false
+    var executionHostSelection: String?
+    var executionHostError: String?
+    var addingProject = false
+    var sidebarMode: SidebarMode = .projects {
+        didSet { filterPreferences?.set(sidebarMode.rawValue, forKey: "sidebar-mode") }
+    }
+    var startingConversation = false
+    var newConversationError: String?
+    var showingWorkspaceChanges = false
+    private var workspacePanelNavigation: [String: WorkspacePanelNavigation] = [:]
+    var workspacePanel: WorkspacePanel {
+        get { selectedID.flatMap { workspacePanelNavigation[$0]?.selection } ?? .tools }
+        set {
+            guard let selectedID else { return }
+            var navigation = workspacePanelNavigation[selectedID] ?? WorkspacePanelNavigation()
+            navigation.selection = newValue
+            if newValue != .tools, !navigation.panels.contains(newValue) { navigation.panels.append(newValue) }
+            workspacePanelNavigation[selectedID] = navigation
+        }
+    }
+    var openWorkspacePanels: [WorkspacePanel] {
+        selectedID.flatMap { workspacePanelNavigation[$0]?.panels } ?? []
+    }
+    var showingTerminalDrawer = false
+    private(set) var terminalFocusRequest = 0
+    private(set) var workspaceChangeReviewRequest = UUID()
+    private var workspaceChangeSelections: [String: String] = [:]
     var selectedID: String?
     var records: [TranscriptRecord] = []
     var query = ""
@@ -101,12 +147,49 @@ final class Store {
     private var readerGeneration = UUID()
     let client: MemexClient
 
-    init(client: MemexClient = MemexClient(), projectCatalog: ProjectCatalog? = nil, filterPreferences: UserDefaults? = nil) {
+    init(client: MemexClient = MemexClient(), projectCatalog: ProjectCatalog? = nil, filterPreferences: UserDefaults? = nil,
+         draftStore: ConversationDraftStore = ConversationDraftStore(), liveConversations: LiveConversations? = nil,
+         createdConversations: CreatedConversationCatalog = CreatedConversationCatalog(),
+         conversationLibrary: ConversationLibrary = ConversationLibrary(),
+         conversationNotifications: ConversationNotifications = ConversationNotifications(),
+         conversationRelationships: ConversationRelationships = ConversationRelationships(),
+         executionHosts: ExecutionHostConnections = ExecutionHostConnections(),
+         localProjects: LocalProjects = LocalProjects(), newConversationDraft: NewConversationDraft = NewConversationDraft(),
+         workspaceClient: ConversationWorkspaceClient = ConversationWorkspaceClient(),
+         makeConversation: @escaping @Sendable (NewConversationRequest) async throws -> CreatedConversation = { try await NewConversationRuntime.create($0) }) {
+        self.liveConversations = liveConversations ?? LiveConversations(drafts: draftStore, executionHosts: executionHosts)
+        self.executionHosts = executionHosts
+        self.createdConversations = createdConversations
+        self.conversationLibrary = conversationLibrary
+        self.conversationNotifications = conversationNotifications
+        self.conversationRelationships = conversationRelationships
+        self.localProjects = localProjects
+        self.newConversationDraft = newConversationDraft
+        self.workspaceClient = workspaceClient
+        self.makeConversation = makeConversation
         self.client = client
         self.projectCatalog = projectCatalog ?? ProjectCatalog(client: client)
         self.filterPreferences = filterPreferences
+        if let value = filterPreferences?.string(forKey: "sidebar-mode"), let mode = SidebarMode(rawValue: value) {
+            sidebarMode = mode
+        }
         if let data = filterPreferences?.data(forKey: Self.filterPreferencesKey),
            let saved = try? JSONDecoder().decode(ConversationFilters.self, from: data) { filters = saved }
+        self.liveConversations.onNotificationState = { [weak self] session, state in
+            guard let self else { return }
+            self.conversationNotifications.receive(self.conversationLibrary.presenting(session), state: state)
+        }
+        self.liveConversations.beforePrompt = { [weak self] session, command in
+            await self?.captureTurnCheckpoint(session: session, turnID: "command:" + command.id, moment: .beforeTurn)
+        }
+        self.liveConversations.afterTurn = { [weak self] session, snapshot in
+            guard let turnID = snapshot.records.last(where: { $0.record.sourceTurnID != nil })?.record.sourceTurnID else { return }
+            await self?.captureTurnCheckpoint(session: session, turnID: turnID, moment: .afterTurn)
+        }
+        self.liveConversations.onTransferQueuedPrompt = { [weak self] source, entry in
+            guard let self else { throw ConversationRuntimeError(message: "The workspace closed before the draft could be saved.") }
+            try await self.transferQueuedPrompt(source: source, entry: entry)
+        }
     }
 
     enum Scope: Hashable {
@@ -117,7 +200,165 @@ final class Store {
         var project: String? { if case .project(let value) = self { value } else { nil } }
     }
 
-    var selected: Session? { sessions.first { $0.id == selectedID } }
+    enum SidebarMode: String, CaseIterable {
+        case projects, recent
+        var title: String { self == .projects ? "Group by project" : "Most recent chats" }
+    }
+
+    func addNewProject() {
+        addingProject = true
+        showingProjectSetup = true
+    }
+
+    func manageProjects() {
+        addingProject = false
+        showingProjectSetup = true
+    }
+
+    enum WorkspacePanel: String, CaseIterable, Identifiable {
+        case tools, changes, files, browser, terminal
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .tools: "Tools"
+            case .changes: "Changes"
+            case .files: "Files"
+            case .browser: "Browser"
+            case .terminal: "Terminal"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .tools: "square.grid.2x2"
+            case .changes: "doc.text.magnifyingglass"
+            case .files: "folder"
+            case .browser: "globe"
+            case .terminal: "terminal"
+            }
+        }
+    }
+
+    private struct WorkspacePanelNavigation {
+        var selection = WorkspacePanel.tools
+        var panels: [WorkspacePanel] = []
+    }
+
+    var selected: Session? {
+        guard let selectedID,
+              let session = sessions.first(where: { $0.id == selectedID })
+                ?? conversationLibrary.savedSession(id: selectedID)
+                ?? createdConversations.sessions.first(where: { $0.id == selectedID }) else { return nil }
+        return conversationLibrary.presenting(session)
+    }
+    var selectedLiveConversation: LiveConversation? { selectedID.flatMap { liveConversations.sessions[$0] } }
+    var selectedWorkspace: URL? {
+        guard let selected, canAccessLocalFiles(for: selected), let cwd = selected.cwd?.nilIfBlank,
+              cwd.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: cwd, isDirectory: true)
+    }
+
+    var selectedRemoteWorkspace: (connection: ExecutionHostConnection, id: String)? {
+        guard let selected, let cwd = selected.cwd?.nilIfBlank,
+              let connection = executionHosts.connection(for: selected) else { return nil }
+        return (connection, cwd)
+    }
+    var hasSelectedWorkspace: Bool { selectedWorkspace != nil || selectedRemoteWorkspace != nil }
+
+    func canAccessLocalFiles(for session: Session) -> Bool {
+        session.machineID == "local" && liveConversations.sessions[session.id]?.isServerOwned != true
+            && executionHosts.connection(for: session) == nil
+    }
+
+    func openHostedConversation(_ session: Session, connection: ExecutionHostConnection, conversationID: String) {
+        Task {
+            do { try await adoptHostedConversation(session, connection: connection, conversationID: conversationID) }
+            catch is CancellationError { }
+            catch { executionHostError = error.localizedDescription; showingExecutionHosts = true }
+        }
+    }
+
+    func adoptHostedConversation(_ session: Session, connection: ExecutionHostConnection, conversationID: String) async throws {
+        try await liveConversations.refreshHosted(session, connection: connection, conversationID: conversationID)
+        guard conversationLibrary.retain(session) else {
+            throw ConversationRuntimeError(message: conversationLibrary.error ?? "The updated conversation location could not be saved.")
+        }
+        if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index] = session }
+        else { sessions.insert(session, at: 0) }
+        if let index = catalog.firstIndex(where: { $0.id == session.id }) { catalog[index] = session }
+        showingExecutionHosts = false
+        openNotifiedConversation(session.id)
+    }
+    var selectedWorkspaceChange: String? {
+        selectedWorkspace.flatMap { workspaceChangeSelections[$0.path] }
+    }
+    func reviewWorkspaceChange(_ path: String?) {
+        guard hasSelectedWorkspace else { return }
+        if let directory = selectedWorkspace, let path { workspaceChangeSelections[directory.path] = path }
+        workspaceChangeReviewRequest = UUID()
+        workspacePanel = .changes
+        showingWorkspaceChanges = true
+    }
+
+    func showWorkspaceBrowser() {
+        workspacePanel = .browser
+        showingWorkspaceChanges = true
+    }
+
+    func selectWorkspacePanel(_ panel: WorkspacePanel) {
+        workspacePanel = panel
+        if panel == .terminal {
+            showingTerminalDrawer = false
+            terminalFocusRequest += 1
+        }
+    }
+
+    func closeWorkspacePanel(_ panel: WorkspacePanel) {
+        guard let selectedID, var navigation = workspacePanelNavigation[selectedID],
+              let index = navigation.panels.firstIndex(of: panel) else { return }
+        navigation.panels.remove(at: index)
+        let wasSelected = navigation.selection == panel
+        if wasSelected { navigation.selection = navigation.panels.last ?? .tools }
+        workspacePanelNavigation[selectedID] = navigation
+        if wasSelected { selectWorkspacePanel(navigation.selection) }
+    }
+
+    func toggleWorkspacePanel() {
+        showingWorkspaceChanges.toggle()
+        if showingWorkspaceChanges && workspacePanel == .terminal {
+            showingTerminalDrawer = false
+            terminalFocusRequest += 1
+        }
+    }
+
+    func showWorkspaceTerminal() {
+        guard hasSelectedWorkspace else { return }
+        selectWorkspacePanel(.terminal)
+        showingWorkspaceChanges = true
+    }
+
+    func toggleTerminalDrawer() {
+        if showingTerminalDrawer {
+            showingTerminalDrawer = false
+        } else {
+            guard hasSelectedWorkspace else { return }
+            if selectedRemoteWorkspace != nil {
+                showWorkspaceTerminal()
+                return
+            }
+            // A terminal has one native surface. Move it out of the inspector
+            // rather than hosting the same shell in two places at once.
+            if workspacePanel == .terminal { showingWorkspaceChanges = false }
+            showingTerminalDrawer = true
+            terminalFocusRequest += 1
+        }
+    }
+
+    func beginNewConversation(project: LocalProject? = nil) {
+        if let project { newConversationDraft.selectProject(project) }
+        scope = .home
+        query = ""
+        newConversationDraft.focusRequest += 1
+    }
     var selectedMachineIDs: [String] {
         switch machineSelection {
         case .all: machines.map(\.id)
@@ -150,6 +391,10 @@ final class Store {
     }
 
     var readerAnchorID: String? { query.nilIfBlank == nil ? nil : selected?.searchRecordID }
+    // An indexed hit names its original source record. Runtime entity/part IDs
+    // are a different namespace and cannot safely stand in for that evidence.
+    var readerUsesLiveSnapshot: Bool { readerAnchorID == nil && selectedLiveConversation?.hasSnapshot == true }
+    var readerTranscriptKey: String { readerUsesLiveSnapshot ? (selectedID ?? "") + ":live" : readerPositionKey }
     var readerStartsAtEnd: Bool { readerAnchorID == nil }
     var readerPositionKey: String {
         // Length-prefixed components avoid collisions with arbitrary query text.
@@ -158,8 +403,78 @@ final class Store {
     var readerRequestID: String { readerPositionKey }
 
     func openConversation(_ session: Session) {
+        conversationLibrary.markRead([nativeLibrarySession(session)], read: true)
         if scope == .home { scope = homeProject.map(Scope.project) ?? .all }
         selectedID = session.id
+    }
+
+    func openNotifiedConversation(_ id: String) {
+        guard let session = sessions.first(where: { $0.id == id })
+            ?? liveConversations.sessions[id]?.session
+            ?? createdConversations.sessions.first(where: { $0.id == id })
+            ?? conversationLibrary.savedSession(id: id) else { return }
+        let entry = conversationLibrary.entries[id]
+        conversationLibraryScope = entry?.removed == true ? .removed : entry?.archived == true ? .archived : .active
+        // Reveal the exact identity without changing archive/removal metadata.
+        query = ""
+        filters = .defaults
+        homeProject = nil
+        scope = .all
+        machineSelection = .machine(session.machineID)
+        if !sessions.contains(where: { $0.id == id }) { sessions.insert(session, at: 0) }
+        selectedID = id
+    }
+
+    @discardableResult
+    func createConversation(_ request: NewConversationRequest,
+                            context: CreatedConversationCatalog.Context? = nil,
+                            initialText: String? = nil, navigate: Bool = true) async throws -> LiveConversation {
+        if let error = createdConversations.error { throw ConversationRuntimeError(message: error) }
+        let created = try await makeConversation(request)
+        // Once creation succeeds, retain its native identity even if adoption or
+        // local persistence fails. Retrying Create would create a different chat.
+        createdConversations.save(created.session, context: context)
+        if let initialText {
+            newConversationDraft.value.createdSessionID = created.session.id
+            await newConversationDraft.flush()
+            liveConversations.drafts.set(.init(text: initialText), for: created.session.id)
+            await liveConversations.drafts.flush()
+        }
+        let conversation = await liveConversations.adopt(created)
+        if navigate {
+            revealCreatedConversation(created.session)
+            conversation.focus()
+        }
+        return conversation
+    }
+
+    func revealCreatedConversation(_ session: Session) {
+        query = ""
+        filters = .defaults
+        scope = .all
+        machineSelection = .machine("local")
+        sessionMachineScope = machineRequestID
+        listGeneration = UUID()
+        sessionBatchesCriteria = nil
+        sessions.removeAll { $0.id == session.id }
+        sessions.insert(session, at: 0)
+        catalog.removeAll { $0.id == session.id }
+        catalog.append(session)
+        selectedID = session.id
+    }
+
+    func updateCreatedConversationTitle() {
+        guard let session = selected, createdConversations.contains(session),
+              let live = selectedLiveConversation,
+              let title = Session.openingTitle(live.snapshot.records),
+              session.label?.nilIfBlank == nil else { return }
+        var updated = session
+        updated.label = title
+        updated.lastAt = Date().formatted(.iso8601)
+        createdConversations.save(updated)
+        if let index = sessions.firstIndex(where: { $0.id == session.id }) { sessions[index] = updated }
+        catalog.removeAll { $0.id == session.id }
+        catalog.append(updated)
     }
 
     func loadMachines() async {
@@ -228,6 +543,7 @@ final class Store {
     }
 
     func refresh(refreshActivity: Bool = true) async {
+        conversationLibrary.reload()
         filterReferenceDate = Date()
         countRefresh += 1
         if refreshActivity { activityRefresh += 1 }
@@ -367,6 +683,8 @@ final class Store {
                     let metadata = Dictionary(catalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
                     sessions = rows.map { row in metadata[row.id].map { row.applyingMetadata($0) } ?? row }
                 } else { sessions = rows }
+                sessions = createdConversations.merging(sessions, machines: ids, project: project,
+                    filters: filters, query: query, since: since, limit: limit)
                 if query == nil {
                     // Search results need metadata from every previously browsed
                     // filter, including subagents explicitly shown by the user.
@@ -375,7 +693,7 @@ final class Store {
                     catalog.append(contentsOf: rows)
                 }
                 hasMoreSessions = rows.count >= limit
-                if scope != .home && !rows.contains(where: { $0.id == selectedID }) { selectedID = rows.first?.id }
+                if scope != .home && !sessions.contains(where: { $0.id == selectedID }) { selectedID = sessions.first?.id }
                 listError = errors.keys.sorted().compactMap { errors[$0] }.joined(separator: "\n").nilIfBlank
             }
         }
@@ -386,6 +704,9 @@ final class Store {
         sessionMetadataGeneration = generation
         loadingSessionMetadata = false
         sessionMetadataError = nil
+        // Created chats already have their native identity and working directory.
+        // The CLI cannot supply external resume metadata until it indexes them.
+        if let selected, createdConversations.contains(selected), selected.searchRecordID == nil { return }
         guard let session = selected,
               session.label?.nilIfBlank == nil || (session.searchRecordID != nil && session.machineID == "local" && session.resumeCommand == nil) else { return }
         let request = readerRequestID
@@ -439,6 +760,23 @@ final class Store {
         hasMoreRecords = false
         hasEarlierRecords = false
         guard let selected else { loadingRecords = false; return }
+        if createdConversations.contains(selected), readerAnchorID == nil, InAppAgentRuntime.isAvailable {
+            liveConversations.prepare(selected)
+            if let live = selectedLiveConversation {
+                loadingRecords = true
+                defer { if readerGeneration == generation { loadingRecords = false } }
+                if !live.hasSnapshot {
+                    do {
+                        let history = try await NewConversationRuntime.records(for: selected)
+                        guard readerGeneration == generation, readerRequestID == request, !Task.isCancelled else { return }
+                        live.showHistory(history)
+                    } catch {
+                        if readerGeneration == generation, readerRequestID == request { readerError = error.localizedDescription }
+                    }
+                }
+                return
+            }
+        }
         if let window = readerWindows[key] {
             records = window.records
             recordsOffset = window.offset

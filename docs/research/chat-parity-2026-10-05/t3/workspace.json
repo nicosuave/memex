@@ -1,0 +1,876 @@
+{
+  "sourceVersions": [
+    {
+      "product": "T3",
+      "commit": "ecfdda5fa804582066c1aa62afea419677c24883",
+      "root": "/private/tmp/t3-chat-inventory-ecfdda5",
+      "provenance": "Parent-provided fresh upstream checkout; inspected current source"
+    },
+    {
+      "product": "Memex",
+      "commit": "17e958778a7398db8238cc9c8415ca12649067e5",
+      "root": "/Users/nico/Code/memex-chat-capabilities",
+      "provenance": "Contract baseline; native app and execution-host source inspected"
+    },
+    {
+      "product": "Memex runtime",
+      "commit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+      "root": "/Users/nico/Code/memex-chat-runtime",
+      "provenance": "Contract baseline; native runtime entry points bounded; adjacent Sidequery web features not attributed to Memex"
+    }
+  ],
+  "coverage": [
+    "projects/worktrees and lifecycle",
+    "Git/diffs/review/rewind",
+    "files/editor",
+    "terminal",
+    "browser and scoped automation",
+    "remote/multi-host; cloud boundary",
+    "schedules/automation",
+    "app-control MCP/server integration; plugin boundary"
+  ],
+  "findings": [
+    {
+      "id": "T3-W01",
+      "category": "projects/worktrees",
+      "capability": "Managed worktrees and lifecycle",
+      "userWorkflow": "Create an isolated checkout, run setup, retain or remove it.",
+      "comparator": "T3",
+      "comparatorState": "Reachable worktree setup UI and authenticated current-thread handoff service.",
+      "memexState": "Existing/new-worktree preparation and archive, reattach, safe clean removal UI.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/WorktreeSetupCard.tsx",
+          "lineStart": 284,
+          "lineEnd": 297,
+          "symbol": "WorktreeSetupCard",
+          "claim": "Setup script and settled outcome presentation."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/mcp/WorktreeMcpService.ts",
+          "lineStart": 248,
+          "lineEnd": 269,
+          "symbol": "handoff",
+          "claim": "Creates the worktree under cancellation/rollback protection."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationWorkspace.swift",
+          "lineStart": 22,
+          "lineEnd": 28,
+          "symbol": "prepare",
+          "claim": "Delegates existing/new checkout preparation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ManagedWorkspaceStore.swift",
+          "lineStart": 102,
+          "lineEnd": 110,
+          "symbol": "prepare",
+          "claim": "Existing workspace branch of preparation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ManagedWorkspaceStore.swift",
+          "lineStart": 155,
+          "lineEnd": 170,
+          "symbol": "prepare",
+          "claim": "Creates managed branch and worktree."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceLifecycleView.swift",
+          "lineStart": 23,
+          "lineEnd": 60,
+          "symbol": "body",
+          "claim": "Archive, reattach and guarded removal."
+        }
+      ],
+      "implication": "Do not count worktrees as a missing Memex capability.",
+      "recommendation": "Preserve Memex isolation and retained-chat cleanup guards; compare handoff UX separately.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    },
+    {
+      "id": "T3-W02",
+      "category": "Git/review",
+      "capability": "Git controls and inline pull-request workspace",
+      "userWorkflow": "Review changes, commit, push and inspect the PR.",
+      "comparator": "T3",
+      "comparatorState": "Git workflow controls plus an environment-scoped PullRequestDetailPanel inside the chat.",
+      "memexState": "Staging, commit, push and GitHub draft PR creation; draft PR opens externally. Local branch diff and review context feed chat.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 10621,
+          "lineEnd": 10665,
+          "symbol": "rightPanelContent",
+          "claim": "Diff and PR detail surfaces are mounted from selected panel."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/GitActionsControl.tsx",
+          "lineStart": 1730,
+          "lineEnd": 1748,
+          "symbol": "GitActionsControl",
+          "claim": "Git initialization and quick action UI."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceGitActionsView.swift",
+          "lineStart": 19,
+          "lineEnd": 28,
+          "symbol": "body",
+          "claim": "Complete native Git menu inventory."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceGitActionsView.swift",
+          "lineStart": 84,
+          "lineEnd": 100,
+          "symbol": "execute",
+          "claim": "Draft PR success opens its URL externally."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceChangesView.swift",
+          "lineStart": 63,
+          "lineEnd": 80,
+          "symbol": "body",
+          "claim": "Current and branch comparison plus Git actions."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceChangesView.swift",
+          "lineStart": 149,
+          "lineEnd": 154,
+          "symbol": "body",
+          "claim": "Adds review context to chat."
+        }
+      ],
+      "implication": "Memex already handles local Git, but its inspected native workflow ends at an external PR URL.",
+      "recommendation": "If PR review parity is desired, add a first-class PR detail/review surface rather than duplicating local Git controls.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    },
+    {
+      "id": "T3-W03",
+      "category": "rewind",
+      "capability": "Checkpoint and conversation rewind",
+      "userWorkflow": "Restore files and rewind provider context to an earlier turn.",
+      "comparator": "T3",
+      "comparatorState": "Timeline revert invokes provider rollback then optional checkpoint restore; provider capability errors are explicit.",
+      "memexState": "Workspace pane wires checkpoint controls and conversation rewind; restore protects managed ownership and captures recovery.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 2285,
+          "lineEnd": 2287,
+          "symbol": "RevertUserMessageButton",
+          "claim": "Timeline revert entry point."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/orchestration-v2/CheckpointRollbackService.ts",
+          "lineStart": 257,
+          "lineEnd": 265,
+          "symbol": "execute",
+          "claim": "Provider rollback followed by optional file restore."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspacePanelView.swift",
+          "lineStart": 18,
+          "lineEnd": 25,
+          "symbol": "body",
+          "claim": "Rewind handler supplied to workspace changes."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceCheckpoints.swift",
+          "lineStart": 69,
+          "lineEnd": 101,
+          "symbol": "restore",
+          "claim": "Isolation validation, recovery snapshot and index restore."
+        }
+      ],
+      "implication": "Both have rewind, with provider and checkout constraints.",
+      "recommendation": "Retain separate file/context intent and provider capability gating; do not infer all providers support rollback.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    },
+    {
+      "id": "T3-W04",
+      "category": "rewind",
+      "capability": "T3 checkpoint staging-state loss",
+      "userWorkflow": "Restore a checkpoint captured while a file had different staged and unstaged contents.",
+      "comparator": "T3",
+      "comparatorState": "Capture stores one final workspace tree; restore writes that tree to both worktree and staging index.",
+      "memexState": "Captures a separate index tree and restores it after raw worktree restoration.",
+      "status": "defect",
+      "priority": "P1",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/vcs/GitVcsDriver.ts",
+          "lineStart": 1030,
+          "lineEnd": 1069,
+          "symbol": "captureCheckpoint",
+          "claim": "Single staged temporary-index tree becomes checkpoint commit."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/vcs/GitVcsDriver.ts",
+          "lineStart": 1091,
+          "lineEnd": 1102,
+          "symbol": "restoreCheckpoint",
+          "claim": "git restore passes both --worktree and --staged with the same source."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceCheckpoints.swift",
+          "lineStart": 98,
+          "lineEnd": 101,
+          "symbol": "restore",
+          "claim": "Restores checkpoint.indexTree separately."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/WorkspaceGitWorkflowTests.swift",
+          "lineStart": 47,
+          "lineEnd": 76,
+          "symbol": "checkpointsPreserveIndexAndRestoreOnlyOwnedIsolatedWorktree",
+          "claim": "Existing test distinguishes staged contents and verifies recovery snapshot."
+        }
+      ],
+      "implication": "T3 cannot reconstruct the original staged/unstaged split from this checkpoint shape; copying it regresses Memex.",
+      "recommendation": "Keep separate index/worktree snapshots. Add an upstream regression test if pursuing a T3 fix.",
+      "caveats": "Deterministic source-level defect, not reproduced by executing Git or tests in this inventory."
+    },
+    {
+      "id": "T3-W05",
+      "category": "files/editor",
+      "capability": "File browsing, editing and previews",
+      "userWorkflow": "Browse a workspace file, edit it, save, or attach context.",
+      "comparator": "T3",
+      "comparatorState": "Chat file preview mounts editable CodeMirror-like source surface and rendered markdown/media/table previews; save uses environment writeFile.",
+      "memexState": "File/folder creation, text edits, save, disk conflict UI, previews and add-to-chat are reachable in workspace Files.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/files/FilePreviewPanel.tsx",
+          "lineStart": 567,
+          "lineEnd": 590,
+          "symbol": "EditableFileSurface",
+          "claim": "Editable file component."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/files/useFileSaveCoordinator.ts",
+          "lineStart": 19,
+          "lineEnd": 40,
+          "symbol": "useFileSaveCoordinator",
+          "claim": "Editor persistence dispatches environment writeFile."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspacePanelView.swift",
+          "lineStart": 38,
+          "lineEnd": 45,
+          "symbol": "body",
+          "claim": "Files view reachable for local workspace."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceFilesView.swift",
+          "lineStart": 31,
+          "lineEnd": 87,
+          "symbol": "body",
+          "claim": "Create, open, add context, save and conflict resolution controls."
+        }
+      ],
+      "implication": "Memex files/editor is implemented; visual editor depth is a separate UX question.",
+      "recommendation": "Retain existing capability and evaluate syntax/navigation refinements only with specific user needs.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    },
+    {
+      "id": "T3-W06",
+      "category": "files/editor",
+      "capability": "T3 editor concurrent-write overwrite",
+      "userWorkflow": "An agent or external editor changes disk after the app loads a file but before its save.",
+      "comparator": "T3",
+      "comparatorState": "Save sends only cwd, path and new contents; server unconditionally writes contents with no expected revision.",
+      "memexState": "Save passes loaded fingerprint and throws a conflict if the disk version differs; draft remains available.",
+      "status": "defect",
+      "priority": "P1",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/files/useFileSaveCoordinator.ts",
+          "lineStart": 31,
+          "lineEnd": 40,
+          "symbol": "persist",
+          "claim": "No expected content revision in write request."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/workspace/WorkspaceFileSystem.ts",
+          "lineStart": 305,
+          "lineEnd": 340,
+          "symbol": "writeFile",
+          "claim": "Path resolution followed by unconditional file write."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceFilesView.swift",
+          "lineStart": 224,
+          "lineEnd": 240,
+          "symbol": "save",
+          "claim": "Passes fingerprint and loads disk version after conflict."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceFiles.swift",
+          "lineStart": 58,
+          "lineEnd": 78,
+          "symbol": "save",
+          "claim": "Checks expectedFingerprint before write."
+        }
+      ],
+      "implication": "T3 autosave can silently overwrite concurrent agent edits; this is a concrete design to avoid.",
+      "recommendation": "Preserve Memex optimistic concurrency and explicit disk-versus-draft reconciliation.",
+      "caveats": "Source-level race scenario; no runtime reproduction performed."
+    },
+    {
+      "id": "T3-W07",
+      "category": "terminal",
+      "capability": "Persistent embedded terminal",
+      "userWorkflow": "Run shells, keep state across pane switches, split terminals and attach output.",
+      "comparator": "T3",
+      "comparatorState": "Persistent panel/drawer terminals with split and context callbacks; server PTY manager owns execution.",
+      "memexState": "Native Ghostty terminals keyed to workspace, multiple shells, right pane/drawer, context capture; existing tests check persistence and independent shells.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 10602,
+          "lineEnd": 10619,
+          "symbol": "PersistentThreadTerminalPanel",
+          "claim": "Persistent terminal, split directions, new/close and context callbacks."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspacePanelView.swift",
+          "lineStart": 56,
+          "lineEnd": 57,
+          "symbol": "body",
+          "claim": "Native terminal pane entry."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceTerminalView.swift",
+          "lineStart": 40,
+          "lineEnd": 52,
+          "symbol": "body.task",
+          "claim": "Retained workspace terminal group selection."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/WorkspaceTerminalTests.swift",
+          "lineStart": 45,
+          "lineEnd": 49,
+          "symbol": "nativeShellKeepsProcessEnvironmentAndScrollbackAcrossHosts",
+          "claim": "Persistence test exists."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/WorkspaceTerminalTests.swift",
+          "lineStart": 127,
+          "lineEnd": 131,
+          "symbol": "independentShellsInOneWorkspaceKeepStateAndCaptureHistory",
+          "claim": "Independent-shell test exists."
+        }
+      ],
+      "implication": "Terminal itself is not a parity gap. Remote terminals are a distinct boundary.",
+      "recommendation": "Reuse the native terminal; do not replace it solely for comparator parity.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    },
+    {
+      "id": "T3-W08",
+      "category": "browser/computer use",
+      "capability": "Browser automation and app-owned preview",
+      "userWorkflow": "Open a page and let an agent inspect/interact with it.",
+      "comparator": "T3",
+      "comparatorState": "Preview panel plus MCP open/navigate/resize/snapshot/click/type/press/scroll/evaluate/wait/recording tools.",
+      "memexState": "App-owned WKWebView tabs; explicit per-conversation capability grant; snapshot/click/type/scroll/evaluate dispatch through execution host and desktop bridge. The opt-in memex-control stdio MCP exposes this path via its generic control tool.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 10588,
+          "lineEnd": 10600,
+          "symbol": "PreviewPanel",
+          "claim": "Browser preview mounts in chat."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/mcp/toolkits/preview/tools.ts",
+          "lineStart": 67,
+          "lineEnd": 91,
+          "symbol": "preview_open / preview_navigate",
+          "claim": "Agent navigation controls."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/mcp/toolkits/preview/tools.ts",
+          "lineStart": 201,
+          "lineEnd": 244,
+          "symbol": "preview tools",
+          "claim": "Evaluate, wait and recording tools."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserAutomation.swift",
+          "lineStart": 68,
+          "lineEnd": 100,
+          "symbol": "allow / dispatch",
+          "claim": "Grant and tab/action validation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserAutomation.swift",
+          "lineStart": 5,
+          "lineEnd": 6,
+          "symbol": "WorkspaceBrowserCapability",
+          "claim": "Five supported action cases."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 78,
+          "lineEnd": 81,
+          "symbol": "applicationDidFinishLaunching",
+          "claim": "Starts browser execution bridge."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/src/control_mcp.rs",
+          "lineStart": 44,
+          "lineEnd": 74,
+          "symbol": "ControlServer.control",
+          "claim": "Registered agent-callable control MCP forwards method and params to the execution host; includes conversation, worktree, schedules and browser operations."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/src/bin/memex-control.rs",
+          "lineStart": 5,
+          "lineEnd": 26,
+          "symbol": "main",
+          "claim": "Separate opt-in binary invokes control_mcp::run with optional root."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/docs/execution-host.md",
+          "lineStart": 92,
+          "lineEnd": 96,
+          "symbol": "Control MCP and browser boundaries",
+          "claim": "Documents opt-in same-user authority and scoped browser describe/dispatch bridge."
+        }
+      ],
+      "implication": "Both products expose agent-callable browser control. The narrower Memex action inventory, not absence of a tool bridge, is the gap.",
+      "recommendation": "Consider first-class navigation/wait/keyboard/recording actions and clearer discovery; preserve opt-in registration and app-owned tab grants.",
+      "caveats": "Does not establish general OS computer-use parity. T3 device tools are separate device surfaces, not evidence of arbitrary macOS app control."
+    },
+    {
+      "id": "T3-W09",
+      "category": "remote/multi-host",
+      "capability": "Remote execution versus remote workspace surfaces",
+      "userWorkflow": "Pair another machine, resume its agent and use its files/Git/terminal.",
+      "comparator": "T3",
+      "comparatorState": "Environment-scoped clients and SSH/connect/direct routes feed the same workspace panels.",
+      "memexState": "Paired execution hosts create/resume durable remote conversations, but selectedWorkspace explicitly excludes host-owned conversations; Git/files/terminal panes require local workspace.",
+      "status": "partial",
+      "priority": "P1",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/settings/EnvironmentRow.tsx",
+          "lineStart": 20,
+          "lineEnd": 44,
+          "symbol": "environment transport presentation",
+          "claim": "SSH, WSL, T3 Connect and direct remote routes."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/settings/EnvironmentRoutesList.tsx",
+          "lineStart": 39,
+          "lineEnd": 68,
+          "symbol": "EnvironmentRoutesList",
+          "claim": "Prioritized connection routes and active route."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/files/useFileSaveCoordinator.ts",
+          "lineStart": 19,
+          "lineEnd": 38,
+          "symbol": "persist",
+          "claim": "File operations route by environmentId."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ExecutionHostConnectionsView.swift",
+          "lineStart": 42,
+          "lineEnd": 77,
+          "symbol": "body",
+          "claim": "Pair host with URL/token."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ExecutionHostConnectionsView.swift",
+          "lineStart": 80,
+          "lineEnd": 111,
+          "symbol": "body",
+          "claim": "Open and create host conversations."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/Store.swift",
+          "lineStart": 216,
+          "lineEnd": 224,
+          "symbol": "selectedWorkspace / canAccessLocalFiles",
+          "claim": "Explicit local-only workspace boundary."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceTerminalView.swift",
+          "lineStart": 20,
+          "lineEnd": 45,
+          "symbol": "body",
+          "claim": "Terminal unavailable without local working folder."
+        }
+      ],
+      "implication": "The high-value gap is remote workspace tooling, not remote conversation execution.",
+      "recommendation": "Route read/review/terminal operations through authenticated execution-host APIs; preserve host-local path identity.",
+      "caveats": "No claim that T3 or Memex provides arbitrary managed cloud compute. Deployment availability was not tested."
+    },
+    {
+      "id": "T3-W10",
+      "category": "schedules/automation",
+      "capability": "Time-based and event-triggered recurring work",
+      "userWorkflow": "Run prompts on a schedule or webhook, targeting a chat or creating a fresh task.",
+      "comparator": "T3",
+      "comparatorState": "Reachable settings supports scheduled/webhook tasks; dispatch either launches a new thread or queues an existing one.",
+      "memexState": "Execution-host UI supports interval and weekday/local-time/timezone schedules for an existing hosted conversation, plus pause/run/delete.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/routes/settings.scheduled-tasks.tsx",
+          "lineStart": 1,
+          "lineEnd": 8,
+          "symbol": "route",
+          "claim": "Mounted scheduled task settings."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/scheduledTasks/ScheduledTaskService.ts",
+          "lineStart": 238,
+          "lineEnd": 252,
+          "symbol": "service interface",
+          "claim": "Webhook rotation and verification/dispatch API."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/scheduledTasks/ScheduledTaskService.ts",
+          "lineStart": 795,
+          "lineEnd": 830,
+          "symbol": "dispatch",
+          "claim": "New-thread or existing-thread queued prompt path."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 35,
+          "lineEnd": 35,
+          "symbol": "menu",
+          "claim": "Execution Hosts and Schedules entry."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ExecutionHostConnectionsView.swift",
+          "lineStart": 114,
+          "lineEnd": 174,
+          "symbol": "Schedules",
+          "claim": "Interval/wall-clock editor and actions."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 328,
+          "lineEnd": 376,
+          "symbol": "schedule mutations",
+          "claim": "Existing conversation schedule model and actions."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 383,
+          "lineEnd": 397,
+          "symbol": "tick",
+          "claim": "Recurrence and skipped wall-clock handling."
+        }
+      ],
+      "implication": "Do not classify automation as absent. Event triggers and fresh-chat-per-run are the inspected gaps.",
+      "recommendation": "Extend the durable host scheduler only if event-driven/fresh-task workflows are required; keep stopped queue semantics.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    },
+    {
+      "id": "T3-W11",
+      "category": "app-control integrations",
+      "capability": "Agent-callable application toolkit breadth and registration",
+      "userWorkflow": "Ask the running agent to manage projects, worktrees, previews or app resources.",
+      "comparator": "T3",
+      "comparatorState": "Authenticated MCP /mcp mounts orchestrator/thread/project/environment/attachment/worktree/PR/device/HTML/preview toolkits into server.",
+      "memexState": "Implemented opt-in memex-control stdio MCP registers a generic control(method, params) tool and forwards to the execution host. Supports conversation lifecycle/control/queue/fork/delegate, schedules, workspace listing, worktree lifecycle and granted browser operations. Ordinary memex mcp stays retrieval-only.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/mcp/McpHttpServer.ts",
+          "lineStart": 748,
+          "lineEnd": 766,
+          "symbol": "layer",
+          "claim": "Authenticated transport and registered toolkits."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/server.ts",
+          "lineStart": 681,
+          "lineEnd": 685,
+          "symbol": "McpHttpServer.layer",
+          "claim": "Server mounts the MCP layer."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 104,
+          "lineEnd": 142,
+          "symbol": "handle",
+          "claim": "Declared host capabilities and method dispatch boundary."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserExecutionBridge.swift",
+          "lineStart": 24,
+          "lineEnd": 43,
+          "symbol": "start",
+          "claim": "Browser-specific app bridge dispatch."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/src/control_mcp.rs",
+          "lineStart": 44,
+          "lineEnd": 74,
+          "symbol": "ControlServer.control",
+          "claim": "Registered agent-callable control MCP forwards method and params to the execution host; includes conversation, worktree, schedules and browser operations."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/src/bin/memex-control.rs",
+          "lineStart": 5,
+          "lineEnd": 26,
+          "symbol": "main",
+          "claim": "Separate opt-in binary invokes control_mcp::run with optional root."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/src/control_mcp.rs",
+          "lineStart": 78,
+          "lineEnd": 96,
+          "symbol": "ServerHandler / run",
+          "claim": "Advertises tool capability and serves the stdio MCP transport."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/docs/execution-host.md",
+          "lineStart": 92,
+          "lineEnd": 96,
+          "symbol": "Control MCP and browser boundaries",
+          "claim": "Documents opt-in same-user authority and scoped browser describe/dispatch bridge."
+        }
+      ],
+      "implication": "Memex has a real agent-callable app-control server. The remaining differences are registration/discovery ergonomics and the narrower explicit operation inventory, including no matching PR/device/HTML app tools in the inspected host dispatcher.",
+      "recommendation": "Credit existing control MCP. Reuse its host owners and explicit authority boundary if adding PR/device/HTML operations or friendlier schema discovery; manual opt-in registration is not a missing API.",
+      "caveats": "Source-only acceptance correction: Rust MCP entry point and forwarding path verified. Parent reports packaging/smoke evidence separately; this worker did not rerun it. Does not claim provider configuration auto-registers the opt-in server."
+    },
+    {
+      "id": "T3-W12",
+      "category": "plugins/cloud/computer use",
+      "capability": "Unproven universal capabilities",
+      "userWorkflow": "Install arbitrary plugins, launch managed cloud compute, or control arbitrary OS apps.",
+      "comparator": "T3",
+      "comparatorState": "Inspected server has built-in app MCP toolkits and device tools; these do not prove a universal plugin marketplace, managed compute product or general desktop CUA.",
+      "memexState": "Inspected native app has runtime clients, execution hosts and scoped browser control; opt-in memex-control exposes a generic host control MCP tool. This is not evidence of a third-party plugin marketplace or arbitrary OS application control.",
+      "status": "unknown",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/mcp/McpHttpServer.ts",
+          "lineStart": 754,
+          "lineEnd": 766,
+          "symbol": "layer",
+          "claim": "Bounded built-in app toolkit inventory."
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/mcp/toolkits/device/tools.ts",
+          "lineStart": 28,
+          "lineEnd": 81,
+          "symbol": "device tools",
+          "claim": "Device list/open/screenshot/close is a separate surface."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/MemexExecutionHostCore/ExecutionHost.swift",
+          "lineStart": 104,
+          "lineEnd": 140,
+          "symbol": "handle",
+          "claim": "Bounded host capabilities."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/WorkspaceBrowserAutomation.swift",
+          "lineStart": 85,
+          "lineEnd": 95,
+          "symbol": "dispatch",
+          "claim": "Only registered app-owned HTTP(S) tabs."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/docs/execution-host.md",
+          "lineStart": 92,
+          "lineEnd": 96,
+          "symbol": "Control MCP and browser boundaries",
+          "claim": "Documents opt-in same-user authority and scoped browser describe/dispatch bridge."
+        }
+      ],
+      "implication": "Do not present a universal absence or parity claim from provider-specific or adjacent-product code.",
+      "recommendation": "Classify managed cloud, third-party plugin lifecycle and arbitrary OS app control as unresolved product-scope questions; composer skill discovery is owned by the other worker.",
+      "caveats": "Source inspection only; no runtime or test execution."
+    }
+  ],
+  "unresolved": [
+    "No runtime UI/provider execution or tests run by design.",
+    "General OS computer use, managed cloud product availability and third-party plugin lifecycle are unknown; built-in tools and provider config are not proof.",
+    "Skill/composer discovery is assigned to the other worker."
+  ]
+}

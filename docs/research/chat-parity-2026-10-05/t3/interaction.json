@@ -1,0 +1,1314 @@
+{
+  "sourceVersions": [
+    {
+      "product": "T3",
+      "commit": "ecfdda5fa804582066c1aa62afea419677c24883",
+      "root": "/private/tmp/t3-chat-inventory-ecfdda5",
+      "provenance": "Exact checkout HEAD independently verified; implementation and existing test source inspected directly."
+    },
+    {
+      "product": "Memex",
+      "commit": "17e958778a7398db8238cc9c8415ca12649067e5",
+      "root": "/Users/nico/Code/memex-chat-capabilities",
+      "provenance": "Exact checkout HEAD independently verified; implementation and existing test source inspected directly."
+    },
+    {
+      "product": "Runtime",
+      "commit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+      "root": "/Users/nico/Code/memex-chat-runtime",
+      "provenance": "Exact checkout HEAD independently verified; implementation and existing test source inspected directly."
+    }
+  ],
+  "coverage": [
+    {
+      "facet": "composer first/follow-up",
+      "disposition": "covered",
+      "findings": [
+        "T3-I01"
+      ]
+    },
+    {
+      "facet": "attachments/paste/drop",
+      "disposition": "covered",
+      "findings": [
+        "T3-I02"
+      ]
+    },
+    {
+      "facet": "mentions/slash/skills context",
+      "disposition": "covered local integration boundary",
+      "findings": [
+        "T3-I03"
+      ]
+    },
+    {
+      "facet": "queue/steer",
+      "disposition": "covered UI through runtime capability policy",
+      "findings": [
+        "T3-I04",
+        "T3-I05"
+      ]
+    },
+    {
+      "facet": "stop/send recovery",
+      "disposition": "covered active command handling",
+      "findings": [
+        "T3-I06",
+        "T3-I14"
+      ]
+    },
+    {
+      "facet": "approval/questions",
+      "disposition": "covered",
+      "findings": [
+        "T3-I07",
+        "T3-I08",
+        "T3-I09"
+      ]
+    },
+    {
+      "facet": "stash/recall",
+      "disposition": "covered",
+      "findings": [
+        "T3-I10",
+        "T3-I11"
+      ]
+    },
+    {
+      "facet": "providers/models/config",
+      "disposition": "covered",
+      "findings": [
+        "T3-I12"
+      ]
+    },
+    {
+      "facet": "runtime/build limits",
+      "disposition": "covered",
+      "findings": [
+        "T3-I13"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "T3-I01",
+      "category": "composer",
+      "capability": "First and follow-up prompts with pre-send configuration",
+      "userWorkflow": "Start from Home; select model/permissions or attachments before sending the first prompt; continue in the chat.",
+      "comparator": "T3",
+      "comparatorState": "T3 uses the same rich composer and provider/model state for draft and existing thread targets.",
+      "memexState": "Home supports Attach files, paste/drop, Model and permissions preparation without sending, then opens the full composer. Explicit preferences are applied and observed before any immediate first send.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 2133,
+          "lineEnd": 2155,
+          "symbol": "ChatComposer provider state",
+          "claim": "Provider-filtered runtime modes and model state apply to composerDraftTarget.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L2133-L2155"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/HomeConversationComposer.swift",
+          "lineStart": 98,
+          "lineEnd": 119,
+          "symbol": "attachToNewDraft/captureClipboard",
+          "claim": "Creates a prepared conversation without sending and captures attachments."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/HomeConversationComposer.swift",
+          "lineStart": 125,
+          "lineEnd": 144,
+          "symbol": "controls",
+          "claim": "Reachable Home attachment and Model and permissions actions."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/StoreNewConversation.swift",
+          "lineStart": 71,
+          "lineEnd": 97,
+          "symbol": "startConversationFromHome",
+          "claim": "Apply settings, attach, transfer durable Home draft, optionally send."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationQueueTests.swift",
+          "lineStart": 217,
+          "lineEnd": 239,
+          "symbol": "firstTurnSettingsWaitForObservedSelectionBeforeReturning",
+          "claim": "Existing test exercises settings acknowledgement before returning."
+        }
+      ],
+      "implication": "The old claim that Memex first prompts cannot use attachments or explicit settings is stale.",
+      "recommendation": "Keep the prepared-session/no-send boundary and inherited-versus-explicit settings distinction.",
+      "caveats": [
+        "Memex preparation creates a real native session; it is not a purely local settings preview.",
+        "Runtime-enabled build is required."
+      ]
+    },
+    {
+      "id": "T3-I02",
+      "category": "attachments",
+      "capability": "Files, pasted images, and media ergonomics",
+      "userWorkflow": "Attach files or paste/drop an image into a new or existing prompt.",
+      "comparator": "T3",
+      "comparatorState": "Image/generic-file classification, HEIC-to-JPEG conversion, video preview eligibility and server capability/size validation are implemented.",
+      "memexState": "Explicit file panel and paste/drop capture are implemented; runtime supports capability-checked images/audio/file contents. Images are limited to PNG/JPEG/GIF/WebP and 3 MiB each, with ten attachments and 20 MiB total. File-URL HEIC receives no conversion before validation. Clipboard TIFF/PNG/JPEG bytes are converted to PNG.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/composerAttachmentFiles.ts",
+          "lineStart": 65,
+          "lineEnd": 136,
+          "symbol": "classifyComposerAttachmentFile/fileAttachmentCapabilityBlockReason",
+          "claim": "Classifies HEIC, generic files, previewable video; blocks unsupported server upload state.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/composerAttachmentFiles.ts#L65-L136"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/lib/imageCompression.ts",
+          "lineStart": 482,
+          "lineEnd": 507,
+          "symbol": "HEIC conversion",
+          "claim": "Converts HEIC/HEIF to compatible JPEG.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/lib/imageCompression.ts#L482-L507"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/composerAttachmentFiles.test.ts",
+          "lineStart": 45,
+          "lineEnd": 60,
+          "symbol": "HEIC and unsupported image tests",
+          "claim": "Existing tests cover image classification.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/composerAttachmentFiles.test.ts#L45-L60"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 85,
+          "lineEnd": 92,
+          "symbol": "paste/drop modifiers",
+          "claim": "Follow-up composer wires clipboard/drop capture."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationAttachment.swift",
+          "lineStart": 9,
+          "lineEnd": 20,
+          "symbol": "capture",
+          "claim": "File attachments go directly through runtime loadFile and validation."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationPromptContext.swift",
+          "lineStart": 80,
+          "lineEnd": 107,
+          "symbol": "ConversationClipboard.capture",
+          "claim": "File URL branch loads original bytes; bitmap paste converts to PNG."
+        },
+        {
+          "product": "Runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "/Users/nico/Code/memex-chat-runtime/packages/sq-acp/Sources/SQACPHost/AgentPromptAttachments.swift",
+          "lineStart": 62,
+          "lineEnd": 95,
+          "symbol": "loadFile/constants",
+          "claim": "Original file bytes and runtime limits."
+        },
+        {
+          "product": "Runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "/Users/nico/Code/memex-chat-runtime/packages/sq-acp/Sources/SQACPHost/AgentPromptAttachments.swift",
+          "lineStart": 115,
+          "lineEnd": 151,
+          "symbol": "validate",
+          "claim": "Provider capability gates, image MIME validation and byte limits."
+        }
+      ],
+      "implication": "Basic attachment parity exists; large screenshots and phone-photo files can require manual conversion/resizing in Memex.",
+      "recommendation": "Add a bounded image-normalization path only if these common inputs are a product priority; preserve captured-byte durability.",
+      "caveats": [
+        "T3 accepting a generic video file is not proof every model can understand video.",
+        "Attachment capability remains provider/model-specific."
+      ]
+    },
+    {
+      "id": "T3-I03",
+      "category": "context",
+      "capability": "File/chat mentions and slash commands/skills",
+      "userWorkflow": "Type @ to capture file or conversation context; select a command or skill.",
+      "comparator": "T3",
+      "comparatorState": "T3 combines thread and path suggestions; built-in /model, /plan, /default, provider slash commands, and skill invocation insertion are wired.",
+      "memexState": "Memex wires mention suggestions into AcpComposerView. File choices capture bytes; chat choices capture a bounded excerpt. Built-in slash controls change settings; provider commands are suggestions; local skill/command files are captured as attachments, with $ARGUMENTS substitution for commands.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 2616,
+          "lineEnd": 2700,
+          "symbol": "composerMenuItems",
+          "claim": "Thread/file suggestions and provider-aware slash/skill menu.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L2616-L2700"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 3939,
+          "lineEnd": 4005,
+          "symbol": "command selection",
+          "claim": "Built-in settings controls, provider token insertion, $skill insertion.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L3939-L4005"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 300,
+          "lineEnd": 338,
+          "symbol": "slashSuggestions",
+          "claim": "Built-in/provider/local prompt suggestions."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 352,
+          "lineEnd": 405,
+          "symbol": "submit/capturePrompt",
+          "claim": "Command dispatch, content capture and argument substitution."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 409,
+          "lineEnd": 436,
+          "symbol": "mentionSuggestions/selectMention",
+          "claim": "File and conversation context wiring."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposerCatalog.swift",
+          "lineStart": 21,
+          "lineEnd": 78,
+          "symbol": "load",
+          "claim": "Local-only bounded 5000-file/1000-prompt catalog; known skills and command roots."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationComposerTests.swift",
+          "lineStart": 74,
+          "lineEnd": 105,
+          "symbol": "fileAndSkillCatalogUsesWorkspaceAndOwningProviderRoots",
+          "claim": "Existing catalog coverage."
+        }
+      ],
+      "implication": "This is a semantic difference, not a missing composer feature. Memex skill selection includes file contents; T3's inspected skill-selection handler inserts $name for downstream resolution.",
+      "recommendation": "Preserve explicit capture semantics and label bounded catalogs/excerpts; do not advertise provider CLI slash behavior beyond reported commands.",
+      "caveats": [
+        "Local file/skill catalog returns empty for server-owned or non-local sessions; remote inventory belongs to another facet owner.",
+        "Memex conversation mentions are excerpts, not a permanent live link to all chat context."
+      ]
+    },
+    {
+      "id": "T3-I04",
+      "category": "queue",
+      "capability": "Queue, edit, reorder, cancel and promote",
+      "userWorkflow": "Write follow-up instructions during a running turn, reorder pending messages or steer immediately.",
+      "comparator": "T3",
+      "comparatorState": "T3 routes running submissions through configurable queue/steer/restart policy and provides queued-run edit/reorder/cancel/promotion controls.",
+      "memexState": "Memex routes Enter through selected queue/steer behavior, exposes explicit Queue message/Steer now buttons, persists queued prompt bytes/order, supports edits, movement, removal, hold/resume and promotion. Stop holds queue.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/packages/client-runtime/src/state/composerDispatch.ts",
+          "lineStart": 1,
+          "lineEnd": 31,
+          "symbol": "resolveComposerDispatchMode",
+          "claim": "Default/alternate queue-versus-steer dispatch.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/packages/client-runtime/src/state/composerDispatch.ts#L1-L31"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/QueuedRunsControl.tsx",
+          "lineStart": 168,
+          "lineEnd": 243,
+          "symbol": "move/steer/remove/editLatest",
+          "claim": "Reachable queue actions.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/QueuedRunsControl.tsx#L168-L243"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/QueuedRunsControl.test.tsx",
+          "lineStart": 78,
+          "lineEnd": 171,
+          "symbol": "queued attachments/edit tests",
+          "claim": "Existing tests cover thumbnails, optimistic acknowledgement and editing visibility.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/QueuedRunsControl.test.tsx#L78-L171"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 94,
+          "lineEnd": 105,
+          "symbol": "while-working controls",
+          "claim": "Explicit queue and steer buttons."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 352,
+          "lineEnd": 377,
+          "symbol": "submit",
+          "claim": "Keyboard submission dispatches working follow-up policy."
+        },
+        {
+          "product": "Runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "/Users/nico/Code/memex-chat-runtime/packages/sq-ui/Sources/SQACPUI/AcpComposerView.swift",
+          "lineStart": 726,
+          "lineEnd": 759,
+          "symbol": "AcpPromptBox/onSubmit",
+          "claim": "Text submission is wired independently of idle Send button disabled state."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 587,
+          "lineEnd": 680,
+          "symbol": "queue lifecycle",
+          "claim": "Durable enqueue and edit/reorder/cancel/hold/resume/promote/drain."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationQueueTests.swift",
+          "lineStart": 79,
+          "lineEnd": 107,
+          "symbol": "queueEditsAndOrderSurviveRelaunchWithoutDispatch",
+          "claim": "Existing persisted-queue contract test."
+        }
+      ],
+      "implication": "The earlier no-queue/no-steer gap is closed for supported native providers.",
+      "recommendation": "Keep capability-gated steering and explicit queue hold after uncertainty or stop.",
+      "caveats": [
+        "Queue implementations have different ownership/lifetimes; this finding covers active input controls rather than claiming identical server recovery."
+      ]
+    },
+    {
+      "id": "T3-I05",
+      "category": "providers",
+      "capability": "Provider-specific steering fallback",
+      "userWorkflow": "Steer a running configured ACP provider that has no native steering.",
+      "comparator": "T3",
+      "comparatorState": "T3 policy chooses native active steering or interrupt/restart when explicitly supported. Common ACP adapter advertises interrupt/restart and app queues; Cursor also uses restart, while Pi and Claude advertise native steering without generic restart.",
+      "memexState": "Memex native Codex/Claude advertise steering. Configured ACP descriptors explicitly mark steering unavailable; UI gates on observed actions. Unsupported steer leaves draft and queue intact.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/orchestration-v2/CommandPolicy.ts",
+          "lineStart": 238,
+          "lineEnd": 269,
+          "symbol": "decideSteeringExecution",
+          "claim": "Capability-checked native versus restart policy.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/CommandPolicy.ts#L238-L269"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.ts",
+          "lineStart": 553,
+          "lineEnd": 565,
+          "symbol": "ACP capabilities",
+          "claim": "Common ACP interrupt/restart and app queue capabilities.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/Adapters/AcpAdapterV2.ts#L553-L565"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/orchestration-v2/Adapters/CursorAdapterV2.ts",
+          "lineStart": 102,
+          "lineEnd": 109,
+          "symbol": "Cursor capabilities",
+          "claim": "No native steering; restart support.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/Adapters/CursorAdapterV2.ts#L102-L109"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationProviderCatalog.swift",
+          "lineStart": 28,
+          "lineEnd": 32,
+          "symbol": "configured descriptor",
+          "claim": "Configured ACP steering unavailable."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 214,
+          "lineEnd": 218,
+          "symbol": "canSteer",
+          "claim": "Observed capability and interaction gates."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/InAppAgentRuntime.swift",
+          "lineStart": 207,
+          "lineEnd": 213,
+          "symbol": "snapshot capabilities",
+          "claim": "Steer comes from actual available action."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationQueueTests.swift",
+          "lineStart": 174,
+          "lineEnd": 191,
+          "symbol": "unsupportedSteerLeavesDraftAndQueueUnchanged",
+          "claim": "Existing no-loss unsupported-steer test."
+        }
+      ],
+      "implication": "T3 covers more active-instruction strategies; Memex does not promise generic ACP steering merely because ACP is configurable.",
+      "recommendation": "Consider explicit interrupt-and-restart as a separately labeled future capability; never silently equate it to native steering.",
+      "caveats": [
+        "Adapter declarations plus orchestration policy establish implementation intent, not live compatibility with every installed ACP agent version."
+      ]
+    },
+    {
+      "id": "T3-I06",
+      "category": "recovery",
+      "capability": "Stop acknowledgement and safe send recovery",
+      "userWorkflow": "Stop work; recover after send acknowledgement is lost without duplicated execution.",
+      "comparator": "T3",
+      "comparatorState": "T3 has durable command receipts/event/effect recording, capability-checked interrupt dispatch and adapter error propagation.",
+      "memexState": "Memex persists outgoing prompt/steer before dispatch, marks ambiguous failures uncertain and requires explicit reconnect/review. Stop awaits terminal snapshot and has a timeout warning with queued work held. Runtime Codex interrupt has an acknowledged completion path.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/orchestration-v2/EventSink.ts",
+          "lineStart": 518,
+          "lineEnd": 576,
+          "symbol": "commitCommandEffect",
+          "claim": "Command receipt deduplication, event/effect recording and post-commit publication.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/EventSink.ts#L518-L576"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/orchestration-v2/ProviderTurnControlService.ts",
+          "lineStart": 171,
+          "lineEnd": 197,
+          "symbol": "interrupt",
+          "claim": "Native interrupt and surfaced errors.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/ProviderTurnControlService.ts#L171-L197"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 366,
+          "lineEnd": 368,
+          "symbol": "terminal snapshot stop settlement",
+          "claim": "Terminal state clears stopping."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 717,
+          "lineEnd": 754,
+          "symbol": "stop",
+          "claim": "Holds queue, handles pre-dispatch cancellation and missing terminal timeout."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 779,
+          "lineEnd": 818,
+          "symbol": "perform",
+          "claim": "Persist-before-provider, uncertain failure and explicit reconnect."
+        },
+        {
+          "product": "Runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "/Users/nico/Code/memex-chat-runtime/packages/sq-acp/Sources/SQACPHost/CodexAppServerTransport.swift",
+          "lineStart": 1119,
+          "lineEnd": 1127,
+          "symbol": "cancelAcknowledged",
+          "claim": "Propagates turn/interrupt completion."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationQueueTests.swift",
+          "lineStart": 108,
+          "lineEnd": 148,
+          "symbol": "stop tests",
+          "claim": "Terminal-state, rejected-stop and timeout tests."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationQueueTests.swift",
+          "lineStart": 192,
+          "lineEnd": 216,
+          "symbol": "recoveryDoesNotReplayAnUnconfirmedDequeuedCommand",
+          "claim": "Existing recovery contract."
+        }
+      ],
+      "implication": "The old discarded-interrupt-response and indefinitely stuck stopping findings do not apply to the inspected current baseline.",
+      "recommendation": "Preserve exact command/native identity checks and never auto-resend an uncertain message.",
+      "caveats": [
+        "No failure was induced in a live provider; source and tests were inspected only.",
+        "T3 process/server restart semantics belong to the lifecycle facet, not this active-send comparison.",
+        "Server command receipts do not establish a durable ordinary web-client send intent; see T3-I14 for the separate client recovery defect."
+      ]
+    },
+    {
+      "id": "T3-I07",
+      "category": "questions",
+      "capability": "Structured choices and question attachments",
+      "userWorkflow": "Answer several pending questions with multi-select/custom text and context.",
+      "comparator": "T3",
+      "comparatorState": "T3 supports choice progress, multi-select, keyboard selection, per-question image/file uploads, non-resumable state and dismissible requests; message-mode requests can remain answerable after their turn ends.",
+      "memexState": "Memex now supplies multi-select, descriptions, secret/default fields, per-question drafts and Back/Next navigation. Answers preserve native choice values and request IDs. Attachments deliberately accept captured UTF-8 only, up to 10 files/1 MiB, and Cancel stops the conversation rather than dismissing one request.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx",
+          "lineStart": 67,
+          "lineEnd": 70,
+          "symbol": "response capability",
+          "claim": "Message-mode versus non-resumable response state.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx#L67-L70"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx",
+          "lineStart": 121,
+          "lineEnd": 169,
+          "symbol": "option and keyboard handling",
+          "claim": "Multi-select and number keys.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx#L121-L169"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx",
+          "lineStart": 203,
+          "lineEnd": 225,
+          "symbol": "dismiss control",
+          "claim": "Dismissibility is request-dependent.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ComposerPendingUserInputPanel.tsx#L203-L225"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9783,
+          "lineEnd": 9816,
+          "symbol": "onRespondToUserInput",
+          "claim": "Per-question uploaded image/file payload collection.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9783-L9816"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationQuestionsView.swift",
+          "lineStart": 21,
+          "lineEnd": 78,
+          "symbol": "questions/submit",
+          "claim": "Navigation, structured draft, Stop cancellation and answer encoding."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationQuestionsView.swift",
+          "lineStart": 105,
+          "lineEnd": 111,
+          "symbol": "question.item",
+          "claim": "Passes descriptions, multiSelect and secret/default fields."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationQuestionContext.swift",
+          "lineStart": 13,
+          "lineEnd": 46,
+          "symbol": "capture/answerText",
+          "claim": "Bounded text-only attachment support."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationQuestionTests.swift",
+          "lineStart": 6,
+          "lineEnd": 47,
+          "symbol": "question tests",
+          "claim": "Captured bytes, media rejection, stable native identity navigation."
+        }
+      ],
+      "implication": "Multi-question UX is present; media answers and asynchronous dismissal are still meaningful semantic differences.",
+      "recommendation": "Keep text-only labeling accurate. Add media/dismissal only through provider contracts that can actually represent them.",
+      "caveats": [
+        "Question media is a T3 orchestration feature; no universal assertion that every provider accepts equivalent native media replies.",
+        "Memex question drafts are view-local state, distinct from durable prompt drafts."
+      ]
+    },
+    {
+      "id": "T3-I08",
+      "category": "approval",
+      "capability": "Provider-specific approval options",
+      "userWorkflow": "Inspect a provider approval and choose its exact decision.",
+      "comparator": "T3",
+      "comparatorState": "T3 renders provider-supplied labels, warnings and primary/secondary options, with live response capability supplied by parent.",
+      "memexState": "Memex maps exact option IDs/titles/kinds and approval detail to SQACPUI; replies preserve request/option IDs and are guarded against stale requests. Cancel invokes Stop.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ComposerPendingApprovalActions.tsx",
+          "lineStart": 24,
+          "lineEnd": 59,
+          "symbol": "approval rendering",
+          "claim": "Provider options plus default primary decisions and warnings.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ComposerPendingApprovalActions.tsx#L24-L59"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 52,
+          "lineEnd": 67,
+          "symbol": "approval adapter",
+          "claim": "Exact options, details and response callbacks."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 757,
+          "lineEnd": 760,
+          "symbol": "approve",
+          "claim": "Validates active approval/option and sends exact IDs."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/LiveConversationTests.swift",
+          "lineStart": 508,
+          "lineEnd": 536,
+          "symbol": "sendIsSingleFlightAndStopAndInteractionRepliesUseOriginalIDs",
+          "claim": "Existing exact-ID response contract."
+        }
+      ],
+      "implication": "Basic approval interaction is implemented in both. Warning/detail semantics differ by provider and projection.",
+      "recommendation": "Keep native option identity and explicit response gating; avoid reducing all providers to one universal allow/deny policy.",
+      "caveats": []
+    },
+    {
+      "id": "T3-I09",
+      "category": "defect",
+      "capability": "T3 non-live approval overflow actions remain enabled",
+      "userWorkflow": "An approval is visible but its responseCapability is not live; open More approval options and select Cancel or session-wide approval.",
+      "comparator": "T3",
+      "comparatorState": "Primary buttons disable on !canRespond, but More trigger and its menu items only disable on isResponding. The parent callback immediately returns for a non-live request, so these enabled controls silently do nothing.",
+      "memexState": "Memex supplies canRespond to the shared approval component and validates the current request/option in its response method. No equivalent T3 split primary/overflow gate is introduced by the Memex integration.",
+      "status": "defect",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 6651,
+          "lineEnd": 6658,
+          "symbol": "approval call site",
+          "claim": "Reachable component receives live-only canRespond.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L6651-L6658"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ComposerPendingApprovalActions.tsx",
+          "lineStart": 49,
+          "lineEnd": 85,
+          "symbol": "approval disabled conditions",
+          "claim": "Primary respects canRespond; menu does not.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ComposerPendingApprovalActions.tsx#L49-L85"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9750,
+          "lineEnd": 9757,
+          "symbol": "onRespondToApproval",
+          "claim": "Non-live callbacks silently return.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9750-L9757"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ComposerPendingApprovalActions.test.tsx",
+          "lineStart": 7,
+          "lineEnd": 63,
+          "symbol": "existing tests",
+          "claim": "Tests all use canRespond=true; inspected suite does not cover expired overflow actions.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ComposerPendingApprovalActions.test.tsx#L7-L63"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 52,
+          "lineEnd": 67,
+          "symbol": "approval integration",
+          "claim": "Shared pending-item canRespond is supplied."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 757,
+          "lineEnd": 760,
+          "symbol": "approve",
+          "claim": "Current request and option guards."
+        },
+        {
+          "product": "Runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "/Users/nico/Code/memex-chat-runtime/packages/sq-ui/Sources/SQACPUI/AcpComposerView.swift",
+          "lineStart": 895,
+          "lineEnd": 909,
+          "symbol": "approval option disabled state",
+          "claim": "Shared approval control disables options using approval.canRespond."
+        }
+      ],
+      "implication": "This is a concrete misleading/dead-control defect in T3, not an authorization bypass.",
+      "recommendation": "Do not copy the inconsistent gate: apply response availability to all decisions and explain expired requests.",
+      "caveats": [
+        "Source-established UI defect; no interactive reproduction performed.",
+        "Memex connected-state gating is not identical to T3 native responseCapability; no universal superiority claim."
+      ]
+    },
+    {
+      "id": "T3-I10",
+      "category": "drafts",
+      "capability": "Prompt stash and recall",
+      "userWorkflow": "Save a prompt for later and recover the unsent draft after navigating prompt history.",
+      "comparator": "T3",
+      "comparatorState": "T3 provides prompt history navigation and a 20-entry stash with rich records/files/images. Capacity evicts the oldest with a warning; restore consumes an entry.",
+      "memexState": "Memex provides previous/next/recent prompt recall, a 20-entry stash that refuses overflow and copies on restore; captured attachment bytes are saved atomically before clearing unchanged input.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 4299,
+          "lineEnd": 4367,
+          "symbol": "prompt history",
+          "claim": "History handling is wired to composer.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L4299-L4367"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 4961,
+          "lineEnd": 4973,
+          "symbol": "stash eviction warning",
+          "claim": "Oldest entry evicted on overflow.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L4961-L4973"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 191,
+          "lineEnd": 269,
+          "symbol": "inputMenu/stashPrompt/restoreStash",
+          "claim": "Reachable stash/recall and unchanged-input clearing."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationPromptLibrary.swift",
+          "lineStart": 15,
+          "lineEnd": 74,
+          "symbol": "stash persistence",
+          "claim": "Copy-on-restore policy, full rejection and atomic captured-payload save."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationComposerTests.swift",
+          "lineStart": 12,
+          "lineEnd": 61,
+          "symbol": "stash/recall tests",
+          "claim": "Roundtrip, full/unreadable store and original draft recall."
+        }
+      ],
+      "implication": "Parity exists and Memex's explicit copy/delete policy avoids destructive stash eviction.",
+      "recommendation": "Keep the non-destructive Memex stash policy rather than adopting every T3 interaction literally.",
+      "caveats": []
+    },
+    {
+      "id": "T3-I11",
+      "category": "defect",
+      "capability": "T3 stash image loss window",
+      "userWorkflow": "Stash an image-bearing prompt, then close/reload the tab before asynchronous image compression finishes.",
+      "comparator": "T3",
+      "comparatorState": "T3 writes a text-only entry with pendingImageCount, clears the composer and releases image uploads, then asynchronously encodes and persists images. Hydration explicitly reports those pending images lost if reload interrupts the encode. Storage quota or encoding limits can also omit images; warnings disclose those outcomes.",
+      "memexState": "Memex saves text plus captured attachment content atomically before clearing the unchanged draft and refuses a failed save.",
+      "status": "defect",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 4898,
+          "lineEnd": 4956,
+          "symbol": "stash first phase",
+          "claim": "Text-only stash followed by composer clear and upload release.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L4898-L4956"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 4984,
+          "lineEnd": 5025,
+          "symbol": "image finalization",
+          "claim": "Image encoding occurs after clear and may be non-durable.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L4984-L5025"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/promptStashStore.ts",
+          "lineStart": 75,
+          "lineEnd": 101,
+          "symbol": "clearOrphanedPendingImages",
+          "claim": "Reload explicitly converts interrupted encodes to missing-image notices.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/promptStashStore.ts#L75-L101"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationPromptLibrary.swift",
+          "lineStart": 40,
+          "lineEnd": 74,
+          "symbol": "stash/save",
+          "claim": "Whole captured entry saved atomically."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 233,
+          "lineEnd": 241,
+          "symbol": "stashPrompt",
+          "claim": "Clears only after awaited successful save and only if input is unchanged."
+        }
+      ],
+      "implication": "T3 has a source-established data-loss window for unsent image context. Its warning/recovery design preserves text but cannot recover those image bytes.",
+      "recommendation": "Do not copy the two-phase destructive image stash. Retain the original draft or durably stage image bytes before clearing.",
+      "caveats": [
+        "This is a bounded crash/reload defect, not a claim that normal completed stash operations lose images.",
+        "T3 intentionally compresses stash images and warns about lossy/omitted content; preserve that distinction from accidental silent loss."
+      ]
+    },
+    {
+      "id": "T3-I12",
+      "category": "providers",
+      "capability": "Provider catalog, model/effort and permission configuration",
+      "userWorkflow": "Choose an executable provider and its reported model, effort and permission options.",
+      "comparator": "T3",
+      "comparatorState": "T3 ships eight driver types: Codex, Claude, Cursor, Grok, OpenCode, Antigravity, Pi and ACP Registry. Model picker is instance-aware; traits and runtime modes are provider-filtered.",
+      "memexState": "Memex has Codex and Claude native integrations plus explicitly configured ACP executables/homes/arguments. It discovers model and nonempty configuration options, preserves unknown inherited values, remembers explicit provider-scoped choices, and waits for acknowledgement. It does not ship the remaining dedicated T3 driver integrations merely because it ingests their history.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/provider/builtInDrivers.ts",
+          "lineStart": 52,
+          "lineEnd": 62,
+          "symbol": "BUILT_IN_DRIVERS",
+          "claim": "Authoritative shipped driver list.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/provider/builtInDrivers.ts#L52-L62"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ProviderModelPicker.tsx",
+          "lineStart": 75,
+          "lineEnd": 96,
+          "symbol": "active instance model label",
+          "claim": "Account/instance-aware selected model state.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ProviderModelPicker.tsx#L75-L96"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/chat/ChatComposer.tsx",
+          "lineStart": 2131,
+          "lineEnd": 2155,
+          "symbol": "provider modes/models",
+          "claim": "Provider-supported mode filtering and model state.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ChatComposer.tsx#L2131-L2155"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationProviderCatalog.swift",
+          "lineStart": 28,
+          "lineEnd": 67,
+          "symbol": "descriptors/catalog",
+          "claim": "Configured ACP and two native built-ins."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/InAppAgentRuntime.swift",
+          "lineStart": 124,
+          "lineEnd": 135,
+          "symbol": "connect dispatch",
+          "claim": "Actual configured ACP/Codex/Claude connection paths."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 139,
+          "lineEnd": 182,
+          "symbol": "controls",
+          "claim": "Reported model/config selectors and inherited defaults."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 540,
+          "lineEnd": 569,
+          "symbol": "applySettings/waitForSettings",
+          "claim": "Observed setting acknowledgement and timeout."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/ConversationProviderCatalogTests.swift",
+          "lineStart": 6,
+          "lineEnd": 55,
+          "symbol": "provider catalog tests",
+          "claim": "Executable-vs-ingestion identity and resume capability tests."
+        }
+      ],
+      "implication": "Provider breadth remains a real gap, but describing Memex as Codex/Claude-only is also incomplete.",
+      "recommendation": "Add dedicated adapters only for demonstrated workflow demand; retain negotiated ACP capability boundaries and explicit installation identity.",
+      "caveats": [
+        "Driver presence is not proof that the required binary/account is configured or that every provider supports every interaction.",
+        "Existing chat model/effort changes are blocked while working in Memex; settings are applied when idle."
+      ]
+    },
+    {
+      "id": "T3-I13",
+      "category": "runtime",
+      "capability": "Build/runtime availability boundary",
+      "userWorkflow": "Install a build and expect active chat functionality to exist.",
+      "comparator": "T3",
+      "comparatorState": "T3 server's shipped provider driver list is built into its normal provider architecture; external provider readiness still controls usability.",
+      "memexState": "Runtime dependencies are included by default when MEMEX_AGENT_RUNTIME_ROOT or .local-runtime-root resolves to a runtime checkout. Package.swift imports SQACP/SQACPHost/SQACPUI from that local root and links its archive. MEMEX_HISTORY_ONLY=1 explicitly removes these dependencies; without a resolved root the conditional Home fallback is EmptyView.",
+      "status": "not-applicable",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-confirmed; existing tests inspected where cited, not executed",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/server/src/provider/builtInDrivers.ts",
+          "lineStart": 1,
+          "lineEnd": 18,
+          "symbol": "driver build contract",
+          "claim": "Configured providers resolve through shipped drivers.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/provider/builtInDrivers.ts#L1-L18"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Package.swift",
+          "lineStart": 4,
+          "lineEnd": 38,
+          "symbol": "conditional runtime dependencies",
+          "claim": "Machine-local optional runtime and archive linkage."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationComposer.swift",
+          "lineStart": 4,
+          "lineEnd": 8,
+          "symbol": "conditional compilation",
+          "claim": "Full composer requires SQACPUI."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/HomeConversationComposer.swift",
+          "lineStart": 226,
+          "lineEnd": 231,
+          "symbol": "history-only fallback",
+          "claim": "Home composer fallback is empty."
+        }
+      ],
+      "implication": "This is an intentional packaging/provenance qualifier, not a demonstrated feature gap in the supplied runtime-enabled build. Installed-binary runtime provenance was not measured.",
+      "recommendation": "Make release/runtime provenance explicit in final synthesis; do not count dormant dependency APIs as shipped app capability.",
+      "caveats": [
+        "No app was built, launched or provider prompted in this task; installed-binary behavior remains unverified.",
+        "The supplied Memex and runtime commits are separate baselines rather than an assertion that Package.swift pins the latter."
+      ]
+    },
+    {
+      "id": "T3-I14",
+      "category": "defect",
+      "capability": "T3 ordinary send clears durable draft before acknowledgement and retries with new identity",
+      "userWorkflow": "Send an ordinary single-target prompt, then close/reload before dispatch completes, or retry after a failure whose original server acceptance is uncertain.",
+      "comparator": "T3",
+      "comparatorState": "The web path snapshots content into local function variables and an optimistic React state row, clears composer content, then awaits settings/upload preparation and startThreadTurn. Failure restores from that closure only when the current draft is empty. A fresh onSend allocates a new messageId; startThreadTurn allocates a fresh commandId because the call supplies no retained commandId. The ordinary path has no durable uncertain-intent record or same-identity retry guard.",
+      "memexState": "Memex persists the outgoing command identity and captured attachments before provider dispatch; ambiguous errors become uncertain. Recovery requires reconnect/review, and restoring the pending prompt does not send it. Queue recovery also retains unconfirmed command identity.",
+      "status": "defect",
+      "priority": "P1",
+      "confidence": "high",
+      "validationLevel": "source-confirmed failure window and identity allocation; no crash or duplicate-provider execution induced",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 1816,
+          "lineEnd": 1816,
+          "symbol": "optimisticUserMessages",
+          "claim": "Ordinary optimistic input is React useState.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L1816-L1816"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 8911,
+          "lineEnd": 8944,
+          "symbol": "ordinary send snapshot",
+          "claim": "Content remains in closure; new message ID allocated for each submission.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L8911-L8944"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9449,
+          "lineEnd": 9451,
+          "symbol": "clear before awaits",
+          "claim": "Clears composer before later asynchronous work.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9449-L9451"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9485,
+          "lineEnd": 9507,
+          "symbol": "settings and attachment awaits",
+          "claim": "Pre-dispatch awaits occur after durable composer clear.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9485-L9507"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9549,
+          "lineEnd": 9593,
+          "symbol": "startThreadTurn invocation",
+          "claim": "New ordinary send passes messageId but no retained commandId.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9549-L9593"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9665,
+          "lineEnd": 9723,
+          "symbol": "failure restoration",
+          "claim": "Restores local snapshots conditionally and reports generic failure.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9665-L9723"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/packages/client-runtime/src/operations/commands.ts",
+          "lineStart": 261,
+          "lineEnd": 270,
+          "symbol": "allocateCommandId/dispatch",
+          "claim": "Missing caller ID creates a random UUID.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/packages/client-runtime/src/operations/commands.ts#L261-L270"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/packages/client-runtime/src/operations/commands.ts",
+          "lineStart": 626,
+          "lineEnd": 639,
+          "symbol": "startThreadTurn",
+          "claim": "Allocates command identity before preparing attachment command payload.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/packages/client-runtime/src/operations/commands.ts#L626-L639"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/packages/client-runtime/src/operations/commands.ts",
+          "lineStart": 755,
+          "lineEnd": 772,
+          "symbol": "message.dispatch",
+          "claim": "Dispatch uses newly allocated command and message identity.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/packages/client-runtime/src/operations/commands.ts#L755-L772"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "/private/tmp/t3-chat-inventory-ecfdda5/apps/web/src/components/ChatView.tsx",
+          "lineStart": 9156,
+          "lineEnd": 9168,
+          "symbol": "fanout uncertainty guard",
+          "claim": "Separate multi-model branch has a guard; it is excluded from this finding.",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L9156-L9168"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 779,
+          "lineEnd": 818,
+          "symbol": "perform",
+          "claim": "Persistent intent precedes provider boundary, ambiguous result requires reconnect."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Sources/Memex/ConversationPendingView.swift",
+          "lineStart": 26,
+          "lineEnd": 34,
+          "symbol": "recovery control",
+          "claim": "Restore draft warns review first and does not resend."
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "/Users/nico/Code/memex-chat-capabilities/apps/macos/Tests/MemexTests/LiveConversationTests.swift",
+          "lineStart": 159,
+          "lineEnd": 208,
+          "symbol": "uncertain/native identity tests",
+          "claim": "Existing tests cover no replay and native identity confirmation."
+        }
+      ],
+      "implication": "A reload/close during a pre-dispatch await can discard the only recoverable prompt snapshot. After accepted-then-lost acknowledgement, a manually retried ordinary send has new identities, so server receipt deduplication cannot identify it as the original command. Duplicate execution is a supported risk, not an observed runtime result.",
+      "recommendation": "Do not copy this client recovery design. Persist the complete outbound intent and original command/message IDs before clearing, reconcile receipt/native state after reconnect, and distinguish rejected from ambiguous outcomes.",
+      "caveats": [
+        "Bounded to the ordinary single-target web send branch. Multi-model fanout has a separate in-memory uncertain-submission map; it was not audited here for persistence.",
+        "Server-side receipts remain useful for retries of the same command ID; the defect is the UI's loss of original outbound intent/identity.",
+        "No test claiming an induced reload or duplicate execution was run."
+      ]
+    }
+  ],
+  "unresolved": [
+    {
+      "topic": "Installed/runtime validation",
+      "classification": "not performed by contract",
+      "detail": "No builds/tests/provider prompts/app launches. Source-reachable implementation and read-only existing test evidence only."
+    },
+    {
+      "topic": "T3 arbitrary provider parity",
+      "classification": "provider/version-dependent",
+      "detail": "Eight shipped drivers do not imply universal native capabilities. Configured binaries/accounts and agent versions unverified."
+    },
+    {
+      "topic": "Workspace/transcript/history/remote/schedules/organization",
+      "classification": "owned elsewhere",
+      "detail": "Only mentions and prompt recall touched as active-input integration boundaries; no independent facet inventory performed."
+    }
+  ]
+}

@@ -4,7 +4,7 @@
 
 ## Build and launch
 
-Requires macOS 14 or later, a Swift toolchain compatible with `Package.swift`,
+Requires macOS 14 or later, Swift 6.2 or later (including the terminal dependency),
 Apple command-line developer tools, and an installed Memex CLI. No Xcode project
 or Xcode GUI is needed. The developer tools supply `swift`, `codesign`, `otool`,
 and `plutil`.
@@ -56,6 +56,64 @@ MEMEX_DAEMON_TEST_CLI="$PWD/target/debug/memex" swift test --package-path apps/m
 
 This test starts and stops its own foreground daemon with a temporary data root
 and one synthetic transcript; it does not use your sources or service settings.
+
+## Workspace terminals
+
+The native terminal uses the pinned public `libghostty-spm` package and its
+checksummed Ghostty XCFramework. SwiftPM downloads the framework; the app build
+script includes the package's shell-integration and terminfo resource bundle.
+No local Ghostty installation, Zig toolchain, or private agent runtime is required.
+
+The terminal registry is keyed by the canonical Git worktree root, or the local
+working folder for a non-Git workspace. Each shell starts lazily when displayed.
+The registry retains its native view and surface when the user hides it, changes
+chats, or moves it between the inspector and the Command-J drawer. Distinct Git
+worktrees have distinct shells. Remote paths never create local terminals.
+Closing a terminal or quitting the app ends its shell; terminal processes do not
+survive an app quit or restart.
+
+Run the real-shell and presentation regressions with:
+
+```sh
+swift test --package-path apps/macos --filter WorkspaceTerminal
+```
+
+## Local in-app agent runtime
+
+An optional local Sidequery checkout supplies `SQACP`, `SQACPHost`, `SQACPUI`, the standalone
+`sq_acp_runtime` static library, and the compiled Claude Agent SDK helper. Set
+`MEMEX_AGENT_RUNTIME_ROOT` to that checkout, or put its absolute path in the
+ignored `apps/macos/.local-runtime-root` file. Ordinary builds without this
+configuration retain external resume only; no runtime source or binary is fetched.
+
+Use [the runtime preparation and provenance workflow](RUNTIME.md) to build the
+locked source archive and Claude helper before packaging. `build.sh` rejects stale
+or mismatched artifacts, and embeds/signs the execution-host and Claude helpers.
+Local dirty source requires an explicit development mode; Developer ID packaging
+requires the clean pinned revision. `MEMEX_HISTORY_ONLY=1` keeps the public
+history-only graph available even when a local runtime checkout is configured.
+
+Selecting a local main Codex or Claude session shows Sidequery's shared composer,
+send/stop controls, and approval/question panels. The first send loads the original
+session and submits the prompt once it is ready; browsing history alone does not
+launch a provider. The toolbar's **Open in** menu opens external applications.
+Continuing a chat requires the original native transcript and working directory. Each provider
+child receives the source installation's `CODEX_HOME` or `CLAUDE_CONFIG_DIR`.
+The provider's normal sign-in remains required. Optional executable overrides
+are `MEMEX_CODEX_EXECUTABLE`, `MEMEX_CLAUDE_EXECUTABLE`, and `MEMEX_CLAUDE_HELPER`.
+
+The provider writes its original transcript; existing Memex indexing continues
+to pick it up. Private runtime sidecars live under
+`~/Library/Application Support/dev.memex.app/Resume/`. They retain delivery
+receipts and a source archive, separate from the search index. Reconnect reloads
+native history and never automatically retries an uncertain prompt.
+
+The `nativeRuntimeResumesDisposableProviderSessions` test is opt-in. Set
+`MEMEX_LIVE_TEST_SESSIONS` to a JSON array of Memex session metadata for disposable
+sessions whose initial assistant response contains `MEMEX_SEED_OK`. It sends one
+test prompt, checks persistence and duplicate-free reconnect, and closes only its
+own providers. Direct Swift tests also need `MEMEX_CLAUDE_HELPER` for Claude.
+Never point this test at a working conversation.
 
 ## App releases
 

@@ -26,6 +26,7 @@ enum ConversationMatcher {
     }
 
     static func body(_ record: TranscriptRecord) -> String {
+        if record.isRawOnly { return record.rawTranscriptBody }
         if record.record.isActivity || record.record.isInstruction {
             return TranscriptActivity(records: [record]).body
         }
@@ -118,6 +119,15 @@ final class ConversationFindState {
                 self.error = error.localizedDescription
             }
         }
+    }
+    func search(records: [TranscriptRecord]) {
+        let selected = selectedHit
+        reset()
+        guard isOpen, !query.isEmpty else { return }
+        hits = ConversationMatcher.matches(records, query: query)
+        scannedRecords = records.count
+        selectedIndex = selected.flatMap { old in hits.firstIndex { $0.recordID == old.recordID && $0.occurrence == old.occurrence } }
+            ?? (hits.isEmpty ? nil : 0)
     }
     func move(_ delta: Int) {
         guard !hits.isEmpty else { return }

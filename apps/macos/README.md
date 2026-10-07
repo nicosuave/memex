@@ -1,8 +1,12 @@
 # Memex for macOS
 
-A native app for browsing and searching your agent conversations. Find a project,
-read its history, and resume a local session in your preferred terminal or open a
-Codex conversation in ChatGPT.
+A native app for browsing, searching, and working with agent conversations. Find
+a project, read its history, or continue in your preferred terminal. Builds with
+the optional agent runtime can also create and continue conversations in the app.
+
+See [conversations and workspace tools](CONVERSATIONS.md) for composing prompts,
+queues, providers, branching, files, Git, browser tabs, and terminals. The optional
+runtime has a [separate reproducible build contract](RUNTIME.md).
 
 <img width="1876" height="1146" alt="Memex native macOS app" src="https://github.com/user-attachments/assets/6e112c96-5b1c-4de3-80bc-c06939dac18a" />
 
@@ -75,6 +79,21 @@ depend on the engine; see the [engine support table](../../README.md#engine-supp
 macOS may request Automation permission on first use. Ghostty needs its scripting
 API, and cmux needs socket access.
 
+## Workspace terminal
+
+Choose **Terminal** in the right workspace pane, or press **Command-J** to open
+the bottom terminal drawer. The dock button moves the same terminal between the
+right pane and drawer. Drag the drawer's top edge to resize it.
+
+Each local worktree has its own terminal group, with independent shells and
+scrollback. Chats in the same worktree share that group; switching chats or hiding
+the pane keeps it running. Add shells, choose a split layout, save scrollback
+snapshots, or add selected output to a conversation from the terminal controls. Shells
+start in the worktree root, or the chat's working folder when it is not a Git
+repository. The terminal menu can end a shell, and **Restart** opens a new one
+after it exits. Quitting Memex ends its terminals and asks before closing live
+shells.
+
 ## Multiple machines
 
 The machine selector offers **All Machines**, **This Mac**, and your configured
@@ -82,11 +101,15 @@ machines. Project and conversation results load independently from each machine,
 so a slow peer does not hold back local results. Failed peers show an error and
 retain cached project counts.
 
-You can search and read remote conversations, but **remote resume is disabled**
-in the macOS app. Resume those sessions on their own machine. Remote file paths
-are never opened against this computer's filesystem.
+History connections support search and reading. To operate a remote conversation,
+separately pair its execution host through **Execution Hosts and Schedules…**.
+The host retains the provider process when a viewing client disconnects. Execution
+pairing is distinct from history authentication, and remote file paths are never
+opened against this computer's filesystem.
 
 See [SSH configuration](../../docs/machines.md) to connect another machine.
+See [execution hosts](../../docs/execution-host.md) for host setup, web/mobile
+controls, schedules, and the opt-in control MCP.
 
 ## Background indexing
 

@@ -1,6 +1,24 @@
 {
-  "originHash" : "b8be4a9af0872baabe71d3c0b8fbfcd2639374f4ca277d84d689d5a37b280a09",
+  "originHash" : "9c55324009e115a7c594b631843b22860ff67b2ab49f390cdc36b84644198c3c",
   "pins" : [
+    {
+      "identity" : "displaylink",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Lakr233/DisplayLink.git",
+      "state" : {
+        "revision" : "41bea2661e04bebcb1c4f15fc0b6197850100fdd",
+        "version" : "3.0.1"
+      }
+    },
+    {
+      "identity" : "libghostty-spm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/Lakr233/libghostty-spm.git",
+      "state" : {
+        "revision" : "f320873965a57d8f138a922853f255a77da6c9c0",
+        "version" : "2.2.2026100303"
+      }
+    },
     {
       "identity" : "swift-cmark",
       "kind" : "remoteSourceControl",

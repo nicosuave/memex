@@ -5,7 +5,7 @@ import Foundation
 /// wrappers appearing after user prose remain normal message content.
 enum TranscriptPresentation {
     static func project(_ records: [TranscriptRecord]) -> [TranscriptRecord] {
-        records.flatMap { sourceEntry in
+        records.filter { !$0.isRawOnly }.flatMap { sourceEntry in
             if let reply = questionReply(sourceEntry) { return reply }
             var displayMessage = sourceEntry.record
             displayMessage.text = SourceContent.displayText(displayMessage)

@@ -1,0 +1,902 @@
+{
+  "sourceVersions": [
+    {
+      "product": "T3",
+      "commit": "ecfdda5fa804582066c1aa62afea419677c24883",
+      "root": "/private/tmp/t3-chat-inventory-ecfdda5",
+      "provenance": "Fresh git ls-remote --symref https://github.com/pingdotgg/t3code.git HEAD then detached clone; package server/desktop version 0.0.45"
+    },
+    {
+      "product": "Memex",
+      "commit": "17e958778a7398db8238cc9c8415ca12649067e5",
+      "root": "/Users/nico/Code/memex-chat-capabilities",
+      "provenance": "Pinned contract baseline; git rev-parse verified"
+    },
+    {
+      "product": "Memex runtime",
+      "commit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+      "root": "/Users/nico/Code/memex-chat-runtime",
+      "provenance": "Pinned contract baseline; git rev-parse verified"
+    }
+  ],
+  "coverage": [
+    {
+      "facets": [
+        "plan/tasks/subagents/forks",
+        "transcript/rendering/search/history",
+        "organization/notifications/settings",
+        "performance/accessibility/keybindings"
+      ],
+      "examinedBoundaries": [
+        "reachable macOS Reader/sidebar/controller/source projection",
+        "T3 web ChatView/MessagesTimeline/relationships/menu/settings and server search",
+        "runtime Codex child APIs; existing fixture tests",
+        "No runtime execution; no universal provider claims"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "T3-TR-01",
+      "category": "plan/tasks/subagents/forks",
+      "capability": "Structured plans and implementation",
+      "userWorkflow": "Inspect task steps, refine a plan, implement in this or a new conversation.",
+      "comparator": "T3",
+      "comparatorState": "Typed todo_list and proposed-plan cards; direct plan follow-up/new-thread dispatch.",
+      "memexState": "Latest recognized native plan/update_plan/TodoWrite steps; Refine/Implement attach context to unsent draft; new-conversation preparation is wired.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 2688,
+          "lineEnd": 2705,
+          "symbol": "ProposedPlanTimelineRow",
+          "claim": "Renders proposed plan card",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L2688-L2705"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/ChatView.tsx",
+          "lineStart": 10091,
+          "lineEnd": 10140,
+          "symbol": "plan follow-up",
+          "claim": "Starts implementation follow-up",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ChatView.tsx#L10091-L10140"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationWork.swift",
+          "lineStart": 44,
+          "lineEnd": 66,
+          "symbol": "project",
+          "claim": "Recognizes structured steps, never prose",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationWork.swift#L44-L66"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationWork.swift",
+          "lineStart": 114,
+          "lineEnd": 132,
+          "symbol": "ConversationWorkView",
+          "claim": "Reachable refine/implement/new-conversation actions",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationWork.swift#L114-L132"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/Reader.swift",
+          "lineStart": 40,
+          "lineEnd": 46,
+          "symbol": "Reader",
+          "claim": "Wires work panel",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/Reader.swift#L40-L46"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationHistoryTests.swift",
+          "lineStart": 98,
+          "lineEnd": 110,
+          "symbol": "providerTransitionCapturesContextIntoUnsentDraftAndMergePreservesParentDraft",
+          "claim": "Plan branch retains unsent draft",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationHistoryTests.swift#L98-L110"
+        }
+      ],
+      "implication": "The old no-plan-workflow finding is obsolete. The products choose different dispatch semantics.",
+      "recommendation": "Preserve review-before-send semantics; consider richer proposed-plan export only if wanted.",
+      "caveats": "Source inspection only; tests mentioned were read, not executed."
+    },
+    {
+      "id": "T3-TR-02",
+      "category": "plan/tasks/subagents/forks",
+      "capability": "Live subagent visibility and navigation",
+      "userWorkflow": "Follow children and open their work.",
+      "comparator": "T3",
+      "comparatorState": "Live projected agent status, grouped timing and child-thread navigation.",
+      "memexState": "Structured child rows and known spawn/wait schemas provide roster/status; Open resolves only an already indexed same-provider/same-machine session. Runtime child read API is not wired by this panel.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 3037,
+          "lineEnd": 3110,
+          "symbol": "V2SubagentGroup",
+          "claim": "Combines current projection statuses and timing",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L3037-L3110"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 5303,
+          "lineEnd": 5326,
+          "symbol": "work entry navigation",
+          "claim": "Opens child thread",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L5303-L5326"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationWork.swift",
+          "lineStart": 30,
+          "lineEnd": 93,
+          "symbol": "project",
+          "claim": "Collects exact IDs/status; unknown remains unknown",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationWork.swift#L30-L93"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationWork.swift",
+          "lineStart": 133,
+          "lineEnd": 152,
+          "symbol": "ConversationWorkView",
+          "claim": "Child Open gated on indexed sessions",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationWork.swift#L133-L152"
+        },
+        {
+          "product": "Memex runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "packages/sq-acp/Sources/SQACPHost/CodexAppServerTransport.swift",
+          "lineStart": 1284,
+          "lineEnd": 1296,
+          "symbol": "readChild",
+          "claim": "Runtime API exists"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationFidelityTests.swift",
+          "lineStart": 105,
+          "lineEnd": 114,
+          "symbol": "completedSpawnOperationDoesNotClaimChildCompleted",
+          "claim": "Does not confuse tool completion with child completion",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationFidelityTests.swift#L105-L114"
+        },
+        {
+          "product": "Memex runtime",
+          "sourceVersion": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+          "path": "packages/sq-acp/Sources/SQACPHost/AgentConversationService.swift",
+          "lineStart": 1030,
+          "lineEnd": 1050,
+          "symbol": "receive",
+          "claim": "Publishes native child status metadata to root conversation"
+        }
+      ],
+      "implication": "Memex has live roster presentation but provider child capabilities exceed the reachable native control surface.",
+      "recommendation": "Expose verified runtime child history/navigation when indexing has not caught up; keep unknown status explicit.",
+      "caveats": "Source inspection only; tests mentioned were read, not executed."
+    },
+    {
+      "id": "T3-TR-03",
+      "category": "plan/tasks/subagents/forks",
+      "capability": "Forks, lineage and context return",
+      "userWorkflow": "Branch a conversation and bring findings back.",
+      "comparator": "T3",
+      "comparatorState": "Response fork and relationship panel with merge-back.",
+      "memexState": "Native history fork/rewind for capable connected idle provider, context branch across providers, parent/child navigation, captured context to parent draft, durable pending-operation inspection.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 2575,
+          "lineEnd": 2586,
+          "symbol": "assistant fork action",
+          "claim": "Response fork control",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L2575-L2586"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/ThreadRelationshipsControl.tsx",
+          "lineStart": 282,
+          "lineEnd": 300,
+          "symbol": "merge",
+          "claim": "Dispatches merge-back and opens parent",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/ThreadRelationshipsControl.tsx#L282-L300"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationHistoryActions.swift",
+          "lineStart": 19,
+          "lineEnd": 44,
+          "symbol": "ConversationHistoryActions",
+          "claim": "Reachable native/context fork and parent return",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationHistoryActions.swift#L19-L44"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/StoreConversationHistory.swift",
+          "lineStart": 42,
+          "lineEnd": 81,
+          "symbol": "branchWithContext",
+          "claim": "Captures context, preserves draft and relationship",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/StoreConversationHistory.swift#L42-L81"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/StoreConversationHistory.swift",
+          "lineStart": 110,
+          "lineEnd": 126,
+          "symbol": "mergeContextToParent",
+          "claim": "Adds captured context to parent draft",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/StoreConversationHistory.swift#L110-L126"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationHistoryTests.swift",
+          "lineStart": 50,
+          "lineEnd": 66,
+          "symbol": "pendingNativeMutationSurvivesReopenAndCannotBeRepeated",
+          "claim": "Durable operation marker",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationHistoryTests.swift#L50-L66"
+        }
+      ],
+      "implication": "Old no-fork/lineage finding is obsolete. Context return is not a Git merge in either product.",
+      "recommendation": "Retain explicit native-history versus captured-context distinction.",
+      "caveats": "Provider capability and idle-state gates apply; Memex context capture is capped at 4 MB and errors rather than silently truncating."
+    },
+    {
+      "id": "T3-TR-04",
+      "category": "transcript/rendering/search/history",
+      "capability": "Typed transcript fidelity",
+      "userWorkflow": "Read commentary, completed work, lifecycle and tool media after resume.",
+      "comparator": "T3",
+      "comparatorState": "Typed work, reasoning, lifecycle/error/compaction/todo rows and rich attachments.",
+      "memexState": "Exact evidence metadata now restores phase/turn/lifecycle; opaque image tool content and full-output artifacts retained; unknown evidence stays raw.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 2730,
+          "lineEnd": 2802,
+          "symbol": "v2EventPresentation",
+          "claim": "Explicit error/interrupt/handoff/fork/compaction/todo semantics",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L2730-L2802"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationProjection.swift",
+          "lineStart": 104,
+          "lineEnd": 125,
+          "symbol": "metadataByEntity",
+          "claim": "Exact retained evidence join",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationProjection.swift#L104-L125"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationProjection.swift",
+          "lineStart": 177,
+          "lineEnd": 201,
+          "symbol": "emitMetadata",
+          "claim": "Child/lifecycle projection",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationProjection.swift#L177-L201"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationProjection.swift",
+          "lineStart": 286,
+          "lineEnd": 310,
+          "symbol": "tool_result",
+          "claim": "Retains media/full artifact",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationProjection.swift#L286-L310"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationFidelityTests.swift",
+          "lineStart": 6,
+          "lineEnd": 57,
+          "symbol": "fidelity tests",
+          "claim": "Tests phase folding and resumed Claude media/full output",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationFidelityTests.swift#L6-L57"
+        }
+      ],
+      "implication": "The earlier completed-work and nested-Claude-image defects are addressed at the inspected baseline.",
+      "recommendation": "Avoid repeating the old defects; preserve these composition tests.",
+      "caveats": "Not equal rendering of every provider field or media type; artifact references do not prove the underlying file still exists."
+    },
+    {
+      "id": "T3-TR-05",
+      "category": "transcript/rendering/search/history",
+      "capability": "Historical search scope",
+      "userWorkflow": "Find prior discussions across providers and machines.",
+      "comparator": "T3",
+      "comparatorState": "Literal SQL LIKE over finished user/assistant messages in active V2 threads/projects, one best result per thread; archived/tool/system/unimported V1 content excluded.",
+      "memexState": "Native UI uses indexed lexical search with provider/project/time/origin/machine filters and record anchors.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/server/src/orchestration-v2/ThreadSearch.ts",
+          "lineStart": 64,
+          "lineEnd": 68,
+          "symbol": "ThreadSearch contract",
+          "claim": "Defines active V2 corpus",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/ThreadSearch.ts#L64-L68"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/server/src/orchestration-v2/ThreadSearch.ts",
+          "lineStart": 88,
+          "lineEnd": 143,
+          "symbol": "searchRows",
+          "claim": "Explicit exclusions and one-best-match ranking",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/ThreadSearch.ts#L88-L143"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/Client.swift",
+          "lineStart": 126,
+          "lineEnd": 143,
+          "symbol": "search",
+          "claim": "Filtered native lexical search",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/Client.swift#L126-L143"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/Client.swift",
+          "lineStart": 235,
+          "lineEnd": 249,
+          "symbol": "initialRecordOffset",
+          "claim": "Exact source-record anchor lookup",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/Client.swift#L235-L249"
+        }
+      ],
+      "implication": "Memex remains a history-retrieval product; T3 search is active-thread discovery. Archiving a T3 thread removes its message content from this search.",
+      "recommendation": "Do not copy T3 search exclusions into Memex; keep retrieval scope clear.",
+      "caveats": "Native macOS search is lexical, not the MCP hybrid/semantic surface. The T3 search limitation is an implemented boundary, not an alleged data-loss defect."
+    },
+    {
+      "id": "T3-TR-06",
+      "category": "transcript/rendering/search/history",
+      "capability": "Exact in-conversation Find and raw evidence",
+      "userWorkflow": "Find each literal occurrence, including hidden raw source, across a long chat.",
+      "comparator": "T3",
+      "comparatorState": "Reviewed MessagesTimeline/ThreadDetailsPanel and shared state expose rich normalized items; no all-history exact-occurrence Find or raw-provider-transcript toggle located.",
+      "memexState": "Paged literal case-insensitive Find with previous/next and exact raw fallback; live mode searches projected records.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 1342,
+          "lineEnd": 1385,
+          "symbol": "MessagesTimeline",
+          "claim": "Virtualized bounded rendered rows, not full-history browser Find",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L1342-L1385"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/server/src/orchestration-v2/ThreadSearch.ts",
+          "lineStart": 88,
+          "lineEnd": 143,
+          "symbol": "searchRows",
+          "claim": "Separate cross-thread search is one match per thread",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/server/src/orchestration-v2/ThreadSearch.ts#L88-L143"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationFind.swift",
+          "lineStart": 12,
+          "lineEnd": 25,
+          "symbol": "ranges",
+          "claim": "Literal occurrence ranges",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationFind.swift#L12-L25"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationFind.swift",
+          "lineStart": 83,
+          "lineEnd": 136,
+          "symbol": "ConversationFindState",
+          "claim": "Reads successive pages; preserves live selection",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationFind.swift#L83-L136"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationFidelityTests.swift",
+          "lineStart": 92,
+          "lineEnd": 102,
+          "symbol": "rawOnlyEvidenceCanBeFoundAndRevealedExactly",
+          "claim": "Raw hidden match reveals exact source",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationFidelityTests.swift#L92-L102"
+        }
+      ],
+      "implication": "Memex retains an evidence-navigation advantage; browser Find cannot search rows absent from the virtual DOM.",
+      "recommendation": "Preserve exact Find and raw access when adding richer rendering.",
+      "caveats": "T3 absence claim is bounded to reviewed web transcript/shared runtime, not every external browser extension; live Memex raw evidence is the projected record, not a full provider dump."
+    },
+    {
+      "id": "T3-TR-07",
+      "category": "transcript/rendering/search/history",
+      "capability": "Conversation outline and reading position",
+      "userWorkflow": "Jump to earlier prompts and return to a reading position.",
+      "comparator": "T3",
+      "comparatorState": "Timeline minimap, citation targeting, remembered position and anchor preservation.",
+      "memexState": "Wired prompt-outline popover, previous/next selection and exact record reveal, reading/disclosure restoration.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 1342,
+          "lineEnd": 1385,
+          "symbol": "MessagesTimeline",
+          "claim": "Anchoring plus minimap",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L1342-L1385"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/Reader.swift",
+          "lineStart": 67,
+          "lineEnd": 73,
+          "symbol": "outline refresh",
+          "claim": "Loads historical/live outline and follows visible record",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/Reader.swift#L67-L73"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/Reader.swift",
+          "lineStart": 197,
+          "lineEnd": 223,
+          "symbol": "outlinePopover",
+          "claim": "Previous/next and prompt selection",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/Reader.swift#L197-L223"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/Reader.swift",
+          "lineStart": 268,
+          "lineEnd": 269,
+          "symbol": "toolbar",
+          "claim": "Reachable outline control",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/Reader.swift#L268-L269"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationFidelityTests.swift",
+          "lineStart": 80,
+          "lineEnd": 89,
+          "symbol": "outlineLiveRefreshPreservesSelectionAndOriginalOffsets",
+          "claim": "Retains selection",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationFidelityTests.swift#L80-L89"
+        }
+      ],
+      "implication": "Earlier dormant-outline finding is obsolete.",
+      "recommendation": "Treat layout differences as design choices, not missing navigation.",
+      "caveats": "Source inspection only; tests mentioned were read, not executed."
+    },
+    {
+      "id": "T3-TR-08",
+      "category": "organization/notifications/settings",
+      "capability": "Rename, pin, archive, removal and bulk ordering",
+      "userWorkflow": "Organize chats without altering native provider history.",
+      "comparator": "T3",
+      "comparatorState": "Thread action menu supports rename/pin/archive/delete, with archive distinct from deletion.",
+      "memexState": "Reachable rename/pin/archive/restore/remove and multi-selection; locked atomic local metadata persists and preserves provider history. Removal is reversible local hiding, not destructive deletion.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/threadActionMenu.logic.ts",
+          "lineStart": 121,
+          "lineEnd": 125,
+          "symbol": "thread actions",
+          "claim": "Pin/unpin",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/threadActionMenu.logic.ts#L121-L125"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/threadActionMenu.logic.ts",
+          "lineStart": 219,
+          "lineEnd": 235,
+          "symbol": "thread actions",
+          "claim": "Archive versus permanent deletion",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/threadActionMenu.logic.ts#L219-L235"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationLibrary.swift",
+          "lineStart": 83,
+          "lineEnd": 108,
+          "symbol": "organization mutations",
+          "claim": "Reversible metadata actions",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationLibrary.swift#L83-L108"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/SidebarConversations.swift",
+          "lineStart": 211,
+          "lineEnd": 232,
+          "symbol": "bulk context menu",
+          "claim": "Reachable pin/archive/restore/remove",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/SidebarConversations.swift#L211-L232"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationLibraryTests.swift",
+          "lineStart": 11,
+          "lineEnd": 39,
+          "symbol": "organizationSurvivesRelaunchWithoutChangingProviderHistory",
+          "claim": "Native source untouched",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationLibraryTests.swift#L11-L39"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationLibraryTests.swift",
+          "lineStart": 64,
+          "lineEnd": 106,
+          "symbol": "library concurrency/reorder tests",
+          "claim": "Concurrent metadata and filtered order",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationLibraryTests.swift#L64-L106"
+        }
+      ],
+      "implication": "Old basic-lifecycle absence is obsolete. Memex deliberately protects ingested provider records.",
+      "recommendation": "Preserve reversible removal semantics.",
+      "caveats": "Source inspection only; tests mentioned were read, not executed."
+    },
+    {
+      "id": "T3-TR-09",
+      "category": "organization/notifications/settings",
+      "capability": "Completion and input notifications",
+      "userWorkflow": "Get alerts when background work completes or needs input.",
+      "comparator": "T3",
+      "comparatorState": "Opt-in per-client sound/desktop/in-app notification path with browser permission gate.",
+      "memexState": "Native opt-in completion/approval/question notifications, sound-only mode, per-conversation visibility suppression, click opens conversation; packaged-app permission gate.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-and-existing-tests",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/ThreadNotificationCoordinator.tsx",
+          "lineStart": 124,
+          "lineEnd": 179,
+          "symbol": "EnvironmentNotifications",
+          "claim": "Transition-driven alerts and sound",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ThreadNotificationCoordinator.tsx#L124-L179"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/ThreadNotificationCoordinator.tsx",
+          "lineStart": 209,
+          "lineEnd": 231,
+          "symbol": "desktop notification",
+          "claim": "Permission-gated delivery",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/ThreadNotificationCoordinator.tsx#L209-L231"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationNotifications.swift",
+          "lineStart": 87,
+          "lineEnd": 103,
+          "symbol": "setMode",
+          "claim": "Packaged app and OS authorization",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationNotifications.swift#L87-L103"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/ConversationNotifications.swift",
+          "lineStart": 111,
+          "lineEnd": 145,
+          "symbol": "receive",
+          "claim": "Identity dedupe and visibility suppression",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/ConversationNotifications.swift#L111-L145"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 82,
+          "lineEnd": 90,
+          "symbol": "notification wiring",
+          "claim": "Activates and navigates notifications",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/MemexApp.swift#L82-L90"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Tests/MemexTests/ConversationNotificationTests.swift",
+          "lineStart": 14,
+          "lineEnd": 71,
+          "symbol": "notification tests",
+          "claim": "Avoids historical replay and dedupes pending requests",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Tests/MemexTests/ConversationNotificationTests.swift#L14-L71"
+        }
+      ],
+      "implication": "Notification delivery is now implemented in Memex, not merely sidebar indicators.",
+      "recommendation": "Do not carry the old missing-notifications claim forward.",
+      "caveats": "OS/browser permissions, running client and user opt-in constrain delivery. No actual notification was emitted during research."
+    },
+    {
+      "id": "T3-TR-11",
+      "category": "organization/notifications/settings",
+      "capability": "Sidebar snooze",
+      "userWorkflow": "Temporarily hide a chat until later.",
+      "comparator": "T3",
+      "comparatorState": "T3 supports snooze in thread lifecycle actions.",
+      "memexState": "Not considered for implementation by explicit research contract.",
+      "status": "intentionally-excluded",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/threadActionMenu.logic.ts",
+          "lineStart": 128,
+          "lineEnd": 140,
+          "symbol": "lifecycle actions",
+          "claim": "Snooze is distinct from pin and settle",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/threadActionMenu.logic.ts#L128-L140"
+        }
+      ],
+      "implication": "This is an explicit exclusion, not a backlog recommendation.",
+      "recommendation": "Do not propose sidebar snooze.",
+      "caveats": "Source inspection only; tests mentioned were read, not executed."
+    },
+    {
+      "id": "T3-TR-10",
+      "category": "performance/accessibility/keybindings",
+      "capability": "Customizable keyboard bindings",
+      "userWorkflow": "Change shortcuts and detect conflicts.",
+      "comparator": "T3",
+      "comparatorState": "Editable keybindings with recording/conflict handling; browser warns when native browser shortcuts intercept.",
+      "memexState": "Built-in native commands and composer shortcuts; no equivalent native customization surface located in command/settings inventory.",
+      "status": "partial",
+      "priority": "P2",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/settings/KeybindingsSettings.tsx",
+          "lineStart": 751,
+          "lineEnd": 778,
+          "symbol": "keybinding editor",
+          "claim": "Conflict checks and recording",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/settings/KeybindingsSettings.tsx#L751-L778"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/settings/KeybindingsSettings.tsx",
+          "lineStart": 1314,
+          "lineEnd": 1322,
+          "symbol": "browser warning",
+          "claim": "Browser may intercept shortcuts",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/settings/KeybindingsSettings.tsx#L1314-L1322"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/MemexApp.swift",
+          "lineStart": 12,
+          "lineEnd": 33,
+          "symbol": "commands",
+          "claim": "Statically declared native keyboard shortcuts",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/MemexApp.swift#L12-L33"
+        }
+      ],
+      "implication": "Keyboard customization is a real feature difference, independent of rendering performance.",
+      "recommendation": "Consider customization if fixed shortcuts conflict with user workflows.",
+      "caveats": "Source inspection only; tests mentioned were read, not executed."
+    },
+    {
+      "id": "T3-TR-12",
+      "category": "performance/accessibility/keybindings",
+      "capability": "Long-history publish architecture",
+      "userWorkflow": "Read long live conversations efficiently.",
+      "comparator": "T3",
+      "comparatorState": "LegendList virtualization and cursor-based progressive history loads.",
+      "memexState": "NSTableView reuse and bounded visible window; native publish reads/reprojects complete runtime conversation before slicing.",
+      "status": "unknown",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 1342,
+          "lineEnd": 1372,
+          "symbol": "MessagesTimeline",
+          "claim": "Virtualized rows",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L1342-L1372"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "packages/client-runtime/src/state/threads.ts",
+          "lineStart": 636,
+          "lineEnd": 691,
+          "symbol": "loadEarlier",
+          "claim": "Cursor-based progressive history request",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/packages/client-runtime/src/state/threads.ts#L636-L691"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/InAppAgentRuntime.swift",
+          "lineStart": 191,
+          "lineEnd": 218,
+          "symbol": "publish",
+          "claim": "Reads/projects full conversation",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/InAppAgentRuntime.swift#L191-L218"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/LiveConversation.swift",
+          "lineStart": 238,
+          "lineEnd": 245,
+          "symbol": "visibleRecords",
+          "claim": "Window after snapshot",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/LiveConversation.swift#L238-L245"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/TranscriptController.swift",
+          "lineStart": 633,
+          "lineEnd": 640,
+          "symbol": "tableView",
+          "claim": "Reusable native rows",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/TranscriptController.swift#L633-L640"
+        }
+      ],
+      "implication": "Architecture differs, but source cannot determine latency, CPU or memory cost at actual transcript sizes.",
+      "recommendation": "Benchmark representative long conversations before deciding whether this path needs optimization.",
+      "caveats": "Validation need, not established performance defect; no benchmark or runtime measurement was run."
+    },
+    {
+      "id": "T3-TR-13",
+      "category": "performance/accessibility/keybindings",
+      "capability": "Accessibility hooks",
+      "userWorkflow": "Navigate transcript controls using assistive technology.",
+      "comparator": "T3",
+      "comparatorState": "ARIA labels/expanded state and reduced-motion-aware following.",
+      "memexState": "Native copy/disclosure accessibility labels and expanded state.",
+      "status": "present",
+      "priority": "none",
+      "confidence": "high",
+      "validationLevel": "source-only",
+      "evidence": [
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 1356,
+          "lineEnd": 1372,
+          "symbol": "MessagesTimeline",
+          "claim": "Reduced-motion scrolling",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L1356-L1372"
+        },
+        {
+          "product": "T3",
+          "sourceVersion": "ecfdda5fa804582066c1aa62afea419677c24883",
+          "path": "apps/web/src/components/chat/MessagesTimeline.tsx",
+          "lineStart": 3070,
+          "lineEnd": 3075,
+          "symbol": "subagent disclosure",
+          "claim": "ARIA label/description",
+          "url": "https://github.com/pingdotgg/t3code/blob/ecfdda5fa804582066c1aa62afea419677c24883/apps/web/src/components/chat/MessagesTimeline.tsx#L3070-L3075"
+        },
+        {
+          "product": "Memex",
+          "sourceVersion": "17e958778a7398db8238cc9c8415ca12649067e5",
+          "path": "apps/macos/Sources/Memex/TranscriptController.swift",
+          "lineStart": 874,
+          "lineEnd": 921,
+          "symbol": "row accessibility",
+          "claim": "Copy/disclosure labels and values",
+          "url": "https://github.com/nicosuave/memex/blob/17e958778a7398db8238cc9c8415ca12649067e5/apps/macos/Sources/Memex/TranscriptController.swift#L874-L921"
+        }
+      ],
+      "implication": "Both implement observable accessibility hooks; source does not establish comprehensive accessibility.",
+      "recommendation": "Keep these hooks when changing presentation; audit with assistive technology for claims beyond source presence.",
+      "caveats": "No screen-reader, keyboard-only usability or compliance audit performed."
+    }
+  ],
+  "unresolved": [
+    {
+      "topic": "Runtime/platform verification",
+      "disposition": "Out of scope: source and existing tests inspected only; no builds/provider prompts/UI actions."
+    },
+    {
+      "topic": "T3 exact transcript Find",
+      "disposition": "No reachable web/shared implementation located; negative bounded to inspected transcript and search paths."
+    }
+  ]
+}

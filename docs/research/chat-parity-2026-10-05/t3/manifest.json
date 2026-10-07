@@ -1,0 +1,152 @@
+{
+  "resolvedAt": "2026-10-05 America/Los_Angeles",
+  "t3Upstream": "https://github.com/pingdotgg/t3code.git",
+  "defaultRef": "refs/heads/main",
+  "commit": "ecfdda5fa804582066c1aa62afea419677c24883",
+  "commitTime": "2026-10-05T18:39:51-07:00",
+  "packageVersion": "0.0.45 (server and desktop manifests; not installed-release assertion)",
+  "oldGuideCommit": "1604ccc9d79f5270fb8e14d60664184bf142c4cb",
+  "commitsSinceGuide": 57,
+  "checkout": "/private/tmp/t3-chat-inventory-ecfdda5",
+  "provenance": "git ls-remote --symref resolved HEAD; fresh filtered clone checked out detached immutable commit; checkout remains clean",
+  "memexCommit": "17e958778a7398db8238cc9c8415ca12649067e5",
+  "runtimeCommit": "7818518b094f44911aecfec7dbeb905c57ea24a9",
+  "validation": "Source, reachable call paths and existing tests inspected; no test execution/build/provider/UI actions",
+  "findings": 39,
+  "sourceRangesValidated": 228,
+  "coverage": [
+    {
+      "facet": "composer and input/attachments/context",
+      "findingIds": [
+        "T3-I01",
+        "T3-I02",
+        "T3-I03",
+        "T3-I10",
+        "T3-I11"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "queue/steer/stop/recovery",
+      "findingIds": [
+        "T3-I04",
+        "T3-I05",
+        "T3-I06",
+        "T3-I14"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "plan/tasks/subagents/forks",
+      "findingIds": [
+        "T3-TR-01",
+        "T3-TR-02",
+        "T3-TR-03"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "transcript/rendering/search/history",
+      "findingIds": [
+        "T3-TR-04",
+        "T3-TR-05",
+        "T3-TR-06",
+        "T3-TR-07"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "approval/questions",
+      "findingIds": [
+        "T3-I07",
+        "T3-I08",
+        "T3-I09"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "providers/models/configuration",
+      "findingIds": [
+        "T3-I12",
+        "T3-I13"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "projects/worktrees/Git/review/files",
+      "findingIds": [
+        "T3-W01",
+        "T3-W02",
+        "T3-W03",
+        "T3-W04",
+        "T3-W05",
+        "T3-W06"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "terminal/browser/computer use",
+      "findingIds": [
+        "T3-W07",
+        "T3-W08",
+        "T3-W12"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "remote/cloud/multi-host",
+      "findingIds": [
+        "T3-W09",
+        "T3-W12"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "schedules/automation",
+      "findingIds": [
+        "T3-W10"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "app-control tools/plugins/skills",
+      "findingIds": [
+        "T3-W11",
+        "T3-W12",
+        "T3-I03"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "organization/notifications/settings",
+      "findingIds": [
+        "T3-TR-08",
+        "T3-TR-09",
+        "T3-TR-11"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    },
+    {
+      "facet": "performance/accessibility/keybindings",
+      "findingIds": [
+        "T3-TR-10",
+        "T3-TR-12",
+        "T3-TR-13"
+      ],
+      "disposition": "examined",
+      "boundary": "Pinned source and existing tests only; see finding caveats for provider/build/platform scope."
+    }
+  ]
+}

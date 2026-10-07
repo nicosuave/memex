@@ -16,6 +16,18 @@ struct ConversationPrompt: Identifiable, Equatable {
     private var token = UUID()
     private var recordOffsets: [String: Int] = [:]
 
+    func load(records: [TranscriptRecord]) {
+        token = UUID()
+        scanning = false
+        error = nil
+        recordOffsets = Dictionary(records.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { first, _ in first })
+        for (index, record) in records.enumerated() where recordOffsets[record.sourceID] == nil {
+            recordOffsets[record.sourceID] = index
+        }
+        prompts = Self.entries(records, offset: 0)
+        if let selectedID, !prompts.contains(where: { $0.id == selectedID }) { self.selectedID = nil }
+    }
+
     func load(session: Session?, client: MemexClient) async {
         let token = UUID()
         self.token = token
@@ -26,13 +38,19 @@ struct ConversationPrompt: Identifiable, Equatable {
         defer { if self.token == token { scanning = false } }
         do {
             var offset = 0
+            var promptIDs = Set<String>()
             while true {
                 try Task.checkCancellation()
                 let page = try await client.records(for: session, offset: offset)
                 try Task.checkCancellation()
                 guard self.token == token else { return }
-                for (index, record) in page.enumerated() { recordOffsets[record.id] = offset + index }
-                prompts += Self.entries(page, offset: offset)
+                for (index, record) in page.enumerated() {
+                    if recordOffsets[record.id] == nil { recordOffsets[record.id] = offset + index }
+                    if recordOffsets[record.sourceID] == nil { recordOffsets[record.sourceID] = offset + index }
+                }
+                let entries = Self.entries(page, offset: offset, excludingIDs: promptIDs)
+                promptIDs.formUnion(entries.map(\.id))
+                prompts += entries
                 if page.count < MemexClient.pageSize { break }
                 offset += page.count
             }
@@ -40,13 +58,14 @@ struct ConversationPrompt: Identifiable, Equatable {
         } catch { if self.token == token { self.error = error.localizedDescription } }
     }
 
-    static func entries(_ records: [TranscriptRecord], offset: Int) -> [ConversationPrompt] {
-        records.enumerated().compactMap { index, record in
+    static func entries(_ records: [TranscriptRecord], offset: Int, excludingIDs: Set<String> = []) -> [ConversationPrompt] {
+        var seen = excludingIDs
+        return records.enumerated().compactMap { index, record in
             guard record.record.role == "user" else { return nil }
             let visible = TranscriptPresentation.project([record]).filter { !$0.record.isInstruction }
                 .map { $0.record.text }.joined(separator: " ")
             let preview = visible.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-            guard !preview.isEmpty else { return nil }
+            guard !preview.isEmpty, seen.insert(record.id).inserted else { return nil }
             return ConversationPrompt(id: record.id, offset: offset + index, preview: String(preview.prefix(180)))
         }
     }
