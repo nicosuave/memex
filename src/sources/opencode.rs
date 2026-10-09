@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
     index: 2,
-    usage: 4,
+    usage: 5,
 };
 
 /// Version for the SQLite event cursor and owned-session reconciliation rules.  This is
@@ -31,7 +31,7 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// `(max_seq, max_time_updated)` cursors for v2 databases, so persisted v1
 /// cursors must be re-derived once.
 /// v4 removes legacy resurrection, splits tool records, and strengthens change detection.
-pub const DATABASE_STATE_VERSION: u32 = 4;
+pub const DATABASE_STATE_VERSION: u32 = 5;
 
 pub fn matches_path(path: &str) -> bool {
     (path.contains("opencode/storage/message") || path.contains("opencode\\storage\\message"))
@@ -250,7 +250,8 @@ fn table_exists(connection: &Connection, path: &Path, table: &str) -> Result<boo
         .with_context(|| format!("inspect OpenCode table `{table}` in {}", path.display()))
 }
 
-/// Message storage determines the generation independently of the session table's name.
+/// Whether the database has the v2 projection schema. This is a capability, not ownership:
+/// `v2_ownership` decides which sessions actually live in it.
 fn has_v2_schema(connection: &Connection, path: &Path) -> Result<bool> {
     table_exists(connection, path, "session_message")
 }
@@ -263,6 +264,168 @@ fn v2_session_table(connection: &Connection, path: &Path) -> Result<&'static str
     }
 }
 
+/// Which sessions keep their history in the v2 `session_message` projection.
+#[derive(Debug)]
+enum V2Ownership {
+    None,
+    All,
+    Sessions(HashSet<String>),
+}
+
+impl V2Ownership {
+    fn owns(&self, session_id: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Sessions(ids) => ids.contains(session_id),
+        }
+    }
+}
+
+/// `session_message` types that carry conversation content. The `agent-switched` and
+/// `model-switched` metadata rows are left out: OpenCode's v1 prompt path also emitted them, so
+/// they appear in sessions whose history never left v1.
+const V2_CONTENT_ROW_TYPES: &[&str] = &[
+    "user",
+    "system",
+    "assistant",
+    "synthetic",
+    "shell",
+    "compaction",
+];
+
+/// Durable `session.next.*` events, without their version suffix, that write or change
+/// conversation content. Switches, `moved`, staged or cleared reverts, streaming deltas and
+/// unknown kinds only touch metadata or cannot be told apart from it, so they are not evidence.
+const V2_CONTENT_EVENTS: &[&str] = &[
+    "prompted",
+    "prompt.admitted",
+    "context.updated",
+    "synthetic",
+    "shell.started",
+    "shell.ended",
+    "step.started",
+    "step.ended",
+    "step.failed",
+    "text.started",
+    "text.ended",
+    "reasoning.started",
+    "reasoning.ended",
+    "tool.input.started",
+    "tool.input.ended",
+    "tool.called",
+    "tool.progress",
+    "tool.success",
+    "tool.failed",
+    "retried",
+    "compaction.started",
+    "compaction.ended",
+    "revert.committed",
+];
+
+/// Whether a stored event type such as `session.next.prompted.1` is v2 content evidence.
+fn is_v2_content_event(stored: &str) -> bool {
+    let Some(kind) = stored.strip_prefix("session.next.") else {
+        return false;
+    };
+    let base = match kind.rsplit_once('.') {
+        Some((base, version))
+            if !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => kind,
+    };
+    V2_CONTENT_EVENTS.contains(&base)
+}
+
+/// Classify the database's sessions by storage generation.
+///
+/// OpenCode keeps writing v1 `message`/`part` rows next to the v2 projection, and its schema
+/// migrations create (and have cleared) the v2 tables without moving v1 history, so the
+/// projection's existence alone does not make any session v2. In the shared `session` layout a
+/// session is v2 only on positive content evidence: projected content rows, or durable content
+/// events, which outlive reverts and deletions of projected rows. Metadata such as agent and
+/// model switches is not evidence, because v1 sessions record it too. A separate `session_v2`
+/// inventory, or a database without v1 message tables, stays wholly v2.
+///
+/// Nothing durable records ownership once both kinds of evidence are gone (OpenCode's
+/// `reset_v2_session_state` migration erases them), so such a session falls back to the v1
+/// history OpenCode still holds for it, which may include rows hidden while it was v2.
+fn v2_ownership(connection: &Connection, path: &Path) -> Result<V2Ownership> {
+    if !has_v2_schema(connection, path)? {
+        return Ok(V2Ownership::None);
+    }
+    if table_exists(connection, path, "session_v2")?
+        || !table_exists(connection, path, "message")?
+        || !table_exists(connection, path, "part")?
+    {
+        return Ok(V2Ownership::All);
+    }
+    let row_types = V2_CONTENT_ROW_TYPES
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut ids = query_ids(
+        connection,
+        path,
+        &format!("SELECT DISTINCT session_id FROM session_message WHERE type IN ({row_types})"),
+    )?;
+    if table_has_column(connection, path, "event", "type")? {
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT aggregate_id, type FROM event
+                 WHERE type LIKE 'session.next.%'",
+            )
+            .with_context(|| format!("prepare OpenCode event evidence for {}", path.display()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .with_context(|| format!("query OpenCode event evidence in {}", path.display()))?;
+        for row in rows {
+            let (session_id, kind) = row?;
+            if is_v2_content_event(&kind) {
+                ids.insert(session_id);
+            }
+        }
+    }
+    Ok(V2Ownership::Sessions(ids))
+}
+
+fn query_ids(connection: &Connection, path: &Path, query: &str) -> Result<HashSet<String>> {
+    let mut statement = connection
+        .prepare(query)
+        .with_context(|| format!("prepare OpenCode ownership query for {}", path.display()))?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .with_context(|| format!("query OpenCode session ownership in {}", path.display()))?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .with_context(|| format!("read OpenCode session ownership in {}", path.display()))?;
+    Ok(ids)
+}
+
+fn table_has_column(
+    connection: &Connection,
+    path: &Path,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    if !table_exists(connection, path, table)? {
+        return Ok(false);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("inspect OpenCode `{table}` table in {}", path.display()))?;
+    let found = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("read OpenCode `{table}` columns in {}", path.display()))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("read OpenCode `{table}` columns in {}", path.display()))?;
+    Ok(found.iter().any(|name| name == column))
+}
+
 /// Enumerate the modern session inventory from one OpenCode database.
 ///
 /// Databases with a v2 projection use its metadata inventory exclusively. Without an explicit
@@ -270,7 +433,7 @@ fn v2_session_table(connection: &Connection, path: &Path) -> Result<&'static str
 pub fn enumerate_sessions(path: &Path) -> Result<Vec<OpencodeSession>> {
     let connection = open_read_only_database(path)?;
     if has_v2_schema(&connection, path)? {
-        Ok(v2_sessions_from_connection(&connection, path)?.0)
+        enumerate_v2_sessions_from_connection(&connection, path)
     } else {
         require_modern_schema(&connection, path)?;
         enumerate_sessions_from_connection(&connection, path)
@@ -342,17 +505,6 @@ fn enumerate_v2_sessions_from_connection(
          FROM {table} ORDER BY id"
         ),
     )
-}
-
-/// The projection is the database's ownership boundary. Do not infer incomplete migration
-/// from missing rows: neither known layout provides durable per-session migration tombstones.
-fn v2_sessions_from_connection(
-    connection: &Connection,
-    path: &Path,
-) -> Result<(Vec<OpencodeSession>, HashSet<String>)> {
-    let sessions = enumerate_v2_sessions_from_connection(connection, path)?;
-    let v2_ids = sessions.iter().map(|session| session.id.clone()).collect();
-    Ok((sessions, v2_ids))
 }
 
 fn nonnegative_timestamp(value: i64) -> Result<u64> {
@@ -539,6 +691,55 @@ fn full_reconcile(
     (dirty, removed)
 }
 
+/// Sessions with events after the previous cursor, or `None` when that cursor no longer
+/// identifies the same event and every v1 session must be reconsidered.
+fn event_delta(
+    connection: &Connection,
+    path: &Path,
+    previous: &OpencodeDatabaseState,
+    cursor: &DatabaseCursor,
+) -> Result<Option<HashSet<String>>> {
+    if previous.event_rowid < 0 || cursor.event_rowid < previous.event_rowid {
+        return Ok(None);
+    }
+    if previous.event_rowid == 0 {
+        if previous.event_id.is_some() {
+            return Ok(None);
+        }
+    } else {
+        let still_valid = connection
+            .query_row(
+                "SELECT id FROM event WHERE rowid = ?1",
+                [previous.event_rowid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .with_context(|| format!("verify OpenCode event cursor in {}", path.display()))?
+            .is_some_and(|event_id| Some(event_id) == previous.event_id);
+        if !still_valid {
+            return Ok(None);
+        }
+    }
+    if !table_exists(connection, path, "event")? {
+        return Ok(Some(HashSet::new()));
+    }
+    let mut statement = connection
+        .prepare("SELECT aggregate_id FROM event WHERE rowid > ?1 ORDER BY rowid")
+        .with_context(|| format!("prepare OpenCode event delta query for {}", path.display()))?;
+    let rows = statement
+        .query_map([previous.event_rowid], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .with_context(|| format!("query OpenCode event delta in {}", path.display()))?;
+    let mut sessions = HashSet::new();
+    for row in rows {
+        if let Some(session_id) = row? {
+            sessions.insert(session_id);
+        }
+    }
+    Ok(Some(sessions))
+}
+
 /// Scan the short-lived inventory/event snapshot used to plan database hydration.
 ///
 /// The connection is opened and all inventory/event reads are completed before this function
@@ -562,111 +763,59 @@ pub fn scan_database(
         require_modern_schema(&connection, path)?;
         require_event_schema(&connection, path)?;
     }
-    let (sessions, session_cursors, v2_session_ids) = if v2 {
-        let (sessions, v2_ids) = v2_sessions_from_connection(&connection, path)?;
-        (
-            sessions,
-            current_session_cursors(&connection, path)?,
-            v2_ids,
-        )
+    let sessions = if v2 {
+        enumerate_v2_sessions_from_connection(&connection, path)?
     } else {
-        (
-            enumerate_sessions_from_connection(&connection, path)?,
-            HashMap::new(),
-            HashSet::new(),
-        )
+        enumerate_sessions_from_connection(&connection, path)?
     };
-    let cursor = if v2 {
-        DatabaseCursor {
-            event_rowid: 0,
-            event_id: None,
-        }
+    let ownership = v2_ownership(&connection, path)?;
+    let v2_session_ids = sessions
+        .iter()
+        .filter(|session| ownership.owns(&session.id))
+        .map(|session| session.id.clone())
+        .collect::<HashSet<_>>();
+    let has_v1_sessions = v2_session_ids.len() < sessions.len();
+    if v2 && has_v1_sessions {
+        // v1 sessions in a v2-capable database hydrate from v1 tables and are detected
+        // through the event log, so both must be readable.
+        require_modern_schema(&connection, path)?;
+        require_event_schema(&connection, path)?;
+    }
+    let session_cursors = if v2 {
+        current_session_cursors(&connection, path)?
     } else {
-        current_event_cursor(&connection, path)?
+        HashMap::new()
     };
+    let cursor = current_event_cursor(&connection, path)?;
     let (mut dirty, removed) = full_reconcile(&sessions, previous);
 
-    if v2 {
-        // v2 databases are event-sourced, so the `event` rowid cursor cannot detect in-place
-        // `session_message` updates.  Per-session cursors drive change detection instead, and
-        // the event delta path is bypassed entirely.
-        if let Some(previous) =
-            previous.filter(|state| state.parser_version == DATABASE_STATE_VERSION)
-        {
-            let mut dirty_ids = HashSet::new();
-            for session in &sessions {
-                let is_new = !previous.owned_session_ids.contains(&session.id);
-                let is_changed =
-                    previous.session_cursors.get(&session.id) != session_cursors.get(&session.id);
-                if is_new || is_changed {
-                    dirty_ids.insert(session.id.clone());
-                }
-            }
-            dirty = dirty_ids.into_iter().collect();
-            dirty.sort();
-        }
-    } else {
-        let current_ids = sessions
-            .iter()
-            .map(|session| session.id.as_str())
-            .collect::<HashSet<_>>();
-
-        let valid_previous = match previous {
-            Some(previous)
-                if previous.parser_version == DATABASE_STATE_VERSION
-                    && previous.event_rowid >= 0
-                    && cursor.event_rowid >= previous.event_rowid =>
-            {
-                if previous.event_rowid == 0 && previous.event_id.is_none() {
-                    true
-                } else if previous.event_rowid > 0 {
-                    connection
-                        .query_row(
-                            "SELECT id FROM event WHERE rowid = ?1",
-                            [previous.event_rowid],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .with_context(|| {
-                            format!("verify OpenCode event cursor in {}", path.display())
-                        })?
-                        .is_some_and(|event_id| Some(event_id) == previous.event_id)
-                } else {
-                    false
-                }
-            }
-            _ => false,
+    if let Some(previous) = previous.filter(|state| state.parser_version == DATABASE_STATE_VERSION)
+    {
+        // v1 sessions are dirtied by the `event` delta since the previous cursor. v2 sessions are
+        // event-sourced into `session_message`, whose in-place updates the rowid cursor cannot
+        // see, so their per-session cursors decide instead. A session that changed generation
+        // is always rehydrated from its new projection.
+        let v1_delta = if has_v1_sessions {
+            event_delta(&connection, path, previous, &cursor)?
+        } else {
+            Some(HashSet::new())
         };
-
-        if valid_previous {
-            let mut statement = connection
-                .prepare(
-                    "SELECT aggregate_id FROM event
-                     WHERE rowid > ?1 ORDER BY rowid",
-                )
-                .with_context(|| {
-                    format!("prepare OpenCode event delta query for {}", path.display())
-                })?;
-            let rows = statement
-                .query_map(
-                    [previous.expect("valid previous exists").event_rowid],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .with_context(|| format!("query OpenCode event delta in {}", path.display()))?;
-            let previous = previous.expect("valid previous exists");
-            let mut dirty_ids = current_ids
-                .iter()
-                .filter(|id| !previous.owned_session_ids.contains(**id))
-                .map(|id| (*id).to_string())
-                .collect::<HashSet<_>>();
-            for row in rows {
-                if let Some(session_id) = row?.filter(|id| current_ids.contains(id.as_str())) {
-                    dirty_ids.insert(session_id);
-                }
-            }
-            dirty = dirty_ids.into_iter().collect();
-            dirty.sort();
-        }
+        dirty = sessions
+            .iter()
+            .filter(|session| {
+                let id = &session.id;
+                let is_v2 = v2_session_ids.contains(id);
+                !previous.owned_session_ids.contains(id)
+                    || previous.v2_session_ids.contains(id) != is_v2
+                    || if is_v2 {
+                        previous.session_cursors.get(id) != session_cursors.get(id)
+                    } else {
+                        v1_delta.as_ref().is_none_or(|delta| delta.contains(id))
+                    }
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        dirty.sort();
     }
 
     let scan = DatabaseScan {
@@ -930,11 +1079,20 @@ pub(crate) fn parse_database_records(
     emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
     let connection = open_database_for_sessions(path)?;
-    // Never fall back to frozen rows when a projected session has been deleted.
-    if has_v2_schema(&connection, path)? {
-        return parse_session_records_v2(&connection, path, session_id, state, next_doc_id, emit);
-    }
-    parse_session_records(&connection, path, session_id, state, next_doc_id, emit)
+    // Classify and read in one snapshot so a concurrent generation change cannot split them.
+    connection
+        .execute_batch("BEGIN")
+        .with_context(|| format!("begin OpenCode session snapshot in {}", path.display()))?;
+    // Never fill a v2 session from frozen v1 rows, even after its projection is emptied.
+    let output = if v2_ownership(&connection, path)?.owns(session_id) {
+        parse_session_records_v2(&connection, path, session_id, state, next_doc_id, emit)
+    } else {
+        parse_session_records(&connection, path, session_id, state, next_doc_id, emit)
+    }?;
+    connection
+        .execute_batch("COMMIT")
+        .with_context(|| format!("finish OpenCode session snapshot in {}", path.display()))?;
+    Ok(output)
 }
 
 /// Open once for a batch of `parse_session_records` calls against the same database.
@@ -1688,22 +1846,52 @@ fn parse_usage_message(path: &Path) -> Result<Vec<UsageEvent>> {
 
 fn parse_usage_database(path: &Path) -> Result<Vec<UsageEvent>> {
     let connection = open_read_only_database(path)?;
+    // Ownership and usage rows must come from one snapshot, or a concurrent generation change
+    // could count a session twice or not at all.
+    connection
+        .execute_batch("BEGIN")
+        .with_context(|| format!("begin OpenCode usage snapshot in {}", path.display()))?;
+    let events = usage_events_from_connection(&connection, path)?;
+    connection
+        .execute_batch("COMMIT")
+        .with_context(|| format!("finish OpenCode usage snapshot in {}", path.display()))?;
+    Ok(events)
+}
+
+fn usage_events_from_connection(connection: &Connection, path: &Path) -> Result<Vec<UsageEvent>> {
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut ids = HashSet::new();
     let mut events = Vec::new();
-    if has_v2_schema(&connection, path)? {
+    let ownership = v2_ownership(connection, path)?;
+    let v2 = has_v2_schema(connection, path)?;
+    if v2 {
         // v2 assistant rows carry the usage projection.  v2 `data` has no top-level
         // `sessionID`, so the selected `session_id` column is passed as the fallback.
-        let table = v2_session_table(&connection, path)?;
+        let table = v2_session_table(connection, path)?;
         let mut statement = connection.prepare(&format!(
             "SELECT m.id, m.session_id, m.data FROM session_message AS m
              JOIN {table} AS s ON s.id = m.session_id WHERE m.type = 'assistant'"
         ))?;
         let rows = statement.query_map([], usage_row)?;
         collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
-    } else {
-        let mut statement = connection.prepare("SELECT id, session_id, data FROM message")?;
-        let rows = statement.query_map([], usage_row)?;
+    }
+    if !matches!(ownership, V2Ownership::All) {
+        // Sessions without v2 evidence keep their usage in v1 rows, as their records do. A
+        // v2-capable database owns its inventory, so rows of deleted sessions stay excluded.
+        let query = if v2 {
+            "SELECT m.id, m.session_id, m.data FROM message AS m
+             JOIN session AS s ON s.id = m.session_id"
+        } else {
+            "SELECT id, session_id, data FROM message"
+        };
+        let mut statement = connection.prepare(query)?;
+        let rows = statement.query_map([], usage_row)?.filter(|row| {
+            row.as_ref().map_or(true, |(_, session_id, _)| {
+                session_id
+                    .as_deref()
+                    .is_none_or(|session_id| !ownership.owns(session_id))
+            })
+        });
         collect_usage_events(path, &source_path, &mut ids, &mut events, rows)?;
     }
     Ok(events)
@@ -2005,6 +2193,7 @@ mod tests {
             event_id: scan.cursor.event_id.clone(),
             owned_session_ids: scan.sessions.iter().map(|s| s.id.clone()).collect(),
             session_cursors: scan.session_cursors.clone(),
+            v2_session_ids: scan.v2_session_ids.clone(),
         }
     }
 
@@ -2027,7 +2216,9 @@ mod tests {
                  VALUES ('project', '/repo', 1, 1, '[]');
              INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
                  VALUES ('current', 'project', 'parent', 'slug', '/repo', 'test', '2', 1, 200);
-             INSERT INTO event_sequence (aggregate_id, seq) VALUES ('current', 5);"
+             INSERT INTO event_sequence (aggregate_id, seq) VALUES ('current', 5);
+             INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES ('evt_prompt', 'current', 5, 'session.next.prompted.1', '{}');"
         ).unwrap();
         connection.execute(
             "INSERT INTO session_message VALUES ('answer', 'current', 'assistant', 2, 200, 200, ?1)",
@@ -4209,5 +4400,409 @@ mod tests {
             usage_provider_model(&value),
             (Some("p".to_string()), Some("m".to_string()))
         );
+    }
+
+    /// The pinned upstream schema in the shared `session` layout, with `s_v1` and `s_v2`.
+    fn shared_fixture(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/opencode/upstream-5a833585.sql"
+            ))
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                     VALUES ('project', '/repo', 1, 1, '[]');
+                 INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+                     VALUES ('s_v1', 'project', 's_v1', '/repo/v1', 'v1', '2', 1, 300),
+                            ('s_v2', 'project', 's_v2', '/repo/v2', 'v2', '2', 1, 300);",
+            )
+            .unwrap();
+        connection
+    }
+
+    const V1_ASSISTANT_DATA: &str = r#"{"role":"assistant","providerID":"anthropic","modelID":"claude","tokens":{"input":3,"output":4},"cost":0.0,"time":{"created":300}}"#;
+
+    fn insert_v1_assistant(connection: &Connection, id: &str, session_id: &str, text: &str) {
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, 300, 300, ?3)",
+                params![id, session_id, V1_ASSISTANT_DATA],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, 300, 300, ?4)",
+                params![
+                    format!("{id}_part"),
+                    id,
+                    session_id,
+                    serde_json::json!({"type": "text", "text": text}).to_string()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_event(connection: &Connection, id: &str, session_id: &str, kind: &str) {
+        connection
+            .execute(
+                "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?1, 0)
+                 ON CONFLICT (aggregate_id) DO UPDATE SET seq = seq + 1",
+                [session_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 SELECT ?1, ?2, seq, ?3, '{}' FROM event_sequence WHERE aggregate_id = ?2",
+                params![id, session_id, kind],
+            )
+            .unwrap();
+    }
+
+    fn texts(path: &Path, session_id: &str) -> Vec<String> {
+        parse_database_session(path, session_id, 0, &AtomicU64::new(1))
+            .unwrap()
+            .into_iter()
+            .map(|record| record.text)
+            .collect()
+    }
+
+    #[test]
+    fn empty_v2_projection_keeps_v1_history() {
+        // OpenCode creates (and its reset migration empties) `session_message` without moving
+        // v1 history, so its presence alone must not hide v1 sessions.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_1", "s_v1", "v1 history");
+        insert_event(&connection, "evt_1", "s_v1", "message.updated.1");
+        drop(connection);
+
+        let scan = scan_database(&path, None).unwrap();
+        assert!(scan.v2);
+        assert!(scan.v2_session_ids.is_empty());
+        assert_eq!(scan.dirty_session_ids, vec!["s_v1", "s_v2"]);
+        assert_eq!(texts(&path, "s_v1"), vec!["v1 history"]);
+        let usage = parse_usage_database(&path).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].session_id.as_deref(), Some("s_v1"));
+        assert_eq!(usage[0].tokens.uncached_input, 3);
+
+        let steady = scan_database(&path, Some(&state_from_scan(&scan))).unwrap();
+        assert!(steady.dirty_session_ids.is_empty());
+    }
+
+    #[test]
+    fn mixed_database_reads_each_session_from_its_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_v1", "s_v1", "v1 history");
+        insert_event(&connection, "evt_v1", "s_v1", "message.updated.1");
+        // A frozen v1 row for the v2 session must not reappear in its records or usage.
+        insert_v1_assistant(&connection, "msg_stale", "s_v2", "stale v1 history");
+        insert_event(&connection, "evt_v2", "s_v2", "session.next.prompted.1");
+        connection
+            .execute(
+                "INSERT INTO session_message VALUES ('sm_1', 's_v2', 'assistant', 1, 200, 200, ?1)",
+                [V2_ASSISTANT_DATA],
+            )
+            .unwrap();
+        drop(connection);
+
+        let scan = scan_database(&path, None).unwrap();
+        assert_eq!(scan.v2_session_ids, HashSet::from(["s_v2".to_string()]));
+        assert_eq!(texts(&path, "s_v1"), vec!["v1 history"]);
+        assert_eq!(texts(&path, "s_v2"), vec!["hi"]);
+        let mut usage = parse_usage_database(&path)
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.session_id.unwrap(), event.message_id.unwrap()))
+            .collect::<Vec<_>>();
+        usage.sort();
+        assert_eq!(
+            usage,
+            vec![
+                ("s_v1".to_string(), "msg_v1".to_string()),
+                ("s_v2".to_string(), "sm_1".to_string())
+            ]
+        );
+
+        // v1 writes are found through the event log, v2 writes through projection cursors.
+        let previous = state_from_scan(&scan);
+        let connection = Connection::open(&path).unwrap();
+        insert_v1_assistant(&connection, "msg_v1_2", "s_v1", "more v1 history");
+        insert_event(&connection, "evt_v1_2", "s_v1", "message.updated.1");
+        let after_v1 = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(after_v1.dirty_session_ids, vec!["s_v1"]);
+
+        let previous = state_from_scan(&after_v1);
+        connection
+            .execute(
+                "INSERT INTO session_message VALUES ('sm_2', 's_v2', 'user', 2, 400, 400, ?1)",
+                [V2_USER_DATA],
+            )
+            .unwrap();
+        let after_v2 = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(after_v2.dirty_session_ids, vec!["s_v2"]);
+    }
+
+    #[test]
+    fn session_generation_change_forces_rehydration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_1", "s_v1", "v1 history");
+        insert_event(&connection, "evt_1", "s_v1", "message.updated.1");
+        let scan = scan_database(&path, None).unwrap();
+        let previous = state_from_scan(&scan);
+
+        // The first durable v2 event moves the session to v2 before any row is projected.
+        insert_event(&connection, "evt_2", "s_v1", "session.next.prompted.1");
+        let promoted = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(promoted.dirty_session_ids, vec!["s_v1"]);
+        assert!(promoted.v2_session_ids.contains("s_v1"));
+        assert!(texts(&path, "s_v1").is_empty());
+
+        // An upstream reset that erases the projection and its events leaves only v1 history,
+        // which is what OpenCode itself still holds for the session.
+        let previous = state_from_scan(&promoted);
+        connection
+            .execute_batch("DELETE FROM event; DELETE FROM event_sequence;")
+            .unwrap();
+        let reset = scan_database(&path, Some(&previous)).unwrap();
+        assert!(reset.v2_session_ids.is_empty());
+        assert_eq!(reset.dirty_session_ids, vec!["s_v1", "s_v2"]);
+        assert_eq!(texts(&path, "s_v1"), vec!["v1 history"]);
+    }
+
+    #[test]
+    fn deleted_v1_session_usage_is_excluded_in_v2_capable_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        insert_v1_assistant(&connection, "msg_live", "s_v1", "live");
+        insert_v1_assistant(&connection, "msg_gone", "s_v2", "deleted");
+        connection
+            .execute("DELETE FROM session WHERE id = 's_v2'", [])
+            .unwrap();
+        drop(connection);
+
+        let usage = parse_usage_database(&path).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].message_id.as_deref(), Some("msg_live"));
+        assert!(texts(&path, "s_v2").is_empty());
+    }
+
+    #[test]
+    fn v2_capable_plan_rejects_incomplete_v1_hydration_schema() {
+        for (mutation, expected) in [
+            (
+                "ALTER TABLE message RENAME TO message_old;
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER)",
+                "message",
+            ),
+            (
+                "ALTER TABLE part RENAME TO part_old;
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT)",
+                "part",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = modern_fixture(&path);
+            connection
+                .execute_batch(
+                    "CREATE TABLE session_message (
+                        id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                        seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                        time_updated INTEGER NOT NULL, data TEXT NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection.execute_batch(mutation).unwrap();
+            drop(connection);
+
+            let error =
+                scan_database(&path, None).expect_err("incomplete schema must fail planning");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    fn insert_projected_row(connection: &Connection, id: &str, session_id: &str, kind: &str) {
+        connection
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                 SELECT ?1, ?2, ?3, COALESCE(MAX(seq), 0) + 1, 200, 200, '{}'
+                 FROM session_message WHERE session_id = ?2",
+                params![id, session_id, kind],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stored_event_types_match_content_kinds_without_version_suffix() {
+        for (stored, expected) in [
+            ("session.next.prompted.1", true),
+            ("session.next.prompted", true),
+            ("session.next.step.ended.1", true),
+            ("session.next.step.ended.2", true),
+            ("session.next.tool.input.started.1", true),
+            ("session.next.revert.committed.1", true),
+            ("session.next.model.switched.1", false),
+            ("session.next.agent.switched.1", false),
+            ("session.next.moved.1", false),
+            ("session.next.revert.staged.1", false),
+            ("session.next.revert.cleared.1", false),
+            ("session.next.text.delta.1", false),
+            ("session.next.tool.input.delta.1", false),
+            ("session.next.future.kind.1", false),
+            ("session.next.prompted.x", false),
+            ("message.updated.1", false),
+        ] {
+            assert_eq!(is_v2_content_event(stored), expected, "{stored}");
+        }
+    }
+
+    #[test]
+    fn metadata_only_v2_evidence_keeps_v1_history() {
+        // OpenCode 1.17's v1 prompt path recorded agent and model switches as v2 events and
+        // projected rows while the conversation itself stayed in v1.
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "switch rows and events",
+                &["model-switched", "agent-switched"],
+                &[
+                    "session.next.model.switched.1",
+                    "session.next.agent.switched.1",
+                ],
+            ),
+            ("switch row only", &["model-switched"], &[]),
+            ("switch event only", &[], &["session.next.agent.switched.1"]),
+            ("moved", &[], &["session.next.moved.1"]),
+            (
+                "staged and cleared revert",
+                &[],
+                &[
+                    "session.next.revert.staged.1",
+                    "session.next.revert.cleared.1",
+                ],
+            ),
+            (
+                "deltas and unknown kinds",
+                &[],
+                &["session.next.text.delta.1", "session.next.future.kind.1"],
+            ),
+        ];
+        for (name, rows, events) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = shared_fixture(&path);
+            insert_v1_assistant(&connection, "msg_1", "s_v1", "v1 history");
+            insert_event(&connection, "evt_v1", "s_v1", "message.updated.1");
+            for (index, kind) in rows.iter().enumerate() {
+                insert_projected_row(&connection, &format!("sm_{index}"), "s_v1", kind);
+            }
+            for (index, kind) in events.iter().enumerate() {
+                insert_event(&connection, &format!("evt_{index}"), "s_v1", kind);
+            }
+            drop(connection);
+
+            let scan = scan_database(&path, None).unwrap();
+            assert!(scan.v2_session_ids.is_empty(), "{name}");
+            assert_eq!(texts(&path, "s_v1"), vec!["v1 history"], "{name}");
+            assert_eq!(parse_usage_database(&path).unwrap().len(), 1, "{name}");
+            let steady = scan_database(&path, Some(&state_from_scan(&scan))).unwrap();
+            assert!(steady.dirty_session_ids.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn each_content_kind_is_v2_evidence() {
+        let rows = V2_CONTENT_ROW_TYPES.iter().map(|kind| (Some(*kind), None));
+        let events = V2_CONTENT_EVENTS
+            .iter()
+            .flat_map(|kind| {
+                [
+                    format!("session.next.{kind}.1"),
+                    format!("session.next.{kind}.2"),
+                ]
+            })
+            .map(|kind| (None, Some(kind)));
+        for (row, event) in rows.chain(events) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = shared_fixture(&path);
+            insert_v1_assistant(&connection, "msg_stale", "s_v1", "stale v1 history");
+            if let Some(kind) = row {
+                insert_projected_row(&connection, "sm_1", "s_v1", kind);
+            }
+            if let Some(kind) = &event {
+                insert_event(&connection, "evt_1", "s_v1", kind);
+            }
+            drop(connection);
+
+            let scan = scan_database(&path, None).unwrap();
+            assert_eq!(
+                scan.v2_session_ids,
+                HashSet::from(["s_v1".to_string()]),
+                "{row:?} {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unindexed_v2_content_still_owns_the_session() {
+        // memex skips shell output, but it is v2 history, so stale v1 rows must stay hidden.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_stale", "s_v1", "stale v1 history");
+        insert_projected_row(&connection, "sm_shell", "s_v1", "shell");
+        insert_event(
+            &connection,
+            "evt_shell",
+            "s_v1",
+            "session.next.shell.ended.1",
+        );
+        drop(connection);
+
+        assert!(
+            scan_database(&path, None)
+                .unwrap()
+                .v2_session_ids
+                .contains("s_v1")
+        );
+        assert!(texts(&path, "s_v1").is_empty());
+        assert!(parse_usage_database(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_with_wrong_generation_rehydrates_without_database_changes() {
+        // State written by an earlier rule that counted switch metadata as v2 ownership.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_1", "s_v1", "v1 history");
+        insert_projected_row(&connection, "sm_switch", "s_v1", "model-switched");
+        insert_event(
+            &connection,
+            "evt_switch",
+            "s_v1",
+            "session.next.model.switched.1",
+        );
+        drop(connection);
+
+        let scan = scan_database(&path, None).unwrap();
+        let mut previous = state_from_scan(&scan);
+        previous.v2_session_ids.insert("s_v1".to_string());
+        let repaired = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(repaired.dirty_session_ids, vec!["s_v1"]);
+        assert!(repaired.v2_session_ids.is_empty());
     }
 }

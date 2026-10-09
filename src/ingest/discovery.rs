@@ -1336,6 +1336,12 @@ pub(super) fn discover_opencode(
                     parser_version: crate::sources::opencode::DATABASE_STATE_VERSION,
                     event_rowid: database.scan.cursor.event_rowid,
                     event_id: database.scan.cursor.event_id.clone(),
+                    v2_session_ids: database
+                        .scan
+                        .v2_session_ids
+                        .intersection(&owned_session_ids)
+                        .cloned()
+                        .collect(),
                     owned_session_ids,
                     session_cursors: database.scan.session_cursors.clone(),
                 },

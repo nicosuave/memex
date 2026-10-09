@@ -238,6 +238,9 @@ pub struct OpencodeDatabaseState {
     pub owned_session_ids: HashSet<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub session_cursors: HashMap<String, OpencodeSessionCursor>,
+    /// Sessions hydrated from the v2 projection, so a generation change forces rehydration.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub v2_session_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +532,7 @@ mod tests {
             event_rowid: 12,
             event_id: Some("event".to_string()),
             owned_session_ids: HashSet::from(["session".to_string()]),
+            v2_session_ids: HashSet::from(["session".to_string()]),
             session_cursors: HashMap::from([(
                 "session".to_string(),
                 OpencodeSessionCursor {
