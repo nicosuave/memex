@@ -1133,9 +1133,9 @@ pub(super) fn prehydrate_opencode_database(
             Ok(())
         };
         for session_id in session_ids {
-            // Per-session dispatch: v2 sessions hydrate from `session_message` (plus the v1
-            // union), everything else from the v1 projection.  The connection and schema are
-            // shared for the whole database.
+            // Per-session dispatch: v2 sessions hydrate only from `session_message`, everything
+            // else from the v1 projection.  The connection and schema are shared for the whole
+            // database.
             let output = if scan.v2_session_ids.contains(session_id) {
                 crate::sources::opencode::parse_session_records_v2(
                     &connection,

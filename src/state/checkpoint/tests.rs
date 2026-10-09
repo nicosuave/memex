@@ -50,6 +50,7 @@ fn database() -> OpencodeDatabaseState {
         event_rowid: i64::MIN,
         event_id: Some("event".into()),
         owned_session_ids: HashSet::from(["session".into()]),
+        v2_session_ids: HashSet::from(["session".into()]),
         session_cursors: HashMap::from([(
             "session".into(),
             OpencodeSessionCursor {
