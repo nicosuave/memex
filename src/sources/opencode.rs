@@ -282,13 +282,71 @@ impl V2Ownership {
     }
 }
 
+/// `session_message` types that carry conversation content. The `agent-switched` and
+/// `model-switched` metadata rows are left out: OpenCode's v1 prompt path also emitted them, so
+/// they appear in sessions whose history never left v1.
+const V2_CONTENT_ROW_TYPES: &[&str] = &[
+    "user",
+    "system",
+    "assistant",
+    "synthetic",
+    "shell",
+    "compaction",
+];
+
+/// Durable `session.next.*` events, without their version suffix, that write or change
+/// conversation content. Switches, `moved`, staged or cleared reverts, streaming deltas and
+/// unknown kinds only touch metadata or cannot be told apart from it, so they are not evidence.
+const V2_CONTENT_EVENTS: &[&str] = &[
+    "prompted",
+    "prompt.admitted",
+    "context.updated",
+    "synthetic",
+    "shell.started",
+    "shell.ended",
+    "step.started",
+    "step.ended",
+    "step.failed",
+    "text.started",
+    "text.ended",
+    "reasoning.started",
+    "reasoning.ended",
+    "tool.input.started",
+    "tool.input.ended",
+    "tool.called",
+    "tool.progress",
+    "tool.success",
+    "tool.failed",
+    "retried",
+    "compaction.started",
+    "compaction.ended",
+    "revert.committed",
+];
+
+/// Whether a stored event type such as `session.next.prompted.1` is v2 content evidence.
+fn is_v2_content_event(stored: &str) -> bool {
+    let Some(kind) = stored.strip_prefix("session.next.") else {
+        return false;
+    };
+    let base = match kind.rsplit_once('.') {
+        Some((base, version))
+            if !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => kind,
+    };
+    V2_CONTENT_EVENTS.contains(&base)
+}
+
 /// Classify the database's sessions by storage generation.
 ///
 /// OpenCode keeps writing v1 `message`/`part` rows next to the v2 projection, and its schema
 /// migrations create (and have cleared) the v2 tables without moving v1 history, so the
 /// projection's existence alone does not make any session v2. In the shared `session` layout a
-/// session is v2 only on positive evidence: projected messages, or durable `session.next.*`
-/// events, which outlive reverts and deletions of projected rows. A separate `session_v2`
+/// session is v2 only on positive content evidence: projected content rows, or durable content
+/// events, which outlive reverts and deletions of projected rows. Metadata such as agent and
+/// model switches is not evidence, because v1 sessions record it too. A separate `session_v2`
 /// inventory, or a database without v1 message tables, stays wholly v2.
 ///
 /// Nothing durable records ownership once both kinds of evidence are gone (OpenCode's
@@ -304,17 +362,34 @@ fn v2_ownership(connection: &Connection, path: &Path) -> Result<V2Ownership> {
     {
         return Ok(V2Ownership::All);
     }
+    let row_types = V2_CONTENT_ROW_TYPES
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut ids = query_ids(
         connection,
         path,
-        "SELECT DISTINCT session_id FROM session_message",
+        &format!("SELECT DISTINCT session_id FROM session_message WHERE type IN ({row_types})"),
     )?;
     if table_has_column(connection, path, "event", "type")? {
-        ids.extend(query_ids(
-            connection,
-            path,
-            "SELECT DISTINCT aggregate_id FROM event WHERE type LIKE 'session.next.%'",
-        )?);
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT aggregate_id, type FROM event
+                 WHERE type LIKE 'session.next.%'",
+            )
+            .with_context(|| format!("prepare OpenCode event evidence for {}", path.display()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .with_context(|| format!("query OpenCode event evidence in {}", path.display()))?;
+        for row in rows {
+            let (session_id, kind) = row?;
+            if is_v2_content_event(&kind) {
+                ids.insert(session_id);
+            }
+        }
     }
     Ok(V2Ownership::Sessions(ids))
 }
@@ -4557,5 +4632,177 @@ mod tests {
                 scan_database(&path, None).expect_err("incomplete schema must fail planning");
             assert!(error.to_string().contains(expected));
         }
+    }
+
+    fn insert_projected_row(connection: &Connection, id: &str, session_id: &str, kind: &str) {
+        connection
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                 SELECT ?1, ?2, ?3, COALESCE(MAX(seq), 0) + 1, 200, 200, '{}'
+                 FROM session_message WHERE session_id = ?2",
+                params![id, session_id, kind],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stored_event_types_match_content_kinds_without_version_suffix() {
+        for (stored, expected) in [
+            ("session.next.prompted.1", true),
+            ("session.next.prompted", true),
+            ("session.next.step.ended.1", true),
+            ("session.next.step.ended.2", true),
+            ("session.next.tool.input.started.1", true),
+            ("session.next.revert.committed.1", true),
+            ("session.next.model.switched.1", false),
+            ("session.next.agent.switched.1", false),
+            ("session.next.moved.1", false),
+            ("session.next.revert.staged.1", false),
+            ("session.next.revert.cleared.1", false),
+            ("session.next.text.delta.1", false),
+            ("session.next.tool.input.delta.1", false),
+            ("session.next.future.kind.1", false),
+            ("session.next.prompted.x", false),
+            ("message.updated.1", false),
+        ] {
+            assert_eq!(is_v2_content_event(stored), expected, "{stored}");
+        }
+    }
+
+    #[test]
+    fn metadata_only_v2_evidence_keeps_v1_history() {
+        // OpenCode 1.17's v1 prompt path recorded agent and model switches as v2 events and
+        // projected rows while the conversation itself stayed in v1.
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "switch rows and events",
+                &["model-switched", "agent-switched"],
+                &[
+                    "session.next.model.switched.1",
+                    "session.next.agent.switched.1",
+                ],
+            ),
+            ("switch row only", &["model-switched"], &[]),
+            ("switch event only", &[], &["session.next.agent.switched.1"]),
+            ("moved", &[], &["session.next.moved.1"]),
+            (
+                "staged and cleared revert",
+                &[],
+                &[
+                    "session.next.revert.staged.1",
+                    "session.next.revert.cleared.1",
+                ],
+            ),
+            (
+                "deltas and unknown kinds",
+                &[],
+                &["session.next.text.delta.1", "session.next.future.kind.1"],
+            ),
+        ];
+        for (name, rows, events) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = shared_fixture(&path);
+            insert_v1_assistant(&connection, "msg_1", "s_v1", "v1 history");
+            insert_event(&connection, "evt_v1", "s_v1", "message.updated.1");
+            for (index, kind) in rows.iter().enumerate() {
+                insert_projected_row(&connection, &format!("sm_{index}"), "s_v1", kind);
+            }
+            for (index, kind) in events.iter().enumerate() {
+                insert_event(&connection, &format!("evt_{index}"), "s_v1", kind);
+            }
+            drop(connection);
+
+            let scan = scan_database(&path, None).unwrap();
+            assert!(scan.v2_session_ids.is_empty(), "{name}");
+            assert_eq!(texts(&path, "s_v1"), vec!["v1 history"], "{name}");
+            assert_eq!(parse_usage_database(&path).unwrap().len(), 1, "{name}");
+            let steady = scan_database(&path, Some(&state_from_scan(&scan))).unwrap();
+            assert!(steady.dirty_session_ids.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn each_content_kind_is_v2_evidence() {
+        let rows = V2_CONTENT_ROW_TYPES.iter().map(|kind| (Some(*kind), None));
+        let events = V2_CONTENT_EVENTS
+            .iter()
+            .flat_map(|kind| {
+                [
+                    format!("session.next.{kind}.1"),
+                    format!("session.next.{kind}.2"),
+                ]
+            })
+            .map(|kind| (None, Some(kind)));
+        for (row, event) in rows.chain(events) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = shared_fixture(&path);
+            insert_v1_assistant(&connection, "msg_stale", "s_v1", "stale v1 history");
+            if let Some(kind) = row {
+                insert_projected_row(&connection, "sm_1", "s_v1", kind);
+            }
+            if let Some(kind) = &event {
+                insert_event(&connection, "evt_1", "s_v1", kind);
+            }
+            drop(connection);
+
+            let scan = scan_database(&path, None).unwrap();
+            assert_eq!(
+                scan.v2_session_ids,
+                HashSet::from(["s_v1".to_string()]),
+                "{row:?} {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unindexed_v2_content_still_owns_the_session() {
+        // memex skips shell output, but it is v2 history, so stale v1 rows must stay hidden.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_stale", "s_v1", "stale v1 history");
+        insert_projected_row(&connection, "sm_shell", "s_v1", "shell");
+        insert_event(
+            &connection,
+            "evt_shell",
+            "s_v1",
+            "session.next.shell.ended.1",
+        );
+        drop(connection);
+
+        assert!(
+            scan_database(&path, None)
+                .unwrap()
+                .v2_session_ids
+                .contains("s_v1")
+        );
+        assert!(texts(&path, "s_v1").is_empty());
+        assert!(parse_usage_database(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_with_wrong_generation_rehydrates_without_database_changes() {
+        // State written by an earlier rule that counted switch metadata as v2 ownership.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = shared_fixture(&path);
+        insert_v1_assistant(&connection, "msg_1", "s_v1", "v1 history");
+        insert_projected_row(&connection, "sm_switch", "s_v1", "model-switched");
+        insert_event(
+            &connection,
+            "evt_switch",
+            "s_v1",
+            "session.next.model.switched.1",
+        );
+        drop(connection);
+
+        let scan = scan_database(&path, None).unwrap();
+        let mut previous = state_from_scan(&scan);
+        previous.v2_session_ids.insert("s_v1".to_string());
+        let repaired = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(repaired.dirty_session_ids, vec!["s_v1"]);
+        assert!(repaired.v2_session_ids.is_empty());
     }
 }
