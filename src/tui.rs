@@ -5798,6 +5798,38 @@ pub(crate) fn evaluate_search(
     Ok(crate::retrieval_eval::EvaluationResults { hits, snippets })
 }
 
+/// The federated search for a TUI query.
+///
+/// Reranking is disabled: the TUI searches as the user types, and a model load or the
+/// one-shot notice on stderr would disrupt the terminal UI.
+fn federated_search_spec(request: &SearchRequest, project: Option<&str>) -> SearchSpec {
+    let tantivy_project = if request.grouping == ProjectGrouping::Flat {
+        project.map(str::to_string)
+    } else {
+        None
+    };
+    SearchSpec {
+        query: request.query.clone(),
+        project: tantivy_project,
+        role: None,
+        tool: None,
+        session_id: None,
+        session_scope: None,
+        cwd: None,
+        source: request.source.as_filter(),
+        since: request.since,
+        until: None,
+        limit: RESULT_LIMIT * 5,
+        mode: SearchMode::Lexical,
+        recency_weight: 1.0,
+        recency_half_life_days: 30.0,
+        min_score: None,
+        project_grouping: Some(request.grouping),
+        text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+        rerank: Some(false),
+    }
+}
+
 fn run_search_request(
     paths: &Paths,
     config: &UserConfig,
@@ -5816,34 +5848,11 @@ fn run_search_request(
                 false,
             )?
         } else {
-            let tantivy_project = if request.grouping == ProjectGrouping::Flat {
-                project.map(str::to_string)
-            } else {
-                None
-            };
             federated_search(
                 paths,
                 config,
                 &request.machines,
-                &SearchSpec {
-                    query: request.query.clone(),
-                    project: tantivy_project,
-                    role: None,
-                    tool: None,
-                    session_id: None,
-                    session_scope: None,
-                    cwd: None,
-                    source: request.source.as_filter(),
-                    since: request.since,
-                    until: None,
-                    limit: RESULT_LIMIT * 5,
-                    mode: SearchMode::Lexical,
-                    recency_weight: 1.0,
-                    recency_half_life_days: 30.0,
-                    min_score: None,
-                    project_grouping: Some(request.grouping),
-                    text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
-                },
+                &federated_search_spec(&request, project),
                 false,
             )?
         };
@@ -7354,6 +7363,33 @@ mod tests {
             },
         );
         (tmp, app)
+    }
+
+    #[test]
+    fn federated_searches_never_rerank() {
+        let request = SearchRequest {
+            request_id: 1,
+            query: "needle".to_string(),
+            project: "memex".to_string(),
+            machines: vec!["local".to_string()],
+            source: SourceChoice::All,
+            since: None,
+            grouping: ProjectGrouping::Flat,
+            kind: crate::analytics::SessionKindFilter::All,
+        };
+        let spec = federated_search_spec(&request, Some("memex"));
+        assert_eq!(spec.rerank, Some(false));
+        assert_eq!(spec.project.as_deref(), Some("memex"));
+        // Reranking is configured, but the explicit opt-out wins in every process and mode.
+        for mode in [
+            crate::config::RerankMode::Local,
+            crate::config::RerankMode::Remote,
+        ] {
+            assert_eq!(
+                crate::rerank::decide(mode, spec.rerank, true, &spec.query),
+                crate::rerank::RerankDecision::Skip
+            );
+        }
     }
 
     #[test]
