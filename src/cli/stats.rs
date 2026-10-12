@@ -29,6 +29,12 @@ struct StatsReport {
     embedding_batch_size: usize,
     execution_provider: String,
     compute_units: Option<String>,
+    rerank: &'static str,
+    rerank_model: Option<String>,
+    rerank_candidates: Option<usize>,
+    rerank_doc_chars: Option<usize>,
+    /// Why the reranking settings are invalid; the rest of the report still renders.
+    rerank_error: Option<String>,
     sources: Vec<String>,
 }
 
@@ -77,6 +83,10 @@ fn build_report(paths: &Paths) -> Result<StatsReport> {
     let memory = MemoryStore::new(paths.root.join("memory/documents.json")).load()?;
     let runtime = config.resolve_embed_runtime()?;
     let scan_cache_ttl_seconds = config.scan_cache_ttl();
+    let (rerank, rerank_error) = match config.resolve_rerank() {
+        Ok(rerank) => (rerank, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     Ok(StatsReport {
         index: paths.index.display().to_string(),
         documents: index.doc_count()?,
@@ -105,6 +115,13 @@ fn build_report(paths: &Paths) -> Result<StatsReport> {
         embedding_batch_size: runtime.batch_size(),
         execution_provider: runtime.execution_provider.as_str().to_string(),
         compute_units: runtime.compute_units,
+        rerank: config.rerank_mode().as_str(),
+        rerank_model: rerank
+            .as_ref()
+            .map(|rerank| crate::rerank::model_name(&rerank.model).to_string()),
+        rerank_candidates: rerank.as_ref().map(|rerank| rerank.candidates),
+        rerank_doc_chars: rerank.as_ref().map(|rerank| rerank.doc_chars),
+        rerank_error,
         // IndexSource owns the providers with local transcript discovery; usage-only
         // providers must not be presented as supported transcript sources.
         sources: IndexSource::value_variants()
@@ -163,6 +180,20 @@ fn print_report(report: &StatsReport, out: &mut impl Write) -> Result<()> {
         if let Some(compute_units) = &report.compute_units {
             writeln!(out, "  compute-units: {compute_units}")?;
         }
+    }
+    writeln!(out, "\nreranking:")?;
+    writeln!(out, "  mode: {}", report.rerank)?;
+    if let Some(model) = &report.rerank_model {
+        writeln!(out, "  model: {model}")?;
+    }
+    if let Some(candidates) = report.rerank_candidates {
+        writeln!(out, "  candidates: {candidates}")?;
+    }
+    if let Some(doc_chars) = report.rerank_doc_chars {
+        writeln!(out, "  doc-chars: {doc_chars}")?;
+    }
+    if let Some(error) = &report.rerank_error {
+        writeln!(out, "  error: {error}")?;
     }
     writeln!(out, "\nsources:")?;
     for source in &report.sources {
@@ -250,6 +281,66 @@ mod tests {
         assert_eq!(json["doc_ids"], 1);
         assert!(json["index_bytes"].as_u64().unwrap() > 0);
         assert!(json["ids_bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn reranking_settings_are_reported_in_text_and_json() {
+        let _guard = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let report = build_report(&paths).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["rerank"], "off");
+        assert!(json["rerank_model"].is_null());
+        let mut text = Vec::new();
+        print_report(&report, &mut text).unwrap();
+        assert!(
+            String::from_utf8(text)
+                .unwrap()
+                .contains("\nreranking:\n  mode: off\n\nsources:")
+        );
+
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "rerank = true\nrerank_model = \"JINARerankerV2BaseMultiligual\"\nrerank_candidates = 12\n",
+        )
+        .unwrap();
+        let report = build_report(&paths).unwrap();
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["rerank"], "local");
+        assert_eq!(json["rerank_model"], "jina-v2");
+        assert_eq!(json["rerank_candidates"], 12);
+        assert_eq!(json["rerank_doc_chars"], 1500);
+        let mut text = Vec::new();
+        print_report(&report, &mut text).unwrap();
+        assert!(String::from_utf8(text).unwrap().contains(
+            "\nreranking:\n  mode: local\n  model: jina-v2\n  candidates: 12\n  doc-chars: 1500\n"
+        ));
+        assert!(json["rerank_error"].is_null());
+
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "rerank = true\nrerank_model = \"jina-turbo\"\nrerank_candidates = 500\n",
+        )
+        .unwrap();
+        let report = build_report(&paths).expect("misconfigured reranking still reports");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["rerank"], "local");
+        assert!(json["rerank_model"].is_null());
+        let error = json["rerank_error"].as_str().unwrap();
+        assert!(
+            error.starts_with("rerank_candidates must be between 5 and 100"),
+            "{error}"
+        );
+        let mut text = Vec::new();
+        print_report(&report, &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(
+            text.contains("\nreranking:\n  mode: local\n  error: rerank_candidates must be"),
+            "{text}"
+        );
+        assert!(text.contains("\nsources:"), "{text}");
     }
 
     #[test]

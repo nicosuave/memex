@@ -75,6 +75,10 @@ pub struct SearchSpec {
     /// starts at the first query term when that lies beyond the cap.
     #[serde(default)]
     pub text_limit: Option<usize>,
+    /// Per-search reranking override: `Some(false)` disables it and `Some(true)` loads the
+    /// model even in a one-shot process. Each machine reranks with its own configuration.
+    #[serde(default)]
+    pub rerank: Option<bool>,
 }
 
 impl SearchSpec {
@@ -2691,12 +2695,88 @@ fn search_local(
     spec: &SearchSpec,
     auto_index: bool,
 ) -> Result<Vec<(f32, Record)>> {
+    let settings = local_rerank_settings(
+        config,
+        spec,
+        crate::rerank::background_loading_enabled(),
+        &mut crate::rerank::warn_failure,
+        &mut crate::rerank::notify_one_shot_skip,
+    );
+    let mut score = |query: &str, documents: &[String]| match &settings {
+        Some(settings) => {
+            crate::rerank::rerank_local(settings, spec.rerank == Some(true), query, documents)
+        }
+        None => Err(anyhow!("reranking is not configured")),
+    };
+    let rerank = settings.as_ref().map(|settings| SearchRerank {
+        candidates: settings.candidates,
+        doc_chars: settings.doc_chars,
+        score: &mut score,
+    });
+    search_local_with(paths, config, spec, auto_index, rerank)
+}
+
+/// Reranking settings for one local search, or `None` when it does not rerank.
+///
+/// Invalid reranking configuration goes to `warn` and the search continues without
+/// reranking; a one-shot process that skips configured reranking calls `notify_one_shot`.
+fn local_rerank_settings(
+    config: &UserConfig,
+    spec: &SearchSpec,
+    background: bool,
+    warn: &mut dyn FnMut(&anyhow::Error),
+    notify_one_shot: &mut dyn FnMut(),
+) -> Option<crate::rerank::RerankSettings> {
+    use crate::rerank::RerankDecision;
+    let configured = config.rerank_mode() == crate::config::RerankMode::Local;
+    match crate::rerank::decide(configured, spec.rerank, background, &spec.query) {
+        RerankDecision::Skip => None,
+        RerankDecision::SkipOneShot => {
+            notify_one_shot();
+            None
+        }
+        RerankDecision::Run => match config.resolve_rerank() {
+            Ok(settings) => settings,
+            Err(error) => {
+                warn(&error);
+                None
+            }
+        },
+    }
+}
+
+/// One score per document in input order, or `None` to skip reranking this search.
+type RerankScorer<'a> = dyn FnMut(&str, &[String]) -> Result<Option<Vec<f32>>> + 'a;
+
+/// Cross-encoder rescoring of the leading results of one local search.
+struct SearchRerank<'a> {
+    /// Leading results rescored; retrieval fetches at least this many.
+    candidates: usize,
+    /// Characters of each result passed to `score`.
+    doc_chars: usize,
+    /// Scores the documents built from the leading results.
+    score: &'a mut RerankScorer<'a>,
+}
+
+fn search_local_with(
+    paths: &Paths,
+    config: &UserConfig,
+    spec: &SearchSpec,
+    auto_index: bool,
+    rerank: Option<SearchRerank<'_>>,
+) -> Result<Vec<(f32, Record)>> {
     crate::profiling::span!("search.local");
+    // A blank query gives the reranker nothing to compare against.
+    let mut rerank = rerank.filter(|_| !spec.query.trim().is_empty());
+    let retrieval_limit = rerank
+        .as_ref()
+        .map_or(spec.limit, |rerank| spec.limit.max(rerank.candidates));
     if auto_index {
         ensure_local_index(paths, config)?;
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
+    options.limit = retrieval_limit;
     if let Some(cwd) = spec.cwd.as_deref() {
         options.session_scope = Some(session_scope_for_cwd(paths, cwd)?);
     }
@@ -2705,19 +2785,19 @@ fn search_local(
         SearchMode::Lexical => index.search(&options)?,
         // A blank query has no meaning to embed.
         SearchMode::Semantic | SearchMode::Hybrid if spec.query.trim().is_empty() => {
-            return lexical_results(&index, &options, spec, now_ms);
+            return lexical_results(&index, &options, spec, now_ms, rerank.as_mut());
         }
         SearchMode::Semantic => {
             let vector = match VectorIndex::open(&paths.vectors) {
                 Ok(vector) => vector,
                 Err(err) if err.to_string() == "vector index not found" => {
-                    return lexical_results(&index, &options, spec, now_ms);
+                    return lexical_results(&index, &options, spec, now_ms, rerank.as_mut());
                 }
                 Err(err) => return Err(err),
             };
             let Some(model) = resolve_vector_query_model(&vector, || config.resolve_model(None))?
             else {
-                return lexical_results(&index, &options, spec, now_ms);
+                return lexical_results(&index, &options, spec, now_ms, rerank.as_mut());
             };
             let runtime = config.resolve_embed_runtime()?;
             let mut embedder =
@@ -2727,7 +2807,7 @@ fn search_local(
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("embedding missing"))?;
-            search_filtered_records(&vector, &index, &embedding, spec.limit, &options)?
+            search_filtered_records(&vector, &index, &embedding, retrieval_limit, &options)?
                 .into_iter()
                 .map(|(distance, record)| (1.0 / (1.0 + distance), record))
                 .collect()
@@ -2736,15 +2816,15 @@ fn search_local(
             let vector = match VectorIndex::open(&paths.vectors) {
                 Ok(vector) => vector,
                 Err(err) if err.to_string() == "vector index not found" => {
-                    return lexical_results(&index, &options, spec, now_ms);
+                    return lexical_results(&index, &options, spec, now_ms, rerank.as_mut());
                 }
                 Err(err) => return Err(err),
             };
             let Some(model) = resolve_vector_query_model(&vector, || config.resolve_model(None))?
             else {
-                return lexical_results(&index, &options, spec, now_ms);
+                return lexical_results(&index, &options, spec, now_ms, rerank.as_mut());
             };
-            let candidate_limit = (spec.limit * 5).clamp(50, 500);
+            let candidate_limit = (spec.limit * 5).clamp(50, 500).max(retrieval_limit);
             let lexical = index.search(&QueryOptions {
                 limit: candidate_limit,
                 ..options.clone()
@@ -2798,6 +2878,9 @@ fn search_local(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.1.ts.cmp(&left.1.ts))
     });
+    if let Some(rerank) = rerank.as_mut() {
+        apply_rerank(&mut results, spec, rerank, now_ms);
+    }
     results.truncate(spec.limit);
     apply_project_grouping(paths, &mut results, spec.project_grouping);
     Ok(results)
@@ -2825,6 +2908,7 @@ fn lexical_results(
     options: &QueryOptions,
     spec: &SearchSpec,
     now_ms: u64,
+    rerank: Option<&mut SearchRerank<'_>>,
 ) -> Result<Vec<(f32, Record)>> {
     let mut results = index.search(options)?;
     for (score, record) in &mut results {
@@ -2840,7 +2924,101 @@ fn lexical_results(
     if let Some(min_score) = spec.min_score {
         results.retain(|(score, _)| *score >= min_score);
     }
+    if let Some(rerank) = rerank {
+        apply_rerank(&mut results, spec, rerank, now_ms);
+    }
+    results.truncate(spec.limit);
     Ok(results)
+}
+
+/// Smallest score a reranked result keeps.
+const MIN_RERANK_SCORE: f32 = 1e-30;
+
+/// Rerank the leading results in place, keeping the original order when reranking fails.
+fn apply_rerank(
+    results: &mut Vec<(f32, Record)>,
+    spec: &SearchSpec,
+    rerank: &mut SearchRerank<'_>,
+    now_ms: u64,
+) {
+    crate::profiling::span!("search.rerank");
+    if let Err(error) = rerank_results(results, spec, rerank, now_ms) {
+        crate::rerank::warn_failure(&error);
+    }
+}
+
+/// Reorder the first `rerank.candidates` results by reranker score.
+///
+/// Leaves `results` unchanged when the scorer skips this search.
+/// The reranker score, with the recency boost when `spec.recency_weight` is positive and
+/// raised to at least [`MIN_RERANK_SCORE`], replaces the retrieval score; ties keep the
+/// retrieval order. Later results keep their
+/// order after the reranked ones. Every score is lowered below the score before it where
+/// needed, so a later sort by score, whatever its tie-breaker, preserves this order.
+/// `results` is unchanged on error.
+fn rerank_results(
+    results: &mut Vec<(f32, Record)>,
+    spec: &SearchSpec,
+    rerank: &mut SearchRerank<'_>,
+    now_ms: u64,
+) -> Result<()> {
+    let pool = rerank.candidates.min(results.len());
+    if pool == 0 {
+        return Ok(());
+    }
+    let terms = crate::rerank::window_terms(&spec.query);
+    let documents: Vec<String> = results
+        .iter()
+        .take(pool)
+        .map(|(_, record)| crate::rerank::document(record, &terms, rerank.doc_chars))
+        .collect();
+    let Some(scores) = (rerank.score)(&spec.query, &documents)? else {
+        return Ok(());
+    };
+    if scores.len() != pool {
+        bail!(
+            "reranker returned {} scores for {pool} documents",
+            scores.len()
+        );
+    }
+    if scores.iter().any(|score| !score.is_finite()) {
+        bail!("reranker returned a non-finite score");
+    }
+    let tail = results.split_off(pool);
+    let mut head: Vec<(f32, Record)> = std::mem::take(results)
+        .into_iter()
+        .zip(scores)
+        .map(|((_, record), score)| {
+            let score = if spec.recency_weight > 0.0 {
+                apply_recency(
+                    score,
+                    record.ts,
+                    now_ms,
+                    spec.recency_weight,
+                    spec.recency_half_life_days,
+                )
+            } else {
+                score
+            };
+            (score, record)
+        })
+        .collect();
+    for (score, _) in &mut head {
+        // Keeps saturated-zero scores and the steps below them positive.
+        *score = score.max(MIN_RERANK_SCORE);
+    }
+    // Stable, so equal scores keep the retrieval order.
+    head.sort_by(|left, right| right.0.total_cmp(&left.0));
+    let mut previous: Option<f32> = None;
+    for (score, record) in head.into_iter().chain(tail) {
+        let score = match previous {
+            Some(previous) if score >= previous => previous.next_down(),
+            _ => score,
+        };
+        previous = Some(score);
+        results.push((score, record));
+    }
+    Ok(())
 }
 
 fn recent_local(
@@ -2914,7 +3092,7 @@ fn chars_before_lowercase(field: &str, lower_byte: usize) -> usize {
 
 /// Keep `limit` characters of `field`: from the start, or from the first occurrence of a query
 /// term when every term lies beyond the first `limit` characters.
-fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
+pub(crate) fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
     if field.chars().count() <= limit {
         return;
     }
@@ -3865,6 +4043,7 @@ mod tests {
             min_score: None,
             project_grouping: None,
             text_limit: None,
+            rerank: None,
         }
     }
 
@@ -3970,6 +4149,562 @@ mod tests {
             };
             search_local(&paths, &config, &spec, false).expect("blank query uses lexical search");
         }
+    }
+
+    /// Scores each document by the record number at its end and keeps every call.
+    #[derive(Default)]
+    struct NumberScorer {
+        calls: Vec<Vec<String>>,
+        fixed: Option<f32>,
+        fail: Option<&'static str>,
+    }
+
+    impl crate::rerank::RerankBackend for NumberScorer {
+        fn rerank(&mut self, _query: &str, documents: &[String]) -> Result<Vec<f32>> {
+            self.calls.push(documents.to_vec());
+            if let Some(message) = self.fail {
+                bail!(message);
+            }
+            documents
+                .iter()
+                .map(|document| {
+                    let number = document
+                        .rsplit(' ')
+                        .next()
+                        .unwrap_or_default()
+                        .parse::<f32>()?;
+                    Ok(self.fixed.unwrap_or(number))
+                })
+                .collect()
+        }
+    }
+
+    fn rerank_search(
+        paths: &Paths,
+        config: &UserConfig,
+        spec: &SearchSpec,
+        candidates: usize,
+        backend: &mut dyn crate::rerank::RerankBackend,
+    ) -> Vec<(f32, Record)> {
+        let mut score =
+            |query: &str, documents: &[String]| backend.rerank(query, documents).map(Some);
+        search_local_with(
+            paths,
+            config,
+            spec,
+            false,
+            Some(SearchRerank {
+                candidates,
+                doc_chars: 1500,
+                score: &mut score,
+            }),
+        )
+        .expect("reranked search")
+    }
+
+    /// Records whose text ends in their id; shorter records rank higher lexically.
+    fn rerank_fixture(count: u64) -> (TempDir, Paths) {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let records: Vec<Record> = (1..=count)
+            .map(|id| Record {
+                text: format!("needle {}{id}", "padding ".repeat(id as usize)),
+                ts: now_ms - id * 86_400_000,
+                ..test_record(id, &format!("session-{id}"), "/tmp/rerank.jsonl", 0)
+            })
+            .collect();
+        write_test_index(&paths, &records);
+        (tmp, paths)
+    }
+
+    fn needle_spec(mode: SearchMode, limit: usize) -> SearchSpec {
+        SearchSpec {
+            query: "needle".to_string(),
+            limit,
+            ..search_spec(mode)
+        }
+    }
+
+    fn ids(results: &[(f32, Record)]) -> Vec<u64> {
+        results.iter().map(|(_, record)| record.doc_id).collect()
+    }
+
+    #[test]
+    fn rerank_reorders_the_pool_and_keeps_the_tail_order() {
+        let (_tmp, paths) = rerank_fixture(12);
+        let config = UserConfig::default();
+        let baseline = search_local_with(
+            &paths,
+            &config,
+            &needle_spec(SearchMode::Lexical, 12),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(baseline.len(), 12);
+
+        let mut scorer = NumberScorer::default();
+        let results = rerank_search(
+            &paths,
+            &config,
+            &needle_spec(SearchMode::Lexical, 8),
+            5,
+            &mut scorer,
+        );
+        let mut head = ids(&baseline[..5]);
+        head.sort_unstable_by(|left, right| right.cmp(left));
+        let mut expected = head.clone();
+        expected.extend(ids(&baseline[5..8]));
+        assert_eq!(ids(&results), expected);
+        for ((score, record), id) in results.iter().zip(&head) {
+            assert_eq!(*score, *id as f32, "doc {}", record.doc_id);
+        }
+        assert!(
+            results.windows(2).all(|pair| pair[0].0 > pair[1].0),
+            "scores must decrease: {results:?}"
+        );
+        assert_eq!(scorer.calls.len(), 1);
+        assert_eq!(scorer.calls[0].len(), 5);
+        assert!(scorer.calls[0][0].starts_with("needle "));
+    }
+
+    #[test]
+    fn rerank_widens_lexical_and_fallback_retrieval_to_the_pool() {
+        let (_tmp, paths) = rerank_fixture(12);
+        let config = UserConfig::default();
+        // Semantic search without a vector index falls back to lexical results.
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+        ] {
+            let mut scorer = NumberScorer::default();
+            let results = rerank_search(&paths, &config, &needle_spec(mode, 3), 10, &mut scorer);
+            assert_eq!(scorer.calls.len(), 1, "{mode:?}");
+            assert_eq!(scorer.calls[0].len(), 10, "{mode:?}");
+            assert_eq!(results.len(), 3, "{mode:?}");
+            // The best of all ten candidates wins, not the best of the first three.
+            assert_eq!(results[0].1.doc_id, 10, "{mode:?}");
+        }
+    }
+
+    /// Answers embedding requests with constant `width`-length vectors until 500 ms pass
+    /// without a request.
+    fn serve_constant_embeddings(width: usize) -> (String, std::thread::JoinHandle<()>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(500)) {
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let count = body["input"].as_array().map_or(0, Vec::len);
+                let data = (0..count)
+                    .map(|index| serde_json::json!({"index": index, "embedding": vec![0.5; width]}))
+                    .collect::<Vec<_>>();
+                let response =
+                    tiny_http::Response::from_string(serde_json::json!({"data": data}).to_string())
+                        .with_header(
+                            tiny_http::Header::from_bytes("Content-Type", "application/json")
+                                .unwrap(),
+                        );
+                request.respond(response).unwrap();
+            }
+        });
+        (format!("http://{address}/v1"), handle)
+    }
+
+    #[test]
+    fn rerank_widens_semantic_and_hybrid_retrieval_to_the_pool() {
+        let (_tmp, paths) = rerank_fixture(70);
+        let mut vector =
+            VectorIndex::open_or_create(&paths.vectors, 8, Some("remote:embed-small")).unwrap();
+        for id in 1..=70 {
+            vector.add(id, &[0.5; 8]).unwrap();
+        }
+        vector.save().unwrap();
+        let (base_url, server) = serve_constant_embeddings(8);
+        let config: UserConfig = toml::from_str(&format!(
+            r#"
+                embeddings = "remote"
+                model = "embed-small"
+                embedding_base_url = "{base_url}"
+                embedding_max_retries = 0
+            "#
+        ))
+        .unwrap();
+        // Hybrid already oversamples to 50; a larger pool must widen it further.
+        for (mode, candidates) in [(SearchMode::Semantic, 10), (SearchMode::Hybrid, 60)] {
+            let mut scorer = NumberScorer::default();
+            let results = rerank_search(
+                &paths,
+                &config,
+                &needle_spec(mode, 3),
+                candidates,
+                &mut scorer,
+            );
+            assert_eq!(scorer.calls.len(), 1, "{mode:?}");
+            assert_eq!(scorer.calls[0].len(), candidates, "{mode:?}");
+            assert_eq!(results.len(), 3, "{mode:?}");
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rerank_applies_min_score_to_retrieval_scores() {
+        let (_tmp, paths) = rerank_fixture(12);
+        let config = UserConfig::default();
+        let baseline = search_local_with(
+            &paths,
+            &config,
+            &needle_spec(SearchMode::Lexical, 12),
+            false,
+            None,
+        )
+        .unwrap();
+        let threshold = baseline[3].0;
+        let spec = SearchSpec {
+            min_score: Some(threshold),
+            ..needle_spec(SearchMode::Lexical, 12)
+        };
+        let kept = baseline
+            .iter()
+            .filter(|(score, _)| *score >= threshold)
+            .count();
+        assert!(kept < 12);
+        // Reranker scores far below the threshold do not drop anything.
+        let mut scorer = NumberScorer {
+            fixed: Some(0.0),
+            ..NumberScorer::default()
+        };
+        let results = rerank_search(&paths, &config, &spec, 30, &mut scorer);
+        assert_eq!(scorer.calls[0].len(), kept);
+        assert_eq!(results.len(), kept);
+        // Zero scores are raised to the floor and step down from it, staying positive.
+        assert_eq!(results[0].0, MIN_RERANK_SCORE);
+        assert!(
+            results
+                .iter()
+                .all(|(score, _)| *score > 0.0 && *score <= MIN_RERANK_SCORE)
+        );
+    }
+
+    fn rerank_with(
+        paths: &Paths,
+        spec: &SearchSpec,
+        mut score: impl FnMut(&str, &[String]) -> Result<Option<Vec<f32>>>,
+    ) -> Vec<(f32, Record)> {
+        search_local_with(
+            paths,
+            &UserConfig::default(),
+            spec,
+            false,
+            Some(SearchRerank {
+                candidates: 30,
+                doc_chars: 1500,
+                score: &mut score,
+            }),
+        )
+        .expect("reranked search")
+    }
+
+    fn document_id(document: &str) -> usize {
+        document.rsplit(' ').next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn rerank_applies_recency_only_with_a_positive_weight() {
+        let (_tmp, paths) = rerank_fixture(6);
+        let config = UserConfig::default();
+        let flat = needle_spec(SearchMode::Lexical, 6);
+        let baseline = search_local_with(&paths, &config, &flat, false, None).unwrap();
+        let mut scorer = NumberScorer {
+            fixed: Some(1.0),
+            ..NumberScorer::default()
+        };
+        let results = rerank_search(&paths, &config, &flat, 30, &mut scorer);
+        assert_eq!(
+            ids(&results),
+            ids(&baseline),
+            "ties keep the retrieval order"
+        );
+        assert_eq!(results[0].0, 1.0);
+        // Tied scores step down so the merge's timestamp tie-breaker keeps this order.
+        assert!(results.windows(2).all(|pair| pair[0].0 > pair[1].0));
+        assert!(results.iter().all(|(score, _)| *score > 0.9999));
+
+        // The reranker slightly prefers older records; lower ids are newer.
+        let prefer_older = |_: &str, documents: &[String]| {
+            Ok(Some(
+                documents
+                    .iter()
+                    .map(|document| 1.0 + document_id(document) as f32 / 1000.0)
+                    .collect(),
+            ))
+        };
+        assert_eq!(
+            ids(&rerank_with(&paths, &flat, prefer_older)),
+            vec![6, 5, 4, 3, 2, 1]
+        );
+        let boosted = SearchSpec {
+            recency_weight: 1.0,
+            ..flat
+        };
+        let results = rerank_with(&paths, &boosted, prefer_older);
+        assert_eq!(ids(&results), vec![1, 2, 3, 4, 5, 6]);
+        assert!(results.iter().all(|(score, _)| *score > 1.5));
+        assert!(results.windows(2).all(|pair| pair[0].0 > pair[1].0));
+    }
+
+    #[test]
+    fn recency_reorders_normalized_scores_unless_they_saturate_at_zero() {
+        // Lexical order is 1, 2, 3, 4 (shortest first); record 4 is the newest.
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let records: Vec<Record> = (1..=4u64)
+            .map(|id| Record {
+                text: format!("needle {}{id}", "padding ".repeat(id as usize)),
+                ts: now_ms - (5 - id) * 86_400_000,
+                ..test_record(id, &format!("session-{id}"), "/tmp/rerank.jsonl", 0)
+            })
+            .collect();
+        write_test_index(&paths, &records);
+        let flat = needle_spec(SearchMode::Lexical, 4);
+        let boosted = SearchSpec {
+            recency_weight: 1.0,
+            ..flat.clone()
+        };
+        let retrieval = vec![1, 2, 3, 4];
+        let newest_first = vec![4, 3, 2, 1];
+        for (case, logits, without_recency, with_recency) in [
+            // Normalized negative logits favoring older records.
+            (
+                "negative",
+                [-3.96, -3.97, -3.98, -3.99],
+                &retrieval,
+                &newest_first,
+            ),
+            (
+                "mixed sign",
+                [0.015, 0.005, -0.005, -0.015],
+                &retrieval,
+                &newest_first,
+            ),
+            // Probabilities near zero are still positive, so recency still applies.
+            (
+                "near zero",
+                [-30.0, -30.0, -30.0, -30.0],
+                &retrieval,
+                &newest_first,
+            ),
+            // Saturated at one: ties keep the retrieval order until recency breaks them.
+            (
+                "saturated one",
+                [40.0, 40.0, 40.0, 40.0],
+                &retrieval,
+                &newest_first,
+            ),
+            // Saturated at zero: recency cannot lift a zero score.
+            (
+                "saturated zero",
+                [-200.0, -200.0, -200.0, -200.0],
+                &retrieval,
+                &retrieval,
+            ),
+        ] {
+            let score = |_: &str, documents: &[String]| {
+                documents
+                    .iter()
+                    .map(|document| crate::rerank::sigmoid(logits[document_id(document) - 1]))
+                    .collect::<Result<Vec<_>>>()
+                    .map(Some)
+            };
+            let results = rerank_with(&paths, &flat, score);
+            assert_eq!(&ids(&results), without_recency, "{case}");
+            for results in [results, rerank_with(&paths, &boosted, score)] {
+                assert!(
+                    results
+                        .iter()
+                        .all(|(score, _)| *score > 0.0 && *score <= 2.0),
+                    "{case}: {results:?}"
+                );
+                assert!(
+                    results.windows(2).all(|pair| pair[0].0 > pair[1].0),
+                    "{case}: {results:?}"
+                );
+            }
+            assert!(
+                rerank_with(&paths, &flat, score)
+                    .iter()
+                    .all(|(score, _)| *score <= 1.0),
+                "{case}"
+            );
+            assert_eq!(
+                &ids(&rerank_with(&paths, &boosted, score)),
+                with_recency,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_skips_blank_queries_and_keeps_order_on_failure_or_skip() {
+        let (_tmp, paths) = rerank_fixture(8);
+        let config = UserConfig::default();
+        let blank = SearchSpec {
+            query: " \t".to_string(),
+            ..needle_spec(SearchMode::Hybrid, 3)
+        };
+        let mut scorer = NumberScorer::default();
+        let results = rerank_search(&paths, &config, &blank, 10, &mut scorer);
+        assert!(scorer.calls.is_empty());
+        assert!(results.len() <= 3);
+
+        let spec = needle_spec(SearchMode::Lexical, 4);
+        let baseline = search_local_with(&paths, &config, &spec, false, None).unwrap();
+        let expected: Vec<_> = baseline
+            .iter()
+            .map(|(score, record)| (*score, record.doc_id))
+            .collect();
+        let mut failing = NumberScorer {
+            fail: Some("machine test rerank failure"),
+            ..NumberScorer::default()
+        };
+        let mut wrong_count = |_: &str, _: &[String]| Ok(Some(vec![1.0]));
+        let mut not_finite =
+            |_: &str, documents: &[String]| Ok(Some(vec![f32::NAN; documents.len()]));
+        let mut skipped = |_: &str, _: &[String]| Ok(None);
+        let mut failing_score = |query: &str, documents: &[String]| {
+            crate::rerank::RerankBackend::rerank(&mut failing, query, documents).map(Some)
+        };
+        let scorers: [&mut RerankScorer<'_>; 4] = [
+            &mut failing_score,
+            &mut wrong_count,
+            &mut not_finite,
+            &mut skipped,
+        ];
+        for score in scorers {
+            let results = search_local_with(
+                &paths,
+                &config,
+                &spec,
+                false,
+                Some(SearchRerank {
+                    candidates: 10,
+                    doc_chars: 1500,
+                    score,
+                }),
+            )
+            .expect("a reranking failure never fails the search");
+            let actual: Vec<_> = results
+                .iter()
+                .map(|(score, record)| (*score, record.doc_id))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn search_reranking_decision_warns_on_invalid_config_and_notifies_one_shot_skips() {
+        let _guard = crate::test_support::env_lock();
+        let _env = crate::test_support::EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+        let invalid: UserConfig = toml::from_str("rerank = \"local\"").unwrap();
+        let valid: UserConfig =
+            toml::from_str("rerank = \"local\"\nrerank_model = \"jina-turbo\"").unwrap();
+        let spec = needle_spec(SearchMode::Lexical, 3);
+        let mut warnings = Vec::new();
+        let mut notices = 0;
+        let mut decide = |config: &UserConfig, requested: Option<bool>, background: bool| {
+            local_rerank_settings(
+                config,
+                &SearchSpec {
+                    rerank: requested,
+                    ..spec.clone()
+                },
+                background,
+                &mut |error| warnings.push(error.to_string()),
+                &mut || notices += 1,
+            )
+        };
+        assert_eq!(decide(&invalid, Some(true), false), None);
+        assert_eq!(decide(&invalid, None, false), None);
+        assert_eq!(decide(&valid, None, false), None);
+        assert_eq!(decide(&valid, Some(false), true), None);
+        let settings = decide(&valid, None, true).expect("background process reranks");
+        assert_eq!(settings.candidates, 30);
+        assert!(decide(&valid, Some(true), false).is_some());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("requires rerank_model"),
+            "{}",
+            warnings[0]
+        );
+        assert_eq!(notices, 2);
+
+        // The search itself still runs with the invalid configuration.
+        let (_tmp, paths) = rerank_fixture(3);
+        let results = search_local(
+            &paths,
+            &invalid,
+            &SearchSpec {
+                rerank: Some(true),
+                ..spec
+            },
+            false,
+        )
+        .expect("search without reranking");
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn search_spec_without_rerank_still_deserializes() {
+        let mut value = serde_json::to_value(search_spec(SearchMode::Hybrid)).unwrap();
+        value.as_object_mut().unwrap().remove("rerank");
+        let spec: SearchSpec = serde_json::from_value(value).expect("older peer spec");
+        assert_eq!(spec.rerank, None);
+        assert_eq!(spec.mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    fn rerank_documents_center_on_query_terms() {
+        let mut long = test_record(1, "session", "/tmp/rerank.jsonl", 0);
+        long.text = format!(
+            "{} deep needle evidence {}",
+            "lead ".repeat(2000),
+            "tail ".repeat(500)
+        );
+        let terms = crate::cli::query_literals("needle");
+        let document = crate::rerank::document(&long, &terms, 200);
+        assert!(document.contains("deep needle evidence"), "{document}");
+        assert!(
+            document.starts_with('…') && document.ends_with('…'),
+            "{document}"
+        );
+        assert!(document.chars().count() <= 200);
+        // Without a match the window keeps the head.
+        let head = crate::rerank::document(&long, &crate::cli::query_literals("absent"), 200);
+        assert!(head.starts_with("lead lead"), "{head}");
+        assert!(head.chars().count() <= 200);
+
+        let mut tool = test_record(2, "session", "/tmp/rerank.jsonl", 0);
+        tool.text = String::new();
+        tool.tool_name = Some("Bash".to_string());
+        tool.tool_input = Some(format!("{} needle_cmd {}", "é".repeat(500), "x".repeat(50)));
+        tool.tool_output = Some(format!("{} needle found", "ö".repeat(5000)));
+        let terms = crate::cli::query_literals("needle");
+        let document = crate::rerank::document(&tool, &terms, 300);
+        assert!(document.starts_with("Bash\n…"), "{document}");
+        assert!(document.contains("needle_cmd"), "{document}");
+        assert!(document.contains("needle found"), "{document}");
+        assert!(
+            document.chars().count() <= 300,
+            "{}",
+            document.chars().count()
+        );
+        let input = document.split('\n').nth(1).unwrap();
+        assert!(input.chars().count() <= 150);
     }
 
     #[test]
