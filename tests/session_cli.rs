@@ -138,6 +138,44 @@ fn session_batch_reads_what_was_written_since_the_last_index() {
     );
 }
 
+fn rpc_session_texts(fixture: &Fixture, session: &str) -> Vec<String> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_memex"))
+        .env("HOME", &fixture.home)
+        .args(["rpc", "--root"])
+        .arg(&fixture.root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run rpc");
+    {
+        let stdin = child.stdin.as_mut().expect("rpc stdin");
+        let request = json!({
+            "protocol": 1,
+            "request": {"op": "session", "session_id": session, "source_path": ""}
+        });
+        write!(stdin, "{request}").expect("write rpc request");
+    }
+    let output = child.wait_with_output().expect("wait for rpc");
+    assert_success(&output, "rpc session");
+    let response: Value = serde_json::from_slice(&output.stdout).expect("rpc response JSON");
+    response["response"]["context"]["records"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|record| record["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn rpc_session_reads_what_was_written_since_the_last_index() {
+    let fixture = fixture("embeddings = false\nscan_cache_ttl = 0\n");
+    write_after_index(&fixture);
+    assert_eq!(rpc_session_texts(&fixture, "known"), ["seed", "continued"]);
+    assert_eq!(rpc_session_texts(&fixture, "fresh"), ["started"]);
+}
+
 #[test]
 fn session_reads_leave_the_index_alone_when_auto_indexing_is_off() {
     let fixture = fixture("auto_index_on_search = false\nembeddings = false\nscan_cache_ttl = 0\n");

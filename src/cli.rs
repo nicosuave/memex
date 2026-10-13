@@ -3684,6 +3684,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             limit,
         } => {
             check_index(&machine)?;
+            ensure_local_index_for_reads(paths, &config, [machine.as_str()])?;
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -3715,6 +3716,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             max_chars,
         } => {
             check_index(&machine)?;
+            ensure_local_index_for_reads(paths, &config, [machine.as_str()])?;
             let (records, page) = collect_session_page(
                 paths,
                 &config,
