@@ -7,9 +7,9 @@ use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
-    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_sessions,
-    federated_usage, read_context, read_memory, read_record, read_session_pages,
-    session_page_context,
+    SessionListSpec, SessionPageRequest, UsageSpec, ensure_local_index_for_reads,
+    federated_memory_search, federated_sessions, federated_usage, read_context, read_memory,
+    read_record, read_session_pages, session_page_context,
 };
 use crate::memory::MemoryStore;
 use crate::memory_search::{
@@ -4464,6 +4464,7 @@ fn run_hydrate(
             )
         })
         .collect();
+    ensure_local_index_for_reads(&paths, &config, requests.iter().map(|(id, _)| id.as_str()))?;
     let mut writer = output.writer();
     let mut remaining = budget.remaining();
     let mut position = 0;
@@ -4674,6 +4675,7 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
     } = args;
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    ensure_local_index_for_reads(&paths, &config, [machine.as_str()])?;
     let source_path = source_path.unwrap_or_default();
     let (records, page) = collect_session_page(
         &paths,

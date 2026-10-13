@@ -2397,6 +2397,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             max_chars,
         } => {
             validate_session_batch(&requests)?;
+            ensure_local_index(paths, config)?;
             let contexts = requests
                 .iter()
                 .map(|request| session_page_context_local(paths, request))
@@ -2407,12 +2408,14 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }
         RpcOperation::SessionPage { request } => {
             validate_session_page_request(&request)?;
+            ensure_local_index(paths, config)?;
             Ok(RpcPayload::SessionPage {
                 context: session_page_context_local(paths, &request)?,
             })
         }
         RpcOperation::SessionBatch { requests } => {
             validate_session_batch(&requests)?;
+            ensure_local_index(paths, config)?;
             let contexts = requests
                 .iter()
                 .map(|request| session_page_context_local(paths, request))
@@ -2981,6 +2984,19 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
         abbreviated.push('…');
     }
     *field = abbreviated;
+}
+
+/// Session reads see what agents wrote since the last scan, as searches do. A read that
+/// names no local session leaves the index alone.
+pub fn ensure_local_index_for_reads<'a>(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if machine_ids.into_iter().any(|id| id == LOCAL_MACHINE_ID) {
+        ensure_local_index(paths, config).context("refresh the index before a session read")?;
+    }
+    Ok(())
 }
 
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
@@ -4196,7 +4212,10 @@ mod tests {
             test_record(3, "session", "b.jsonl", 3),
         ];
         write_test_index(&paths, &records);
-        let config = UserConfig::default();
+        let config = UserConfig {
+            auto_index_on_search: Some(false),
+            ..UserConfig::default()
+        };
 
         let selector = ContextSelector::doc_id(2);
         let RpcPayload::BoundedRecord { record } = rpc_handler_round_trip(

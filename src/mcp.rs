@@ -224,6 +224,11 @@ impl MemexServer {
             let budget = read_limit(request.max_chars)?;
             let page = request.page.validate()?;
             let (paths, config) = load(root)?;
+            machine::ensure_local_index_for_reads(
+                &paths,
+                &config,
+                [request.page.machine.as_str()],
+            )?;
             let result = machine::read_session_pages(
                 &paths,
                 &config,
@@ -461,6 +466,11 @@ fn hydrate_pages(root: Option<PathBuf>, request: HydrateRequest) -> Result<Value
         .map(PageRequest::validate)
         .collect::<Result<Vec<_>>>()?;
     let (paths, config) = load(root)?;
+    machine::ensure_local_index_for_reads(
+        &paths,
+        &config,
+        request.requests.iter().map(|r| r.machine.as_str()),
+    )?;
     let mut pages = Vec::new();
     let mut failures = Vec::new();
     let mut position = 0;
