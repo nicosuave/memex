@@ -7106,3 +7106,78 @@ fn kilocode_migrates_database_checkpoint_and_honors_session_exclusions() {
     run(&options);
     assert!(indexed_texts(&paths).is_empty());
 }
+
+fn write_claude_messages(path: &Path, texts: &[&str]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for text in texts {
+        append_claude_message(path, text);
+    }
+}
+
+fn indexed_source_paths(paths: &Paths) -> Vec<PathBuf> {
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut source_paths = Vec::new();
+    index
+        .for_each_record(|record| {
+            source_paths.push(PathBuf::from(record.source_path));
+            Ok(())
+        })
+        .unwrap();
+    source_paths.sort();
+    source_paths.dedup();
+    source_paths
+}
+
+#[test]
+fn workflow_agent_copies_index_once_and_follow_the_more_complete_copy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("claude-projects");
+    let subagents = root.join("-tmp-project/session/subagents");
+    let direct = subagents.join("agent-a1.jsonl");
+    let workflow = subagents.join("workflows/wf_run/agent-a1.jsonl");
+    write_claude_messages(&direct, &["first", "second"]);
+    write_claude_messages(&workflow, &["first", "second", "third"]);
+    let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![root];
+    let lease = ingest_lease(&paths);
+    let open = || SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_texts(&paths), ["first", "second", "third"]);
+    assert_eq!(
+        indexed_source_paths(&paths),
+        std::slice::from_ref(&workflow)
+    );
+
+    // A resumed agent grows its direct copy past the workflow copy. A watcher hint for that
+    // copy alone moves the agent to it and retires the workflow copy's records.
+    append_claude_message(&direct, "third");
+    append_claude_message(&direct, "fourth");
+    let dirty = HashSet::from([direct.clone()]);
+    let result = ingest_dirty(&paths, &open(), &options, &lease, &dirty).unwrap();
+    assert!(!result.full_scan);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["first", "fourth", "second", "third"]
+    );
+    assert_eq!(indexed_source_paths(&paths), std::slice::from_ref(&direct));
+
+    // A full scan keeps the same choice.
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_source_paths(&paths), std::slice::from_ref(&direct));
+
+    // Without a watcher hint, a full scan still notices that the retired copy grew: listings of
+    // unchanged directories hold only indexed files, so the copies are looked up on disk.
+    append_claude_message(&workflow, "fourth");
+    append_claude_message(&workflow, "fifth");
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_source_paths(&paths), [workflow]);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["fifth", "first", "fourth", "second", "third"]
+    );
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).unwrap();
+    assert_eq!(analytics.session_count().unwrap(), 1);
+}

@@ -109,6 +109,40 @@ pub(super) fn discover_transcripts(
             }
         }
     }
+    // Claude workflow runs store each agent transcript twice, and the copies diverge. Index
+    // one copy per agent and retire the other's records. A watcher hint names one copy, and a
+    // full scan reuses unchanged directories' listings of indexed files only, so the copies are
+    // looked up on disk.
+    let agents = files
+        .iter()
+        .filter(|file| file.source == SourceKind::Claude)
+        .filter_map(|file| crate::sources::claude::agent_copy_key(&file.path))
+        .collect::<HashSet<_>>();
+    let mut workflow_runs = HashMap::new();
+    let mut candidates = Vec::new();
+    for (subagents, name) in agents {
+        let runs = workflow_runs
+            .entry(subagents.clone())
+            .or_insert_with(|| crate::sources::claude::workflow_runs(&subagents));
+        candidates.extend(crate::sources::claude::agent_copies(
+            &subagents, runs, &name,
+        ));
+    }
+    let owners = crate::sources::claude::agent_copy_owners(
+        candidates
+            .into_iter()
+            .filter(|path| !excluder.is_excluded(path)),
+    );
+    for (copy, owner) in &owners {
+        if copy != owner {
+            superseded_projections.insert(copy.to_string_lossy().into_owned());
+        }
+    }
+    for file in &mut files {
+        if let Some(owner) = owners.get(&file.path) {
+            file.path = owner.clone();
+        }
+    }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     files.dedup();
 

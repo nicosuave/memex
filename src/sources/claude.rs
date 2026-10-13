@@ -20,7 +20,8 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     // Preserve pre-reader fallback IDs independently of attachment-only messages,
     // and classify background transcripts consistently across every record.
     index: 8,
-    usage: 4,
+    // Count a response split into content-block lines once when it has no request ID.
+    usage: 5,
 };
 
 /// Return the human-facing title Claude stores alongside a conversation.
@@ -139,7 +140,10 @@ pub fn discover(
 }
 
 pub fn usage_files() -> Vec<PathBuf> {
-    super::common::jsonl_files(crate::config::default_claude_sources())
+    let mut files = super::common::jsonl_files(crate::config::default_claude_sources());
+    let owners = agent_copy_owners(files.iter().cloned());
+    files.retain(|path| owners.get(path).is_none_or(|owner| owner == path));
+    files
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -215,6 +219,130 @@ fn decode_project_name(folder_name: &str) -> String {
     } else {
         meaningful.join("-")
     }
+}
+
+/// The `subagents` directory and file name shared by every copy of an agent transcript.
+/// Workflow runs store each agent twice, as `subagents/agent-<id>.jsonl` and as
+/// `subagents/workflows/<run>/agent-<id>.jsonl`.
+pub(crate) fn agent_copy_key(path: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
+    let name = path.file_name()?;
+    if !name.to_str()?.starts_with("agent-") {
+        return None;
+    }
+    let parent = path.parent()?;
+    let subagents = if parent.file_name()? == "subagents" {
+        parent
+    } else {
+        let workflows = parent.parent()?;
+        let subagents = workflows.parent()?;
+        (workflows.file_name()? == "workflows" && subagents.file_name()? == "subagents")
+            .then_some(subagents)?
+    };
+    Some((subagents.to_path_buf(), name.to_os_string()))
+}
+
+/// The workflow run directories under a `subagents` directory.
+pub(crate) fn workflow_runs(subagents: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(subagents.join("workflows"))
+        .map(|runs| runs.flatten().map(|run| run.path()).collect())
+        .unwrap_or_default()
+}
+
+/// Every copy of one agent transcript that exists on disk.
+pub(crate) fn agent_copies(
+    subagents: &Path,
+    runs: &[PathBuf],
+    name: &std::ffi::OsStr,
+) -> Vec<PathBuf> {
+    let mut copies = vec![subagents.join(name)];
+    copies.extend(runs.iter().map(|run| run.join(name)));
+    copies.retain(|path| path.is_file());
+    copies
+}
+
+/// Map every copy of each duplicated agent transcript among `paths` to the copy to read.
+/// Index and token usage read the same copy: the direct copy omits `requestId`, so usage
+/// reconciliation cannot match its records with the workflow copy's.
+pub(crate) fn agent_copy_owners(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> std::collections::HashMap<PathBuf, PathBuf> {
+    let mut groups = std::collections::HashMap::<_, Vec<PathBuf>>::new();
+    for path in paths {
+        if let Some(key) = agent_copy_key(&path) {
+            groups.entry(key).or_default().push(path);
+        }
+    }
+    let mut owners = std::collections::HashMap::new();
+    for mut copies in groups.into_values() {
+        copies.sort();
+        copies.dedup();
+        if copies.len() < 2 {
+            continue;
+        }
+        let owner = preferred_agent_copy(&copies)
+            .expect("a duplicated agent has copies")
+            .clone();
+        owners.extend(copies.into_iter().map(|copy| (copy, owner.clone())));
+    }
+    owners
+}
+
+/// The copy of an agent transcript to index. The workflow copy is written as the agent runs;
+/// the direct copy appears later, may hold only the tail, and gains the records of a resumed
+/// agent. So the copy whose last record is newest wins, then the larger file (the workflow
+/// copy repeats extra fields on every line), then the direct `subagents/` copy. Timestamps
+/// count only when every copy's last record is readable.
+pub(crate) fn preferred_agent_copy(copies: &[PathBuf]) -> Option<&PathBuf> {
+    let timestamps = copies
+        .iter()
+        .map(|path| last_record_timestamp(path))
+        .collect::<Option<Vec<_>>>();
+    copies
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, path)| {
+            let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+            (
+                timestamps
+                    .as_ref()
+                    .map(|timestamps| timestamps[*index].clone()),
+                size,
+                std::cmp::Reverse(path.components().count()),
+            )
+        })
+        .map(|(_, path)| path)
+}
+
+/// The `timestamp` of the last record in a transcript's final 256 KiB. Most last lines are a
+/// few KiB, so a short tail is tried first.
+fn last_record_timestamp(path: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Stamped {
+        timestamp: Option<String>,
+    }
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    for tail_bytes in [16 * 1024, 256 * 1024] {
+        let start = len.saturating_sub(tail_bytes);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        // Unless the tail is the whole file, its first line began before it.
+        let complete = match tail.iter().position(|byte| *byte == b'\n') {
+            Some(newline) if start > 0 => &tail[newline + 1..],
+            None if start > 0 => &[],
+            _ => &tail[..],
+        };
+        let timestamp = complete.rsplit(|byte| *byte == b'\n').find_map(|line| {
+            serde_json::from_slice::<Stamped>(line)
+                .ok()
+                .and_then(|record| record.timestamp)
+        });
+        if timestamp.is_some() || start == 0 {
+            return timestamp;
+        }
+    }
+    None
 }
 
 pub fn is_subagent_path(path: &Path) -> bool {
@@ -870,18 +998,19 @@ fn usage_timestamp_millis(timestamp: &simd_json::BorrowedValue<'_>) -> u64 {
 pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
     use std::collections::HashMap;
 
-    let mut best_exact: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut best_exact: HashMap<(&str, &str, &str), usize> = HashMap::new();
     let mut keep = vec![true; events.len()];
     for (index, event) in events.iter().enumerate() {
         if event.source != "claude" {
             continue;
         }
-        let (Some(message), Some(request)) =
-            (event.message_id.as_deref(), event.request_id.as_deref())
-        else {
-            continue;
+        // Claude Code writes one line per content block, each repeating the response's usage.
+        // Without a `requestId`, the message ID still names the response within its file.
+        let key = match (event.message_id.as_deref(), event.request_id.as_deref()) {
+            (Some(message), Some(request)) => (message, request, ""),
+            (Some(message), None) => (message, "", &*event.source_path),
+            (None, _) => continue,
         };
-        let key = (message, request);
         if let Some(previous) = best_exact.get(&key).copied() {
             if choose_usage(&events[previous], event) {
                 keep[index] = false;
@@ -1142,6 +1271,143 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session_title(&path, "s").as_deref(), Some("Escaped type"));
+    }
+
+    #[test]
+    fn agent_copies_share_a_key_and_equal_sizes_keep_the_direct_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        fs::write(&direct, "{}\n").unwrap();
+        fs::write(&workflow, "{}\n").unwrap();
+        fs::write(subagents.join("workflows/wf_1/journal.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(agent_copy_key(&direct), agent_copy_key(&workflow));
+        assert_eq!(
+            agent_copy_key(&subagents.join("workflows/wf_1/journal.jsonl")),
+            None
+        );
+        assert_eq!(
+            agent_copy_key(&temp.path().join("projects/-p/agent-a.jsonl")),
+            None
+        );
+        let (directory, name) = agent_copy_key(&workflow).unwrap();
+        let mut copies = agent_copies(&directory, &workflow_runs(&directory), &name);
+        copies.sort();
+        assert_eq!(copies, [direct.clone(), workflow.clone()]);
+        assert_eq!(preferred_agent_copy(&copies), Some(&direct));
+        fs::write(&workflow, "{}\n{}\n").unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+    }
+
+    #[test]
+    fn the_agent_copy_with_the_newest_record_wins_over_a_larger_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let record = |uuid: &str, minute: u32, extra: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"{uuid}\",{extra}\"timestamp\":\"2026-10-11T10:{minute:02}:00.000Z\",\"message\":{{\"content\":\"x\"}}}}\n"
+            )
+        };
+        // The workflow copy repeats extra fields on every line.
+        let extra = format!("\"version\":\"{}\",", "2".repeat(200));
+        fs::write(
+            &workflow,
+            record("u1", 1, &extra) + &record("u2", 2, &extra),
+        )
+        .unwrap();
+        // A resumed agent adds one short record to the direct copy only.
+        fs::write(
+            &direct,
+            record("u1", 1, "") + &record("u2", 2, "") + &record("u3", 3, ""),
+        )
+        .unwrap();
+        assert!(fs::metadata(&direct).unwrap().len() < fs::metadata(&workflow).unwrap().len());
+        let copies = [direct.clone(), workflow.clone()];
+        assert_eq!(preferred_agent_copy(&copies), Some(&direct));
+
+        // A direct copy rewritten with only the tail ends on the same record and loses to the
+        // complete workflow copy.
+        fs::write(&direct, record("u2", 2, "")).unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+
+        // A last line longer than the tail hides the workflow copy's newest record; an older
+        // direct copy must not win by default, so sizes decide.
+        let huge = format!("\"content\":\"{}\",", "x".repeat(300 * 1024));
+        fs::write(
+            &workflow,
+            record("u1", 1, &extra) + &record("u2", 2, &extra) + &record("u3", 3, &huge),
+        )
+        .unwrap();
+        fs::write(&direct, record("u1", 1, "") + &record("u2", 2, "")).unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+    }
+
+    #[test]
+    fn usage_reads_one_copy_of_a_workflow_agent() {
+        let _guard = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvVarGuard::set_os(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(temp.path().as_os_str()),
+        )]);
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        // Claude Code omits `requestId` from the direct copy only, so reconciliation alone
+        // cannot tell that both copies record the same response.
+        let line = r#"{"type":"assistant","isSidechain":true,"message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        fs::write(&direct, format!("{line}\n")).unwrap();
+        fs::write(
+            &workflow,
+            format!(
+                "{}\n",
+                line.replacen('{', r#"{"requestId":"req_1","version":"2.1","#, 1)
+            ),
+        )
+        .unwrap();
+        let mut both = parse_usage_file(&direct).unwrap();
+        both.extend(parse_usage_file(&workflow).unwrap());
+        reconcile_usage(&mut both);
+        assert_eq!(both.len(), 2);
+
+        assert_eq!(usage_files(), [workflow]);
+    }
+
+    #[test]
+    fn usage_counts_each_content_block_response_once_without_request_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-a.jsonl");
+        let line = |output: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{{\"id\":\"msg_1\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":{output}}}}}}}\n"
+            )
+        };
+        // Two content blocks of one response, then a separate response.
+        let other = line(7).replace("msg_1", "msg_2");
+        fs::write(&path, format!("{}{}{other}", line(4), line(5))).unwrap();
+        let mut events = parse_usage_file(&path).unwrap();
+        // The same response in another file is not merged without a request ID.
+        let elsewhere = temp.path().join("other.jsonl");
+        fs::write(&elsewhere, line(5)).unwrap();
+        events.extend(parse_usage_file(&elsewhere).unwrap());
+
+        reconcile_usage(&mut events);
+
+        let mut outputs = events
+            .iter()
+            .map(|event| (event.source_path.to_string(), event.tokens.output))
+            .collect::<Vec<_>>();
+        outputs.sort();
+        let path = path.to_string_lossy().into_owned();
+        let elsewhere = elsewhere.to_string_lossy().into_owned();
+        assert_eq!(outputs, [(path.clone(), 5), (path, 7), (elsewhere, 5)]);
     }
 
     #[test]
