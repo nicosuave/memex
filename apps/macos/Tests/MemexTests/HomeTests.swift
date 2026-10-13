@@ -186,11 +186,10 @@ struct HomeTests {
         #expect(store.scope == .all)
     }
 
-    @Test func homeCollapsesListAndRestoresBrowserColumnsAndToolbar() async throws {
+    @Test func homeAndChatKeepTwoColumnsAndRestoreToolbarActions() async throws {
         _ = NSApplication.shared
         let store = Store()
-        let controller = BrowserColumnsController(store: store, sidebar: Text("Sidebar"),
-            conversations: Text("Conversations"), reader: Text("Content"))
+        let controller = BrowserColumnsController(store: store, sidebar: Text("Sidebar"), reader: Text("Content"))
         let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1380, height: 700),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -203,13 +202,14 @@ struct HomeTests {
             store.scope = scope
             try await Task.sleep(for: .milliseconds(100))
             window.contentView?.layoutSubtreeIfNeeded()
-            #expect(controller.splitViewItems[1].isCollapsed == (scope == .home))
+            #expect(controller.splitViewItems.count == 2)
+            #expect(!controller.splitViewItems[1].isCollapsed)
             let toolbar = try #require(window.toolbar)
             let separators = toolbar.items.compactMap { $0 as? NSTrackingSeparatorToolbarItem }
-            #expect(separators.count == (scope == .home ? 1 : 2))
+            #expect(separators.count == 1)
             #expect(toolbar.items.contains { $0.itemIdentifier == BrowserToolbarController.search } == (scope != .home))
             #expect(toolbar.items.contains { $0.itemIdentifier == BrowserToolbarController.title } == (scope != .home))
-            #expect(toolbar.items.contains { $0.itemIdentifier == BrowserToolbarController.refresh } == (scope != .home))
+            #expect(toolbar.items.contains { $0.itemIdentifier == BrowserToolbarController.conversationActions } == (scope != .home))
             #expect(controller.readerHost.view.frame.width > 0)
         }
     }

@@ -1,5 +1,6 @@
 [package]
 name = "memex"
+default-run = "memex"
 version = "0.28.0"
 edition = "2024"
 build = "build.rs"

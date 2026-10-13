@@ -1,6 +1,6 @@
 import Foundation
 
-struct Session: Decodable, Identifiable, Hashable, Sendable {
+struct Session: Codable, Identifiable, Hashable, Sendable {
     let source: String
     let sessionID: String
     let sourcePath: String
@@ -105,15 +105,18 @@ struct TranscriptRecord: Decodable, Identifiable, Equatable, Sendable {
     let record: Message
     var sourceRecordID: String? = nil
     var rawJSON: String? = nil
+    // Provider evidence without a readable message stays available in Raw transcript.
+    var isRawOnly = false
     var sourceID: String { sourceRecordID ?? recordID }
     var id: String { recordID }
     enum CodingKeys: String, CodingKey { case recordID = "record_id", record }
 
-    init(recordID: String, record: Message, sourceRecordID: String? = nil, rawJSON: String? = nil) {
+    init(recordID: String, record: Message, sourceRecordID: String? = nil, rawJSON: String? = nil, isRawOnly: Bool = false) {
         self.recordID = recordID
         self.record = record
         self.sourceRecordID = sourceRecordID
         self.rawJSON = rawJSON
+        self.isRawOnly = isRawOnly
     }
 
     init(from decoder: Decoder) throws {
@@ -130,7 +133,8 @@ struct TranscriptRecord: Decodable, Identifiable, Equatable, Sendable {
                              ("tool_output", record.toolOutput), ("event_id", record.eventID),
                              ("parent_tool_use_id", record.parentToolUseID), ("source_turn_id", record.sourceTurnID),
                              ("assistant_phase", record.assistantPhase), ("lifecycle_event", record.lifecycleEvent),
-                             ("source_record_type", record.sourceRecordType)] {
+                             ("source_record_type", record.sourceRecordType), ("structured_activity", record.structuredActivity),
+                             ("activity_status", record.activityStatus), ("output_completeness", record.outputCompleteness)] {
             if let value { fields[key] = .string(value) }
         }
         if let content = record.sourceContent { fields["source_content"] = .string(content) }
@@ -153,6 +157,10 @@ struct Message: Decodable, Equatable, Sendable {
     var sourceRecordType: String? = nil
     var sourceContent: String? = nil
     var toolResultIsError: Bool? = nil
+    var mcpAppJSON: String? = nil
+    var structuredActivity: String? = nil
+    var activityStatus: String? = nil
+    var outputCompleteness: String? = nil
     // Display-only classification; source records and serialized content stay intact.
     var contextLabel: String? = nil
 
@@ -163,7 +171,10 @@ struct Message: Decodable, Equatable, Sendable {
         case sourceTurnID = "source_turn_id", assistantPhase = "assistant_phase"
         case lifecycleEvent = "lifecycle_event", sourceRecordType = "source_record_type"
         case sourceContent = "source_content"
+        case mcpAppJSON = "mcp_app"
         case toolResultIsError = "tool_result_is_error"
+        case structuredActivity = "structured_activity", activityStatus = "activity_status"
+        case outputCompleteness = "output_completeness"
     }
 
     var isActivity: Bool { ["tool_use", "tool_result", "tool", "reasoning"].contains(role) }
@@ -272,23 +283,49 @@ struct TranscriptItem: Identifiable, Sendable {
     var isActivity: Bool { isCompletedWork || records[0].record.isActivity }
     var isInstructions: Bool { records[0].record.isInstruction }
     var activitySummary: String {
-        if isCompletedWork { return "Completed work" }
         if isInstructions { return title }
         let entries = activities
+        if isCompletedWork {
+            let work = Self.workSentence(entries)
+            return work.map { "Worked · " + $0.prefix(1).lowercased() + $0.dropFirst() } ?? "Worked"
+        }
         guard entries.count > 1 else { return entries.first?.presentation.title ?? title }
-        if entries.allSatisfy({ $0.presentation.category == nil && $0.records[0].record.role != "reasoning" }) {
-            return "\(entries.count) tool calls"
+        return Self.workSentence(entries) ?? "Thought"
+    }
+
+    /// Describes operations, not records: reasoning and commentary are context
+    /// for the work and are not counted. Nil when nothing but those remains.
+    private static func workSentence(_ entries: [TranscriptActivity]) -> String? {
+        var counts: [(kind: String, count: Int)] = []
+        var otherTools: Set<String> = []
+        for entry in entries where !["reasoning", "assistant"].contains(entry.records[0].record.role) {
+            let presentation = entry.presentation
+            let kind = presentation.category ?? "Tool"
+            // Name a single kind of tool; unnamed results only count as generic tools.
+            let message = entry.records[0].record
+            if kind == "Tool" { otherTools.insert(message.toolName?.nilIfBlank == nil ? "" : message.activityTitle) }
+            if let index = counts.firstIndex(where: { $0.kind == kind }) { counts[index].count += 1 }
+            else { counts.append((kind, 1)) }
         }
-        var categories: [(String, Int)] = []
-        for entry in entries {
-            let category = entry.presentation.category?.lowercased() ?? (entry.records[0].record.role == "reasoning" ? "reasoning" : "tool")
-            if let index = categories.firstIndex(where: { $0.0 == category }) { categories[index].1 += 1 }
-            else { categories.append((category, 1)) }
+        func plural(_ count: Int, _ noun: String) -> String { count == 1 ? "a \(noun)" : "\(count) \(noun)s" }
+        let phrases = counts.map { kind, count -> String in
+            switch kind {
+            case "Command": "ran " + plural(count, "command")
+            case "Read": "read " + plural(count, "file")
+            case "Search": count == 1 ? "searched once" : "searched \(count) times"
+            case "Edit": count == 1 ? "made an edit" : "made \(count) edits"
+            case "Write": "wrote " + plural(count, "file")
+            case "Image": "viewed " + plural(count, "image")
+            default:
+                if otherTools.count == 1, let name = otherTools.first, !name.isEmpty {
+                    count == 1 ? "called \(name)" : "called \(name) \(count) times"
+                } else { "called " + plural(count, "tool") }
+            }
         }
-        let details = categories.prefix(3).map { name, count in
-            name == "reasoning" ? "reasoning" : "\(count) \(name)\(count == 1 ? "" : name == "search" ? "es" : "s")"
-        }.joined(separator: ", ")
-        return "\(entries.count) activities · \(details)" + (categories.count > 3 ? ", …" : "")
+        guard !phrases.isEmpty else { return nil }
+        let sentence = phrases.count == 1 ? phrases[0]
+            : phrases.dropLast().joined(separator: ", ") + " and " + phrases[phrases.count - 1]
+        return sentence.prefix(1).uppercased() + sentence.dropFirst()
     }
     var title: String {
         if isInstructions { return "Session context" }

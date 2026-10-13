@@ -158,3 +158,28 @@ MEMORY.md:1-2|note=[prior context]
     let code = "`multiline\n:codex-annotation{index=\"1\"}\nexample`"
     #expect(TranscriptPresentation.project([presentationRecord("a", "assistant", code)])[0].record.text == code)
 }
+
+@Test func unreadableReasoningIsNotDisplayedButSummariesAre() {
+    let projected = TranscriptPresentation.project([
+        presentationRecord("encrypted", "reasoning", ""),
+        presentationRecord("blank", "reasoning", "  \n"),
+        presentationRecord("summary", "reasoning", "Checked the toolbar layout"),
+        presentationRecord("answer", "assistant", "Done"),
+    ])
+    #expect(projected.map(\.id) == ["summary", "answer"])
+}
+
+@Test func liveStatusFollowsThePendingCallThenTheLatestReasoningOfTheCurrentTurn() {
+    let call = TranscriptRecord(recordID: "call", record: Message(role: "tool_use", text: "", toolName: "Bash",
+        toolInput: #"{"command":"swift test"}"#, toolOutput: nil, eventID: "call"))
+    let result = TranscriptRecord(recordID: "result", record: Message(role: "tool_result", text: "", toolName: nil,
+        toolInput: nil, toolOutput: "ok", parentToolUseID: "call"))
+    let earlier = presentationRecord("earlier", "reasoning", "**Reading the old turn**")
+    let request = presentationRecord("request", "user", "Fix the reader")
+    let thought = presentationRecord("thought", "reasoning", "**Checking the tests**\n\nThe suite is slow.")
+    #expect(TranscriptPresentation.liveStatus([earlier, request, thought, call]) == "Running swift test")
+    #expect(TranscriptPresentation.liveStatus([earlier, request, thought, call, result]) == "Checking the tests")
+    #expect(TranscriptPresentation.liveStatus([earlier, request, call, result]) == nil)
+    #expect(TranscriptPresentation.liveStatus([earlier, request, presentationRecord("plain", "reasoning", "Just thinking")]) == nil)
+    #expect(TranscriptPresentation.liveStatus([]) == nil)
+}

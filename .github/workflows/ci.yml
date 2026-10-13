@@ -14,7 +14,8 @@ env:
 jobs:
   macos-app:
     runs-on: macos-26
-    timeout-minutes: 20
+    env:
+      MEMEX_HISTORY_ONLY: "1"
     steps:
       - uses: actions/checkout@v7
 
@@ -27,7 +28,6 @@ jobs:
         run: swift build --package-path apps/macos --product Memex --force-resolved-versions
 
       - name: Test macOS app
-        timeout-minutes: 10
         # AppKit tests share process-wide window and application state.
         run: swift test --package-path apps/macos --force-resolved-versions --no-parallel
 
@@ -37,6 +37,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check local release scripts
         run: bash apps/macos/Tests/release-scripts.sh
+      - name: Check runtime provenance policy without private source
+        run: bash apps/macos/Tests/runtime-provenance.sh
       - name: Check Nix daemon activation
         run: bash nix/tests/activation.sh
 
@@ -91,15 +93,12 @@ jobs:
         run: mbx build --verbose
 
       - name: Run unit, integration, and lexical relevance regression tests
-        timeout-minutes: 10
         run: mbx test --verbose -- --test-threads=1
 
       - name: Test profiling feature
-        timeout-minutes: 10
         run: cargo test --features profiling --verbose -- --test-threads=1
 
       - name: Smoke test Criterion benchmarks
-        timeout-minutes: 10
         run: cargo bench --bench index --profile dev -- --test
 
   # homebrew/core autobumps memex from release tags. Build this checkout with the

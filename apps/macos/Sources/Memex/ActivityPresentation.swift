@@ -8,6 +8,8 @@ struct ActivityPresentation: Equatable, Sendable {
     let hasFailure: Bool
     let category: String?
     var isInterrupted = false
+    /// Present-tense label for a call that has not produced a result yet.
+    var activeTitle: String? = nil
     var needsAttention: Bool { hasFailure || isInterrupted }
 }
 
@@ -32,15 +34,20 @@ extension TranscriptActivity {
             if let output = message.toolOutput, Self.explicitFailure(output) { return true }
             return ["tool_result", "tool"].contains(message.role) && Self.explicitFailure(message.text)
         }
-        func value(_ title: String, _ symbol: String, _ category: String? = nil) -> ActivityPresentation {
+        func value(_ title: String, _ symbol: String, _ category: String? = nil, active: String? = nil) -> ActivityPresentation {
             ActivityPresentation(title: interruption.map { $0 + " · " + title } ?? (failed ? "Failed · " + title : title),
                                  symbolName: interruption == nil ? symbol : "pause.circle", hasFailure: failed, category: category,
-                                 isInterrupted: interruption != nil)
+                                 isInterrupted: interruption != nil, activeTitle: active)
         }
         if let label = message.contextLabel { return value(label, "doc.text") }
         if message.isEnvironmentContext { return value("Environment context", "info.circle") }
         if message.isInstruction { return value(message.role.capitalized + " instructions", "doc.text") }
-        if message.role == "reasoning" { return value("Reasoning", "ellipsis.bubble") }
+        if message.role == "reasoning" {
+            // A summary heading says what the model was thinking about; the
+            // body keeps the complete text, including the heading itself.
+            let heading = TranscriptPresentation.reasoningHeading(message.text).map(Self.compact)
+            return value(heading.map { "Thought · " + $0 } ?? "Thought", "ellipsis.bubble", active: heading)
+        }
         if message.role == "assistant" { return value(Self.compact(message.text), "text.bubble") }
 
         // Match a complete tool name, including the final component of provider namespaces.
@@ -55,33 +62,38 @@ extension TranscriptActivity {
             guard let detail else { return verb }
             return verb + " " + Self.compact(detail)
         }
+        // The same subject in both tenses, so a live status matches the row it becomes.
+        func tool(_ verb: String, _ activeVerb: String, _ keys: [String], _ symbol: String, _ category: String) -> ActivityPresentation {
+            let subject = detail(keys)
+            return value(title(verb, subject), symbol, category, active: title(activeVerb, subject))
+        }
         switch name {
         case "read", "read_file", "readfile":
-            return value(title("Read", detail(["file_path", "path", "filename"])), "doc.text", "Read")
+            return tool("Read", "Reading", ["file_path", "path", "filename"], "doc.text", "Read")
         case "grep", "search", "search_code", "search_files", "search_query", "ripgrep":
-            return value(title("Search", detail(["pattern", "query", "q", "search_term"])), "magnifyingglass", "Search")
+            return tool("Search", "Searching", ["pattern", "query", "q", "search_term"], "magnifyingglass", "Search")
         case "glob", "find_files", "list_files", "list_directory", "ls":
-            return value(title("List files", detail(["pattern", "glob", "path", "directory"])), "folder", "Search")
+            return tool("List files", "Listing files", ["pattern", "glob", "path", "directory"], "folder", "Search")
         case "bash", "shell", "shell_command", "exec_command", "run_command", "terminal":
-            return value(title("Run", detail(["command", "cmd"])), "terminal", "Command")
+            return tool("Run", "Running", ["command", "cmd"], "terminal", "Command")
         case "exec" where detail(["command", "cmd"]) != nil:
-            return value(title("Run", detail(["command", "cmd"])), "terminal", "Command")
+            return tool("Run", "Running", ["command", "cmd"], "terminal", "Command")
         case "exec" where message.toolName == "functions.exec":
-            return value("Run tool script", "terminal", "Command")
+            return value("Run tool script", "terminal", "Command", active: "Running tool script")
         case "wait", "write_stdin":
-            return value("Wait for command", "terminal", "Command")
+            return value("Wait for command", "terminal", "Command", active: "Waiting for command")
         case "view_image", "open_image":
-            return value(title("View image", detail(["path", "image_path"])), "photo", "Image")
+            return tool("View image", "Viewing image", ["path", "image_path"], "photo", "Image")
         case "write", "write_file", "writefile", "create_file":
-            return value(title("Write", detail(["file_path", "path", "filename"])), "doc.badge.plus", "Write")
+            return tool("Write", "Writing", ["file_path", "path", "filename"], "doc.badge.plus", "Write")
         case "edit", "edit_file", "editfile", "multiedit", "multi_edit", "replace_in_file":
-            return value(title("Edit", detail(["file_path", "path", "filename"])), "pencil", "Edit")
+            return tool("Edit", "Editing", ["file_path", "path", "filename"], "pencil", "Edit")
         case "apply_patch":
-            return value("Apply patch", "pencil", "Edit")
+            return value("Apply patch", "pencil", "Edit", active: "Applying patch")
         case "web_fetch", "webfetch", "fetch_url":
-            return value(title("Fetch", detail(["url"])), "globe", "Search")
+            return tool("Fetch", "Fetching", ["url"], "globe", "Search")
         default:
-            return value(message.activityTitle, "wrench.and.screwdriver")
+            return value(message.activityTitle, "wrench.and.screwdriver", active: message.toolName?.nilIfBlank.map { _ in "Using " + message.activityTitle })
         }
     }
 

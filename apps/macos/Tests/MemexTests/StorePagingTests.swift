@@ -108,28 +108,14 @@ private struct PagingHome: View {
         #expect(Set(store.sessions.map(\.id)).count == 450)
     }
 
-    @Test func delayedPeerPagePreservesVisibleRemoteRowAndNativeScrollAnchor() async throws {
+    @Test func delayedPeerPagePreservesVisibleRemoteRow() async throws {
         let fixture = try PagingFixture()
         defer { fixture.cleanUp() }
         let store = Store(client: fixture.client)
         store.machines = [.local, MachineChoice(id: "peer", label: "Peer")]
         await store.loadSessions()
-        let controller = ConversationListController()
-        let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 300, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.alphaValue = 0
-        window.contentViewController = controller
-        window.setContentSize(NSSize(width: 300, height: 600))
-        defer { window.close() }
-        controller.update(sessions: store.sessions, selectedID: store.sessions.first?.id, select: { _ in }, loadMore: { _ in })
-        window.orderBack(nil)
-        await Task.yield()
-        window.contentView?.layoutSubtreeIfNeeded()
         let anchorIndex = try #require(store.sessions.indices.first { $0 > 150 && store.sessions[$0].machineID == "peer" })
         let anchorID = store.sessions[anchorIndex].id
-        let anchorY = controller.table.rect(ofRow: anchorIndex).minY + 7
-        controller.scrollView.contentView.scroll(to: NSPoint(x: 0, y: anchorY))
-        controller.scrollView.reflectScrolledClipView(controller.scrollView.contentView)
         try fixture.mark("hold-peer")
         store.loadMoreSessionsIfNeeded(visibleID: try #require(store.sessions.last?.id))
         let pending = Task { await store.loadSessions() }
@@ -137,16 +123,10 @@ private struct PagingHome: View {
         try await waitForPage(store)
         #expect(store.loadingSessions)
         #expect(store.sessions.contains { $0.id == anchorID })
-        controller.update(sessions: store.sessions, selectedID: store.sessions.first?.id, select: { _ in }, loadMore: { _ in })
-        controller.table.layoutSubtreeIfNeeded()
-        #expect(abs(controller.scrollView.contentView.bounds.minY - anchorY) < 1)
         try fixture.remove("hold-peer")
         await pending.value
-        controller.update(sessions: store.sessions, selectedID: store.sessions.first?.id, select: { _ in }, loadMore: { _ in })
-        controller.table.layoutSubtreeIfNeeded()
         #expect(store.sessions.count == 400)
         #expect(store.sessions.contains { $0.id == anchorID })
-        #expect(abs(controller.scrollView.contentView.bounds.minY - anchorY) < 1)
     }
 
     @Test func failedPeerPageKeepsLoadedRowsAndReportsFailure() async throws {

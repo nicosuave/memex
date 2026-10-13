@@ -198,6 +198,19 @@ private struct ReaderFixture {
     #expect(session.title == "Title")
 }
 
+@MainActor @Test func missingSearchAnchorShowsUnavailableInsteadOfLatestPage() async throws {
+    let fixture = try ReaderFixture()
+    defer { fixture.cleanUp() }
+    let store = Store(client: fixture.client)
+    let session = fixture.session("one", anchor: "removed-record")
+    store.sessions = [session]
+    store.selectedID = session.id
+    store.query = "needle"
+    await store.loadRecords()
+    #expect(store.readerError?.contains("no longer available") == true)
+    #expect(store.records.isEmpty)
+}
+
 @MainActor @Test func readerCancellationDoesNotPublishPartialWindow() async throws {
     let fixture = try ReaderFixture()
     defer { fixture.cleanUp() }

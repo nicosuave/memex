@@ -1,7 +1,7 @@
 import Foundation
 
 /// Retains unknown CLI fields for inspection without coupling the reader to the entire schema.
-indirect enum RawTranscriptJSON: Codable {
+indirect enum RawTranscriptJSON: Codable, Equatable, Sendable {
     case object([String: RawTranscriptJSON])
     case array([RawTranscriptJSON])
     case string(String)
