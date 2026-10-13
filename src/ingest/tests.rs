@@ -7106,3 +7106,58 @@ fn kilocode_migrates_database_checkpoint_and_honors_session_exclusions() {
     run(&options);
     assert!(indexed_texts(&paths).is_empty());
 }
+
+#[test]
+fn kilocode_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert_eq!(report.files_skipped, 0);
+}
+
+#[test]
+fn kilocode_store_removed_with_its_directory_keeps_indexed_sessions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let database = root.join("kilo.db");
+    fs::create_dir_all(&root).unwrap();
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    crate::sources::kilocode::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    full();
+    let indexed = indexed_texts(&paths);
+    assert!(!indexed.is_empty());
+
+    // The volume holding the store is gone: keep its sessions and say so.
+    fs::remove_dir_all(&root).unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), indexed);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+
+    // The store is deleted while its directory remains: the sessions go with it.
+    fs::create_dir_all(&root).unwrap();
+    let report = full();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert!(indexed_texts(&paths).is_empty());
+}
