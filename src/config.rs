@@ -300,6 +300,8 @@ pub struct UserConfig {
     pub bob_resume_cmd: Option<String>,
     /// Resume command template for KiloCode CLI sessions.
     pub kilocode_resume_cmd: Option<String>,
+    /// Resume command template for Kimi Code CLI sessions.
+    pub kimi_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
     pub herdr_resume: Option<String>,
     /// Glob patterns matched against transcript source paths; matched files are

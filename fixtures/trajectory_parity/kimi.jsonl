@@ -1,0 +1,17 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1782864000000}
+{"type":"runtime.set_binding","workspaceId":"wd_kimi-project_0123456789ab","runtimeId":"local","agentId":"main","time":1782864000001}
+{"type":"profile.bind","agentId":"main","thinkingEffort":"high","systemPrompt":"","environmentDisclosure":{"cwd":"/workspace/kimi-project"},"disallowedTools":[],"time":1782864000002}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Inspect the project"}],"toolCalls":[],"id":"msg_01KIMI0000000000000000USER","origin":{"kind":"user"}},"time":1782864000003}
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>todo list reminder</system-reminder>"}],"toolCalls":[],"origin":{"kind":"injection","variant":"todo_list_reminder"}},"time":1782864000004}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.begin","uuid":"step-1","turnId":"0","step":1},"time":1782864000005}
+{"type":"llm.request","agentId":"main","kind":"loop","provider":"openai","model":"k3","modelAlias":"kimi-code/k3","toolSelect":false,"systemPromptHash":"0","toolsHash":"0","messageCount":2,"turnStep":"0.1","time":1782864000006}
+{"type":"usage.record","agentId":"main","model":"kimi-code/k3","usage":{"inputOther":100,"output":20,"inputCacheRead":40,"inputCacheCreation":5},"usageScope":"turn","time":1782864000007}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"think-1","turnId":"0","step":1,"stepUuid":"step-1","part":{"type":"think","think":"Plain Kimi reasoning"}},"time":1782864000008}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"text-1","turnId":"0","step":1,"stepUuid":"step-1","part":{"type":"text","text":"I will read the file."}},"time":1782864000009}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.call","uuid":"call-1","turnId":"0","step":1,"stepUuid":"step-1","toolCallId":"tool_1","name":"Read","args":{"path":"README.md"},"display":{"kind":"file_io","path":"README.md"}},"time":1782864000010}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.result","parentUuid":"call-1","toolCallId":"tool_1","result":{"output":"project contents","note":"<system>1 line read</system>","durationMs":2}},"time":1782864000011}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":"step-1","turnId":"0","step":1,"finishReason":"stop","usage":{"inputOther":100,"output":20,"inputCacheRead":40,"inputCacheCreation":5},"messageId":"chatcmpl-1"},"time":1782864000012}
+{"type":"turn.ended","agentId":"main","turnId":0,"reason":"completed","durationMs":9,"time":1782864000013}
+{"type":"context.apply_compaction","agentId":"main","summary":"Read the README and reported the project contents.","compactedCount":4,"time":1782864000014}
+{"type":"agent.message.appended","kind":"event","message":{"message":{"role":"assistant","content":[{"type":"text","text":"I will read the file."}]},"meta":{"source":"llm"}},"time":1782864000015}
+not-json

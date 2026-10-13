@@ -202,6 +202,12 @@ struct IndexArgs {
     /// Skip indexing KiloCode CLI sessions
     #[arg(long = "no-kilocode", default_value_t = false, hide = true)]
     no_kilocode: bool,
+    /// Index Kimi Code CLI sessions from ~/.kimi-code/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kimi: bool,
+    /// Skip indexing Kimi Code CLI sessions
+    #[arg(long = "no-kimi", default_value_t = false, hide = true)]
+    no_kimi: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -345,7 +351,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long, help_heading = "Filters")]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
         #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
         /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
@@ -683,7 +689,7 @@ EXAMPLES:
         /// Filter by project (repository grouping)
         #[arg(long)]
         project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Only include sessions active on or after this date/timestamp
@@ -933,7 +939,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -2699,6 +2705,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_bob: index.source_enabled(IndexSource::Bob),
         include_zcode: index.source_enabled(IndexSource::Zcode),
         include_kilocode: index.source_enabled(IndexSource::Kilocode),
+        include_kimi: index.source_enabled(IndexSource::Kimi),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -5974,6 +5981,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Zcode => "zcode",
         crate::types::SourceKind::Kiro => "kiro",
         crate::types::SourceKind::Kilocode => "kilocode",
+        crate::types::SourceKind::Kimi => "kimi",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -7330,6 +7338,9 @@ fn build_index_command_args(
     }
     if !index.kilocode || index.no_kilocode {
         args.push("--no-kilocode".to_string());
+    }
+    if !index.kimi || index.no_kimi {
+        args.push("--no-kimi".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -9034,6 +9045,8 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9104,6 +9117,8 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9167,6 +9182,8 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9232,6 +9249,8 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9923,6 +9942,7 @@ arguments = {
             "--no-jcode",
             "--no-muse",
             "--no-kiro",
+            "--no-kimi",
         ])
         .unwrap();
 
@@ -9936,6 +9956,8 @@ arguments = {
         assert!(index.no_grok);
         assert!(index.no_jcode);
         assert!(index.no_muse);
+        assert!(index.no_kiro);
+        assert!(index.no_kimi);
     }
 
     #[test]

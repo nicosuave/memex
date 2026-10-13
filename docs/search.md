@@ -134,7 +134,7 @@ Index all supported sources by default. Use repeatable `--only-source <source>` 
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
 to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
-`muse`, `antigravity`, `bob`, `zcode`, and `kilocode`.
+`muse`, `antigravity`, `bob`, `zcode`, `kilocode`, and `kimi`.
 Hermes transcripts and usage are read from `state.db` under `~/.hermes` and its
 named profiles; `HERMES_PROFILE_ROOTS` (comma-separated paths) selects alternate
 stores. Plaintext reasoning is indexed only with `--include-reasoning`.
@@ -150,6 +150,11 @@ KiloCode CLI sessions are read from `~/.local/share/kilo/kilo.db`
 roots) adds extra stores. Subagent sessions are indexed under their own session id
 with the parent recorded, and token usage comes from the per-request counters each
 assistant message carries.
+Kimi Code sessions are read from `~/.kimi-code/sessions` (`KIMI_CODE_HOME` relocates
+the home directory). Each agent journals its own `agents/<agent>/wire.jsonl`; subagent
+journals are indexed as `<session>:<agent>` sessions with the parent recorded. Reasoning
+parts are indexed only with `--include-reasoning`, and token usage comes from the
+`usage.record` line each model request journals.
 
 ## Agent memories
 
@@ -355,7 +360,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode|kimi`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

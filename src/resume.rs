@@ -68,6 +68,8 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Kiro => None,
         // KiloCode sessions resume with `kilo --session <id>` in a project directory.
         SourceKind::Kilocode => config.kilocode_resume_cmd.clone(),
+        // Kimi Code sessions resume with `kimi --session <id>` in a project directory.
+        SourceKind::Kimi => config.kimi_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -114,6 +116,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "kilocode" if remote || find_in_path("kilo").is_some() => {
             Some("cd {cwd_shell} && kilo --session {session_id}".to_string())
+        }
+        "kimi" if remote || find_in_path("kimi").is_some() => {
+            Some("cd {cwd_shell} && kimi --session {session_id}".to_string())
         }
         _ => None,
     }

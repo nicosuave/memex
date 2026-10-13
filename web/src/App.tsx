@@ -1070,6 +1070,7 @@ function App() {
                   <SelectItem value="copilot">Copilot</SelectItem>
                   <SelectItem value="kiro">Kiro</SelectItem>
                   <SelectItem value="kilocode">KiloCode</SelectItem>
+                  <SelectItem value="kimi">Kimi Code</SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1400,6 +1401,7 @@ function App() {
                           <SelectItem value="copilot">Copilot</SelectItem>
                           <SelectItem value="kiro">Kiro</SelectItem>
                           <SelectItem value="kilocode">KiloCode</SelectItem>
+                          <SelectItem value="kimi">Kimi Code</SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>

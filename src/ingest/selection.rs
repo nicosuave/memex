@@ -37,6 +37,7 @@ enum Shape {
     Zcode,
     Kiro,
     Kilocode,
+    Kimi,
 }
 
 struct Root {
@@ -130,6 +131,9 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
     }
     if options.include_kiro {
         roots.push(Root::new(sources::kiro::sessions_root(), Shape::Kiro));
+    }
+    if options.include_kimi {
+        roots.push(Root::new(sources::kimi::sessions_root(), Shape::Kimi));
     }
     if options.include_muse {
         roots.push(Root::new(sources::muse::sessions_root(), Shape::Muse));
@@ -253,6 +257,12 @@ fn classify(root: &Root, path: &Path) -> Match {
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
         Shape::Kiro => (parts.len() == 3 && name == "messages.jsonl").then_some(SourceKind::Kiro),
+        Shape::Kimi => {
+            // `<workspace>/<session>/agents/<agent>/wire.jsonl`; task output
+            // spools nest deeper under the agent directory.
+            (parts.len() == 5 && parts[2] == "agents" && name == "wire.jsonl")
+                .then_some(SourceKind::Kimi)
+        }
         Shape::Bob => {
             // Every task shares one database and discovery diffs task aggregates
             // itself, so a commit targets the database (`resolve` already routed WAL
@@ -345,6 +355,18 @@ fn resolve(
                 && path.file_name().is_some_and(|n| n == "session.json")
             {
                 path.set_file_name("messages.jsonl");
+                if !path.exists() && !state.contains_file(path.to_string_lossy().as_ref())? {
+                    continue;
+                }
+            }
+            // Session metadata (title, cwd) feeds the main journal's fingerprint.
+            if matches!(root.shape, Shape::Kimi)
+                && path
+                    .strip_prefix(&root.lexical)
+                    .is_ok_and(|p| p.components().count() == 3)
+                && path.file_name().is_some_and(|n| n == "state.json")
+            {
+                path = path.with_file_name("agents/main/wire.jsonl");
                 if !path.exists() && !state.contains_file(path.to_string_lossy().as_ref())? {
                     continue;
                 }
@@ -571,6 +593,7 @@ mod tests {
             include_bob: false,
             include_zcode: false,
             include_kilocode: false,
+            include_kimi: false,
             include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -755,6 +778,11 @@ mod tests {
             (Shape::Jcode, "project/session_one.json", SourceKind::Jcode),
             (Shape::Muse, "project/id/session.jsonl", SourceKind::Muse),
             (
+                Shape::Kimi,
+                "project/session/agents/agent-0/wire.jsonl",
+                SourceKind::Kimi,
+            ),
+            (
                 Shape::Antigravity,
                 "antigravity-ide/conversations/abc.db",
                 SourceKind::Antigravity,
@@ -835,6 +863,12 @@ mod tests {
             (Shape::Muse, "notes.jsonl"),
             (Shape::Kiro, "project/id/snapshots/messages.jsonl"),
             (Shape::Kiro, "project/id/session.json"),
+            (Shape::Kimi, "project/session/wire.jsonl"),
+            (Shape::Kimi, "project/session/state.json"),
+            (
+                Shape::Kimi,
+                "project/session/agents/main/tasks/bash-1/wire.jsonl",
+            ),
             (Shape::Opencode, "nested/opencode.db"),
             (Shape::Opencode, "other.db-wal"),
             (Shape::CodexHome, "settings.json"),

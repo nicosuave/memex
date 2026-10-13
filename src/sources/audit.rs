@@ -101,6 +101,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(SourceKind::Kimi, super::kimi::usage_files());
     push(
         SourceKind::Muse,
         super::muse::discover(None)
@@ -334,6 +335,12 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         SourceKind::Kiro => {
             if let Some(kind) = value.pointer("/payload/type").and_then(Value::as_str) {
                 increment(&mut audit.semantic_types, kind);
+            }
+        }
+        SourceKind::Kimi => {
+            // Loop events nest the conversation shape one level down.
+            if let Some(kind) = value.pointer("/event/type").and_then(Value::as_str) {
+                increment(&mut audit.semantic_types, &format!("{top_level}/{kind}"));
             }
         }
         SourceKind::Muse => {

@@ -144,6 +144,10 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::kilocode::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Kimi => SourceSpec {
+            parser_version: crate::sources::kimi::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
     }
 }
 
@@ -189,6 +193,7 @@ pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
             .map(|file| file.path)
             .collect(),
         SourceFilter::Kilocode => crate::sources::kilocode::usage_files(),
+        SourceFilter::Kimi => crate::sources::kimi::usage_files(),
     }
 }
 
@@ -507,6 +512,9 @@ pub(crate) fn parse_source_file(
         SourceFilter::Bob => crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
         SourceFilter::Zcode => crate::sources::zcode::parse_usage_file(path),
         SourceFilter::Kilocode => crate::sources::kilocode::parse_usage_file(path),
+        SourceFilter::Kimi => {
+            crate::sources::kimi::parse_usage_file(path).map(FileParse::cacheable)
+        }
         SourceFilter::Jcode => {
             crate::sources::jcode::parse_usage_file(path).map(FileParse::cacheable)
         }
@@ -883,6 +891,27 @@ fn scan_kilocode(
     Ok(())
 }
 
+fn scan_kimi(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = source_files(SourceFilter::Kimi);
+    scan_files_cached(
+        SourceScan {
+            source: "kimi",
+            parser_version: crate::sources::kimi::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::kimi::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
 fn scan_kiro(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
@@ -910,7 +939,7 @@ pub(crate) type SourceScanner =
 
 /// Scanner ordinals double as merge tiebreaks: partitions are laid out and merged in
 /// this order, reproducing the combined assembly's stable sort exactly.
-pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 17] = [
+pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 18] = [
     (SourceFilter::Claude, scan_claude),
     (SourceFilter::Codex, scan_codex),
     (SourceFilter::Opencode, scan_opencode),
@@ -928,6 +957,7 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 17] = [
     (SourceFilter::Zcode, scan_zcode),
     (SourceFilter::Kiro, scan_kiro),
     (SourceFilter::Kilocode, scan_kilocode),
+    (SourceFilter::Kimi, scan_kimi),
 ];
 
 /// Scan and reconcile one source partition. Shared by combined assembly and

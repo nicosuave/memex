@@ -1556,6 +1556,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Kilocode => {
             crate::sources::kilocode::session_cwd(Path::new(&first.source_path), &first.session_id)
         }
+        SourceKind::Kimi => {
+            crate::sources::kimi::session_cwd(Path::new(&first.source_path)).map(PathBuf::from)
+        }
         SourceKind::Zcode => {
             crate::sources::zcode::session_cwd(Path::new(&first.source_path), &first.session_id)
         }

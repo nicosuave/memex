@@ -1473,6 +1473,9 @@ fn resolve_session_cwd_from_parts(
     if source == SourceKind::Kiro {
         return crate::sources::kiro::session_cwd(Path::new(source_path));
     }
+    if source == SourceKind::Kimi {
+        return crate::sources::kimi::session_cwd(Path::new(source_path));
+    }
     if source == SourceKind::Muse
         && let Some(cwd) = crate::sources::muse::cwd_from_muse_session(Path::new(source_path))
     {
@@ -2186,6 +2189,13 @@ fn extract_session_label(
             if let Some(title) =
                 crate::sources::kilocode::session_title(Path::new(source_path), session_id)
             {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Kimi => {
+            if let Some(title) = crate::sources::kimi::session_title(Path::new(source_path)) {
                 title
             } else {
                 first_user_text?.to_string()

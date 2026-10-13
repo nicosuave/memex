@@ -304,6 +304,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             assert_eq!(report["vector_backfill"]["running"], false);
             let sources = report["sources"].as_array().unwrap();
             assert!(sources.iter().any(|source| source == "kiro"));
+            assert!(sources.iter().any(|source| source == "kimi"));
             assert!(sources.iter().any(|source| source == "zcode"));
             assert!(sources.iter().any(|source| source == "hermes"));
         }
@@ -323,6 +324,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             "  model: minilm",
             "  execution-provider: cpu",
             "  - kiro",
+            "  - kimi",
             "  - hermes",
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");

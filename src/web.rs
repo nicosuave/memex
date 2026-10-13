@@ -1429,6 +1429,7 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "bob" => Ok(SourceFilter::Bob),
         "zcode" => Ok(SourceFilter::Zcode),
         "kilocode" => Ok(SourceFilter::Kilocode),
+        "kimi" => Ok(SourceFilter::Kimi),
         "kiro" => Ok(SourceFilter::Kiro),
         _ => Err(anyhow!("unknown source: {value}")),
     }

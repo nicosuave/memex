@@ -154,6 +154,7 @@ grok_resume_cmd = "cd {cwd_shell} && grok --resume {session_id}"
 bob_resume_cmd = "cd {cwd_shell} && bob --resume {session_id}"
 jcode_resume_cmd = "cd {cwd_shell} && jcode --resume {session_id}"
 muse_resume_cmd = "cd {cwd_shell} && muse resume {session_id}"
+kimi_resume_cmd = "cd {cwd_shell} && kimi --session {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"
 
 [mcp]

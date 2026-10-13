@@ -161,6 +161,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_kiro {
         roots.push(crate::sources::kiro::sessions_root());
     }
+    if options.include_kimi {
+        roots.push(crate::sources::kimi::sessions_root());
+    }
     if options.include_muse {
         roots.push(crate::sources::muse::sessions_root());
     }
@@ -826,6 +829,7 @@ mod tests {
             include_bob: true,
             include_zcode: true,
             include_kilocode: true,
+            include_kimi: true,
             include_kiro: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -889,6 +893,7 @@ mod tests {
             ("JCODE_HOME", Some("/tmp/memex-watch-test-jcode")),
             ("MUSE_HOME", Some("/tmp/memex-watch-test-muse")),
             ("KIRO_SESSIONS_DIR", None),
+            ("KIMI_CODE_HOME", None),
             ("XDG_DATA_HOME", None),
         ]);
 
@@ -913,6 +918,7 @@ mod tests {
             "jcode/sessions",
             "muse/sessions",
             ".kiro/sessions",
+            ".kimi-code/sessions",
         ] {
             assert!(
                 rendered.iter().any(|root| root.contains(expected)),
@@ -946,6 +952,7 @@ mod tests {
         options.include_zcode = false;
         options.include_kilocode = false;
         options.include_kiro = false;
+        options.include_kimi = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
