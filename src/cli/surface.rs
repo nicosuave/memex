@@ -459,6 +459,8 @@ mod tests {
             "--no-pi",
             "--claude-path",
             "/tmp/custom projects",
+            "--claude-path",
+            "/tmp/another profile/projects",
         ]);
         let args = super::super::build_index_command_args(
             &selected,
@@ -473,8 +475,11 @@ mod tests {
         command.extend(args.iter().map(String::as_str));
         let reparsed = index_args(&command);
         assert_eq!(
-            reparsed.source.as_deref(),
-            Some(std::path::Path::new("/tmp/custom projects"))
+            reparsed.source,
+            vec![
+                std::path::PathBuf::from("/tmp/custom projects"),
+                std::path::PathBuf::from("/tmp/another profile/projects"),
+            ]
         );
         for &source in IndexSource::value_variants() {
             assert_eq!(
@@ -510,8 +515,8 @@ mod tests {
             "--no-kilocode",
         ]);
         assert_eq!(
-            selected.source.as_deref(),
-            Some(std::path::Path::new("/tmp/custom"))
+            selected.source,
+            vec![std::path::PathBuf::from("/tmp/custom")]
         );
         for &source in IndexSource::value_variants() {
             assert_eq!(

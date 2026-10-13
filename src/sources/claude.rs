@@ -139,8 +139,8 @@ pub fn discover(
     Ok(files)
 }
 
-pub fn usage_files() -> Vec<PathBuf> {
-    let mut files = super::common::jsonl_files(crate::config::default_claude_sources());
+pub fn usage_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = super::common::jsonl_files(roots.iter().cloned());
     let owners = agent_copy_owners(files.iter().cloned());
     files.retain(|path| owners.get(path).is_none_or(|owner| owner == path));
     files
@@ -218,6 +218,35 @@ fn decode_project_name(folder_name: &str) -> String {
         folder_name.to_string()
     } else {
         meaningful.join("-")
+    }
+}
+
+/// Index of the `projects` component that roots a Claude transcript path. Encoded cwd
+/// directories start with `-`, so the last component named `projects` is the root's.
+fn projects_component(path: &Path) -> Option<usize> {
+    path.components()
+        .enumerate()
+        .filter(|(_, component)| component.as_os_str() == "projects")
+        .last()
+        .map(|(index, _)| index)
+}
+
+/// The transcript's path below its `projects` directory: `<encoded cwd>/<session>.jsonl`,
+/// or deeper for agent transcripts. It names the same conversation under any config root.
+pub(crate) fn project_relative_path(path: &Path) -> Option<PathBuf> {
+    let projects = projects_component(path)?;
+    let relative: PathBuf = path.components().skip(projects + 1).collect();
+    (relative.components().count() >= 2).then_some(relative)
+}
+
+/// Name of the Claude config directory a transcript was read from, such as `work` for
+/// `~/.claude-profiles/work/projects/...` or `.claude` for `~/.claude/projects/...`.
+pub fn profile_from_path(path: &Path) -> Option<String> {
+    let projects = projects_component(path)?;
+    let config_dir = path.components().nth(projects.checked_sub(1)?)?;
+    match config_dir {
+        std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+        _ => None,
     }
 }
 
@@ -1274,6 +1303,31 @@ mod tests {
     }
 
     #[test]
+    fn transcript_paths_name_their_profile_and_conversation() {
+        let main = Path::new("/home/u/.claude-profiles/work/projects/-home-u-repo/s.jsonl");
+        let agent = Path::new(
+            "/home/u/.claude/projects/-home-u-projects/s/subagents/workflows/wf_1/agent-a.jsonl",
+        );
+        assert_eq!(profile_from_path(main).as_deref(), Some("work"));
+        assert_eq!(profile_from_path(agent).as_deref(), Some(".claude"));
+        assert_eq!(profile_from_path(Path::new("/data/claude/s.jsonl")), None);
+        assert_eq!(
+            project_relative_path(main),
+            Some(PathBuf::from("-home-u-repo/s.jsonl"))
+        );
+        assert_eq!(
+            project_relative_path(agent),
+            Some(PathBuf::from(
+                "-home-u-projects/s/subagents/workflows/wf_1/agent-a.jsonl"
+            ))
+        );
+        assert_eq!(
+            project_relative_path(Path::new("/x/projects/s.jsonl")),
+            None
+        );
+    }
+
+    #[test]
     fn agent_copies_share_a_key_and_equal_sizes_keep_the_direct_copy() {
         let temp = tempfile::tempdir().unwrap();
         let subagents = temp.path().join("projects/-p/s/subagents");
@@ -1377,7 +1431,10 @@ mod tests {
         reconcile_usage(&mut both);
         assert_eq!(both.len(), 2);
 
-        assert_eq!(usage_files(), [workflow]);
+        assert_eq!(
+            usage_files(&crate::config::default_claude_sources()),
+            [workflow]
+        );
     }
 
     #[test]

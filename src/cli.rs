@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
-use crate::config::{Paths, UserConfig, default_claude_sources};
+use crate::config::{Paths, UserConfig};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::{IndexRevision, QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_dirty};
@@ -88,14 +88,14 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 struct IndexArgs {
-    /// Path to Claude projects directory [default: CLAUDE_CONFIG_DIR or ~/.claude/projects]
+    /// Claude projects directory (repeatable) [default: claude_paths from config, else CLAUDE_CONFIG_DIR, else ~/.claude/projects]
     #[arg(
         long = "claude-path",
         alias = "source",
         value_name = "PATH",
         help_heading = "Sources"
     )]
-    source: Option<PathBuf>,
+    source: Vec<PathBuf>,
     /// Index only these providers (repeatable); exclusions take precedence
     #[arg(long, value_enum, value_name = "SOURCE", help_heading = "Sources")]
     only_source: Vec<IndexSource>,
@@ -222,6 +222,59 @@ struct IndexArgs {
     /// `exclude_paths` in ~/.memex/config.toml.
     #[arg(long = "exclude", value_name = "GLOB", help_heading = "Sources")]
     exclude: Vec<String>,
+}
+
+/// `memex sessions` arguments. A separate struct keeps their parser builders out of the
+/// stack frame that builds every subcommand, which debug test threads can barely hold.
+#[derive(Args)]
+struct SessionsArgs {
+    /// Return one exact count object instead of session rows (unavailable totals are null)
+    #[arg(long)]
+    count: bool,
+    /// Count conversations matching this lexical query; requires --count
+    #[arg(long, requires = "count", conflicts_with = "cwd")]
+    query: Option<String>,
+    /// Query these machines (repeatable; defaults to configured machines)
+    #[arg(long)]
+    machine: Vec<String>,
+    /// Match this exact session ID
+    #[arg(long)]
+    session_id: Option<String>,
+    /// Match this exact indexed source path
+    #[arg(long)]
+    source_path: Option<String>,
+    /// Only sessions whose cwd is this path, lives under it, or whose git root is it
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Filter by project (repository grouping)
+    #[arg(long)]
+    project: Option<String>,
+    /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
+    #[arg(long)]
+    source: Option<SourceFilter>,
+    /// Only Claude sessions from this config directory, such as `work` for ~/.claude-profiles/work
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+    /// Only include sessions active on or after this date/timestamp
+    #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
+    since: Option<String>,
+    /// Maximum number of sessions
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
+    #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+    origin: SessionOrigin,
+    /// Only show interactive sessions (alias for --origin interactive)
+    #[arg(long, conflicts_with = "origin", hide = true)]
+    interactive_only: bool,
+    /// Emit one JSON array instead of JSON Lines
+    #[arg(long, hide = true)]
+    json_array: bool,
+    /// Path to memex data directory [default: ~/.memex]
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[derive(Subcommand)]
@@ -661,52 +714,7 @@ EXAMPLES:
     memex sessions --cwd .                # sessions from the current repo
     memex sessions --source claude --limit 5
     memex sessions --format json")]
-    Sessions {
-        /// Return one exact count object instead of session rows (unavailable totals are null)
-        #[arg(long)]
-        count: bool,
-        /// Count conversations matching this lexical query; requires --count
-        #[arg(long, requires = "count", conflicts_with = "cwd")]
-        query: Option<String>,
-        /// Query these machines (repeatable; defaults to configured machines)
-        #[arg(long)]
-        machine: Vec<String>,
-        /// Match this exact session ID
-        #[arg(long)]
-        session_id: Option<String>,
-        /// Match this exact indexed source path
-        #[arg(long)]
-        source_path: Option<String>,
-        /// Only sessions whose cwd is this path, lives under it, or whose git root is it
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Filter by project (repository grouping)
-        #[arg(long)]
-        project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
-        #[arg(long)]
-        source: Option<SourceFilter>,
-        /// Only include sessions active on or after this date/timestamp
-        #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
-        since: Option<String>,
-        /// Maximum number of sessions
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
-        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
-        origin: SessionOrigin,
-        /// Only show interactive sessions (alias for --origin interactive)
-        #[arg(long, conflicts_with = "origin", hide = true)]
-        interactive_only: bool,
-        /// Emit one JSON array instead of JSON Lines
-        #[arg(long, hide = true)]
-        json_array: bool,
-        /// Path to memex data directory [default: ~/.memex]
-        #[arg(long)]
-        root: Option<PathBuf>,
-        #[command(flatten)]
-        output: OutputArgs,
-    },
+    Sessions(SessionsArgs),
     /// Herdr plugin helpers (used by herdr/plugin.sh)
     #[command(hide = true)]
     Herdr {
@@ -1146,6 +1154,9 @@ pub(crate) struct SessionsRequest {
     pub(crate) project: Option<String>,
     /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
     pub(crate) source: Option<String>,
+    /// Claude config directory name, such as `work` for `~/.claude-profiles/work`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
     /// Earliest activity timestamp (RFC3339, date, unix seconds, or unix milliseconds).
     pub(crate) since: Option<String>,
     /// Session origin: regular (default) excludes permission reviews; all includes them. Interactive and subagent select ordinary session subsets.
@@ -1839,7 +1850,7 @@ pub fn run() -> Result<()> {
                 .resolve(OutputFormat::Jsonl, None, false)?
                 .print_values(items)?;
         }
-        Commands::Sessions {
+        Commands::Sessions(SessionsArgs {
             count,
             query,
             machine,
@@ -1848,6 +1859,7 @@ pub fn run() -> Result<()> {
             cwd,
             project,
             source,
+            profile,
             since,
             limit,
             origin,
@@ -1855,7 +1867,7 @@ pub fn run() -> Result<()> {
             json_array,
             output,
             root,
-        } => {
+        }) => {
             let origin = if interactive_only {
                 SessionOrigin::Interactive
             } else {
@@ -1869,6 +1881,7 @@ pub fn run() -> Result<()> {
                     cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                     project,
                     source: source.map(|value| value.as_str().to_string()),
+                    profile,
                     since,
                     limit,
                     origin,
@@ -1900,6 +1913,7 @@ pub fn run() -> Result<()> {
                 cwd,
                 project,
                 source,
+                profile,
                 since,
                 limit,
                 origin,
@@ -1967,7 +1981,8 @@ pub fn run() -> Result<()> {
             run_analytics_backfill(root)?;
         }
         Commands::SourceAudit { source } => {
-            let audits = crate::sources::audit::audit_installed_sources(source)?;
+            let claude_sources = UserConfig::load(&Paths::new(None)?)?.claude_sources();
+            let audits = crate::sources::audit::audit_installed_sources(source, &claude_sources)?;
             println!("{}", serde_json::to_string_pretty(&audits)?);
         }
         Commands::Skill { command } => {
@@ -2673,14 +2688,12 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         "embeddings",
     )?;
     Ok(IngestOptions {
-        claude_sources: if index.source_enabled(IndexSource::Claude) {
-            index
-                .source
-                .clone()
-                .map(|source| vec![source])
-                .unwrap_or_else(default_claude_sources)
-        } else {
+        claude_sources: if !index.source_enabled(IndexSource::Claude) {
             Vec::new()
+        } else if index.source.is_empty() {
+            config.claude_sources()
+        } else {
+            index.source.clone()
         },
         include_agents: index.include_agents,
         include_reasoning,
@@ -3572,6 +3585,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     filters.cwd.map(PathBuf::from),
                     filters.project,
                     parse_source_filter(filters.source)?,
+                    filters.profile,
                     filters.since,
                     filters.limit,
                     filters.origin,
@@ -4969,6 +4983,7 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
         include_reviews: origin == SessionOrigin::All,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: 0,
+        claude_sources: Some(config.claude_sources()),
     };
     // A cold usage cache re-parses whole log corpora, which can take minutes; narrate the
     // parse phase on stderr so the scan doesn't read as a hang. Rendered with the same
@@ -5313,12 +5328,13 @@ fn source_dir_of(source_path: &str) -> String {
 pub(crate) fn session_resume_command(
     config: &UserConfig,
     row: &crate::analytics::SessionDetailRow,
+    claude_sources: &[PathBuf],
 ) -> Option<(String, String)> {
     let template = crate::resume::resume_template(config, row.source, false)?;
     let source_dir = source_dir_of(&row.source_path);
     // Transcript stores are never workspaces: falling back into one makes the
     // resumed CLI ask the user to trust an agent's internal state directory.
-    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir);
+    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir, claude_sources);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {
@@ -5327,6 +5343,11 @@ pub(crate) fn session_resume_command(
             project: &row.project,
             source_path: &row.source_path,
             source_dir: &source_dir,
+            claude_config_dir: crate::resume::claude_config_dir(
+                row.source,
+                &row.source_path,
+                claude_sources,
+            ),
         },
         &cwd,
     );
@@ -5340,6 +5361,7 @@ fn run_sessions(
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
+    profile: Option<String>,
     since: Option<String>,
     limit: usize,
     origin: SessionOrigin,
@@ -5365,6 +5387,7 @@ fn run_sessions(
             },
             session_id,
             source_path,
+            profile,
         },
     )?;
     for (machine, error) in result.failures {
@@ -5404,6 +5427,7 @@ pub(crate) fn collect_sessions(
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
+    profile: Option<String>,
     since: Option<String>,
     limit: usize,
     origin: SessionOrigin,
@@ -5411,6 +5435,7 @@ pub(crate) fn collect_sessions(
 ) -> Result<Vec<Value>> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    let claude_sources = config.claude_sources();
     let store = open_analytics_read_only(&paths)?;
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
@@ -5426,12 +5451,14 @@ pub(crate) fn collect_sessions(
         kind_filter,
         session_id.as_deref(),
         source_path.as_deref(),
+        profile.as_deref(),
         Some(limit),
     )?;
 
     let mut items = Vec::new();
     for row in &rows {
-        let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
+        let resume_cmd =
+            session_resume_command(&config, row, &claude_sources).map(|(command, _)| command);
         let mut value = serde_json::to_value(row)?;
         let object = value
             .as_object_mut()
@@ -5497,6 +5524,11 @@ pub(crate) fn collect_session_count(
         if let Some(path) = request.source_path {
             scopes.retain(|scope| scope.2 == path);
         }
+        if let Some(profile) = &request.profile {
+            scopes.retain(|(source, _, path)| {
+                crate::analytics::session_profile(*source, path).as_ref() == Some(profile)
+            });
+        }
         if scopes.is_empty() || kind == crate::analytics::SessionKindFilter::All {
             return Ok(SessionCount {
                 total: Some(scopes.len() as u64),
@@ -5530,6 +5562,7 @@ pub(crate) fn collect_session_count(
             Some(kind),
             request.session_id.as_deref(),
             request.source_path.as_deref(),
+            request.profile.as_deref(),
         )?;
         Ok(SessionCount {
             total: Some(total),
@@ -5547,6 +5580,7 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
         request.cwd.map(PathBuf::from),
         request.project,
         source,
+        request.profile,
         request.since,
         request.limit,
         request.origin,
@@ -5571,6 +5605,7 @@ fn run_herdr_resume(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
+    let claude_sources = config.claude_sources();
     let store = open_analytics_read_only(&paths)?;
     let cwd_filter = canonical_cwd_filter(cwd);
 
@@ -5601,10 +5636,9 @@ fn run_herdr_resume(
         }
     }
 
-    let Some((row, command, cwd)) = rows
-        .iter()
-        .find_map(|row| session_resume_command(&config, row).map(|(cmd, cwd)| (row, cmd, cwd)))
-    else {
+    let Some((row, command, cwd)) = rows.iter().find_map(|row| {
+        session_resume_command(&config, row, &claude_sources).map(|(cmd, cwd)| (row, cmd, cwd))
+    }) else {
         return Err(anyhow!("no resumable session found"));
     };
 
@@ -7257,7 +7291,7 @@ fn build_index_command_args(
     let mut args = Vec::new();
     args.push("index".to_string());
 
-    if let Some(source) = &index.source {
+    for source in &index.source {
         args.push("--claude-path".to_string());
         args.push(source.to_string_lossy().to_string());
     }
@@ -8923,14 +8957,14 @@ mod tests {
             "1",
         ])
         .unwrap();
-        let Commands::Sessions {
+        let Commands::Sessions(SessionsArgs {
             session_id,
             source_path,
             source,
             origin,
             limit,
             ..
-        } = cli.command.unwrap()
+        }) = cli.command.unwrap()
         else {
             panic!("expected sessions command");
         };
@@ -8961,7 +8995,7 @@ mod tests {
                 let cli = Cli::try_parse_from(args).unwrap();
                 let origin = match cli.command.unwrap() {
                     Commands::Search { origin, .. }
-                    | Commands::Sessions { origin, .. }
+                    | Commands::Sessions(SessionsArgs { origin, .. })
                     | Commands::Usage { origin, .. } => origin,
                     _ => unreachable!(),
                 };
@@ -9001,7 +9035,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: Vec::new(),
@@ -9071,7 +9105,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: vec!["~/work/**".to_string(), "/tmp/secret/*.jsonl".to_string()],
@@ -9134,7 +9168,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: Vec::new(),
@@ -9199,7 +9233,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: Vec::new(),

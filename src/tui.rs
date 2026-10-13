@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_path};
-use crate::config::{Paths, UserConfig, default_claude_sources};
+use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
@@ -1165,7 +1165,7 @@ impl App {
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
                 let opts = IngestOptions {
-                    claude_sources: default_claude_sources(),
+                    claude_sources: config.claude_sources(),
                     include_agents: false,
                     include_reasoning: config.include_reasoning_default(),
                     include_codex: true,
@@ -1571,6 +1571,7 @@ impl App {
             self.paths.state.join("usage-cache.sqlite3"),
         );
         query.include_reviews = session_kind == crate::analytics::SessionKindFilter::All;
+        query.claude_sources = Some(config.claude_sources());
         std::thread::spawn(move || {
             if !config.machines.is_empty() {
                 let result = federated_usage_activity(
@@ -2631,9 +2632,24 @@ impl App {
             };
             cwd
         } else {
-            crate::resume::resume_cwd(resolve_session_cwd(&session), &session.source_dir)
+            crate::resume::resume_cwd(
+                resolve_session_cwd(&session),
+                &session.source_dir,
+                &self.config.claude_sources(),
+            )
         };
-        let local_command = expand_resume_template(&template, &session, &cwd);
+        // Only this machine's roots locate a config directory; a remote session resumes in the
+        // remote environment's own.
+        let claude_config_dir = (!remote)
+            .then(|| {
+                crate::resume::claude_config_dir(
+                    session.source,
+                    &session.source_path,
+                    &self.config.claude_sources(),
+                )
+            })
+            .flatten();
+        let local_command = expand_resume_template(&template, &session, &cwd, claude_config_dir);
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)
                 .ok_or_else(|| anyhow::anyhow!("unknown machine '{}'", session.machine))?;
@@ -3826,6 +3842,7 @@ fn home_token_usage_query(
         include_events: false,
         include_reviews: false,
         cache_path: Some(cache_path),
+        claude_sources: None,
         // Keystrokes and result updates re-run this query with different post-assembly
         // filters; reuse the assembled scan between them instead of re-reading logs. On a
         // large corpus assembly takes seconds even warm, so favor staleness (the chart lags
@@ -6075,7 +6092,12 @@ fn build_detail_lines_from_records(
     Ok(lines)
 }
 
-fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -> String {
+fn expand_resume_template(
+    template: &str,
+    session: &SessionSummary,
+    cwd: &str,
+    claude_config_dir: Option<PathBuf>,
+) -> String {
     crate::resume::expand_resume_template(
         template,
         &crate::resume::ResumeSession {
@@ -6084,6 +6106,7 @@ fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -
             project: &session.project,
             source_path: &session.source_path,
             source_dir: &session.source_dir,
+            claude_config_dir,
         },
         cwd,
     )

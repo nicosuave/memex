@@ -93,6 +93,17 @@ pub struct SessionDetailRow {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_kind: Option<String>,
+    /// Claude config directory the session was read from; derived from `source_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// The Claude config directory (`work` for `~/.claude-profiles/work/projects/...`) a
+/// session's transcript lives in. Other sources have no profile.
+pub fn session_profile(source: SourceKind, source_path: &str) -> Option<String> {
+    (source == SourceKind::Claude)
+        .then(|| crate::sources::claude::profile_from_path(Path::new(source_path)))
+        .flatten()
 }
 
 pub struct AnalyticsStore {
@@ -478,7 +489,7 @@ impl AnalyticsStore {
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
         self.query_sessions_detailed_selected(
-            source, project, cwd, since_ms, kind, None, None, limit,
+            source, project, cwd, since_ms, kind, None, None, None, limit,
         )
     }
 
@@ -493,6 +504,7 @@ impl AnalyticsStore {
         kind: Option<SessionKindFilter>,
         session_id: Option<&str>,
         source_path: Option<&str>,
+        profile: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
         let mut sql = String::from(
@@ -508,10 +520,11 @@ impl AnalyticsStore {
             kind,
             session_id,
             source_path,
+            profile,
         );
         sql.push_str(&predicate);
         sql.push_str(" ORDER BY last_at DESC");
-        if let Some(limit) = limit {
+        if let Some(limit) = limit.filter(|_| profile.is_none()) {
             sql.push_str(" LIMIT ?");
             values.push(rusqlite::types::Value::Integer(limit as i64));
         }
@@ -521,10 +534,12 @@ impl AnalyticsStore {
             let source_label: String = row.get(0)?;
             let source = SourceKind::from_label(&source_label).unwrap_or(SourceKind::Claude);
             let repo_project: Option<String> = row.get(4)?;
+            let source_path: String = row.get(2)?;
             Ok(SessionDetailRow {
                 source,
                 session_id: row.get(1)?,
-                source_path: row.get(2)?,
+                profile: session_profile(source, &source_path),
+                source_path,
                 project: row.get(3)?,
                 repo_project: repo_project.filter(|value| !value.is_empty()),
                 cwd: row.get::<_, Option<String>>(5)?.filter(|v| !v.is_empty()),
@@ -539,7 +554,13 @@ impl AnalyticsStore {
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            if limit.is_some_and(|limit| out.len() >= limit) {
+                break;
+            }
+            let row = row?;
+            if profile.is_none() || row.profile.as_deref() == profile {
+                out.push(row);
+            }
         }
         let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
         for row in &mut out {
@@ -560,7 +581,7 @@ impl AnalyticsStore {
         cwd: Option<&str>,
     ) -> Result<Vec<crate::index::SessionScopeKey>> {
         let (predicate, values) =
-            session_selection_sql(None, repository_project, cwd, None, None, None, None);
+            session_selection_sql(None, repository_project, cwd, None, None, None, None, None);
         let mut statement = self.conn.prepare(&format!(
             "select source, session_id, source_path from sessions{predicate}"
         ))?;
@@ -586,6 +607,7 @@ impl AnalyticsStore {
         kind: Option<SessionKindFilter>,
         session_id: Option<&str>,
         source_path: Option<&str>,
+        profile: Option<&str>,
     ) -> Result<u64> {
         let (predicate, values) = session_selection_sql(
             source,
@@ -595,12 +617,24 @@ impl AnalyticsStore {
             kind,
             session_id,
             source_path,
+            profile,
         );
-        Ok(self.conn.query_row(
-            &format!("SELECT count(*) FROM sessions{predicate}"),
-            params_from_iter(values),
-            |row| row.get(0),
-        )?)
+        let Some(profile) = profile else {
+            return Ok(self.conn.query_row(
+                &format!("SELECT count(*) FROM sessions{predicate}"),
+                params_from_iter(values),
+                |row| row.get(0),
+            )?);
+        };
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT source_path FROM sessions{predicate}"))?;
+        let mut count = 0;
+        for path in stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))? {
+            count +=
+                u64::from(session_profile(SourceKind::Claude, &path?).as_deref() == Some(profile));
+        }
+        Ok(count)
     }
 
     /// Count indexed identities using canonical whole-session origin metadata.
@@ -2351,9 +2385,19 @@ fn session_selection_sql(
     kind: Option<SessionKindFilter>,
     session_id: Option<&str>,
     source_path: Option<&str>,
+    profile: Option<&str>,
 ) -> (String, Vec<rusqlite::types::Value>) {
     let mut clauses = Vec::new();
     let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(profile) = profile {
+        // A superset of the rows whose `session_profile` is `profile`; callers apply it exactly.
+        clauses.push("source = ? AND instr(source_path, ?) > 0".to_string());
+        values.push(rusqlite::types::Value::Text(
+            SourceKind::Claude.storage_label().to_string(),
+        ));
+        values.push(rusqlite::types::Value::Text(profile.to_string()));
+    }
 
     if let Some(session_id) = session_id {
         clauses.push("session_id = ?".to_string());
@@ -2477,6 +2521,69 @@ mod tests {
     }
 
     #[test]
+    fn profile_filter_matches_the_reported_profile_before_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
+             ('claude', 'decoy', '/home/u/work/.claude/projects/-x/decoy.jsonl', 'p', 1, 4),
+             ('claude', 'nested', '/home/u/projects/dotfiles/claude/projects/-x/nested.jsonl', 'p', 1, 3),
+             ('claude', 'work', '/home/u/.claude-profiles/work/projects/-x/work.jsonl', 'p', 1, 2),
+             ('codex', 'other', '/home/u/.codex/work/projects/other.jsonl', 'p', 1, 1);",
+        ).unwrap();
+        let listed = |profile| {
+            store
+                .query_sessions_detailed_selected(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(profile),
+                    Some(1),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.session_id, row.profile.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let count = |profile| {
+            store
+                .count_sessions_selected(None, None, None, None, None, None, None, Some(profile))
+                .unwrap()
+        };
+
+        assert_eq!(listed("work"), [("work".to_string(), "work".to_string())]);
+        assert_eq!(
+            listed("claude"),
+            [("nested".to_string(), "claude".to_string())]
+        );
+        assert!(listed("u").is_empty());
+        assert!(
+            store
+                .query_sessions_detailed_selected(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("work"),
+                    Some(0),
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            (count("work"), count("claude"), count(".claude"), count("u")),
+            (1, 1, 1, 0)
+        );
+    }
+
+    #[test]
     fn detailed_sessions_exact_selectors_apply_before_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
@@ -2497,6 +2604,7 @@ mod tests {
                     None,
                     session_id,
                     source_path,
+                    None,
                     Some(1),
                 )
                 .unwrap()
@@ -2519,6 +2627,7 @@ mod tests {
                     None,
                     Some("shared"),
                     Some("/old"),
+                    None,
                     Some(1),
                 )
                 .unwrap()
@@ -2866,6 +2975,7 @@ mod tests {
                     None,
                     None,
                     Some(target.to_string_lossy().as_ref()),
+                    None,
                     None,
                     None,
                     None,

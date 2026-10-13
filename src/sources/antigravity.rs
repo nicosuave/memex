@@ -1759,6 +1759,7 @@ mod tests {
             project: &record.project,
             source_path: &record.source_path,
             source_dir: path.parent().unwrap().to_str().unwrap(),
+            claude_config_dir: None,
         };
         let template = crate::resume::default_resume_template("antigravity", true).unwrap();
         assert_eq!(

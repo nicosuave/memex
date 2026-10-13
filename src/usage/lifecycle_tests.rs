@@ -274,12 +274,23 @@ fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
     lock_partitions().remove(&key);
     fs::write(&transcript, claude_line("changed", 20)).unwrap();
-    let observed = validate_partition(SourceFilter::Claude, Some(path), None).unwrap();
+    let observed = validate_partition(
+        SourceFilter::Claude,
+        Some(path),
+        None,
+        &crate::config::default_claude_sources(),
+    )
+    .unwrap();
     assert!(!observed.valid);
     // The supplied checkpoint predates this second mutation. The rebuilt
     // assembly can answer, but its disk facts must not be marked synchronized.
     fs::write(&transcript, claude_line("later", 300)).unwrap();
-    populate_after_failed_validation(SourceFilter::Claude, path, observed.fingerprint);
+    populate_after_failed_validation(
+        SourceFilter::Claude,
+        path,
+        observed.fingerprint,
+        &crate::config::default_claude_sources(),
+    );
     assert!(lock_partitions().contains_key(&key));
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 300);
     assert!(
@@ -292,9 +303,14 @@ fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
     expire(&query);
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 300);
     assert!(
-        validate_partition(SourceFilter::Claude, Some(path), None)
-            .unwrap()
-            .valid
+        validate_partition(
+            SourceFilter::Claude,
+            Some(path),
+            None,
+            &crate::config::default_claude_sources()
+        )
+        .unwrap()
+        .valid
     );
 
     // Exercise the actual cold query entry point with a stable changed source.
@@ -302,9 +318,14 @@ fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
     fs::write(&transcript, claude_line("final", 400)).unwrap();
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 400);
     assert!(
-        validate_partition(SourceFilter::Claude, Some(path), None)
-            .unwrap()
-            .valid
+        validate_partition(
+            SourceFilter::Claude,
+            Some(path),
+            None,
+            &crate::config::default_claude_sources()
+        )
+        .unwrap()
+        .valid
     );
 }
 
@@ -330,7 +351,11 @@ fn failed_cold_validation_does_not_replace_a_snapshot_or_wait_for_refresh() {
     populate_after_failed_validation(
         SourceFilter::Claude,
         path,
-        discovery_fingerprint(SourceFilter::Claude),
+        discovery_fingerprint(
+            SourceFilter::Claude,
+            &crate::config::default_claude_sources(),
+        ),
+        &crate::config::default_claude_sources(),
     );
     assert!(std::sync::Arc::ptr_eq(
         &original,
@@ -341,7 +366,11 @@ fn failed_cold_validation_does_not_replace_a_snapshot_or_wait_for_refresh() {
     populate_after_failed_validation(
         SourceFilter::Claude,
         path,
-        discovery_fingerprint(SourceFilter::Claude),
+        discovery_fingerprint(
+            SourceFilter::Claude,
+            &crate::config::default_claude_sources(),
+        ),
+        &crate::config::default_claude_sources(),
     );
     assert!(!lock_partitions().contains_key(&key));
 }
@@ -408,6 +437,7 @@ fn interrupted_blob_only_refresh_cannot_validate_old_facts() {
         scan_claude,
         &mut warnings,
         Some(&mut cache),
+        &crate::config::default_claude_sources(),
     );
     assert!(warnings.is_empty());
     assert_eq!(

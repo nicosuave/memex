@@ -701,6 +701,7 @@ pub(crate) fn raw_activity_payload(
                     include_reviews: params.origin == SessionKindFilter::All,
                     cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                     memo_ttl_ms: 60_000,
+                    claude_sources: Some(config.claude_sources()),
                 };
                 let report = scan_usage(&query)?;
                 let partial = !report.warnings.is_empty();
@@ -769,6 +770,7 @@ pub(crate) fn raw_activity_payload(
                 include_reviews: params.origin == SessionKindFilter::All,
                 cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                 memo_ttl_ms: 60_000,
+                claude_sources: Some(config.claude_sources()),
             };
             let scan_warnings = visit_usage_activity(&query, |point| {
                 add_activity_value(

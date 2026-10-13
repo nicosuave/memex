@@ -1923,14 +1923,29 @@ pub(super) fn prepare_refresh(
     // unavailable, so absence from discovery never removes state on its own. A direct
     // NotFound confirms removal only while the file's immediate container is still
     // readable: otherwise one unavailable ancestor looks like every transcript under it
-    // was deleted individually.
+    // was deleted individually. A Claude transcript found at the same relative path under
+    // another readable root also confirms a move, even when its old config directory is gone.
     let mut missing_state_paths = Vec::new();
     if full_scan {
+        let claude_roots = options
+            .claude_sources
+            .iter()
+            .filter(|root| root.is_dir() && std::fs::read_dir(root).is_ok())
+            .collect::<Vec<_>>();
         for path in state.file_keys()? {
             let confirmed_missing = match Path::new(&path).metadata() {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Path::new(&path)
-                    .parent()
-                    .is_some_and(|parent| parent.metadata().is_ok_and(|meta| meta.is_dir())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let path = Path::new(&path);
+                    path.parent()
+                        .is_some_and(|parent| parent.metadata().is_ok_and(|meta| meta.is_dir()))
+                        || crate::sources::claude::project_relative_path(path).is_some_and(
+                            |relative| {
+                                claude_roots.iter().any(|root| {
+                                    !path.starts_with(root) && root.join(&relative).is_file()
+                                })
+                            },
+                        )
+                }
                 _ => false,
             };
             if confirmed_missing {

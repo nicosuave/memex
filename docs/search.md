@@ -132,9 +132,10 @@ is enabled by this evaluator.
 
 Index all supported sources by default. Use repeatable `--only-source <source>` or
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
-to use a non-default Claude projects directory. Claude Code workflow runs store each
-agent transcript twice, under `subagents/` and `subagents/workflows/<run>/`; indexing and
-token usage read only one copy. Index sources are `claude`, `codex`,
+(repeatable) to use non-default Claude projects directories; `claude_paths` in the config
+sets them permanently. Claude Code workflow runs store each agent transcript twice, under
+`subagents/` and `subagents/workflows/<run>/`; indexing and token usage read only one copy.
+Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
 `muse`, `antigravity`, `bob`, `zcode`, and `kilocode`.
 Hermes transcripts and usage are read from `state.db` under `~/.hermes` and its

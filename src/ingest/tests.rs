@@ -7181,3 +7181,69 @@ fn workflow_agent_copies_index_once_and_follow_the_more_complete_copy() {
     let analytics = AnalyticsStore::open(analytics_path(&paths.state)).unwrap();
     assert_eq!(analytics.session_count().unwrap(), 1);
 }
+
+#[test]
+fn several_claude_roots_index_together() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path();
+    let legacy = home.join(".claude/projects");
+    let work = home.join(".claude-profiles/work/projects");
+    write_claude_messages(
+        &legacy.join("-tmp-project/legacy.jsonl"),
+        &["legacy question"],
+    );
+    write_claude_messages(&work.join("-tmp-project/work.jsonl"), &["work question"]);
+    let paths = Paths::new(Some(home.join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![
+        legacy,
+        work,
+        home.join(".claude-profiles/not-yet-used/projects"),
+    ];
+
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    assert_eq!(indexed_texts(&paths), ["legacy question", "work question"]);
+}
+
+#[test]
+fn moved_claude_config_directory_retires_old_rows_but_keeps_lost_ones() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path();
+    let legacy = home.join(".claude/projects");
+    let profile = home.join(".claude-profiles/personal/projects");
+    write_claude_messages(
+        &legacy.join("-tmp-moved/session.jsonl"),
+        &["moved conversation"],
+    );
+    write_claude_messages(
+        &legacy.join("-tmp-lost/session.jsonl"),
+        &["lost conversation"],
+    );
+    let paths = Paths::new(Some(home.join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![legacy.clone(), profile.clone()];
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    // The whole config directory moves into a profile; one conversation does not survive.
+    fs::create_dir_all(home.join(".claude-profiles")).unwrap();
+    fs::rename(home.join(".claude"), home.join(".claude-profiles/personal")).unwrap();
+    fs::remove_dir_all(profile.join("-tmp-lost")).unwrap();
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    assert_eq!(
+        indexed_source_paths(&paths),
+        [
+            legacy.join("-tmp-lost/session.jsonl"),
+            profile.join("-tmp-moved/session.jsonl"),
+        ]
+    );
+    assert_eq!(
+        indexed_texts(&paths),
+        ["lost conversation", "moved conversation"]
+    );
+}

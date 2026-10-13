@@ -1,7 +1,7 @@
 use crate::analytics::{
     AnalyticsStore, ProjectGrouping, SessionDetailRow, SessionKindFilter, analytics_path,
 };
-use crate::config::{MachineConfig, Paths, UserConfig, default_claude_sources};
+use crate::config::{MachineConfig, Paths, UserConfig};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
 use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
@@ -181,11 +181,17 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
-    fn new(records: Vec<Record>, source_path: &str, session_id: &str) -> Self {
+    fn new(
+        records: Vec<Record>,
+        source_path: &str,
+        session_id: &str,
+        claude_sources: &[std::path::PathBuf],
+    ) -> Self {
         let path = std::path::Path::new(source_path);
         let cwd = discover_cwd(path, session_id);
         let source_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
-        let resume_cwd = crate::resume::resume_cwd(cwd.clone(), &source_dir.to_string_lossy());
+        let resume_cwd =
+            crate::resume::resume_cwd(cwd.clone(), &source_dir.to_string_lossy(), claude_sources);
         Self {
             records,
             cwd,
@@ -341,6 +347,8 @@ pub struct SessionListSpec {
     #[serde(default)]
     pub source_path: Option<String>,
     pub source: Option<SourceFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     pub project: Option<String>,
     pub cwd: Option<String>,
     pub since_ms: Option<u64>,
@@ -962,24 +970,39 @@ pub fn federated_sessions(
                 .join("; ")
         );
     }
-    Ok(merge_sessions(successes, failures, spec.limit))
+    Ok(merge_sessions(
+        successes,
+        failures,
+        spec.limit,
+        spec.profile.as_deref(),
+    ))
 }
 
 fn merge_sessions(
     successes: Vec<(String, Vec<SessionListing>)>,
     mut failures: Vec<(String, String)>,
     limit: usize,
+    profile: Option<&str>,
 ) -> Federated<LocatedSession> {
     let mut items = successes
         .into_iter()
         .flat_map(|(machine, sessions)| {
-            sessions.into_iter().map(move |session| LocatedSession {
-                machine: machine.clone(),
-                session: session.session,
-                resume_cmd: session.resume_cmd,
+            sessions.into_iter().map(move |mut listing| {
+                // A machine running an older memex neither reports nor filters by profile.
+                let session = &mut listing.session;
+                session.profile = session.profile.take().or_else(|| {
+                    crate::analytics::session_profile(session.source, &session.source_path)
+                });
+                LocatedSession {
+                    machine: machine.clone(),
+                    session: listing.session,
+                    resume_cmd: listing.resume_cmd,
+                }
             })
         })
+        .filter(|item| profile.is_none() || item.session.profile.as_deref() == profile)
         .collect::<Vec<_>>();
+
     items.sort_by(|left, right| {
         right
             .session
@@ -1029,6 +1052,7 @@ pub fn session_context(
             records_for_session(&index, session_id, source_path)?,
             source_path,
             session_id,
+            &config.claude_sources(),
         ));
     }
     let machine = config
@@ -2263,6 +2287,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                 request.cwd.map(std::path::PathBuf::from),
                 request.project,
                 crate::cli::parse_source_filter(request.source)?,
+                request.profile,
                 request.since,
                 request.limit,
                 request.origin,
@@ -2303,7 +2328,12 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             let index = SearchIndex::open_or_create(&paths.index)?;
             let records = records_for_session(&index, &session_id, &source_path)?;
             Ok(RpcPayload::Session {
-                context: SessionContext::new(records, &source_path, &session_id),
+                context: SessionContext::new(
+                    records,
+                    &source_path,
+                    &session_id,
+                    &config.claude_sources(),
+                ),
             })
         }
         RpcOperation::Show { doc_id } => {
@@ -2425,6 +2455,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
 fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
     let config = UserConfig::load(paths)?;
+    let claude_sources = config.claude_sources();
     let cwd = crate::cli::canonical_cwd_filter(spec.cwd.as_ref().map(std::path::PathBuf::from));
     let rows = store.query_sessions_detailed_selected(
         spec.source,
@@ -2434,13 +2465,14 @@ fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionLi
         spec.origin,
         spec.session_id.as_deref(),
         spec.source_path.as_deref(),
+        spec.profile.as_deref(),
         Some(spec.limit),
     )?;
     Ok(rows
         .into_iter()
         .map(|session| {
-            let resume_cmd =
-                crate::cli::session_resume_command(&config, &session).map(|(command, _)| command);
+            let resume_cmd = crate::cli::session_resume_command(&config, &session, &claude_sources)
+                .map(|(command, _)| command);
             SessionListing {
                 session,
                 resume_cmd,
@@ -2586,6 +2618,7 @@ fn usage_query(paths: &Paths, spec: &UsageSpec) -> Result<UsageQuery> {
         include_reviews: spec.kind == Some(SessionKindFilter::All),
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: spec.memo_ttl_ms,
+        claude_sources: Some(UserConfig::load(paths)?.claude_sources()),
     })
 }
 
@@ -3089,7 +3122,7 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
 
 fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
     Ok(IngestOptions {
-        claude_sources: default_claude_sources(),
+        claude_sources: config.claude_sources(),
         include_agents: false,
         include_reasoning: config.include_reasoning_default(),
         include_codex: true,
@@ -3534,7 +3567,8 @@ mod tests {
                             .to_string(),
                     )
                     .unwrap();
-                    let context = SessionContext::new(Vec::new(), path.to_str().unwrap(), "s1");
+                    let context =
+                        SessionContext::new(Vec::new(), path.to_str().unwrap(), "s1", &[]);
                     // Factual cwd stays distinct from the safe fallback.
                     assert_eq!(
                         context.cwd,
@@ -4915,6 +4949,7 @@ mod tests {
                 started_at: last_at.saturating_sub(1),
                 last_at,
                 message_count: 1,
+                profile: None,
             },
         };
         let result = merge_sessions(
@@ -4924,6 +4959,7 @@ mod tests {
             ],
             vec![("offline".to_string(), "unavailable".to_string())],
             1,
+            None,
         );
 
         assert_eq!(result.items.len(), 1);
@@ -4931,6 +4967,63 @@ mod tests {
         assert_eq!(result.items[0].session.session_id, "newer");
         assert_eq!(result.candidate_count, 2);
         assert_eq!(result.failures[0].0, "offline");
+    }
+
+    #[test]
+    fn session_feed_filters_profiles_of_older_machines_before_the_limit() {
+        let session = |id: &str, profile: &str, last_at: u64, reported: bool| SessionListing {
+            resume_cmd: None,
+            session: SessionDetailRow {
+                label: None,
+                conversation_kind: None,
+                source: SourceKind::Claude,
+                session_id: id.to_string(),
+                source_path: format!("/home/u/.claude-profiles/{profile}/projects/-p/{id}.jsonl"),
+                project: "memex".to_string(),
+                repo_project: None,
+                cwd: None,
+                git_root: None,
+                started_at: last_at,
+                last_at,
+                message_count: 1,
+                profile: reported.then(|| profile.to_string()),
+            },
+        };
+        // An older peer ignores the filter and reports no profile; its newer rows must not
+        // crowd out matching local rows.
+        let result = merge_sessions(
+            vec![
+                (
+                    "local".to_string(),
+                    vec![session("local-work", "work", 1, true)],
+                ),
+                (
+                    "old-peer".to_string(),
+                    vec![
+                        session("peer-personal", "personal", 3, false),
+                        session("peer-work", "work", 2, false),
+                    ],
+                ),
+            ],
+            Vec::new(),
+            2,
+            Some("work"),
+        );
+
+        let ids = result
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.session.session_id.as_str(),
+                    item.session.profile.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [("peer-work", Some("work")), ("local-work", Some("work"))]
+        );
     }
 
     #[test]

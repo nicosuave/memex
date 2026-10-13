@@ -7,8 +7,9 @@ use directories::BaseDirs;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fmt;
+use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -45,41 +46,30 @@ impl Paths {
     }
 }
 
+/// Claude Code `projects` directories named by the environment: the comma-separated
+/// `CLAUDE_CONFIG_DIR`, else `~/.claude/projects` and `~/.config/claude/projects`.
+/// `UserConfig::claude_sources` applies the configured `claude_paths` first.
 pub fn default_claude_sources() -> Vec<PathBuf> {
     if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        let mut roots: Vec<_> = value
-            .to_string_lossy()
-            .split(',')
-            .filter_map(|value| {
-                let value = value.trim();
-                if value.is_empty() {
-                    None
-                } else {
-                    let root = PathBuf::from(value);
-                    Some(
-                        if root.file_name().and_then(|name| name.to_str()) == Some("projects") {
-                            root
-                        } else {
-                            root.join("projects")
-                        },
-                    )
-                }
-            })
-            .collect();
-        let mut seen = HashSet::new();
-        roots.retain(|root| seen.insert(root.clone()));
+        let roots = unique_roots(
+            value
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| claude_projects_dir(PathBuf::from(value)))
+                .collect(),
+        );
         if !roots.is_empty() {
             return roots;
         }
     }
 
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    vec![
+    let home = crate::sources::common::home();
+    unique_roots(vec![
         home.join(".claude").join("projects"),
         home.join(".config").join("claude").join("projects"),
-    ]
+    ])
 }
 
 pub fn default_claude_source() -> PathBuf {
@@ -87,6 +77,89 @@ pub fn default_claude_source() -> PathBuf {
         .into_iter()
         .next()
         .expect("default Claude sources are never empty")
+}
+
+/// Expand `claude_paths` entries. `~` is the home directory, and an entry names a Claude
+/// config directory or its `projects` directory. A glob entry yields the matching
+/// directories that hold a `projects` directory now; a literal entry is kept even while it
+/// is missing, like the defaults, so the watcher notices when it appears.
+fn expand_claude_paths(patterns: &[String], home: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for pattern in patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+    {
+        let path = match pattern.strip_prefix('~') {
+            Some("") => home.to_path_buf(),
+            Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
+            _ => PathBuf::from(pattern),
+        };
+        if path_has_glob(&path) {
+            roots.extend(
+                glob_directories(&path)
+                    .into_iter()
+                    .map(claude_projects_dir)
+                    .filter(|root| root.is_dir()),
+            );
+        } else {
+            roots.push(claude_projects_dir(path));
+        }
+    }
+    unique_roots(roots)
+}
+
+fn claude_projects_dir(root: PathBuf) -> PathBuf {
+    if root.file_name().and_then(|name| name.to_str()) == Some("projects") {
+        root
+    } else {
+        root.join("projects")
+    }
+}
+
+/// Drop roots that repeat an earlier one. Resolved paths are compared, so a symlinked config
+/// directory is read once.
+fn unique_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(fs::canonicalize(root).unwrap_or_else(|_| root.clone())));
+    roots
+}
+
+fn component_has_glob(component: &str) -> bool {
+    component.contains(['*', '?', '[', '{'])
+}
+
+fn path_has_glob(path: &Path) -> bool {
+    path.components()
+        .any(|component| component_has_glob(&component.as_os_str().to_string_lossy()))
+}
+
+/// Directories matching `pattern`, resolving one glob component at a time. Components are
+/// validated when the config loads.
+fn glob_directories(pattern: &Path) -> Vec<PathBuf> {
+    let mut matches = vec![PathBuf::new()];
+    for component in pattern.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if !component_has_glob(&text) {
+            for path in &mut matches {
+                path.push(component);
+            }
+            continue;
+        }
+        let Ok(glob) = globset::Glob::new(&text) else {
+            return Vec::new();
+        };
+        let matcher = glob.compile_matcher();
+        matches = matches
+            .iter()
+            .filter_map(|directory| fs::read_dir(directory).ok())
+            .flat_map(|entries| entries.flatten())
+            .filter(|entry| matcher.is_match(entry.file_name()) && entry.path().is_dir())
+            .map(|entry| entry.path())
+            .collect();
+    }
+    matches.sort();
+    matches
 }
 
 const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
@@ -305,6 +378,10 @@ pub struct UserConfig {
     /// Glob patterns matched against transcript source paths; matched files are
     /// never indexed. Applied during source discovery, not at query time.
     pub exclude_paths: Option<Vec<String>>,
+    /// Claude Code config or `projects` directories to read, replacing `CLAUDE_CONFIG_DIR`
+    /// and the defaults. Entries may start with `~/` and use one-level globs, such as
+    /// `~/.claude-profiles/*`, which every full scan re-expands.
+    pub claude_paths: Option<Vec<String>>,
     /// Multi-machine search and control defaults.
     #[serde(default)]
     pub multi_machine: MultiMachineConfig,
@@ -403,7 +480,31 @@ impl UserConfig {
         }
         let contents = std::fs::read_to_string(path)?;
         let config: UserConfig = toml::from_str(&contents)?;
+        for pattern in config.claude_paths.iter().flatten() {
+            for component in Path::new(pattern.trim()).components() {
+                let text = component.as_os_str().to_string_lossy();
+                if text.contains("**") {
+                    return Err(anyhow!(
+                        "claude_paths entry {pattern:?}: `**` is not supported; each glob component matches one directory"
+                    ));
+                }
+                if component_has_glob(&text) {
+                    globset::Glob::new(&text)
+                        .map_err(|error| anyhow!("claude_paths entry {pattern:?}: {error}"))?;
+                }
+            }
+        }
         Ok(config)
+    }
+
+    /// Claude Code `projects` directories to read: `claude_paths`, else
+    /// `default_claude_sources`. Globs expand on every call, so the next full scan finds a
+    /// profile directory created after startup.
+    pub fn claude_sources(&self) -> Vec<PathBuf> {
+        match &self.claude_paths {
+            Some(patterns) => expand_claude_paths(patterns, &crate::sources::common::home()),
+            None => default_claude_sources(),
+        }
     }
 
     pub fn embeddings_mode(&self) -> EmbeddingsMode {
@@ -782,6 +883,94 @@ mod tests {
             default_claude_source(),
             PathBuf::from("/tmp/claude-one/projects")
         );
+    }
+
+    #[test]
+    fn claude_paths_expand_home_globs_and_config_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for directory in [
+            ".claude/projects",
+            ".claude-profiles/work/projects",
+            ".claude-profiles/personal/projects",
+            // Shared configuration, not a profile: it has no transcripts directory.
+            ".claude-profiles/shared/agents",
+        ] {
+            fs::create_dir_all(home.join(directory)).unwrap();
+        }
+        let patterns = [
+            "~/.claude",
+            "~/.claude-profiles/*",
+            "~/.claude-profiles/*/projects",
+            "/missing/claude/projects",
+            " ",
+        ]
+        .map(String::from);
+
+        assert_eq!(
+            expand_claude_paths(&patterns, home),
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-profiles/personal/projects"),
+                home.join(".claude-profiles/work/projects"),
+                PathBuf::from("/missing/claude/projects"),
+            ]
+        );
+
+        fs::create_dir_all(home.join(".claude-profiles/new/projects")).unwrap();
+        assert!(
+            expand_claude_paths(&patterns, home)
+                .contains(&home.join(".claude-profiles/new/projects"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_paths_read_a_symlinked_config_directory_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for directory in [
+            ".claude-profiles/personal/projects",
+            ".claude-profiles/work/projects",
+        ] {
+            fs::create_dir_all(home.join(directory)).unwrap();
+        }
+        std::os::unix::fs::symlink(home.join(".claude-profiles/personal"), home.join(".claude"))
+            .unwrap();
+
+        assert_eq!(
+            expand_claude_paths(
+                &["~/.claude", "~/.claude-profiles/*"].map(String::from),
+                home
+            ),
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-profiles/work/projects"),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_paths_reject_invalid_globs_when_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "claude_paths = [\"~/.claude-profiles/[/projects\"]\n",
+        )
+        .unwrap();
+        let error = UserConfig::load(&Paths::new(Some(temp.path().to_path_buf())).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("claude_paths entry"), "{error}");
+        fs::write(
+            temp.path().join("config.toml"),
+            "claude_paths = [\"~/accounts/**/projects\"]\n",
+        )
+        .unwrap();
+        let error = UserConfig::load(&Paths::new(Some(temp.path().to_path_buf())).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("one directory"), "{error}");
     }
 
     #[test]

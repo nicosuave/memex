@@ -21,7 +21,10 @@ pub struct SourceAudit {
     pub producer_versions: BTreeMap<String, u64>,
 }
 
-pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<SourceAudit>> {
+pub fn audit_installed_sources(
+    source: Option<SourceFilter>,
+    claude_sources: &[PathBuf],
+) -> Result<Vec<SourceAudit>> {
     let mut groups = Vec::new();
     let mut push = |kind: SourceKind, files: Vec<PathBuf>| {
         if source.is_none_or(|filter| filter.matches(kind)) {
@@ -29,7 +32,10 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
         }
     };
 
-    push(SourceKind::Claude, super::claude::usage_files());
+    push(
+        SourceKind::Claude,
+        super::claude::usage_files(claude_sources),
+    );
     push(
         SourceKind::Codex,
         super::codex::discover_rollouts(None)

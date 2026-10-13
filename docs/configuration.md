@@ -136,6 +136,7 @@ scan_cache_ttl = 3600  # seconds (default 1 hour)
 max_indexed_tool_input_bytes = 65536  # 64 KiB default
 max_indexed_tool_output_bytes = 262144  # 256 KiB default
 exclude_paths = ["~/.claude/projects/*-client-*", "~/work/**"]  # never index matched transcripts
+claude_paths = ["~/.claude", "~/.claude-profiles/*"]  # Claude config dirs to read; globs allowed
 index_service_mode = "interval"  # interval or continuous
 index_service_interval = 3600  # seconds (ignored when mode = "continuous")
 index_service_poll_interval = 30  # seconds
@@ -177,10 +178,21 @@ new limits to records that are already indexed.
 matched transcripts never enter the index (a leading `~/` is expanded to your home directory).
 Adding a pattern also removes records previously indexed from matched paths — no rebuild
 required. For one-off runs, pass `--exclude GLOB` (repeatable) to `memex index`.
+`claude_paths` lists the Claude Code config directories (or their `projects` directories) to
+index and scan for token usage, for one config directory per account selected with
+`CLAUDE_CONFIG_DIR`. It replaces `CLAUDE_CONFIG_DIR` and the default `~/.claude/projects` and
+`~/.config/claude/projects`; `--claude-path` overrides it for one run. A leading `~/` expands
+to your home directory. Each glob component matches one directory level (`**` is rejected)
+and is re-expanded on every full scan, so the daemon's next resync picks up a profile created
+later without a restart. `memex sessions --profile NAME` lists the sessions of one config
+directory: `NAME` is the directory's name, such as `work` for `~/.claude-profiles/work` or
+`.claude` for `~/.claude`. Moving transcripts between configured roots retires the records
+indexed under their old paths and indexes them again from the new ones; see
+[vector-migration.md](vector-migration.md) to keep their embeddings.
 `execution_provider` applies to local ONNX-backed models; `potion` uses the model2vec backend.
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.
 
-Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`.
+Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`. `{claude_env}` expands to `CLAUDE_CONFIG_DIR='<dir>' ` for a local Claude session read from a configured config directory other than Claude's default `~/.claude` or `~/.config/claude`, and to nothing otherwise; the default Claude template uses it.
 
 The skill definitions are bundled in `skills/`.
