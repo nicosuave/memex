@@ -71,6 +71,8 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Kiro => None,
         // KiloCode sessions resume with `kilo --session <id>` in a project directory.
         SourceKind::Kilocode => config.kilocode_resume_cmd.clone(),
+        // Kimi Code sessions resume with `kimi --session <id>` in a project directory.
+        SourceKind::Kimi => config.kimi_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -118,14 +120,21 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         "kilocode" if remote || find_in_path("kilo").is_some() => {
             Some("cd {cwd_shell} && kilo --session {session_id}".to_string())
         }
+        "kimi" if remote || find_in_path("kimi").is_some() => {
+            Some("cd {cwd_shell} && kimi --session {session_id}".to_string())
+        }
         _ => None,
     }
 }
 
 pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str) -> String {
+    let session_id = match session.source {
+        SourceKind::Kimi => crate::sources::kimi::resume_session_id(session.session_id),
+        _ => session.session_id,
+    };
     template
         .replace("{claude_env}", &claude_env(session))
-        .replace("{session_id}", session.session_id)
+        .replace("{session_id}", session_id)
         .replace("{project}", session.project)
         .replace("{source}", session.source.label())
         .replace("{source_path_shell}", &shell_quote(session.source_path))
@@ -339,6 +348,25 @@ mod tests {
             default_resume_template("opencode", true).as_deref(),
             Some("opencode --session {session_id}")
         );
+    }
+
+    #[test]
+    fn kimi_subagent_resumes_its_owning_session() {
+        let template = default_resume_template("kimi", true).unwrap();
+        let session = |session_id| ResumeSession {
+            source: SourceKind::Kimi,
+            session_id,
+            project: "repo",
+            source_path: "/k/sessions/wd/session_a/agents/agent-0/wire.jsonl",
+            source_dir: "/k/sessions/wd/session_a/agents/agent-0",
+            claude_config_dir: None,
+        };
+        for session_id in ["session_a", "session_a:agent-0"] {
+            assert_eq!(
+                expand_resume_template(&template, &session(session_id), "/repo"),
+                "cd '/repo' && kimi --session session_a"
+            );
+        }
     }
 
     #[test]

@@ -83,6 +83,48 @@ pub(crate) fn is_db_path(path: &Path) -> bool {
         && !is_wal_or_shm(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
 }
 
+/// Open a conversation store without ever writing beside it.
+///
+/// Antigravity leaves its stores in WAL mode and removes the `-wal`/`-shm`
+/// sidecars on clean close. A plain read-only connection to such a store either
+/// recreates the sidecars inside Antigravity's directory (SQLite 3.45, the
+/// bundled library) or fails on the first statement with `SQLITE_CANTOPEN`
+/// (3.51, the system library Homebrew builds link). An immutable open reads the
+/// file as it is, which is exact while no writer holds the store open: a writer
+/// would have created the sidecars. Stores with sidecars, or in rollback-journal
+/// mode, keep the regular read-only path.
+fn open_store(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let immutable = wal_without_sidecars(path)
+        .then(|| std::path::absolute(path).ok())
+        .flatten()
+        .and_then(|absolute| url::Url::from_file_path(absolute).ok());
+    match immutable {
+        Some(mut uri) => {
+            uri.set_query(Some("immutable=1"));
+            Connection::open_with_flags(uri.as_str(), flags | rusqlite::OpenFlags::SQLITE_OPEN_URI)
+        }
+        None => Connection::open_with_flags(path, flags),
+    }
+}
+
+/// WAL-mode header (file format bytes 18 and 19 are 2) with no sidecar beside it.
+fn wal_without_sidecars(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    let readable = std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok();
+    readable
+        && header[18] == 2
+        && header[19] == 2
+        && ["-wal", "-shm"].iter().all(|suffix| {
+            let mut sidecar = path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            !Path::new(&sidecar).exists()
+        })
+}
+
 fn is_overview_path(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()) == Some("overview.txt")
 }
@@ -250,8 +292,8 @@ fn index_db_file(
     diagnostics: &mut ParseDiagnostics,
     start_turn_id: u32,
 ) -> Result<(String, u32, u64, Option<String>)> {
-    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open antigravity store {}", path.display()))?;
+    let conn =
+        open_store(path).with_context(|| format!("open antigravity store {}", path.display()))?;
     let store_id = |query: &str| {
         conn.prepare(query).ok().and_then(|mut stmt| {
             stmt.query_row([], |row| row.get::<_, Option<String>>(0))
@@ -904,8 +946,7 @@ pub(crate) fn project_root_from_payload(payload: &[u8]) -> Option<String> {
 /// steps. This is used by analytics to resolve the enclosing Git repository.
 pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
     if is_db_path(path) {
-        let conn =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        let conn = open_store(path).ok()?;
         let mut stmt = conn
             .prepare("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx")
             .ok()?;
@@ -1766,5 +1807,70 @@ mod tests {
             crate::resume::expand_resume_template(&template, &session, "/repo"),
             "cd '/repo' && agy --conversation e2a4562b-5476-4222-84bf-5110195946bf"
         );
+    }
+
+    #[test]
+    fn reads_wal_stores_without_sidecars_and_without_writing_beside_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = write_store(temp.path());
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload)
+                 VALUES (4, 23, 3, false, ?1)",
+                rusqlite::params![model_step("after wal")],
+            )
+            .unwrap();
+            let project_root = field_bytes(
+                19,
+                &field_bytes(
+                    4,
+                    &field_bytes(2, &field_bytes(13, b"file:///Users/x/src/repo-api")),
+                ),
+            );
+            conn.execute(
+                "INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload)
+                 VALUES (5, 14, 3, false, ?1)",
+                rusqlite::params![project_root],
+            )
+            .unwrap();
+        }
+        // The last connection closing checkpoints the log and removes both sidecars,
+        // which is how Antigravity leaves every closed conversation.
+        let entries = || {
+            let mut names = fs::read_dir(db.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(entries(), ["conv-1.db"]);
+        assert!(wal_without_sidecars(&db));
+
+        let (records, _) = emit_collect(&db, false);
+        assert!(records.iter().any(|record| record.text == "after wal"));
+        assert_eq!(
+            session_cwd(&db),
+            Some(PathBuf::from("/Users/x/src/repo-api"))
+        );
+        assert_eq!(entries(), ["conv-1.db"], "reading must not create sidecars");
+
+        // A store held open by a writer has sidecars and reads through the WAL.
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute(
+                "INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload)
+                 VALUES (6, 23, 3, false, ?1)",
+                rusqlite::params![model_step("while open")],
+            )
+            .unwrap();
+        assert!(!wal_without_sidecars(&db));
+        let (records, _) = emit_collect(&db, false);
+        assert!(records.iter().any(|record| record.text == "while open"));
+        drop(writer);
+        assert!(!wal_without_sidecars(&temp.path().join("missing.db")));
     }
 }

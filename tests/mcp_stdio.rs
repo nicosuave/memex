@@ -423,6 +423,7 @@ fn search_reuses_cli_fusion_projection_and_observes_new_generations() {
             "--no-muse",
             "--no-kiro",
             "--no-kilocode",
+            "--no-kimi",
             "--no-embeddings",
             "--root",
         ])

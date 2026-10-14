@@ -17,6 +17,7 @@ pub mod hermes;
 pub mod jcode;
 mod jsonl;
 pub mod kilocode;
+pub mod kimi;
 pub mod kiro;
 pub mod muse;
 pub mod omp;
@@ -297,6 +298,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Zcode => zcode::VERSIONS,
         SourceKind::Kiro => kiro::VERSIONS,
         SourceKind::Kilocode => kilocode::VERSIONS,
+        SourceKind::Kimi => kimi::VERSIONS,
     }
 }
 
@@ -316,6 +318,7 @@ pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<
         SourceKind::Kilocode => {
             kilocode::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
         }
+        SourceKind::Kimi => kimi::session_cwd(path),
         SourceKind::Hermes => hermes::session_cwd(path, session_id),
         _ => jsonl::scan_session_cwd(path, session_id),
     }
@@ -360,6 +363,7 @@ fn state_store_roots(claude_sources: &[PathBuf]) -> Vec<PathBuf> {
     roots.extend(antigravity::profile_roots());
     roots.extend(bob::roots());
     roots.extend(kilocode::roots());
+    roots.push(kimi::home());
     roots
 }
 
@@ -386,6 +390,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Zcode
                 | SourceKind::Kiro
                 | SourceKind::Kilocode
+                | SourceKind::Kimi
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -413,6 +418,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Kiro
     } else if kilocode::matches_path(path) {
         SourceKind::Kilocode
+    } else if kimi::matches_path(path) {
+        SourceKind::Kimi
     } else if grok::matches_path(path) {
         SourceKind::Grok
     } else if cursor::matches_path(path) {
@@ -514,6 +521,7 @@ mod tests {
             SourceKind::Muse,
             SourceKind::Kiro,
             SourceKind::Kilocode,
+            SourceKind::Kimi,
             SourceKind::Grok,
         ] {
             assert_ne!(

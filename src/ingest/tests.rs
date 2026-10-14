@@ -55,6 +55,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_bob: false,
         include_zcode: false,
         include_kilocode: false,
+        include_kimi: false,
         include_kiro: false,
         embeddings,
         backfill_embeddings: false,
@@ -2907,6 +2908,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_bob: false,
         include_zcode: false,
         include_kilocode: false,
+        include_kimi: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3685,6 +3687,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_bob: false,
         include_zcode: false,
         include_kilocode: false,
+        include_kimi: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -7246,4 +7249,282 @@ fn moved_claude_config_directory_retires_old_rows_but_keeps_lost_ones() {
         indexed_texts(&paths),
         ["lost conversation", "moved conversation"]
     );
+}
+
+#[test]
+fn kilocode_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert_eq!(report.files_skipped, 0);
+}
+
+#[test]
+fn kilocode_store_removed_with_its_directory_keeps_indexed_sessions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let database = root.join("kilo.db");
+    fs::create_dir_all(&root).unwrap();
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    crate::sources::kilocode::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    full();
+    let indexed = indexed_texts(&paths);
+    assert!(!indexed.is_empty());
+
+    // The volume holding the store is gone: keep its sessions and say so.
+    fs::remove_dir_all(&root).unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), indexed);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+
+    // The store is deleted while its directory remains: the sessions go with it.
+    fs::create_dir_all(&root).unwrap();
+    let report = full();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn ingest_kimi_journals_from_kimi_code_home_override() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kimi_home = tmp.path().join("kimi-home");
+    let session_dir = kimi_home
+        .join("sessions")
+        .join("wd_kimi-project_0123456789ab")
+        .join("session_11111111-2222-3333-4444-555555555555");
+    for agent in ["main", "agent-0"] {
+        fs::create_dir_all(session_dir.join("agents").join(agent)).expect("create agent dir");
+    }
+    fs::write(
+        session_dir.join("state.json"),
+        r#"{"id":"session_11111111-2222-3333-4444-555555555555","version":2,"cwd":"/workspace/kimi-project","title":"Inspect the project","agents":{"main":{"type":"main"},"agent-0":{"type":"sub","parentAgentId":"main"}}}"#,
+    )
+    .expect("write state");
+    let main_wire = session_dir.join("agents/main/wire.jsonl");
+    fs::write(
+        &main_wire,
+        include_str!("../../fixtures/trajectory_parity/kimi.jsonl"),
+    )
+    .expect("write kimi fixture");
+    let subagent_wire = session_dir.join("agents/agent-0/wire.jsonl");
+    fs::write(
+        &subagent_wire,
+        concat!(
+            r#"{"type":"metadata","protocol_version":"1.5","created_at":1782864000020}"#,
+            "\n",
+            r#"{"type":"context.append_message","agentId":"agent-0","message":{"role":"user","content":[{"type":"text","text":"Summarize the README"}],"toolCalls":[],"origin":{"kind":"system_trigger","name":"subagent"}},"time":1782864000021}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","agentId":"agent-0","event":{"type":"content.part","uuid":"sub-text-1","stepUuid":"sub-step-1","part":{"type":"text","text":"Summary: project contents"}},"time":1782864000022}"#,
+            "\n",
+        ),
+    )
+    .expect("write subagent wire");
+    // The sessions tree also holds Kimi's own search cache, which is not a journal.
+    fs::create_dir_all(kimi_home.join("sessions/.index-cache")).expect("create cache dir");
+    fs::write(kimi_home.join("sessions/.index-cache/scan.json"), "{}").expect("write cache");
+    let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(kimi_home.as_os_str()))]);
+
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = SearchIndex::open_or_create(&paths.index).expect("index");
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kimi = true;
+    let lease = ingest_lease(&paths);
+    let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+    assert_eq!(report.files_scanned, 2);
+    // Reasoning is off; the injected reminder, lifecycle records, the duplicate
+    // message projection, and the malformed tail are skipped.
+    assert_eq!(report.records_added, 7);
+    assert_eq!(report.diagnostics.malformed_json_lines, 1);
+    assert!(report.diagnostics.unknown_top_level_types.is_empty());
+
+    let session_id = "session_11111111-2222-3333-4444-555555555555";
+    let records = index
+        .records_by_session_id(session_id)
+        .expect("records by session");
+    assert_eq!(records.len(), 5);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.source == SourceKind::Kimi)
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.project == "kimi-project")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.source_path == main_wire.to_string_lossy())
+    );
+    assert!(!records.iter().any(|record| record.role == "reasoning"));
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text.contains("todo list reminder"))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.role == "user" && record.text == "Inspect the project")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.role == "assistant" && record.text == "I will read the file.")
+    );
+    assert!(records.iter().any(|record| {
+        record.role == "tool_use"
+            && record.tool_name.as_deref() == Some("Read")
+            && record.links.source_tool_use_id.as_deref() == Some("tool_1")
+    }));
+    assert!(records.iter().any(|record| {
+        record.role == "tool_result"
+            && record.text == "project contents"
+            && record.tool_name.as_deref() == Some("Read")
+            && record.links.parent_tool_use_id.as_deref() == Some("tool_1")
+    }));
+    assert!(records.iter().any(|record| {
+        record.links.conversation_kind.as_deref() == Some("compaction")
+            && record.text == "Read the README and reported the project contents."
+    }));
+
+    let subagent = index
+        .records_by_session_id(&format!("{session_id}:agent-0"))
+        .expect("subagent records");
+    assert_eq!(subagent.len(), 2);
+    assert_eq!(subagent[0].role, "user");
+    assert_eq!(subagent[0].text, "Summarize the README");
+    assert!(subagent.iter().all(|record| {
+        record.links.parent_session_id.as_deref() == Some(session_id)
+            && record.links.conversation_kind.as_deref() == Some("subagent")
+            && record.source_path == subagent_wire.to_string_lossy()
+    }));
+
+    // Journals append in place; a refresh only parses the new lines.
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("noop ingest")
+            .records_added,
+        0
+    );
+    let mut writer = fs::OpenOptions::new()
+        .append(true)
+        .open(&main_wire)
+        .expect("reopen main wire");
+    writer
+        .write_all(
+            concat!(
+                r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Now run the tests"}],"toolCalls":[],"origin":{"kind":"user"}},"time":1782864000030}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .expect("append prompt");
+    let appended = ingest_all(&paths, &index, &options, &lease).expect("append ingest");
+    assert_eq!(appended.records_added, 1);
+    let records = index
+        .records_by_session_id(session_id)
+        .expect("records after append");
+    assert_eq!(records.len(), 6);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.role == "user" && record.text == "Now run the tests")
+    );
+}
+
+#[test]
+fn kimi_undo_appended_after_indexing_retracts_the_undone_turn() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kimi_home = tmp.path().join("kimi-home");
+    let session_dir = kimi_home.join("sessions/wd_repo_0123456789ab/session_undo");
+    fs::create_dir_all(session_dir.join("agents/main")).expect("create agent dir");
+    let wire = session_dir.join("agents/main/wire.jsonl");
+    let prompt = |text: &str, time: u64| {
+        format!(
+            "{{\"type\":\"context.append_message\",\"agentId\":\"main\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"toolCalls\":[],\"origin\":{{\"kind\":\"user\"}}}},\"time\":{time}}}\n"
+        )
+    };
+    // Line 1 is the header; the first turn is line 2 and the undone one is line 3.
+    fs::write(
+        &wire,
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1782864000000}"#.to_string()
+            + "\n"
+            + &prompt("keep this", 1782864000001)
+            + &prompt("undo this", 1782864000002),
+    )
+    .expect("write wire");
+    let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(kimi_home.as_os_str()))]);
+
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = SearchIndex::open_or_create(&paths.index).expect("index");
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kimi = true;
+    let lease = ingest_lease(&paths);
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("ingest")
+            .records_added,
+        2
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&wire)
+        .expect("reopen wire")
+        .write_all(
+            (concat!(
+                r#"{"type":"agent.switched","agentId":"main","branch":"b1","reason":"undo","base":{"branch":"main","line":2},"turns":1,"legacyUndoLine":5,"time":1782864000003}"#,
+                "\n",
+                r#"{"type":"context.undo","agentId":"main","count":1,"time":1782864000003}"#,
+                "\n",
+                r#"{"type":"context.undone","agentId":"main","turns":1,"fromTurnId":1,"time":1782864000003}"#,
+                "\n",
+            )
+            .to_string()
+                + &prompt("retyped", 1782864000004))
+                .as_bytes(),
+        )
+        .expect("append undo");
+    ingest_all(&paths, &index, &options, &lease).expect("refresh");
+
+    let mut texts = index
+        .records_by_session_id("session_undo")
+        .expect("records")
+        .into_iter()
+        .map(|record| record.text)
+        .collect::<Vec<_>>();
+    texts.sort();
+    assert_eq!(texts, ["keep this", "retyped"]);
 }

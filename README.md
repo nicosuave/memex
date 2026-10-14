@@ -73,6 +73,7 @@ tool. **Import into** creates a conversation in another tool using the
 | IBM Bob | Yes | Yes | Yes | No | No |
 | ZCode | Yes | Yes | No | No | No |
 | KiloCode CLI | Yes | Yes | Yes | No | No |
+| Kimi Code | Yes | Yes | Yes | No | No |
 | Kiro CLI | Yes | Credits only | No | No | No |
 | Hermes | Yes | Yes | No | No | No |
 
@@ -85,6 +86,8 @@ tool. **Import into** creates a conversation in another tool using the
   Kiro reads `~/.kiro/sessions`; set `KIRO_SESSIONS_DIR` for copied sessions.
   KiloCode CLI reads `~/.local/share/kilo/kilo.db` (`$XDG_DATA_HOME/kilo/kilo.db`);
   set `KILO_DATA_DIR` (comma-separated) to index extra stores.
+  Kimi Code reads `~/.kimi-code/sessions` (`KIMI_CODE_HOME` relocates it); every
+  agent journal, subagents included, is indexed as its own session with the parent recorded.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
   not subscription charges or quota balances. Hermes history and usage are read from
   its local `state.db`; plaintext reasoning is indexed only with `--include-reasoning`.

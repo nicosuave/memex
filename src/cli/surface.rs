@@ -235,6 +235,7 @@ pub(super) enum IndexSource {
     Zcode,
     Kiro,
     Kilocode,
+    Kimi,
 }
 
 impl IndexArgs {
@@ -257,6 +258,7 @@ impl IndexArgs {
             IndexSource::Zcode => self.zcode && !self.no_zcode,
             IndexSource::Kiro => self.kiro && !self.no_kiro,
             IndexSource::Kilocode => self.kilocode && !self.no_kilocode,
+            IndexSource::Kimi => self.kimi && !self.no_kimi,
         };
         legacy_enabled
             && (self.only_source.is_empty() || self.only_source.contains(&source))
@@ -513,6 +515,7 @@ mod tests {
             "--no-zcode",
             "--no-kiro",
             "--no-kilocode",
+            "--no-kimi",
         ]);
         assert_eq!(
             selected.source,

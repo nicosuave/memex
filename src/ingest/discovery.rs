@@ -78,6 +78,9 @@ pub(super) fn discover_transcripts(
     if options.include_kiro && full_scan {
         files.extend(crate::sources::kiro::discover());
     }
+    if options.include_kimi && full_scan {
+        files.extend(crate::sources::kimi::discover());
+    }
 
     // A watcher hint names the file that changed, not necessarily the projection
     // that owns its conversation. Resolve ownership here for both scan modes.
@@ -530,6 +533,9 @@ pub(super) fn prepare_file_task(
     if source == SourceKind::Kiro {
         identity.source_metadata_sha256 = Some(crate::sources::kiro::metadata_fingerprint(&path));
     }
+    if source == SourceKind::Kimi {
+        identity.source_metadata_sha256 = Some(crate::sources::kimi::metadata_fingerprint(&path));
+    }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
     if source == SourceKind::Hermes
         && let Ok(checkpoint) =
@@ -569,7 +575,12 @@ pub(super) fn prepare_file_task(
         _ => (0, 0, HashMap::new()),
     };
     let claude = resolve_claude_background(&path, source, size, previous, change);
-    if claude.reparse {
+    // A Kimi undo retracts lines earlier passes indexed; only a full parse drops them.
+    // If the tail cannot be inspected, fail safe by reparsing.
+    let kimi_undo = source == SourceKind::Kimi
+        && change == FileChange::Append
+        && crate::sources::kimi::has_undo_since(&path, offset, size).unwrap_or(true);
+    if claude.reparse || kimi_undo {
         change = FileChange::Replaced;
         offset = 0;
         turn_id = 0;
@@ -1026,6 +1037,29 @@ fn zcode_database_owns(database: &Path, key: &str) -> bool {
             .is_some_and(|(owner, _)| owner == database)
 }
 
+fn has_indexed_kilocode_sessions(state: &CheckpointSession, database: &Path) -> Result<bool> {
+    // Recovery hides pending paths from the working checkpoint. A first
+    // interrupted publication may leave only the intent as ownership evidence.
+    Ok(state
+        .persisted_file_keys()?
+        .iter()
+        .chain(
+            state
+                .pending
+                .iter()
+                .flat_map(|pending| &pending.source_paths),
+        )
+        .any(|key| kilocode_database_owns(database, key)))
+}
+
+/// The raw database key is the pre-session-scoped checkpoint; virtual session
+/// paths carry their owning store.
+fn kilocode_database_owns(database: &Path, key: &str) -> bool {
+    Path::new(key) == database
+        || crate::sources::kilocode::split_virtual_path(Path::new(key))
+            .is_some_and(|(owner, _)| owner == database)
+}
+
 /// KiloCode sessions own independent checkpoints. Hash conversation rows rather than
 /// the database/WAL so accounting-only commits never schedule transcript replay.
 pub(super) fn discover_kilocode(
@@ -1053,10 +1087,15 @@ pub(super) fn discover_kilocode(
             || alias
                 .as_ref()
                 .is_some_and(|path| excluder.is_excluded(path));
-        let absent = database.metadata().is_err_and(|error| {
-            error.kind() == std::io::ErrorKind::NotFound
-                && database.parent().is_some_and(Path::is_dir)
-        });
+        // Like ZCode: a store that never existed is absent, while one that vanished
+        // with its directory (an unmounted volume) stays unreadable so its sessions
+        // are kept.
+        let missing = database
+            .metadata()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let absent = missing
+            && (database.parent().is_some_and(Path::is_dir)
+                || !has_indexed_kilocode_sessions(state, &database)?);
         let sessions = if excluded || absent {
             Vec::new()
         } else {
@@ -1134,12 +1173,8 @@ pub(super) fn discover_kilocode(
         }
         // Reconcile only after a successful inventory (or confirmed removal).
         // The raw database key is the pre-session-scoped checkpoint; replace it once.
-        let database_key = database.to_string_lossy().into_owned();
         for key in state.file_keys()? {
-            let owned = key == database_key
-                || crate::sources::kilocode::split_virtual_path(Path::new(&key))
-                    .is_some_and(|(owner, _)| owner == database);
-            if owned && !current.contains(&key) {
+            if kilocode_database_owns(&database, &key) && !current.contains(&key) {
                 state.delete_file(&key);
                 result.missing_paths.push(key);
             }

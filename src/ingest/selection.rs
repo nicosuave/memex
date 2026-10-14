@@ -37,6 +37,7 @@ enum Shape {
     Zcode,
     Kiro,
     Kilocode,
+    Kimi,
 }
 
 struct Root {
@@ -130,6 +131,9 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
     }
     if options.include_kiro {
         roots.push(Root::new(sources::kiro::sessions_root(), Shape::Kiro));
+    }
+    if options.include_kimi {
+        roots.push(Root::new(sources::kimi::sessions_root(), Shape::Kimi));
     }
     if options.include_muse {
         roots.push(Root::new(sources::muse::sessions_root(), Shape::Muse));
@@ -253,6 +257,12 @@ fn classify(root: &Root, path: &Path) -> Match {
         }
         Shape::Muse => (name == "session.jsonl").then_some(SourceKind::Muse),
         Shape::Kiro => (parts.len() == 3 && name == "messages.jsonl").then_some(SourceKind::Kiro),
+        Shape::Kimi => {
+            // `<workspace>/<session>/agents/<agent>/wire.jsonl`; task output
+            // spools nest deeper under the agent directory.
+            (parts.len() == 5 && parts[2] == "agents" && name == "wire.jsonl")
+                .then_some(SourceKind::Kimi)
+        }
         Shape::Bob => {
             // Every task shares one database and discovery diffs task aggregates
             // itself, so a commit targets the database (`resolve` already routed WAL
@@ -308,6 +318,19 @@ fn classify(root: &Root, path: &Path) -> Match {
     source.map_or(Match::Ignore, Match::File)
 }
 
+/// The `<workspace>/<session>` directory whose metadata file `path` is, under a Kimi
+/// sessions root.
+fn kimi_metadata_session(root: &Path, path: &Path) -> Option<PathBuf> {
+    let depth = path.strip_prefix(root).ok()?.components().count();
+    sources::kimi::METADATA_FILES.iter().find_map(|name| {
+        let name = Path::new(name);
+        let levels = name.components().count();
+        (depth == 2 + levels && path.ends_with(name))
+            .then(|| path.ancestors().nth(levels).map(Path::to_path_buf))
+            .flatten()
+    })
+}
+
 fn resolve(
     roots: &[Root],
     dirty: &HashSet<PathBuf>,
@@ -345,6 +368,15 @@ fn resolve(
                 && path.file_name().is_some_and(|n| n == "session.json")
             {
                 path.set_file_name("messages.jsonl");
+                if !path.exists() && !state.contains_file(path.to_string_lossy().as_ref())? {
+                    continue;
+                }
+            }
+            // Session metadata (title, cwd) feeds the main journal's fingerprint.
+            if matches!(root.shape, Shape::Kimi)
+                && let Some(session_dir) = kimi_metadata_session(&root.lexical, &path)
+            {
+                path = session_dir.join("agents/main/wire.jsonl");
                 if !path.exists() && !state.contains_file(path.to_string_lossy().as_ref())? {
                     continue;
                 }
@@ -571,6 +603,7 @@ mod tests {
             include_bob: false,
             include_zcode: false,
             include_kilocode: false,
+            include_kimi: false,
             include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -625,6 +658,36 @@ mod tests {
                     }]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn kimi_metadata_hints_refresh_the_main_journal() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("kimi-home");
+        let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(home.as_os_str()))]);
+        let mut options = options();
+        options.include_kimi = true;
+        let state = checkpoint(&temp, &IngestState::default());
+        let session = home.join("sessions/wd_repo_0123456789ab/session_a");
+        let main = session.join("agents/main/wire.jsonl");
+        write(&main);
+        // The root `state.json` and the legacy `session-meta/` location both feed it.
+        for metadata in ["state.json", "session-meta/state.json"] {
+            let selection =
+                resolve_dirty(&options, &HashSet::from([session.join(metadata)]), &state).unwrap();
+            let DirtySelection::Paths { files, databases } = selection else {
+                panic!("expected the main Kimi journal");
+            };
+            assert!(databases.is_empty());
+            assert_eq!(
+                files,
+                vec![SourceFile {
+                    source: SourceKind::Kimi,
+                    path: main.clone(),
+                }]
+            );
         }
     }
 
@@ -755,6 +818,11 @@ mod tests {
             (Shape::Jcode, "project/session_one.json", SourceKind::Jcode),
             (Shape::Muse, "project/id/session.jsonl", SourceKind::Muse),
             (
+                Shape::Kimi,
+                "project/session/agents/agent-0/wire.jsonl",
+                SourceKind::Kimi,
+            ),
+            (
                 Shape::Antigravity,
                 "antigravity-ide/conversations/abc.db",
                 SourceKind::Antigravity,
@@ -835,6 +903,12 @@ mod tests {
             (Shape::Muse, "notes.jsonl"),
             (Shape::Kiro, "project/id/snapshots/messages.jsonl"),
             (Shape::Kiro, "project/id/session.json"),
+            (Shape::Kimi, "project/session/wire.jsonl"),
+            (Shape::Kimi, "project/session/state.json"),
+            (
+                Shape::Kimi,
+                "project/session/agents/main/tasks/bash-1/wire.jsonl",
+            ),
             (Shape::Opencode, "nested/opencode.db"),
             (Shape::Opencode, "other.db-wal"),
             (Shape::CodexHome, "settings.json"),
