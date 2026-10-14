@@ -918,7 +918,7 @@ pub fn run(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let auto_index = config.auto_index_on_search_default();
+    let auto_index = config.index_freshness()? != crate::ingest::Freshness::None;
     if auto_index {
         paths.ensure_dirs()?;
     }
@@ -1212,7 +1212,7 @@ impl App {
                     &paths,
                     &index,
                     &opts,
-                    config.scan_cache_ttl(),
+                    config.index_freshness()?,
                     &lease,
                     Some(journal),
                 )

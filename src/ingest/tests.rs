@@ -240,9 +240,16 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     fs::write(&memory, "# Decisions\n\nRevised middle paragraph.\n").unwrap();
     assert!(can_skip_fresh_scan(&paths, &published, &options, 3600).unwrap());
     assert!(
-        ingest_if_stale(&paths, &published, &options, 3600, &lease, None)
-            .unwrap()
-            .is_none()
+        ingest_if_stale(
+            &paths,
+            &published,
+            &options,
+            Freshness::Bounded { ttl_seconds: 3600 },
+            &lease,
+            None
+        )
+        .unwrap()
+        .is_none()
     );
     let updated = store.load().unwrap();
     assert_eq!(updated.documents[0].stable_id, original_id);
@@ -252,7 +259,15 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     assert_eq!(published.doc_count().unwrap(), 1);
 
     fs::remove_file(memory).unwrap();
-    ingest_if_stale(&paths, &published, &options, 3600, &lease, None).unwrap();
+    ingest_if_stale(
+        &paths,
+        &published,
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        None,
+    )
+    .unwrap();
     assert!(store.load().unwrap().documents.is_empty());
 }
 
@@ -6448,7 +6463,18 @@ fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename()
         let journal = discovery::start_journal_replay(&paths, &options);
         journal.wait_until_streaming(journal::REPLAY_BUDGET);
         let index = open_search_index(&paths);
-        ingest_selected(&paths, &index, &options, &lease, None, None, Some(journal)).unwrap()
+        ingest_selected(
+            &paths,
+            &index,
+            &options,
+            &lease,
+            Narrowing::Journal {
+                replay: journal,
+                walk: true,
+            },
+            None,
+        )
+        .unwrap()
     };
     let indexed = || {
         let index = open_search_index(&paths);
@@ -7532,4 +7558,121 @@ fn kimi_undo_appended_after_indexing_retracts_the_undone_turn() {
         .collect::<Vec<_>>();
     texts.sort();
     assert_eq!(texts, ["keep this", "retyped"]);
+}
+
+fn unanswerable_journal() -> journal::ReplayHandle {
+    journal::ReplayHandle::spawn(Vec::new(), "no roots".to_string(), |_| None)
+}
+
+#[test]
+fn bounded_reads_keep_the_index_when_the_journal_cannot_answer_and_strict_reads_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    append_claude_message(&transcript, "appended");
+
+    let bounded = Freshness::Bounded { ttl_seconds: 3600 };
+    let index = open_search_index(&paths);
+    let report = ingest_if_stale(
+        &paths,
+        &index,
+        &options,
+        bounded,
+        &lease,
+        Some(unanswerable_journal()),
+    )
+    .unwrap()
+    .expect("a journal refresh runs within the TTL");
+    assert_eq!(report.records_added, 0);
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+
+    assert!(
+        ingest_if_stale(&paths, &index, &options, Freshness::None, &lease, None)
+            .unwrap()
+            .is_none()
+    );
+
+    let report = ingest_if_stale(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Strict,
+        &lease,
+        Some(unanswerable_journal()),
+    )
+    .unwrap()
+    .expect("a strict read refreshes");
+    assert_eq!(report.records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["appended", "indexed"]);
+}
+
+#[test]
+fn changed_sources_name_appended_rewritten_and_unrecorded_transcripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let appended = source.join("appended.jsonl");
+    let rewritten = source.join("rewritten.jsonl");
+    let quiet = source.join("quiet.jsonl");
+    append_claude_message(&appended, "appended original");
+    append_claude_message(&rewritten, "rewritten original, long enough to shrink");
+    append_claude_message(&quiet, "quiet original");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    let key = |path: &Path| path.to_string_lossy().into_owned();
+    let all = [key(&appended), key(&rewritten), key(&quiet)];
+    assert!(
+        changed_sources(&paths, all.iter().map(String::as_str))
+            .unwrap()
+            .is_empty()
+    );
+
+    append_claude_message(&appended, "appended later");
+    fs::write(&rewritten, "").unwrap();
+    append_claude_message(&rewritten, "rewritten");
+    let unrecorded = source.join("unrecorded.jsonl");
+    append_claude_message(&unrecorded, "unrecorded");
+    let sources = [
+        key(&appended),
+        key(&rewritten),
+        key(&quiet),
+        key(&unrecorded),
+        key(&source.join("missing.jsonl")),
+    ];
+    let changed = changed_sources(&paths, sources.iter().map(String::as_str)).unwrap();
+    assert_eq!(
+        changed,
+        HashSet::from([appended.clone(), rewritten.clone(), unrecorded.clone()])
+    );
+
+    ingest_dirty(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        &lease,
+        &changed,
+    )
+    .unwrap();
+    assert_eq!(
+        indexed_texts(&paths),
+        [
+            "appended later",
+            "appended original",
+            "quiet original",
+            "rewritten",
+            "unrecorded"
+        ]
+    );
 }

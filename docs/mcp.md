@@ -146,9 +146,9 @@ return successful results alongside `failures`; a tool-level error sets MCP
 defaults, and read tools accept a machine ID. Remote retrieval uses existing SSH
 configuration and requires peers that support bounded reads.
 
-Search retains configured auto-index behavior on local and remote machines.
-Handshake, session discovery, and transcript reads do not trigger ingestion;
-semantic search may load an embedding model. Run the daemon separately
+Search and transcript reads refresh the index first, as `index_freshness`
+allows, on local and remote machines. Handshake and session discovery do not
+trigger ingestion; semantic search may load an embedding model. Run the daemon separately
 when predictable search latency matters. Up to four retrieval calls run at once;
 MCP cancellation stops waiting but synchronous work can finish under its existing
 timeouts. Index readers are opened per call so a running server sees newly
