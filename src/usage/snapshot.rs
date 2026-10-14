@@ -40,6 +40,13 @@ pub(crate) struct PartitionEntry {
     pub(crate) fact_generation: Option<String>,
     pub(crate) assembly: Arc<UsageAssembly>,
     pub(crate) warnings: Arc<Vec<String>>,
+    pub(crate) claude_sources: Vec<PathBuf>,
+}
+
+impl PartitionEntry {
+    pub(crate) fn matches_roots(&self, filter: SourceFilter, claude_sources: &[PathBuf]) -> bool {
+        filter != SourceFilter::Claude || self.claude_sources == claude_sources
+    }
 }
 
 /// Bounded per-source snapshot store. Alternating between filters reuses instead of
@@ -62,10 +69,10 @@ pub(crate) struct MergedSnapshot {
 pub(crate) struct MergedEntry {
     checked_at: Instant,
     snapshot: MergedSnapshot,
+    claude_sources: Vec<PathBuf>,
 }
 
-/// Retained combined views, keyed by cache alone: every combined query shares one
-/// merged order instead of each rebuilding a full assembly.
+/// Retained combined views share a merged order while their cache and Claude roots match.
 pub(crate) static MERGED: Lazy<Mutex<HashMap<Option<PathBuf>, MergedEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -157,14 +164,17 @@ fn oneshot_partition(
     claude_sources: &[PathBuf],
 ) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
     let key = (filter, cache_path.clone());
-    let previous = lock_partitions().get(&key).map(|entry| {
-        (
-            entry.fingerprint.clone(),
-            entry.fact_generation.clone(),
-            entry.assembly.clone(),
-            entry.warnings.clone(),
-        )
-    });
+    let previous = lock_partitions()
+        .get(&key)
+        .filter(|entry| entry.matches_roots(filter, claude_sources))
+        .map(|entry| {
+            (
+                entry.fingerprint.clone(),
+                entry.fact_generation.clone(),
+                entry.assembly.clone(),
+                entry.warnings.clone(),
+            )
+        });
     if let Some((fingerprint, generation, assembly, warnings)) = previous
         && check_snapshot_valid(
             filter,
@@ -212,7 +222,10 @@ pub(crate) fn ensure_partition(
             let lock_start = Instant::now();
             let store = lock_partitions();
             usage_timing(lock_start, || "lock wait".to_string());
-            match store.get(&key) {
+            match store
+                .get(&key)
+                .filter(|entry| entry.matches_roots(filter, claude_sources))
+            {
                 Some(entry) if entry.checked_at.elapsed() < ttl => {
                     return (entry.assembly.clone(), entry.warnings.clone());
                 }
@@ -225,6 +238,7 @@ pub(crate) fn ensure_partition(
                 // Another thread may have refreshed between our check and acquiring
                 // the refresh lock; re-check before doing any I/O.
                 if let Some(entry) = lock_partitions().get(&key)
+                    && entry.matches_roots(filter, claude_sources)
                     && entry.checked_at.elapsed() < ttl
                 {
                     return (entry.assembly.clone(), entry.warnings.clone());
@@ -256,6 +270,7 @@ pub(crate) fn refresh_partition(
         let store = lock_partitions();
         store
             .get(key)
+            .filter(|entry| entry.matches_roots(filter, claude_sources))
             .map(|entry| (entry.fingerprint.clone(), entry.fact_generation.clone()))
     };
     let check_start = Instant::now();
@@ -309,7 +324,10 @@ pub(crate) fn populate_after_failed_validation(
         return;
     };
     let key = (filter, Some(cache_path.to_path_buf()));
-    if lock_partitions().contains_key(&key) {
+    if lock_partitions()
+        .get(&key)
+        .is_some_and(|entry| entry.matches_roots(filter, claude_sources))
+    {
         return;
     }
     let entry = rebuild_partition(filter, &key.1, None, Some(fingerprint), claude_sources);
@@ -396,6 +414,7 @@ fn rebuild_partition(
         warnings: Arc::new(warnings),
         fingerprint,
         fact_generation,
+        claude_sources: claude_sources.to_vec(),
     }
 }
 
@@ -657,7 +676,10 @@ pub(crate) fn ensure_merged(
     loop {
         let stale = {
             let store = lock_merged();
-            match store.get(&cache_path) {
+            match store
+                .get(&cache_path)
+                .filter(|entry| entry.claude_sources == claude_sources)
+            {
                 Some(entry) if entry.checked_at.elapsed() < ttl => {
                     return clone_merged(&entry.snapshot);
                 }
@@ -668,6 +690,7 @@ pub(crate) fn ensure_merged(
         match USAGE_SCAN_LOCK.try_lock() {
             Ok(_refresh) => {
                 if let Some(entry) = lock_merged().get(&cache_path)
+                    && entry.claude_sources == claude_sources
                     && entry.checked_at.elapsed() < ttl
                 {
                     return clone_merged(&entry.snapshot);
@@ -712,6 +735,7 @@ pub(crate) fn refresh_merged(
     let current: Vec<Arc<UsageAssembly>> = parts;
     let mut store = lock_merged();
     if let Some(entry) = store.get_mut(cache_path)
+        && entry.claude_sources == claude_sources
         && entry.snapshot.parts.len() == current.len()
         && entry
             .snapshot
@@ -737,6 +761,7 @@ pub(crate) fn refresh_merged(
         MergedEntry {
             checked_at: Instant::now(),
             snapshot: clone_merged(&snapshot),
+            claude_sources: claude_sources.to_vec(),
         },
     );
     snapshot

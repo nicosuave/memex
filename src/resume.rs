@@ -17,8 +17,8 @@ pub struct ResumeSession<'a> {
     pub project: &'a str,
     pub source_path: &'a str,
     pub source_dir: &'a str,
-    /// For `{claude_env}`: the session's Claude config directory when Claude does not use it
-    /// by default (see `claude_config_dir`).
+    /// For `{claude_env}`: the local session's Claude config directory, including its defaults.
+    /// Remote sessions leave this unset so the remote environment selects its own directory.
     pub claude_config_dir: Option<PathBuf>,
 }
 
@@ -146,9 +146,9 @@ pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str
 }
 
 /// The config directory a local Claude session resumes in: the parent of the configured
-/// `projects` root that holds its transcript. `None` for Claude's default directories, which
-/// need no `CLAUDE_CONFIG_DIR` (setting it also moves `.claude.json`), and for roots that are
-/// not a config directory's `projects`.
+/// `projects` root that holds its transcript. Default directories are returned too so resume
+/// can clear a conflicting inherited `CLAUDE_CONFIG_DIR` without relocating `.claude.json`.
+/// Roots that are not a config directory's `projects` name no config directory.
 pub fn claude_config_dir(
     source: SourceKind,
     source_path: &str,
@@ -163,18 +163,23 @@ pub fn claude_config_dir(
         .filter(|root| root.file_name().is_some_and(|name| name == "projects"))
         .find(|root| path.starts_with(root))?
         .parent()?;
-    let home = crate::sources::common::home();
-    (config_dir != home.join(".claude") && config_dir != home.join(".config").join("claude"))
-        .then(|| config_dir.to_path_buf())
+    Some(config_dir.to_path_buf())
 }
 
-/// `CLAUDE_CONFIG_DIR='<dir>' ` when the session names a config directory, so
-/// `claude --resume` looks there; empty otherwise.
+/// Select a local session's config directory. Default directories use an unset variable,
+/// preserving Claude's default `.claude.json` location; remote and unknown roots inherit it.
 fn claude_env(session: &ResumeSession) -> String {
     session
         .claude_config_dir
         .as_ref()
-        .map(|dir| format!("CLAUDE_CONFIG_DIR={} ", shell_quote(&dir.to_string_lossy())))
+        .map(|dir| {
+            let home = crate::sources::common::home();
+            if *dir == home.join(".claude") || *dir == home.join(".config/claude") {
+                "env -u CLAUDE_CONFIG_DIR ".to_string()
+            } else {
+                format!("CLAUDE_CONFIG_DIR={} ", shell_quote(&dir.to_string_lossy()))
+            }
+        })
         .unwrap_or_default()
 }
 
@@ -251,13 +256,13 @@ mod tests {
             ),
             Some(PathBuf::from("/home/u/.claude-profiles/work"))
         );
-        // Claude's default directory needs no variable, whatever the environment selects.
+        // The default directory must clear a conflicting inherited variable.
         assert_eq!(
             config_dir(
                 SourceKind::Claude,
                 "/home/u/.claude/projects/-repo/abc.jsonl"
             ),
-            None
+            Some(PathBuf::from("/home/u/.claude"))
         );
         // A root that is not a config directory's `projects` names no config directory.
         assert_eq!(

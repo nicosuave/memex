@@ -9,23 +9,38 @@ pub(super) fn parse_claude_file(
     progress: &Arc<Progress>,
 ) -> Result<()> {
     let source_path = task.path.to_string_lossy().to_string();
-    let (parsed, background_session) = crate::sources::claude::parse_index_records_with_background(
-        &task.path,
-        crate::sources::IndexParseState {
-            offset: task.offset,
-            turn_id: task.turn_id,
-            legacy_turn_id: task.legacy_turn_id,
-            pending_tool_calls: task.pending_tool_calls.clone(),
-        },
-        include_reasoning,
-        task.claude_background,
-        task.size,
-        next_doc_id,
-        |record| {
-            progress.add_produced(SourceKind::Claude, 1);
-            tx_record.send(record)
-        },
-    )?;
+    let emit = |record| {
+        progress.add_produced(SourceKind::Claude, 1);
+        tx_record.send(record)
+    };
+    let (parsed, background_session) = if task.claude_agent_copies.is_empty() {
+        crate::sources::claude::parse_index_records_with_background(
+            &task.path,
+            crate::sources::IndexParseState {
+                offset: task.offset,
+                turn_id: task.turn_id,
+                legacy_turn_id: task.legacy_turn_id,
+                pending_tool_calls: task.pending_tool_calls.clone(),
+            },
+            include_reasoning,
+            task.claude_background,
+            task.size,
+            next_doc_id,
+            emit,
+        )?
+    } else {
+        let (mut parsed, background) = crate::sources::claude::parse_agent_records(
+            &task.path,
+            &task.claude_agent_copies,
+            include_reasoning,
+            next_doc_id,
+            emit,
+        )?;
+        // The dependency fingerprint tracks the whole union; the physical owner still owns
+        // its checkpoint size/offset so normal metadata checks remain valid.
+        parsed.offset = task.size;
+        (parsed, background)
+    };
     finish_parsed_source(
         task,
         tx_update,
@@ -1073,9 +1088,10 @@ pub(super) fn finish_file_task(
 ) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
-        Err(error) if is_not_found(&error) => {
-            // Active agent clients may rotate or delete a transcript after discovery. Treat
-            // that filesystem race as a skipped file instead of discarding the whole ingest.
+        Err(error) if is_not_found(&error) && task.claude_agent_copies.is_empty() => {
+            // Active agent clients may rotate or delete a transcript after discovery. A
+            // standalone file can be skipped; a merged agent must retry the whole refresh
+            // so retiring its old projection never publishes only part of the history.
             progress.add_files_done(task.source, 1);
             skipped.fetch_add(1, Ordering::Relaxed);
             Ok(())

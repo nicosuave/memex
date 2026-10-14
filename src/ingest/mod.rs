@@ -118,6 +118,7 @@ struct FileTask {
     parser_version: u32,
     codex_metadata_offsets: Option<Vec<u64>>,
     claude_background: Option<bool>,
+    claude_agent_copies: Vec<crate::sources::claude::AgentCopy>,
 }
 
 impl FileTask {

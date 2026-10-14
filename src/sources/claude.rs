@@ -20,8 +20,8 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     // Preserve pre-reader fallback IDs independently of attachment-only messages,
     // and classify background transcripts consistently across every record.
     index: 8,
-    // Count a response split into content-block lines once when it has no request ID.
-    usage: 5,
+    // Reconcile content blocks and divergent workflow copies as one logical agent.
+    usage: 6,
 };
 
 /// Return the human-facing title Claude stores alongside a conversation.
@@ -140,10 +140,16 @@ pub fn discover(
 }
 
 pub fn usage_files(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut files = super::common::jsonl_files(roots.iter().cloned());
-    let owners = agent_copy_owners(files.iter().cloned());
-    files.retain(|path| owners.get(path).is_none_or(|owner| owner == path));
-    files
+    // Copies can contain unique history. Read them all and reconcile shared responses.
+    super::common::jsonl_files(roots.iter().cloned())
+}
+
+/// A discovered agent copy and the byte boundary captured for this refresh.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentCopy {
+    pub path: PathBuf,
+    pub size: u64,
+    pub metadata_sha256: String,
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -289,9 +295,8 @@ pub(crate) fn agent_copies(
     copies
 }
 
-/// Map every copy of each duplicated agent transcript among `paths` to the copy to read.
-/// Index and token usage read the same copy: the direct copy omits `requestId`, so usage
-/// reconciliation cannot match its records with the workflow copy's.
+/// Map each duplicate to the path that owns its merged index projection. Usage retains the
+/// physical copies so its file cache observes changes to every part of the logical agent.
 pub(crate) fn agent_copy_owners(
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> std::collections::HashMap<PathBuf, PathBuf> {
@@ -316,11 +321,11 @@ pub(crate) fn agent_copy_owners(
     owners
 }
 
-/// The copy of an agent transcript to index. The workflow copy is written as the agent runs;
-/// the direct copy appears later, may hold only the tail, and gains the records of a resumed
-/// agent. So the copy whose last record is newest wins, then the larger file (the workflow
-/// copy repeats extra fields on every line), then the direct `subagents/` copy. Timestamps
-/// count only when every copy's last record is readable.
+/// The path that owns an agent's merged index projection. The workflow copy is written as
+/// the agent runs; the direct copy appears later, may hold only the tail, and gains resumed
+/// records. Prefer the newest last record, then file size, then the direct `subagents/` copy.
+/// Timestamps count only when every copy's last record is readable. This selects a source
+/// path, never a reason to discard unique events from another copy.
 pub(crate) fn preferred_agent_copy(copies: &[PathBuf]) -> Option<&PathBuf> {
     let timestamps = copies
         .iter()
@@ -509,6 +514,137 @@ pub(crate) fn parse_index_records_with_background(
     known_background: Option<bool>,
     byte_boundary: u64,
     next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
+    let file = File::open(path)?;
+    let mmap = super::common::map_sequential(&file)?;
+    parse_index_bytes(
+        path,
+        bounded_transcript_bytes(&mmap, byte_boundary),
+        state,
+        include_reasoning,
+        known_background,
+        next_doc_id,
+        emit,
+    )
+}
+
+/// A growing file's captured boundary may end inside a line. Leave that line for the next
+/// refresh, even if its prefix happens to be valid JSON before the writer finishes it.
+fn bounded_transcript_bytes(bytes: &[u8], byte_boundary: u64) -> &[u8] {
+    let end = byte_boundary.min(bytes.len() as u64) as usize;
+    let captured = &bytes[..end];
+    if end < bytes.len() && !captured.ends_with(b"\n") {
+        &captured[..captured
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1)]
+    } else {
+        captured
+    }
+}
+
+/// Read every copy at its discovered boundary, deduplicate shared events, and parse the
+/// chronological union under one source path. The source transcripts are never rewritten.
+pub(crate) fn parse_agent_records(
+    owner: &Path,
+    copies: &[AgentCopy],
+    include_reasoning: bool,
+    next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut lines = Vec::new();
+    let mut seen = HashSet::new();
+    // Keep the owner's representation when copies differ in metadata for the same event.
+    let mut copies = copies.iter().collect::<Vec<_>>();
+    copies.sort_by_key(|copy| (copy.path != owner, &copy.path));
+    for copy in copies {
+        let file = File::open(&copy.path)?;
+        let mmap = super::common::map_sequential(&file)?;
+        let bytes = bounded_transcript_bytes(&mmap, copy.size);
+        let mut occurrences = HashMap::new();
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let value = match serde_json::from_slice::<Value>(line) {
+                Ok(value) => Some(value),
+                Err(error) if !line.ends_with(b"\n") && error.is_eof() => continue,
+                Err(_) => None,
+            };
+            let key = value.as_ref().map(|value| {
+                if let Some(uuid) = value
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .filter(|uuid| !uuid.is_empty())
+                {
+                    // Content blocks can share an event UUID. Match the block as well so a
+                    // tail-only copy cannot hide a different block from the same response.
+                    serde_json::json!([
+                        value.get("type"),
+                        uuid,
+                        value
+                            .get("message")
+                            .and_then(|message| message.get("content"))
+                    ])
+                    .to_string()
+                } else if let Some(message) = value.get("message") {
+                    serde_json::json!([
+                        value.get("type"),
+                        value.get("timestamp"),
+                        message.get("id"),
+                        message.get("role"),
+                        message.get("content")
+                    ])
+                    .to_string()
+                } else {
+                    value.to_string()
+                }
+            });
+            if let Some(key) = key {
+                // Repeated identical events within one file remain distinct. Only matching
+                // occurrences in another physical copy are suppressed.
+                let occurrence = occurrences.entry(key.clone()).or_insert(0usize);
+                let unique = seen.insert((key, *occurrence));
+                *occurrence += 1;
+                if !unique {
+                    continue;
+                }
+            }
+            let timestamp = value
+                .as_ref()
+                .and_then(|value| value.get("timestamp"))
+                .and_then(Value::as_str)
+                .and_then(super::common::parse_iso_millis)
+                .unwrap_or(0);
+            lines.push((timestamp, line.to_vec()));
+        }
+    }
+    lines.sort_by_key(|(timestamp, _)| *timestamp);
+    let mut merged = Vec::new();
+    for (_, line) in lines {
+        merged.extend_from_slice(&line);
+        if !line.ends_with(b"\n") {
+            merged.push(b'\n');
+        }
+    }
+    parse_index_bytes(
+        owner,
+        &merged,
+        IndexParseState::default(),
+        include_reasoning,
+        None,
+        next_doc_id,
+        emit,
+    )
+}
+
+fn parse_index_bytes(
+    path: &Path,
+    mmap: &[u8],
+    state: IndexParseState,
+    include_reasoning: bool,
+    known_background: Option<bool>,
+    next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<(IndexParseOutput, bool)> {
     let mut legacy_turn_id = state.legacy_ordinal()?;
@@ -522,13 +658,6 @@ pub(crate) fn parse_index_records_with_background(
     use memchr::memchr;
     use simd_json::prelude::*;
 
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
-    // Discovery captured this boundary before parsing began. Never consume
-    // bytes appended after it: they need a fresh metadata probe so a late
-    // `sessionKind: "bg"` marker can reclassify the whole transcript.
-    let defer_unterminated_tail = byte_boundary < mmap.len() as u64;
-    let mmap = &mmap[..byte_boundary.min(mmap.len() as u64) as usize];
     // `sessionKind` is not repeated on every event. Establish this file-level
     // origin before emitting any records so a later `bg` marker cannot leave
     // the transcript split between interactive and background classifications.
@@ -557,9 +686,6 @@ pub(crate) fn parse_index_records_with_background(
         // start offset so the next ingest reads the complete record. A final
         // non-newline record is still valid when this mmap is exactly the task
         // boundary.
-        if !has_newline && defer_unterminated_tail {
-            break;
-        }
         let line = &slice[..relative];
         start += relative + usize::from(has_newline);
         if line.is_empty() {
@@ -1028,9 +1154,31 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
     use std::collections::HashMap;
 
     let mut best_exact: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut best_agent = HashMap::new();
     let mut keep = vec![true; events.len()];
     for (index, event) in events.iter().enumerate() {
         if event.source != "claude" {
+            continue;
+        }
+        if let Some(message) = event.message_id.as_deref()
+            && let Some(agent) = agent_copy_key(Path::new(&*event.source_path))
+        {
+            // The direct copy can omit requestId or hold only the resumed tail. Message IDs
+            // still name responses within the same logical agent across all its copies.
+            if let Some(previous) = best_agent.get(&(agent.clone(), message)).copied() {
+                if choose_usage(&events[previous], event) {
+                    keep[index] = false;
+                } else {
+                    keep[previous] = false;
+                    best_agent.insert((agent, message), index);
+                }
+            } else {
+                best_agent.insert((agent, message), index);
+            }
+        }
+    }
+    for (index, event) in events.iter().enumerate() {
+        if !keep[index] || event.source != "claude" {
             continue;
         }
         // Claude Code writes one line per content block, each repeating the response's usage.
@@ -1061,11 +1209,14 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
         }
     }
     for indices in by_message.into_values() {
-        if indices.len() < 2 || !indices.iter().any(|index| !events[*index].sidechain) {
+        let is_agent = |event: &UsageEvent| {
+            event.sidechain || is_subagent_path(Path::new(&*event.source_path))
+        };
+        if indices.len() < 2 || !indices.iter().any(|index| !is_agent(&events[*index])) {
             continue;
         }
         for index in indices {
-            if events[index].sidechain {
+            if is_agent(&events[index]) {
                 keep[index] = false;
             }
         }
@@ -1403,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_reads_one_copy_of_a_workflow_agent() {
+    fn usage_reads_all_copies_and_counts_a_workflow_response_once() {
         let _guard = crate::test_support::env_lock();
         let temp = tempfile::tempdir().unwrap();
         let _env = crate::test_support::EnvVarGuard::set_os(&[(
@@ -1429,12 +1580,109 @@ mod tests {
         let mut both = parse_usage_file(&direct).unwrap();
         both.extend(parse_usage_file(&workflow).unwrap());
         reconcile_usage(&mut both);
-        assert_eq!(both.len(), 2);
+        assert_eq!(both.len(), 1);
 
         assert_eq!(
             usage_files(&crate::config::default_claude_sources()),
-            [workflow]
+            [direct, workflow]
         );
+    }
+
+    #[test]
+    fn usage_still_prefers_a_parent_response_when_agent_copies_omit_sidechain_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-p");
+        let parent = project.join("s.jsonl");
+        let direct = project.join("s/subagents/agent-a.jsonl");
+        let workflow = project.join("s/subagents/workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let requested = line.replacen('{', r#"{"requestId":"req_1","#, 1);
+        fs::write(&parent, format!("{requested}\n")).unwrap();
+        fs::write(&direct, format!("{line}\n")).unwrap();
+        fs::write(&workflow, format!("{requested}\n")).unwrap();
+        let mut events = parse_usage_file(&direct).unwrap();
+        events.extend(parse_usage_file(&workflow).unwrap());
+        events.extend(parse_usage_file(&parent).unwrap());
+
+        reconcile_usage(&mut events);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(&*events[0].source_path, parent.to_str().unwrap());
+        assert_eq!(events[0].tokens.total(), 15);
+    }
+
+    #[test]
+    fn merged_agent_blocks_keep_unique_content_and_reconstruct_tool_pairs_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let line = |uuid: &str, minute: u32, kind: &str, content: Value| {
+            serde_json::json!({
+                "type": kind, "uuid": uuid,
+                "timestamp": format!("2026-10-11T10:{minute:02}:00.000Z"),
+                "message": {"content": content}
+            })
+            .to_string()
+                + "\n"
+        };
+        let first = line(
+            "shared",
+            1,
+            "assistant",
+            serde_json::json!([{"type":"text","text":"first block"}]),
+        );
+        let second = line(
+            "shared",
+            2,
+            "assistant",
+            serde_json::json!([{"type":"text","text":"second block"}]),
+        );
+        let tool = line(
+            "call",
+            3,
+            "assistant",
+            serde_json::json!([{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"x"}}]),
+        );
+        let result = line(
+            "result",
+            4,
+            "user",
+            serde_json::json!([{"type":"tool_result","tool_use_id":"tool-1","content":"contents"}]),
+        );
+        fs::write(&workflow, format!("{first}{second}{tool}")).unwrap();
+        fs::write(&direct, format!("{second}{result}")).unwrap();
+        let copies = [&direct, &workflow]
+            .into_iter()
+            .map(|path| AgentCopy {
+                path: path.clone(),
+                size: fs::metadata(path).unwrap().len(),
+                metadata_sha256: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+
+        let (parsed, _) =
+            parse_agent_records(&direct, &copies, false, &AtomicU64::new(1), |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].text, "first block");
+        assert_eq!(records[1].text, "second block");
+        assert_eq!(records[2].role, "tool_use");
+        assert_eq!(records[3].role, "tool_result");
+        assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == direct.to_string_lossy())
+        );
+        assert_eq!(parsed.diagnostics.orphan_tool_results, 0);
     }
 
     #[test]

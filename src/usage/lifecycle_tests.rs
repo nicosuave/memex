@@ -231,6 +231,68 @@ fn expire(query: &UsageQuery) {
         .checked_at = Instant::now() - Duration::from_secs(120);
 }
 
+#[test]
+fn retaining_queries_distinguish_claude_roots_in_partitions_and_merged_views() {
+    use super::snapshot::{USAGE_SCAN_LOCK, lock_merged};
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _env = crate::test_support::pin_source_roots(temp.path());
+    let work = temp.path().join("work/projects");
+    let personal = temp.path().join("personal/projects");
+    for (root, message, tokens) in [(&work, "work", 10), (&personal, "personal", 20)] {
+        fs::create_dir_all(root.join("-repo")).unwrap();
+        fs::write(
+            root.join("-repo/session.jsonl"),
+            claude_line(message, tokens),
+        )
+        .unwrap();
+    }
+    for source in [Some(SourceFilter::Claude), None] {
+        for disk_cache in [false, true] {
+            lock_partitions().clear();
+            lock_merged().clear();
+            let mut query = UsageQuery {
+                source,
+                memo_ttl_ms: 60_000,
+                cache_path: disk_cache.then(|| temp.path().join(format!("{source:?}.sqlite3"))),
+                claude_sources: Some(vec![work.clone()]),
+                ..UsageQuery::default()
+            };
+            // Populate facts without retention first, then exercise cold snapshot publication.
+            assert_eq!(
+                scan_usage(&UsageQuery {
+                    memo_ttl_ms: 0,
+                    ..query.clone()
+                })
+                .unwrap()
+                .total_tokens,
+                10
+            );
+            assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+            query.claude_sources = Some(vec![personal.clone()]);
+            assert_eq!(scan_usage(&query).unwrap().total_tokens, 20);
+            query.claude_sources = Some(vec![work.clone()]);
+            assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+
+            // A refresh in progress may serve stale data only from the requested corpus.
+            let refresh = USAGE_SCAN_LOCK.lock().unwrap();
+            query.claude_sources = Some(vec![personal.clone()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let join = std::thread::spawn(move || {
+                tx.send(scan_usage(&query).unwrap().total_tokens).unwrap()
+            });
+            let premature = rx.recv_timeout(Duration::from_millis(50)).ok();
+            drop(refresh);
+            join.join().unwrap();
+            assert_eq!(premature, None);
+            assert_eq!(rx.recv().unwrap(), 20);
+        }
+    }
+    lock_partitions().clear();
+    lock_merged().clear();
+}
+
 fn assert_report_matches(actual: &UsageReport, expected: &UsageReport) {
     assert_eq!(
         serde_json::to_value(actual).unwrap(),

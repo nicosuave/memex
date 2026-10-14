@@ -134,7 +134,8 @@ Index all supported sources by default. Use repeatable `--only-source <source>` 
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
 (repeatable) to use non-default Claude projects directories; `claude_paths` in the config
 sets them permanently. Claude Code workflow runs store each agent transcript twice, under
-`subagents/` and `subagents/workflows/<run>/`; indexing and token usage read only one copy.
+`subagents/` and `subagents/workflows/<run>/`. Indexing merges their unique events into one
+session, and token usage reconciles shared responses across both copies.
 Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
 `muse`, `antigravity`, `bob`, `zcode`, `kilocode`, and `kimi`.

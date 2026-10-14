@@ -194,6 +194,10 @@ indexed under their old paths and indexes them again from the new ones; see
 `cuda_library_paths` and `cudnn_library_paths` accept path lists and are only used
 when `execution_provider = "cuda"`.
 
-Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`. `{claude_env}` expands to `CLAUDE_CONFIG_DIR='<dir>' ` for a local Claude session read from a configured config directory other than Claude's default `~/.claude` or `~/.config/claude`, and to nothing otherwise; the default Claude template uses it.
+Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`. `{claude_env}` expands to `CLAUDE_CONFIG_DIR='<dir>' ` for a local Claude session read from a configured profile, or `env -u CLAUDE_CONFIG_DIR ` for the default `~/.claude` and `~/.config/claude` directories so another account's inherited setting cannot select the wrong profile. Remote sessions and unrecognized roots leave it empty; the default Claude template uses it.
+
+Workflow agent transcripts may have overlapping direct and workflow copies. Indexing merges
+their unique events into one session, and token usage counts each shared response once, so
+resuming a tail-only copy preserves the history that exists only in the workflow copy.
 
 The skill definitions are bundled in `skills/`.

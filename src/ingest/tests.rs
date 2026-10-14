@@ -796,6 +796,7 @@ fn incremental_task(
         turn_id,
         legacy_turn_id: Some(turn_id),
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: metadata.len(),
         mtime: metadata
             .modified()
@@ -4305,6 +4306,7 @@ fn ingest_pi_incremental_records_keep_header_project() {
         turn_id: 1,
         legacy_turn_id: None,
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: (existing.len() + appended.len()) as u64,
         mtime: 0,
         change: FileChange::Append,
@@ -4386,6 +4388,7 @@ fn parse_copilot_session_extracts_messages_tools_and_workspace() {
         turn_id: 0,
         legacy_turn_id: None,
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: meta.len(),
         mtime: 0,
         change: FileChange::Append,
@@ -7154,8 +7157,10 @@ fn workflow_agent_copies_index_once_and_follow_the_more_complete_copy() {
         std::slice::from_ref(&workflow)
     );
 
-    // A resumed agent grows its direct copy past the workflow copy. A watcher hint for that
-    // copy alone moves the agent to it and retires the workflow copy's records.
+    // The direct copy is rewritten as a tail and then resumed. A watcher hint for it alone
+    // must preserve the workflow copy's earlier messages under the new projection owner.
+    fs::write(&direct, "").unwrap();
+    append_claude_message(&direct, "second");
     append_claude_message(&direct, "third");
     append_claude_message(&direct, "fourth");
     let dirty = HashSet::from([direct.clone()]);

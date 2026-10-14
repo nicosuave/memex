@@ -155,7 +155,10 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
         // cold-serve only when the normal path would have to build.
         match query.source {
             Some(filter) => {
-                if lock_partitions().contains_key(&(filter, query.cache_path.clone())) {
+                if lock_partitions()
+                    .get(&(filter, query.cache_path.clone()))
+                    .is_some_and(|entry| entry.matches_roots(filter, &claude_sources))
+                {
                     return None;
                 }
             }
@@ -164,10 +167,11 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
                     return None;
                 }
                 let store = lock_partitions();
-                if SCANNERS
-                    .iter()
-                    .all(|(filter, _)| store.contains_key(&(*filter, query.cache_path.clone())))
-                {
+                if SCANNERS.iter().all(|(filter, _)| {
+                    store
+                        .get(&(*filter, query.cache_path.clone()))
+                        .is_some_and(|entry| entry.matches_roots(*filter, &claude_sources))
+                }) {
                     // All partitions resident: the normal path only re-checks and
                     // merges, which is cheaper than a facts read.
                     return None;
@@ -233,7 +237,10 @@ fn populate_snapshots_from_facts(
     };
     for source in per_source {
         let filter = &source.filter;
-        if lock_partitions().contains_key(&(*filter, Some(cache_path.to_path_buf()))) {
+        if lock_partitions()
+            .get(&(*filter, Some(cache_path.to_path_buf())))
+            .is_some_and(|entry| entry.matches_roots(*filter, claude_sources))
+        {
             continue;
         }
         let Ok(assembly) = read_fact_assembly(&cache.connection, *filter) else {
@@ -262,6 +269,7 @@ fn populate_snapshots_from_facts(
                 fact_generation: Some(source.generation.clone()),
                 assembly,
                 warnings: Arc::new(source.warnings.clone()),
+                claude_sources: claude_sources.to_vec(),
             },
         );
     }
