@@ -7318,3 +7318,72 @@ fn ingest_kimi_journals_from_kimi_code_home_override() {
             .any(|record| record.role == "user" && record.text == "Now run the tests")
     );
 }
+
+#[test]
+fn kimi_undo_appended_after_indexing_retracts_the_undone_turn() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kimi_home = tmp.path().join("kimi-home");
+    let session_dir = kimi_home.join("sessions/wd_repo_0123456789ab/session_undo");
+    fs::create_dir_all(session_dir.join("agents/main")).expect("create agent dir");
+    let wire = session_dir.join("agents/main/wire.jsonl");
+    let prompt = |text: &str, time: u64| {
+        format!(
+            "{{\"type\":\"context.append_message\",\"agentId\":\"main\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"toolCalls\":[],\"origin\":{{\"kind\":\"user\"}}}},\"time\":{time}}}\n"
+        )
+    };
+    // Line 1 is the header; the first turn is line 2 and the undone one is line 3.
+    fs::write(
+        &wire,
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1782864000000}"#.to_string()
+            + "\n"
+            + &prompt("keep this", 1782864000001)
+            + &prompt("undo this", 1782864000002),
+    )
+    .expect("write wire");
+    let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(kimi_home.as_os_str()))]);
+
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = SearchIndex::open_or_create(&paths.index).expect("index");
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kimi = true;
+    let lease = ingest_lease(&paths);
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("ingest")
+            .records_added,
+        2
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&wire)
+        .expect("reopen wire")
+        .write_all(
+            (concat!(
+                r#"{"type":"agent.switched","agentId":"main","branch":"b1","reason":"undo","base":{"branch":"main","line":2},"turns":1,"legacyUndoLine":5,"time":1782864000003}"#,
+                "\n",
+                r#"{"type":"context.undo","agentId":"main","count":1,"time":1782864000003}"#,
+                "\n",
+                r#"{"type":"context.undone","agentId":"main","turns":1,"fromTurnId":1,"time":1782864000003}"#,
+                "\n",
+            )
+            .to_string()
+                + &prompt("retyped", 1782864000004))
+                .as_bytes(),
+        )
+        .expect("append undo");
+    ingest_all(&paths, &index, &options, &lease).expect("refresh");
+
+    let mut texts = index
+        .records_by_session_id("session_undo")
+        .expect("records")
+        .into_iter()
+        .map(|record| record.text)
+        .collect::<Vec<_>>();
+    texts.sort();
+    assert_eq!(texts, ["keep this", "retyped"]);
+}

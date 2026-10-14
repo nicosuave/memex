@@ -318,6 +318,19 @@ fn classify(root: &Root, path: &Path) -> Match {
     source.map_or(Match::Ignore, Match::File)
 }
 
+/// The `<workspace>/<session>` directory whose metadata file `path` is, under a Kimi
+/// sessions root.
+fn kimi_metadata_session(root: &Path, path: &Path) -> Option<PathBuf> {
+    let depth = path.strip_prefix(root).ok()?.components().count();
+    sources::kimi::METADATA_FILES.iter().find_map(|name| {
+        let name = Path::new(name);
+        let levels = name.components().count();
+        (depth == 2 + levels && path.ends_with(name))
+            .then(|| path.ancestors().nth(levels).map(Path::to_path_buf))
+            .flatten()
+    })
+}
+
 fn resolve(
     roots: &[Root],
     dirty: &HashSet<PathBuf>,
@@ -361,12 +374,9 @@ fn resolve(
             }
             // Session metadata (title, cwd) feeds the main journal's fingerprint.
             if matches!(root.shape, Shape::Kimi)
-                && path
-                    .strip_prefix(&root.lexical)
-                    .is_ok_and(|p| p.components().count() == 3)
-                && path.file_name().is_some_and(|n| n == "state.json")
+                && let Some(session_dir) = kimi_metadata_session(&root.lexical, &path)
             {
-                path = path.with_file_name("agents/main/wire.jsonl");
+                path = session_dir.join("agents/main/wire.jsonl");
                 if !path.exists() && !state.contains_file(path.to_string_lossy().as_ref())? {
                     continue;
                 }
@@ -648,6 +658,36 @@ mod tests {
                     }]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn kimi_metadata_hints_refresh_the_main_journal() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("kimi-home");
+        let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(home.as_os_str()))]);
+        let mut options = options();
+        options.include_kimi = true;
+        let state = checkpoint(&temp, &IngestState::default());
+        let session = home.join("sessions/wd_repo_0123456789ab/session_a");
+        let main = session.join("agents/main/wire.jsonl");
+        write(&main);
+        // The root `state.json` and the legacy `session-meta/` location both feed it.
+        for metadata in ["state.json", "session-meta/state.json"] {
+            let selection =
+                resolve_dirty(&options, &HashSet::from([session.join(metadata)]), &state).unwrap();
+            let DirtySelection::Paths { files, databases } = selection else {
+                panic!("expected the main Kimi journal");
+            };
+            assert!(databases.is_empty());
+            assert_eq!(
+                files,
+                vec![SourceFile {
+                    source: SourceKind::Kimi,
+                    path: main.clone(),
+                }]
+            );
         }
     }
 
