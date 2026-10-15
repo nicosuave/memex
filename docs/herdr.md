@@ -5,7 +5,8 @@
 ## herdr plugin
 
 This repo is also a herdr plugin: it turns the memex TUI into a herdr-native session desk. Browse
-and search every past agent session from a herdr pane, then resume one into a new herdr tab.
+and search every past agent session from a herdr pane, then resume one into a new herdr tab, or
+jump to the pane where it is already running.
 
 ```bash
 herdr plugin install nicosuave/memex
@@ -23,7 +24,7 @@ release build matching the plugin version. `link` uses `target/release/memex` fr
 
 | Action | What it does |
 | --- | --- |
-| `memex: session palette` | Recent sessions as an overlay: Enter resumes into a new tab, quitting returns focus where it was |
+| `memex: session palette` | Recent sessions as an overlay: Enter resumes into a new tab (or focuses the pane already running it), quitting returns focus where it was |
 | `memex: recent sessions here` | The palette pre-filtered to the focused workspace's repo |
 | `memex: session desk` | Opens the TUI zoomed over the focused pane |
 | `memex: toggle sidebar` | Opens the TUI as a split beside your work, or closes it |
@@ -31,16 +32,20 @@ release build matching the plugin version. `link` uses `target/release/memex` fr
 | `memex: refresh index` | Runs an incremental `memex index` now |
 | `memex: open web UI` | Starts `memex web` if nothing is listening, then opens it in the browser |
 
-Resuming inside herdr opens the session in a new herdr tab rather than taking over the current
-pane, so the desk stays where it is and you can resume several sessions in a row. Set
-`herdr_resume = "split"` (or `"off"`) in memex's own `config.toml` to change that. Each herdr
-session start also kicks off a background incremental index.
+When the session is already running in a herdr pane, resuming focuses that pane, switching
+workspace and tab as needed, instead of opening a duplicate. Herdr reports each agent pane's
+session id in `herdr pane list`, which is what memex matches on. Otherwise, resuming inside herdr
+opens the session in a new herdr tab rather than taking over the current pane, so the desk stays
+where it is and you can resume several sessions in a row. Set `herdr_resume = "split"` (or
+`"off"`) in memex's own `config.toml` to change that. Each herdr session start also kicks off a
+background incremental index.
 
 The plugin is backed by two new CLI surfaces that work anywhere:
 
 ```bash
 memex sessions --cwd . --limit 5     # JSONL: session_id, cwd, git_root, resume_cmd, ...
-memex herdr resume-last --cwd .      # resume the newest session for this repo into a herdr tab
+memex herdr resume-last --cwd .      # resume the newest session for this repo into a herdr tab,
+                                     # or focus its pane when it is already open
 ```
 
 Plugin config lives at `config.toml` in the plugin's herdr config directory and is re-read on

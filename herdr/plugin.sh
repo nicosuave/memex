@@ -201,7 +201,8 @@ resume-last)
   # scope would resume the most recent session of some other project.
   [ "$ctx_state" = "ok" ] ||
     refuse "cannot read pane context ($ctx_state); refusing to resume without directory scoping"
-  # memex resolves the most recent resumable session and opens it in a new herdr tab itself,
+  # memex resolves the most recent resumable session and opens it in a new herdr tab itself (or
+  # focuses the pane already running it),
   # driving the herdr CLI with the HERDR_* env this action already carries.
   args=(herdr resume-last --strict-cwd)
   [ -n "$ctx_cwd" ] && args+=(--cwd "$ctx_cwd")
