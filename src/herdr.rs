@@ -47,6 +47,37 @@ pub fn resume_placement(config: &UserConfig) -> ResumePlacement {
     }
 }
 
+/// The herdr pane already running `session_id`, if any. Herdr reports each
+/// agent pane's session identity in `herdr pane list`.
+pub fn pane_running_session(session_id: &str) -> Option<String> {
+    let bin = herdr_bin()?;
+    let mut cmd = Command::new(bin);
+    cmd.args(["pane", "list"]);
+    pane_for_session(&run_json(cmd).ok()?, session_id)
+}
+
+fn pane_for_session(value: &serde_json::Value, session_id: &str) -> Option<String> {
+    value
+        .pointer("/result/panes")?
+        .as_array()?
+        .iter()
+        .find(|pane| {
+            pane.pointer("/agent_session/value")
+                .and_then(serde_json::Value::as_str)
+                == Some(session_id)
+        })
+        .and_then(|pane| pane.get("pane_id")?.as_str().map(str::to_string))
+}
+
+/// Focus an existing herdr pane, switching workspace and tab as needed.
+pub fn focus_pane(pane_id: &str) -> Result<()> {
+    let bin = herdr_bin().ok_or_else(|| anyhow!("herdr binary not found"))?;
+    let mut cmd = Command::new(bin);
+    cmd.args(["agent", "focus", pane_id]);
+    run_json(cmd).context("herdr agent focus failed")?;
+    Ok(())
+}
+
 /// Open a new herdr tab or split and run `command` in it. Returns the new
 /// pane id. `cwd` should be `None` for remote sessions (the directory only
 /// exists on the remote machine).
@@ -124,6 +155,18 @@ fn pane_id_at(value: &serde_json::Value, path: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_for_session_matches_agent_session_id() {
+        let value = serde_json::json!({"result": {"panes": [
+            {"pane_id": "w1:p1", "agent_session": {"kind": "id", "value": "aaa"}},
+            {"pane_id": "w2:p3", "agent_session": {"kind": "id", "value": "bbb"}},
+            {"pane_id": "w2:p4"}
+        ]}});
+        assert_eq!(pane_for_session(&value, "bbb").as_deref(), Some("w2:p3"));
+        assert_eq!(pane_for_session(&value, "ccc"), None);
+        assert_eq!(pane_for_session(&serde_json::json!({}), "aaa"), None);
+    }
 
     #[test]
     fn placement_parses_config_values() {

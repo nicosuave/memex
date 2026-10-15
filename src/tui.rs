@@ -2668,6 +2668,17 @@ impl App {
         if crate::herdr::inside_herdr() {
             let placement = crate::herdr::resume_placement(&self.config);
             if placement != crate::herdr::ResumePlacement::Off {
+                // Already open in a herdr pane: jump there instead of opening a duplicate.
+                if !remote
+                    && let Some(pane_id) = crate::herdr::pane_running_session(&session.session_id)
+                    && crate::herdr::focus_pane(&pane_id).is_ok()
+                {
+                    self.set_status(format!(
+                        "{} is already open; focused herdr pane {pane_id}",
+                        session.session_id
+                    ));
+                    return Ok(());
+                }
                 let herdr_cwd = (!remote).then_some(cwd.as_str());
                 match crate::herdr::open_resume_pane(
                     placement,

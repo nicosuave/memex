@@ -5654,6 +5654,16 @@ fn run_herdr_resume(
         if placement == crate::herdr::ResumePlacement::Off {
             return Err(anyhow!("herdr resume is disabled (herdr_resume = \"off\")"));
         }
+        if let Some(pane_id) = crate::herdr::pane_running_session(&row.session_id)
+            && crate::herdr::focus_pane(&pane_id).is_ok()
+        {
+            println!(
+                "{} ({}) is already open; focused herdr pane {pane_id}",
+                row.session_id,
+                row.source.label()
+            );
+            return Ok(());
+        }
         let label = row
             .repo_project
             .clone()
