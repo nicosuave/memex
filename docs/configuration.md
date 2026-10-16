@@ -132,6 +132,7 @@ cuda_device_id = 0  # optional, when execution_provider = "cuda"
 cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs
 cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional list of cuDNN library dirs
 compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
+index_freshness = "bounded"  # strict, bounded or none
 scan_cache_ttl = 3600  # seconds (default 1 hour)
 max_indexed_tool_input_bytes = 65536  # 64 KiB default
 max_indexed_tool_output_bytes = 262144  # 256 KiB default
@@ -167,7 +168,13 @@ allowed_origins = []
 
 Daemon logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.
 
-`scan_cache_ttl` controls how long auto-indexing considers scans fresh.
+`index_freshness` sets how far reads may trail the transcripts on disk. Every read first takes
+in what the file-system journal names as changed (macOS), and a session read first takes in what
+its own transcript gained, so a live session reads back its newest messages. `bounded` (default)
+walks the source trees only when the journal cannot name the changes and the last walk is older
+than `scan_cache_ttl`; `strict` walks whenever the journal cannot name them, so every read sees
+the index as of the moment it started; `none` serves the index as it stands. Leaving it unset
+with `auto_index_on_search = false` means `none`.
 `include_reasoning` defaults to false. Set it to true (or pass `memex index
 --include-reasoning`) to add plaintext reasoning as BM25-only records. Encrypted
 and redacted reasoning payloads are always excluded.

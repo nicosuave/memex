@@ -4,7 +4,10 @@ use crate::analytics::{
 use crate::config::{MachineConfig, Paths, UserConfig};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
-use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
+use crate::ingest::{
+    Freshness, IngestOptions, IngestReport, changed_sources, ingest_all, ingest_dirty,
+    ingest_if_stale,
+};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::memory_search::{
     MemoryReadRequest, MemoryReadValue, MemorySearchHit, MemorySearchOptions,
@@ -1284,10 +1287,7 @@ pub fn read_session_pages(
         return Ok(pages);
     }
     if machine_id == LOCAL_MACHINE_ID {
-        let contexts = requests
-            .iter()
-            .map(|request| session_page_context_local(paths, request))
-            .collect::<Result<Vec<_>>>()?;
+        let contexts = session_pages_local(paths, config, requests)?;
         return apply_session_pages_budget(contexts, max_chars);
     }
     let machine = machine_by_id(config, machine_id)
@@ -1321,7 +1321,8 @@ pub fn session_page_context(
 ) -> Result<SessionPageContext> {
     validate_session_page_request(request)?;
     if machine_id == LOCAL_MACHINE_ID {
-        return session_page_context_local(paths, request);
+        return session_pages_local(paths, config, std::slice::from_ref(request))
+            .map(|mut contexts| contexts.remove(0));
     }
     let machine = config
         .machines
@@ -1354,10 +1355,7 @@ pub fn batch_session_contexts(
 ) -> Result<Vec<SessionPageContext>> {
     validate_session_batch(requests)?;
     if machine_id == LOCAL_MACHINE_ID {
-        return requests
-            .iter()
-            .map(|request| session_page_context_local(paths, request))
-            .collect();
+        return session_pages_local(paths, config, requests);
     }
     let machine = config
         .machines
@@ -1389,6 +1387,22 @@ pub fn batch_session_contexts(
             "session batch returned unexpected response: {other:?}"
         )),
     }
+}
+
+fn session_pages_local(
+    paths: &Paths,
+    config: &UserConfig,
+    requests: &[SessionPageRequest],
+) -> Result<Vec<SessionPageContext>> {
+    refresh_session_sources(
+        paths,
+        config,
+        requests.iter().map(|request| request.source_path.as_str()),
+    )?;
+    requests
+        .iter()
+        .map(|request| session_page_context_local(paths, request))
+        .collect()
 }
 
 fn session_page_context_local(
@@ -2273,7 +2287,27 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Operations that read the index as a whole refresh it first. Session reads refresh only
+/// their transcripts, and searches refresh on their own.
+fn refreshes_index_first(request: &RpcOperation) -> bool {
+    !matches!(
+        request,
+        RpcOperation::Ping
+            | RpcOperation::Index
+            | RpcOperation::Search { .. }
+            | RpcOperation::Recent { .. }
+            | RpcOperation::MemorySearch { .. }
+            | RpcOperation::Session { .. }
+            | RpcOperation::SessionPage { .. }
+            | RpcOperation::SessionBatch { .. }
+            | RpcOperation::ReadSessionPages { .. }
+    )
+}
+
 fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Result<RpcPayload> {
+    if refreshes_index_first(&request) {
+        ensure_local_index(paths, config)?;
+    }
     match request {
         RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
             projects: crate::cli::collect_projects(paths, source)?,
@@ -2325,6 +2359,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             session_id,
             source_path,
         } => {
+            refresh_session_sources(paths, config, [source_path.as_str()])?;
             let index = SearchIndex::open_or_create(&paths.index)?;
             let records = records_for_session(&index, &session_id, &source_path)?;
             Ok(RpcPayload::Session {
@@ -2397,10 +2432,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             max_chars,
         } => {
             validate_session_batch(&requests)?;
-            let contexts = requests
-                .iter()
-                .map(|request| session_page_context_local(paths, request))
-                .collect::<Result<Vec<_>>>()?;
+            let contexts = session_pages_local(paths, config, &requests)?;
             Ok(RpcPayload::BoundedSessionPages {
                 pages: apply_session_pages_budget(contexts, Some(max_chars))?,
             })
@@ -2408,15 +2440,13 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         RpcOperation::SessionPage { request } => {
             validate_session_page_request(&request)?;
             Ok(RpcPayload::SessionPage {
-                context: session_page_context_local(paths, &request)?,
+                context: session_pages_local(paths, config, std::slice::from_ref(&request))?
+                    .remove(0),
             })
         }
         RpcOperation::SessionBatch { requests } => {
             validate_session_batch(&requests)?;
-            let contexts = requests
-                .iter()
-                .map(|request| session_page_context_local(paths, request))
-                .collect::<Result<Vec<_>>>()?;
+            let contexts = session_pages_local(paths, config, &requests)?;
             Ok(RpcPayload::SessionBatch { contexts })
         }
         RpcOperation::Index => {
@@ -2983,8 +3013,21 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
     *field = abbreviated;
 }
 
+/// Session reads see what agents wrote since the last scan, as searches do. A read that
+/// names no local session leaves the index alone.
+pub fn ensure_local_index_for_reads<'a>(
+    paths: &Paths,
+    config: &UserConfig,
+    machine_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if machine_ids.into_iter().any(|id| id == LOCAL_MACHINE_ID) {
+        ensure_local_index(paths, config).context("refresh the index before a session read")?;
+    }
+    Ok(())
+}
+
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
-    if config.auto_index_on_search_default() {
+    if config.index_freshness()? != Freshness::None {
         let report = index_local(paths, config, true)?;
         if report.records_added > 0 || compaction_pending(paths) {
             schedule_compaction_if_fragmented(paths)?;
@@ -3019,6 +3062,43 @@ pub(crate) fn clear_compaction_pending(paths: &Paths) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("clear pending index compaction"),
+    }
+}
+
+/// Session reads take in what their transcripts gained since they were indexed, whatever the
+/// journal or the scan cache say, so a live session reads back its newest messages. A read
+/// that names no transcript refreshes as other reads do.
+fn refresh_session_sources<'a>(
+    paths: &Paths,
+    config: &UserConfig,
+    sources: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if config.index_freshness()? == Freshness::None {
+        return Ok(());
+    }
+    let sources: Vec<&str> = sources.into_iter().collect();
+    if sources.iter().any(|source| source.is_empty()) {
+        return ensure_local_index(paths, config);
+    }
+    let changed = changed_sources(paths, sources)?;
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let options = local_ingest_options(config)?;
+    paths.ensure_dirs()?;
+    let lease = IngestLease::acquire(paths, "session read", INGEST_LEASE_TIMEOUT)?;
+    let report = ingest_dirty(paths, &refresh_index(paths)?, &options, &lease, &changed)?.report;
+    drop(lease);
+    if report.records_added > 0 {
+        schedule_compaction_if_fragmented(paths)?;
+    }
+    Ok(())
+}
+
+fn refresh_index(paths: &Paths) -> Result<SearchIndex> {
+    match SearchIndex::open_or_create(&paths.index) {
+        Ok(index) if !index.is_writable() => Ok(index),
+        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index),
     }
 }
 
@@ -3090,16 +3170,13 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
     });
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
-    let index = match SearchIndex::open_or_create(&paths.index) {
-        Ok(index) if !index.is_writable() => index,
-        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
-    };
+    let index = refresh_index(paths)?;
     if stale_only {
         Ok(ingest_if_stale(
             paths,
             &index,
             &options,
-            config.scan_cache_ttl(),
+            config.index_freshness()?,
             &lease,
             journal,
         )?
@@ -4196,7 +4273,10 @@ mod tests {
             test_record(3, "session", "b.jsonl", 3),
         ];
         write_test_index(&paths, &records);
-        let config = UserConfig::default();
+        let config = UserConfig {
+            auto_index_on_search: Some(false),
+            ..UserConfig::default()
+        };
 
         let selector = ContextSelector::doc_id(2);
         let RpcPayload::BoundedRecord { record } = rpc_handler_round_trip(
@@ -4717,7 +4797,11 @@ mod tests {
             "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n[multi_machine]\ndefault = ['unavailable']\n[[machines]]\nid = 'unavailable'\nssh = 'unavailable'\n",
         )
         .unwrap();
-        let config = UserConfig::load(&paths).unwrap();
+        let config = UserConfig {
+            // A fixture index has no checkpoint for a refresh to build on.
+            index_freshness: Some("none".to_string()),
+            ..UserConfig::load(&paths).unwrap()
+        };
         let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
         for (id, path, ts, source) in [
             ("shared", "/old session.jsonl", 1, SourceKind::Codex),
@@ -4769,7 +4853,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
         paths.ensure_dirs().unwrap();
-        let config = UserConfig::load(&paths).unwrap();
+        let config = UserConfig {
+            // A fixture index has no checkpoint for a refresh to build on.
+            index_freshness: Some("none".to_string()),
+            ..UserConfig::load(&paths).unwrap()
+        };
         let mut records = Vec::new();
         for (doc, source, path, kind, project) in [
             (1, SourceKind::Codex, "a.jsonl", None, "memex"),
@@ -5043,7 +5131,11 @@ mod tests {
         drop(writer);
         let response = rpc_handler_round_trip(
             &paths,
-            &UserConfig::default(),
+            &UserConfig {
+                // A fixture analytics store has no checkpoint for a refresh to build on.
+                index_freshness: Some("none".to_string()),
+                ..UserConfig::default()
+            },
             RpcOperation::HomeActivity {
                 request: crate::web::ActivityRequest {
                     metric: crate::web::ActivityMetric::Sessions,
@@ -5147,5 +5239,109 @@ mod tests {
         assert_eq!(merged.unavailable_token_events, 1);
         assert_eq!(merged.total_tokens, 0);
         assert_eq!(merged.by_source[0].credits, Some(0.75));
+    }
+
+    fn append_claude_line(path: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "user", "uuid": text,
+                "message": {"role": "user", "content": text},
+            })
+        )
+        .unwrap();
+    }
+
+    fn page_texts(paths: &Paths, config: &UserConfig, request: &SessionPageRequest) -> Vec<String> {
+        let RpcPayload::SessionPage { context } = rpc_handler_round_trip(
+            paths,
+            config,
+            RpcOperation::SessionPage {
+                request: request.clone(),
+            },
+        ) else {
+            panic!("expected a session page");
+        };
+        let mut texts: Vec<_> = context.records.into_iter().map(|r| r.text).collect();
+        texts.sort();
+        texts
+    }
+
+    #[test]
+    fn session_pages_read_what_a_live_transcript_appended_within_the_scan_ttl() {
+        let _guard = crate::test_support::env_lock();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let claude = temp.path().join("projects");
+        let transcript = claude.join("project").join("session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let elsewhere = |name: &str| temp.path().join(name).to_string_lossy().into_owned();
+        let (codex, opencode, openclaw, copilot, grok, jcode, muse) = (
+            elsewhere("codex"),
+            elsewhere("opencode"),
+            elsewhere("openclaw"),
+            elsewhere("copilot"),
+            elsewhere("grok"),
+            elsewhere("jcode"),
+            elsewhere("muse"),
+        );
+        let _env = crate::test_support::EnvVarGuard::set(&[
+            ("HOME", Some(home.to_str().unwrap())),
+            ("CLAUDE_CONFIG_DIR", Some(claude.to_str().unwrap())),
+            ("CODEX_HOME", Some(&codex)),
+            ("OPENCODE_DATA_DIR", Some(&opencode)),
+            ("PI_CODING_AGENT_DIR", None),
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CONFIG_DIR", None),
+            ("OMP_PROFILE", None),
+            ("PI_PROFILE", None),
+            ("OPENCLAW_STATE_DIR", Some(&openclaw)),
+            ("CLAWDBOT_STATE_DIR", None),
+            ("COPILOT_HOME", Some(&copilot)),
+            ("GROK_HOME", Some(&grok)),
+            ("JCODE_HOME", Some(&jcode)),
+            ("MUSE_HOME", Some(&muse)),
+            ("XDG_DATA_HOME", None),
+        ]);
+        append_claude_line(&transcript, "first");
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        let config = UserConfig::default();
+        rpc_handler_round_trip(&paths, &config, RpcOperation::Index);
+        let mut record = None;
+        SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .for_each_record(|indexed| {
+                record = Some(indexed);
+                Ok(())
+            })
+            .unwrap();
+        let record = record.expect("the walk indexed the transcript");
+        let request = SessionPageRequest {
+            session_id: record.session_id,
+            source_path: record.source_path,
+            offset: 0,
+            limit: 10,
+        };
+
+        append_claude_line(&transcript, "second");
+        assert_eq!(page_texts(&paths, &config, &request), ["first", "second"]);
+
+        append_claude_line(&transcript, "third");
+        let unrefreshed = UserConfig {
+            index_freshness: Some("none".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            page_texts(&paths, &unrefreshed, &request),
+            ["first", "second"]
+        );
     }
 }

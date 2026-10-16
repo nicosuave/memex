@@ -309,9 +309,13 @@ pub struct UserConfig {
     pub cudnn_library_paths: Option<Vec<PathBuf>>,
     /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
     pub compute_units: Option<String>,
-    /// Scan cache TTL in seconds. If a scan was done within this time,
-    /// skip re-scanning on search. Default: 3600 seconds (1 hour).
+    /// Scan cache TTL in seconds. Under "bounded" freshness, a read whose journal replay
+    /// cannot name the changes walks only once the last walk is older than this.
+    /// Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
+    /// How far reads may trail the transcripts on disk: "strict", "bounded" or "none".
+    /// Default: "bounded", or "none" when `auto_index_on_search` is false.
+    pub index_freshness: Option<String>,
     /// Maximum indexed bytes for tool-call input.
     pub max_indexed_tool_input_bytes: Option<usize>,
     /// Maximum indexed bytes for tool-call output.
@@ -754,6 +758,28 @@ impl UserConfig {
 
     pub fn scan_cache_ttl(&self) -> u64 {
         self.scan_cache_ttl.unwrap_or(3600)
+    }
+
+    pub fn index_freshness(&self) -> Result<crate::ingest::Freshness> {
+        use crate::ingest::Freshness;
+        let bounded = Freshness::Bounded {
+            ttl_seconds: self.scan_cache_ttl(),
+        };
+        let Some(value) = self.index_freshness.as_deref() else {
+            return Ok(if self.auto_index_on_search_default() {
+                bounded
+            } else {
+                Freshness::None
+            });
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => Ok(Freshness::Strict),
+            "bounded" => Ok(bounded),
+            "none" => Ok(Freshness::None),
+            other => Err(anyhow!(
+                "invalid index_freshness: {other} (expected \"strict\", \"bounded\" or \"none\")"
+            )),
+        }
     }
 
     pub fn indexed_tool_content_limits(&self) -> Result<IndexedToolContentLimits> {
