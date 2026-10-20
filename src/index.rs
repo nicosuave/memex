@@ -1539,6 +1539,31 @@ impl SearchIndex {
         Ok(records)
     }
 
+    /// Every source path indexed under `session_id`, read from identity fast fields where the
+    /// index has them.
+    pub fn session_source_paths(&self, session_id: &str) -> Result<HashSet<String>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let schema = self.index.schema();
+        let fast_session_identity = self.fields.source.is_some_and(|source| {
+            [source, self.fields.session_id, self.fields.source_path]
+                .into_iter()
+                .all(|field| schema.get_field_entry(field).is_fast())
+        });
+        let query = session_query(&self.fields, session_id, None, None, None);
+        let scopes = searcher.search(
+            &query,
+            &SessionScopeCollector {
+                fields: self.fields.clone(),
+                fast_session_identity,
+            },
+        )??;
+        Ok(scopes
+            .into_iter()
+            .map(|(_, _, source_path)| source_path)
+            .collect())
+    }
+
     /// Resolve up to two exact identities for a session with bounded document hydration.
     /// Two records are sufficient for callers to reject ambiguous legacy deep links.
     pub fn matching_session_scopes(

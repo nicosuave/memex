@@ -7615,7 +7615,7 @@ fn bounded_reads_keep_the_index_when_the_journal_cannot_answer_and_strict_reads_
 }
 
 #[test]
-fn changed_sources_name_appended_rewritten_and_unrecorded_transcripts() {
+fn session_refresh_targets_name_appended_rewritten_and_unrecorded_transcripts() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("claude");
     fs::create_dir_all(&source).unwrap();
@@ -7633,10 +7633,9 @@ fn changed_sources_name_appended_rewritten_and_unrecorded_transcripts() {
     ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
     let key = |path: &Path| path.to_string_lossy().into_owned();
     let all = [key(&appended), key(&rewritten), key(&quiet)];
-    assert!(
-        changed_sources(&paths, all.iter().map(String::as_str))
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        session_refresh_targets(&paths, all.iter().map(String::as_str)).unwrap(),
+        Some(HashSet::new())
     );
 
     append_claude_message(&appended, "appended later");
@@ -7649,20 +7648,22 @@ fn changed_sources_name_appended_rewritten_and_unrecorded_transcripts() {
         key(&rewritten),
         key(&quiet),
         key(&unrecorded),
-        key(&source.join("missing.jsonl")),
     ];
-    let changed = changed_sources(&paths, sources.iter().map(String::as_str)).unwrap();
+    let targets = session_refresh_targets(&paths, sources.iter().map(String::as_str))
+        .unwrap()
+        .expect("every source is a transcript on disk");
     assert_eq!(
-        changed,
+        targets,
         HashSet::from([appended.clone(), rewritten.clone(), unrecorded.clone()])
     );
 
-    ingest_dirty(
+    ingest_session_sources(
         &paths,
         &open_search_index(&paths),
         &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
         &lease,
-        &changed,
+        &targets,
     )
     .unwrap();
     assert_eq!(
@@ -7675,4 +7676,128 @@ fn changed_sources_name_appended_rewritten_and_unrecorded_transcripts() {
             "unrecorded"
         ]
     );
+}
+
+#[test]
+fn session_refresh_targets_route_database_sessions_to_their_store_and_refuse_other_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let database = tmp.path().join("zcode").join("db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    fs::write(&database, "").unwrap();
+    let session = crate::sources::zcode::virtual_path(&database, "session")
+        .to_string_lossy()
+        .into_owned();
+    // The store is always handed on: a WAL-only commit leaves its own metadata unchanged.
+    assert_eq!(
+        session_refresh_targets(&paths, [session.as_str()]).unwrap(),
+        Some(HashSet::from([database.clone()]))
+    );
+
+    // A legacy OpenCode session is a directory, and a transcript that is gone cannot be
+    // stat'ed; neither can be refreshed on its own.
+    let directory = tmp.path().join("storage").join("session");
+    fs::create_dir_all(&directory).unwrap();
+    let missing = tmp.path().join("missing.jsonl");
+    for untargetable in [directory, missing] {
+        let untargetable = untargetable.to_string_lossy().into_owned();
+        assert_eq!(
+            session_refresh_targets(&paths, [session.as_str(), untargetable.as_str()]).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn session_reads_that_cannot_be_narrowed_walk_only_when_freshness_allows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    append_claude_message(&source.join("other.jsonl"), "elsewhere");
+    // A transcript removed after the read stat'ed it sends the dirty selection to a resync.
+    let vanished = HashSet::from([source.join("vanished.jsonl")]);
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        &vanished,
+    )
+    .unwrap();
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Strict,
+        &lease,
+        &vanished,
+    )
+    .unwrap();
+    assert_eq!(indexed_texts(&paths), ["elsewhere", "indexed"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn bounded_reads_keep_the_stored_cursor_and_scan_cache_when_the_journal_cannot_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    append_claude_message(&source.join("session.jsonl"), "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    let state_path = paths.state.join("ingest.json");
+    // The replay never finds a previous cursor, so it cannot name changes, but on macOS it
+    // still captures where the volume's journal stands.
+    let journal = || journal::ReplayHandle::spawn(vec![source.clone()], "claude".into(), |_| None);
+    // A walking refresh stores the cursor its replay captured.
+    ingest_selected(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        &lease,
+        Narrowing::Journal {
+            replay: journal(),
+            walk: true,
+        },
+        None,
+    )
+    .unwrap();
+    let stored = || {
+        let reader = CheckpointReader::open(&state_path).unwrap();
+        (
+            reader.load_journal_cursor("claude").unwrap(),
+            reader.header().unwrap().scan_cache.last_scan_ts,
+        )
+    };
+    let before = stored();
+    assert!(before.0.is_some(), "the walk stored a cursor");
+    append_claude_message(&source.join("session.jsonl"), "appended");
+
+    ingest_if_stale(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        Some(journal()),
+    )
+    .unwrap();
+    assert_eq!(stored(), before);
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
 }

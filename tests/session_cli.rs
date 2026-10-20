@@ -79,6 +79,10 @@ fn write_after_index(fixture: &Fixture) {
 }
 
 fn session_texts(fixture: &Fixture, session: &str) -> Vec<String> {
+    session_output_texts(&session_output(fixture, session))
+}
+
+fn session_output(fixture: &Fixture, session: &str) -> Output {
     let output = memex(
         &fixture.home,
         &fixture.root,
@@ -87,7 +91,11 @@ fn session_texts(fixture: &Fixture, session: &str) -> Vec<String> {
     .output()
     .expect("run session");
     assert_success(&output, "session");
-    String::from_utf8(output.stdout)
+    output
+}
+
+fn session_output_texts(output: &Output) -> Vec<String> {
+    String::from_utf8(output.stdout.clone())
         .expect("UTF-8 session output")
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -96,6 +104,14 @@ fn session_texts(fixture: &Fixture, session: &str) -> Vec<String> {
 }
 
 fn batch_texts(fixture: &Fixture, sessions: &[&str]) -> Vec<String> {
+    batch_lines(fixture, sessions)
+        .iter()
+        .flat_map(|page| page["records"].as_array().cloned().unwrap_or_default())
+        .filter_map(|record| record["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn batch_lines(fixture: &Fixture, sessions: &[&str]) -> Vec<Value> {
     let mut child = memex(&fixture.home, &fixture.root, &["session", "batch"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -115,9 +131,16 @@ fn batch_texts(fixture: &Fixture, sessions: &[&str]) -> Vec<String> {
         .expect("UTF-8 batch output")
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .flat_map(|page| page["records"].as_array().cloned().unwrap_or_default())
-        .filter_map(|record| record["text"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// The ingest lease file of the fixture's memex root.
+fn lease_path(fixture: &Fixture) -> PathBuf {
+    fixture
+        .root
+        .parent()
+        .expect("memex root parent")
+        .join(".memex.ingest.lock")
 }
 
 #[test]
@@ -182,6 +205,72 @@ fn session_reads_leave_the_index_alone_when_auto_indexing_is_off() {
     write_after_index(&fixture);
     assert_eq!(session_texts(&fixture, "known"), ["seed"]);
     assert!(session_texts(&fixture, "fresh").is_empty());
+}
+
+#[test]
+fn sessions_named_without_a_source_path_read_their_appends_within_the_scan_ttl() {
+    let fixture = fixture("embeddings = false\n");
+    write_after_index(&fixture);
+    assert_eq!(session_texts(&fixture, "known"), ["seed", "continued"]);
+    let mut known = OpenOptions::new()
+        .append(true)
+        .open(fixture.project.join("known.jsonl"))
+        .expect("open transcript for append");
+    write_claude_record(&mut known, "known", 2, "batched");
+    assert_eq!(
+        batch_texts(&fixture, &["known"]),
+        ["seed", "continued", "batched"]
+    );
+}
+
+#[test]
+fn bounded_session_reads_serve_the_index_while_an_ingest_holds_the_lease() {
+    let fixture = fixture("embeddings = false\n");
+    write_after_index(&fixture);
+    let lease = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lease_path(&fixture))
+        .expect("open lease");
+    lease.lock().expect("hold the ingest lease");
+    let output = session_output(&fixture, "known");
+    assert_eq!(session_output_texts(&output), ["seed"]);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reading the index as it stands"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    lease.unlock().expect("release the ingest lease");
+    assert_eq!(session_texts(&fixture, "known"), ["seed", "continued"]);
+}
+
+#[test]
+fn a_failed_strict_refresh_fails_batch_pages_one_by_one_and_a_single_read() {
+    let fixture = fixture("embeddings = false\nindex_freshness = \"strict\"\n");
+    write_after_index(&fixture);
+    // A directory where the lease file belongs makes every refresh fail at once.
+    fs::remove_file(lease_path(&fixture)).expect("remove the lease file");
+    fs::create_dir(lease_path(&fixture)).expect("block the lease");
+    let lines = batch_lines(&fixture, &["known"]);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("refresh the index before a session read")),
+        "{lines:?}"
+    );
+    let output = memex(
+        &fixture.home,
+        &fixture.root,
+        &["session", "known", "--full"],
+    )
+    .output()
+    .expect("run session");
+    assert!(
+        !output.status.success(),
+        "a strict read fails with its refresh"
+    );
 }
 
 fn assert_success(output: &Output, operation: &str) {

@@ -269,40 +269,87 @@ pub fn ingest_if_stale(
     Ok(Some(report))
 }
 
-/// The transcripts among `sources` whose size, identity or timestamps moved since the
-/// checkpoint last recorded them, or that it has never recorded. A path that cannot be
-/// stat'ed is left to the refreshes that discover sources.
-pub(crate) fn changed_sources<'a>(
+/// Bring the sources a session read names up to date, as far as `freshness` asks. `targets`
+/// comes from [`session_refresh_targets`]. A target the dirty selection cannot resolve on its
+/// own walks only when `freshness` would walk for any other read; otherwise the read sees the
+/// index as it stands. Returns Ok(None) when nothing was refreshed.
+pub(crate) fn ingest_session_sources(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    freshness: Freshness,
+    lease: &IngestLease,
+    targets: &HashSet<PathBuf>,
+) -> Result<Option<IngestReport>> {
+    let walk = match freshness {
+        Freshness::None => return Ok(None),
+        Freshness::Strict => true,
+        Freshness::Bounded { ttl_seconds } => {
+            let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
+            !can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)?
+        }
+    };
+    let narrowing = discovery::Narrowing::Dirty {
+        paths: targets,
+        walk,
+    };
+    Ok(Some(
+        ingest_selected(paths, index, options, lease, narrowing, None)?.report,
+    ))
+}
+
+/// The paths a dirty refresh needs to bring `sources` up to date: transcripts whose size,
+/// identity or timestamps moved since the checkpoint last recorded them, or that it never
+/// recorded, and the SQLite store behind every database-backed session, whose writer can
+/// commit to the WAL while the main file's metadata stays put. Returns None when a source
+/// cannot be targeted this way, such as a legacy OpenCode session directory or a transcript
+/// that no longer exists, so the caller refreshes as other reads do.
+pub(crate) fn session_refresh_targets<'a>(
     paths: &Paths,
     sources: impl IntoIterator<Item = &'a str>,
-) -> Result<HashSet<PathBuf>> {
-    let sources: Vec<String> = sources
-        .into_iter()
-        .filter(|source| std::fs::metadata(source).is_ok_and(|metadata| metadata.is_file()))
-        .map(str::to_owned)
-        .collect();
-    let state_path = paths.state.join("ingest.json");
-    if sources.is_empty() || !state_path.exists() {
-        return Ok(sources.into_iter().map(PathBuf::from).collect());
+) -> Result<Option<HashSet<PathBuf>>> {
+    let mut targets = HashSet::new();
+    let mut transcripts = Vec::new();
+    for source in sources {
+        let virtual_database = crate::sources::bob::split_virtual_path(Path::new(source))
+            .or_else(|| crate::sources::zcode::split_virtual_path(Path::new(source)))
+            .or_else(|| crate::sources::kilocode::split_virtual_path(Path::new(source)))
+            .map(|(database, _)| database);
+        if let Some(database) = virtual_database {
+            if !database.is_file() {
+                return Ok(None);
+            }
+            targets.insert(database);
+        } else if std::fs::metadata(source).is_ok_and(|metadata| metadata.is_file()) {
+            transcripts.push(source.to_owned());
+        } else {
+            return Ok(None);
+        }
     }
-    let recorded = CheckpointReader::open(&state_path)?
-        .load_files(&sources, crate::state::checkpoint::FileLoadScope::Targeted)?;
-    Ok(sources
-        .into_iter()
-        .filter(|source| {
-            let current = std::fs::metadata(source);
-            !matches!(
-                (recorded.get(source), current),
-                (Some(Some(previous)), Ok(metadata))
-                    if discovery::unchanged_file_metadata(
-                        previous,
-                        &metadata,
-                        previous.parser_version,
-                    )
-            )
-        })
-        .map(PathBuf::from)
-        .collect())
+    let state_path = paths.state.join("ingest.json");
+    if transcripts.is_empty() || !state_path.exists() {
+        targets.extend(transcripts.into_iter().map(PathBuf::from));
+        return Ok(Some(targets));
+    }
+    let recorded = CheckpointReader::open(&state_path)?.load_files(
+        &transcripts,
+        crate::state::checkpoint::FileLoadScope::Targeted,
+    )?;
+    for source in transcripts {
+        let unchanged = match (recorded.get(&source), std::fs::metadata(&source)) {
+            (Some(Some(previous)), Ok(metadata)) => {
+                discovery::unchanged_file_metadata(previous, &metadata, previous.parser_version)
+                    && previous.identity.sqlite_wal.as_ref().is_none_or(|wal| {
+                        *wal == crate::state::SqliteWalIdentity::read(Path::new(&source))
+                    })
+            }
+            _ => false,
+        };
+        if !unchanged {
+            targets.insert(PathBuf::from(source));
+        }
+    }
+    Ok(Some(targets))
 }
 
 pub fn ingest_all(
@@ -334,7 +381,10 @@ pub(crate) fn ingest_dirty(
         index,
         options,
         lease,
-        discovery::Narrowing::Dirty(dirty),
+        discovery::Narrowing::Dirty {
+            paths: dirty,
+            walk: true,
+        },
         None,
     )
 }
@@ -349,7 +399,7 @@ fn ingest_selected(
 ) -> Result<DirtyIngestReport> {
     crate::profiling::span!("ingest.all");
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
-    let dirty = matches!(narrowing, discovery::Narrowing::Dirty(_));
+    let dirty = matches!(narrowing, discovery::Narrowing::Dirty { .. });
     let pool = parser_thread_pool()?;
     let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
     if !dirty {

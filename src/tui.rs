@@ -898,6 +898,16 @@ impl StdIoRedirect {
     }
 }
 
+/// The freshness a TUI refresh runs under. `force` is the user asking for one, which runs as
+/// `strict` whatever `index_freshness` says; automatic refreshes follow `index_freshness`.
+fn index_refresh_freshness(config: &UserConfig, force: bool) -> Result<crate::ingest::Freshness> {
+    if force {
+        Ok(crate::ingest::Freshness::Strict)
+    } else {
+        config.index_freshness()
+    }
+}
+
 fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
     if SearchIndex::exists(&paths.index) {
         return SearchIndex::open_or_create(&paths.index);
@@ -1153,7 +1163,8 @@ impl App {
     }
 
     fn kickoff_index_refresh(&mut self, force: bool) {
-        if (!force && !self.config.auto_index_on_search_default())
+        let freshness = index_refresh_freshness(&self.config, force);
+        if matches!(freshness, Ok(crate::ingest::Freshness::None))
             || self.index_state == IndexState::Loading
         {
             return;
@@ -1208,14 +1219,7 @@ impl App {
                     Ok(index) if !index.is_writable() => index,
                     _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
                 };
-                ingest_if_stale(
-                    &paths,
-                    &index,
-                    &opts,
-                    config.index_freshness()?,
-                    &lease,
-                    Some(journal),
-                )
+                ingest_if_stale(&paths, &index, &opts, freshness?, &lease, Some(journal))
             })();
             match result {
                 Ok(Some(report)) => {
@@ -7361,6 +7365,32 @@ mod tests {
             },
         );
         (tmp, app)
+    }
+
+    #[test]
+    fn manual_refreshes_always_run_and_automatic_ones_follow_index_freshness() {
+        use crate::ingest::Freshness;
+        let off = UserConfig {
+            auto_index_on_search: Some(false),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            index_refresh_freshness(&off, false).unwrap(),
+            Freshness::None
+        );
+        assert_eq!(
+            index_refresh_freshness(&off, true).unwrap(),
+            Freshness::Strict
+        );
+        let bounded = UserConfig {
+            index_freshness: Some("bounded".to_string()),
+            scan_cache_ttl: Some(60),
+            ..off
+        };
+        assert_eq!(
+            index_refresh_freshness(&bounded, false).unwrap(),
+            Freshness::Bounded { ttl_seconds: 60 }
+        );
     }
 
     #[test]

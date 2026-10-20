@@ -224,11 +224,13 @@ impl MemexServer {
             let budget = read_limit(request.max_chars)?;
             let page = request.page.validate()?;
             let (paths, config) = load(root)?;
-            machine::ensure_local_index_for_reads(
-                &paths,
-                &config,
-                [request.page.machine.as_str()],
-            )?;
+            if request.page.machine == machine::LOCAL_MACHINE_ID {
+                machine::refresh_local_sessions(
+                    &paths,
+                    &config,
+                    machine::session_keys(std::slice::from_ref(&page)),
+                )?;
+            }
             let result = machine::read_session_pages(
                 &paths,
                 &config,
@@ -466,11 +468,20 @@ fn hydrate_pages(root: Option<PathBuf>, request: HydrateRequest) -> Result<Value
         .map(PageRequest::validate)
         .collect::<Result<Vec<_>>>()?;
     let (paths, config) = load(root)?;
-    machine::ensure_local_index_for_reads(
+    // One refresh covers every local request; when a strict refresh fails, only the local
+    // pages report it.
+    let local_refresh = machine::refresh_local_sessions(
         &paths,
         &config,
-        request.requests.iter().map(|r| r.machine.as_str()),
-    )?;
+        request
+            .requests
+            .iter()
+            .zip(&requests)
+            .filter(|(r, _)| r.machine == machine::LOCAL_MACHINE_ID)
+            .map(|(_, page)| (page.session_id.as_str(), page.source_path.as_str())),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
     let mut pages = Vec::new();
     let mut failures = Vec::new();
     let mut position = 0;
@@ -482,6 +493,16 @@ fn hydrate_pages(root: Option<PathBuf>, request: HydrateRequest) -> Result<Value
                 .take_while(|r| &r.machine == machine)
                 .count();
         let batch = &requests[position..end];
+        if machine == machine::LOCAL_MACHINE_ID
+            && let Some(error) = &local_refresh
+        {
+            for (i, page_request) in batch.iter().enumerate() {
+                failures.push(json!({"request_index":position+i,"machine":machine,"session_id":page_request.session_id,
+                    "source_path":page_request.source_path,"offset":page_request.offset,"error":error}));
+            }
+            position = end;
+            continue;
+        }
         match machine::read_session_pages(&paths, &config, machine, batch, Some(remaining)) {
             Ok(results) => {
                 for page in results {

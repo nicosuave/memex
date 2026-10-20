@@ -1683,11 +1683,14 @@ pub(super) struct PreparedRefresh {
     pub identities_changed: bool,
 }
 
-/// How a refresh limits discovery: to event hints from a watcher, to a journal replay started
-/// before the checkpoint was opened, or not at all. A journal refresh that may not `walk`
-/// leaves the index as it stands when the replay cannot name what changed.
+/// How a refresh limits discovery: to event hints from a watcher or a session read, to a
+/// journal replay started before the checkpoint was opened, or not at all. A refresh that may
+/// not `walk` leaves the index as it stands when its hints or replay cannot name what changed.
 pub(super) enum Narrowing<'a> {
-    Dirty(&'a HashSet<PathBuf>),
+    Dirty {
+        paths: &'a HashSet<PathBuf>,
+        walk: bool,
+    },
     Journal {
         replay: journal::ReplayHandle,
         walk: bool,
@@ -1705,7 +1708,7 @@ pub(super) fn prepare_refresh(
     mut scan_cache: Option<ScanCache>,
 ) -> Result<PreparedRefresh> {
     let (dirty, journal, walk) = match narrowing {
-        Narrowing::Dirty(dirty) => (Some(dirty), None, true),
+        Narrowing::Dirty { paths, walk } => (Some(paths), None, walk),
         Narrowing::Journal { replay, walk } => (None, Some(replay), walk),
         Narrowing::None => (None, None, true),
     };
@@ -1723,7 +1726,8 @@ pub(super) fn prepare_refresh(
     {
         match selection::resolve_dirty(options, dirty, &state)? {
             selection::DirtySelection::Paths { files, databases } => Some((files, databases)),
-            selection::DirtySelection::Resync => None,
+            selection::DirtySelection::Resync if walk => None,
+            selection::DirtySelection::Resync => Some((Vec::new(), Vec::new())),
         }
     } else {
         None
