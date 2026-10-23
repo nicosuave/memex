@@ -1017,9 +1017,15 @@ impl SearchIndex {
         fsync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
         atomic_write_current(&pending.index_root, &pending.generation_name)?;
         pending.published.store(true, AtomicOrdering::Release);
-        prune_superseded_generations(&pending.index_root, &pending.generation_name)?;
-        prune_legacy_index_files(&pending.index_root)?;
-        storage::collect_unreachable(&pending.index_root, false)?;
+        // CURRENT already names the new generation, so publication has succeeded. Reporting a
+        // cleanup failure as an error would make callers redo the ingest, leaving another
+        // unreclaimable generation behind on every retry.
+        let cleanup = prune_superseded_generations(&pending.index_root, &pending.generation_name)
+            .and_then(|()| prune_legacy_index_files(&pending.index_root))
+            .and_then(|()| storage::collect_unreachable(&pending.index_root, false).map(drop));
+        if let Err(error) = cleanup {
+            eprintln!("warning: index cleanup failed; run `memex index gc`: {error:#}");
+        }
         Ok(())
     }
 
@@ -4194,6 +4200,38 @@ mod tests {
         let before = fs::read(tmp.path().join("meta.json")).unwrap();
         assert!(SearchIndex::open_or_create_for_ingest(tmp.path()).is_err());
         assert_eq!(fs::read(tmp.path().join("meta.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn publishing_survives_a_failing_post_publication_cleanup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
+        let mut writer = first.writer().expect("first writer");
+        first
+            .add_record(&mut writer, &test_record(1, "first"))
+            .expect("add first");
+        writer.commit().expect("commit first");
+        writer.wait_merging_threads().expect("finish first writer");
+        first.publish_generation().expect("publish first");
+        fs::write(tmp.path().join("segments").join("stray"), b"unexpected").unwrap();
+
+        let second = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("second generation");
+        let mut writer = second.writer().expect("second writer");
+        second
+            .add_record(&mut writer, &test_record(2, "second"))
+            .expect("add second");
+        writer.commit().expect("commit second");
+        writer.wait_merging_threads().expect("finish second writer");
+        second
+            .publish_generation()
+            .expect("cleanup failure must not fail publication");
+        assert_eq!(
+            SearchIndex::open_or_create(tmp.path())
+                .expect("reader after publish")
+                .doc_count()
+                .expect("count after publish"),
+            2
+        );
     }
 
     #[test]
