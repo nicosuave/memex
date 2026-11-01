@@ -172,7 +172,10 @@ fn lease_path(paths: &Paths, kind: &str) -> PathBuf {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("memex");
-    parent.join(format!(".{root_name}.{kind}.lock"))
+    parent.join(format!(
+        ".{}.{kind}.lock",
+        root_name.strip_prefix('.').unwrap_or(root_name)
+    ))
 }
 
 fn open_lease_file(path: &Path) -> Result<File> {
@@ -263,6 +266,21 @@ mod tests {
             CompactionLock::try_acquire(&paths)
                 .expect("third compaction lock")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn a_dotted_root_keeps_a_single_leading_dot_in_its_lease_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(temp.path().join(".memex"))).expect("paths");
+
+        assert_eq!(
+            lease_path(&paths, "ingest"),
+            temp.path().join(".memex.ingest.lock")
+        );
+        assert_eq!(
+            compaction_lock_path(&paths),
+            temp.path().join(".memex.compaction.lock")
         );
     }
 
