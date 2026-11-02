@@ -17,28 +17,22 @@ const SCHEMA_VERSION: i64 = 8;
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
 // The one place a session's project is resolved. A user assignment wins, first the
-// session's own, then its parent's, then its grandparent's (continuations and sub-agents
-// inherit unless they have their own; a nested sub-agent's parent is the agent that
-// spawned it); derived facts follow. Assignments live in the attached assignment store
-// (see `crate::session_meta`), so rebuilds never drop them.
+// session's own and then its parent's (continuations and sub-agents inherit unless
+// they have their own); derived facts follow. Assignments live in the attached
+// assignment store (see `crate::session_meta`), so rebuilds never drop them.
 static ASSIGNED_PROJECT_SQL: LazyLock<String> = LazyLock::new(|| {
     let lookup = |key: &str| {
         format!(
             "(SELECT o.project FROM session_projects o WHERE o.machine = 'local'
-                AND o.source = {CANONICAL_SOURCE_SQL} AND o.session_id = {key})"
+                AND o.source = {CANONICAL_SOURCE_SQL} AND o.session_id = sessions.{key})"
         )
     };
     format!(
-        "COALESCE({}, {}, {})",
-        lookup("sessions.session_id"),
-        lookup("sessions.parent_session_id"),
-        lookup(&GRANDPARENT_SESSION_SQL)
+        "COALESCE({}, {})",
+        lookup("session_id"),
+        lookup("parent_session_id")
     )
 });
-// The parent of a session's parent, from the parent's own row.
-const GRANDPARENT_SESSION_SQL: &str = "(SELECT g.parent_session_id FROM sessions g
-    WHERE g.source = sessions.source AND g.session_id = sessions.parent_session_id
-        AND g.parent_session_id IS NOT NULL LIMIT 1)";
 static REPOSITORY_PROJECT_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "COALESCE({}, NULLIF(repo_project, ''), '{UNFILED_PROJECT}')",
@@ -49,12 +43,11 @@ static FLAT_PROJECT_SQL: LazyLock<String> =
     LazyLock::new(|| format!("COALESCE({}, project)", *ASSIGNED_PROJECT_SQL));
 // Assignments are keyed by canonical provider label; legacy Codex rows keep theirs.
 const CANONICAL_SOURCE_SQL: &str = "(CASE WHEN sessions.source IN ('codex-session', 'codex-history') THEN 'codex' ELSE sessions.source END)";
-// Tags a session carries directly or inherits from its parent and grandparent.
+// Tags a session carries directly or inherits from its parent.
 static SESSION_TAGS_FROM_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "session_tags t WHERE t.machine = 'local' AND t.source = {CANONICAL_SOURCE_SQL}
-            AND t.session_id IN (sessions.session_id, sessions.parent_session_id,
-                {GRANDPARENT_SESSION_SQL})"
+            AND t.session_id IN (sessions.session_id, sessions.parent_session_id)"
     )
 });
 static SESSION_TAGS_SQL: LazyLock<String> = LazyLock::new(|| {
