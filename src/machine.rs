@@ -88,14 +88,15 @@ impl SearchSpec {
         let Some(limit) = self.text_limit else {
             return;
         };
-        let terms = crate::cli::query_literals(&self.query);
+        // Escaped literals always compile; without matchers each field keeps its start.
+        let matchers = crate::cli::build_matchers(&self.query).unwrap_or_default();
         for (_, record) in records {
-            abbreviate_field(&mut record.text, limit, &terms);
+            abbreviate_field(&mut record.text, limit, &matchers);
             if let Some(input) = record.tool_input.as_mut() {
-                abbreviate_field(input, limit, &terms);
+                abbreviate_field(input, limit, &matchers);
             }
             if let Some(output) = record.tool_output.as_mut() {
-                abbreviate_field(output, limit, &terms);
+                abbreviate_field(output, limit, &matchers);
             }
         }
     }
@@ -3016,34 +3017,17 @@ fn apply_project_grouping(
     }
 }
 
-/// Lowercasing can change a character's byte length, so an offset into the lowercased string
-/// does not index the original.
-fn chars_before_lowercase(field: &str, lower_byte: usize) -> usize {
-    let mut lowered = 0;
-    for (index, character) in field.chars().enumerate() {
-        if lowered >= lower_byte {
-            return index;
-        }
-        lowered += character.to_lowercase().map(char::len_utf8).sum::<usize>();
-    }
-    field.chars().count()
-}
-
-/// Keep `limit` characters of `field`: from the start, or from the first occurrence of a query
-/// term when every term lies beyond the first `limit` characters.
-fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
+/// Keep `limit` characters of `field`: from the start, or from a quarter of `limit` before
+/// the window whose query hits are more specific than those of the start, such as an
+/// identifier far past an early common word.
+fn abbreviate_field(field: &mut String, limit: usize, matchers: &[regex::Regex]) {
     if field.chars().count() <= limit {
         return;
     }
-    let lower = field.to_lowercase();
-    let first_hit = terms
-        .iter()
-        .filter(|term| !term.is_empty())
-        .filter_map(|term| lower.find(term.as_str()))
-        .min();
-    let start_byte = match first_hit.map(|byte| (byte, chars_before_lowercase(field, byte))) {
-        Some((_, chars_before)) if chars_before >= limit => {
-            let skip = chars_before.saturating_sub(limit / 4);
+    let lead = limit / 4;
+    let start_byte = match crate::text_window::best_anchor(field, matchers, limit, lead) {
+        Some(anchor) if !anchor.head_suffices => {
+            let skip = anchor.chars.saturating_sub(lead);
             field.char_indices().nth(skip).map_or(0, |(index, _)| index)
         }
         _ => 0,
@@ -3692,21 +3676,43 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod abbreviate_tests {
-    use super::abbreviate_field;
+    use super::{SEARCH_TEXT_BUDGET, abbreviate_field};
+    use crate::cli::build_matchers;
 
     #[test]
     fn query_syntax_keeps_the_positive_text_window() {
         for query in ["\"needle\"", "text:needle AND NOT text:padding"] {
             let mut field = format!("padding {} needle evidence", "x".repeat(200));
-            abbreviate_field(&mut field, 40, &crate::cli::query_literals(query));
+            abbreviate_field(&mut field, 40, &build_matchers(query).unwrap());
             assert!(field.contains("needle"));
             assert!(!field.contains("padding"));
         }
     }
 
     #[test]
+    fn an_identifier_past_an_early_common_word_stays_in_the_window() {
+        let mut field = format!(
+            "error: the build failed {} then parse_retry_budget_v2 rejected the request",
+            "while compiling the workspace ".repeat(200)
+        );
+        let matchers = build_matchers("error parse_retry_budget_v2").unwrap();
+        abbreviate_field(&mut field, SEARCH_TEXT_BUDGET, &matchers);
+        assert!(field.contains("parse_retry_budget_v2"), "{field}");
+        assert!(field.starts_with('…'));
+        assert!(field.chars().count() <= SEARCH_TEXT_BUDGET + 2);
+
+        // When the start already shows the identifier, the field keeps its start.
+        let mut early = format!(
+            "error in parse_retry_budget_v2 {}error again",
+            "while compiling the workspace ".repeat(200)
+        );
+        abbreviate_field(&mut early, SEARCH_TEXT_BUDGET, &matchers);
+        assert!(early.starts_with("error in parse_retry_budget_v2"));
+    }
+
+    #[test]
     fn short_fields_are_untouched_and_long_ones_keep_the_query_window() {
-        let terms = vec!["needle".to_string()];
+        let terms = build_matchers("needle").unwrap();
         let mut short = "a needle in here".to_string();
         abbreviate_field(&mut short, 100, &terms);
         assert_eq!(short, "a needle in here");
@@ -3724,10 +3730,10 @@ mod abbreviate_tests {
 
     #[test]
     fn a_prefix_that_grows_when_lowercased_still_keeps_the_query_window() {
-        let terms = vec!["needle".to_string()];
+        let terms = build_matchers("needle").unwrap();
 
-        // `İ` lowercases to two characters, so the hit's offset in the lowercased string
-        // overshoots the original.
+        // `İ` lowercases to two characters, so an offset taken from a lowercased copy
+        // would overshoot the original; hits must be located in the original text.
         let mut turkish = format!("{}needle tail", "İ".repeat(100));
         abbreviate_field(&mut turkish, 40, &terms);
         assert!(turkish.contains("needle"), "{turkish}");

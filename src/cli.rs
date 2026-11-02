@@ -8334,17 +8334,19 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         .collect()
 }
 
-// Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
+/// Characters of context a preview shows before its first literal hit.
+const PREVIEW_LEAD_CHARS: usize = 80;
+
+// Preview the window with the most specific literal hits, such as an identifier past an
+// early common word; semantic-only hits fall back to a compact prefix.
 pub(crate) fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
-    let first = matchers
-        .iter()
-        .filter_map(|matcher| matcher.find(text))
-        .min_by_key(|m| m.start());
-    let Some(hit) = first else {
+    let Some(anchor) =
+        crate::text_window::best_anchor(text, matchers, max_chars, PREVIEW_LEAD_CHARS)
+    else {
         return summarize(text, max_chars);
     };
-    let prefix = take_last_chars(&text[..hit.start()], 80);
-    let start = hit.start() - prefix.len();
+    let prefix = take_last_chars(&text[..anchor.byte], PREVIEW_LEAD_CHARS);
+    let start = anchor.byte - prefix.len();
     let preview = summarize(&text[start..], max_chars.saturating_sub(1));
     if start > 0 {
         format!("…{preview}")
@@ -9480,6 +9482,21 @@ mod tests {
             "semantic fallback"
         );
         assert!(build_matchers("project:memex").unwrap().is_empty());
+    }
+
+    #[test]
+    fn previews_show_an_identifier_past_an_early_common_word() {
+        let text = format!(
+            "error: the build failed {} then parse_retry_budget_v2 rejected the request",
+            "while compiling the workspace ".repeat(40)
+        );
+        let matchers = build_matchers("error parse_retry_budget_v2").unwrap();
+        let preview = match_preview(&text, &matchers, 400);
+        assert!(preview.contains("parse_retry_budget_v2"), "{preview}");
+        assert!(preview.chars().count() <= 400);
+        // A single term still previews its earliest hit.
+        let preview = match_preview(&text, &build_matchers("error").unwrap(), 400);
+        assert!(preview.starts_with("error: the build failed"), "{preview}");
     }
 
     #[test]
