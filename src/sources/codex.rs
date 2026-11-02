@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub const VERSIONS: ParserVersions = ParserVersions {
     // Recompute ownership after excluding copied parent session metadata.
     identity: 4,
-    index: 9,
+    // Index injected user context as system text, compaction summaries, messages between
+    // agents and voice transcripts, and skip history a forked subagent copied.
+    index: 10,
     usage: 6,
 };
 
@@ -261,6 +263,8 @@ struct SessionMeta {
     cwd: Option<PathBuf>,
     links: SessionLinks,
     source_turn_id: Option<String>,
+    /// First `ordinal` of a forked subagent's own history; earlier lines copy its parent's.
+    history_start: Option<u64>,
 }
 
 fn fallback_meta(path: &Path) -> SessionMeta {
@@ -270,6 +274,7 @@ fn fallback_meta(path: &Path) -> SessionMeta {
         project: SourceKind::Codex.label().to_string(),
         cwd: None,
         source_turn_id: None,
+        history_start: None,
         links: SessionLinks {
             conversation_kind: Some(ConversationKind::Main.as_str().to_string()),
             ..SessionLinks::default()
@@ -357,6 +362,9 @@ fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionM
         })
         .or_else(|| subagent_present.then(|| "subagent".to_string()))
         .or_else(|| forked_from_id.as_ref().map(|_| "fork".to_string()));
+    metadata.history_start = payload
+        .get("subagent_history_start_ordinal")
+        .and_then(|value| value.as_u64());
     metadata.links.parent_session_id = forked_from_id.clone().or(parent_thread_id);
     metadata.links.thread_source = thread_source.clone();
     metadata.links.conversation_kind = Some(
@@ -618,6 +626,26 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
             }
             continue;
         }
+        // A subagent forked with its parent's context starts with a copy of the parent's
+        // rollout, indexed where it began.
+        if metadata.history_start.is_some_and(|history_start| {
+            object
+                .get("ordinal")
+                .and_then(|value| value.as_u64())
+                .is_some_and(|ordinal| ordinal < history_start)
+        }) {
+            continue;
+        }
+        // The model output of a compaction call; the `compacted` line after it holds the
+        // summary.
+        if object
+            .get("metadata")
+            .and_then(|metadata| metadata.get("compaction_output"))
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            continue;
+        }
         if entry_type == "turn_context" {
             metadata.source_turn_id = object
                 .get("payload")
@@ -708,7 +736,70 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
             continue;
         }
         if entry_type != "response_item" {
-            if !matches!(entry_type, "compacted" | "world_state" | "ghost_snapshot") {
+            let payload = object.get("payload").and_then(|value| value.as_object());
+            let conversation = payload.and_then(|payload| match entry_type {
+                // An API-encrypted compaction keeps its summary out of reach.
+                "compacted" => payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .map(compaction_summary)
+                    .filter(|summary| !summary.is_empty())
+                    .map(|summary| ("assistant", format!("compaction: {summary}"))),
+                // A message between agents, such as a subagent's answer.
+                "inter_agent_communication" => payload
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| ("assistant", text.to_string())),
+                // What was said in a voice conversation; its other items are bookkeeping.
+                "realtime_item"
+                    if payload.get("type").and_then(|value| value.as_str())
+                        == Some("transcript_segment") =>
+                {
+                    let role = match payload.get("role").and_then(|value| value.as_str()) {
+                        Some("user") => "user",
+                        _ => "assistant",
+                    };
+                    payload
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(|text| (role, text.to_string()))
+                }
+                _ => None,
+            });
+            if let Some((role, text)) = conversation {
+                let mut links = metadata.links.record_links();
+                links.event_id =
+                    payload.and_then(|payload| super::common::borrowed_string(payload, "id"));
+                links.source_turn_id = metadata.source_turn_id.clone();
+                links.source_record_type = Some(entry_type.to_string());
+                emit(Record {
+                    source: SourceKind::Codex,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: role.to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+            } else if !matches!(
+                entry_type,
+                "compacted"
+                    | "world_state"
+                    | "ghost_snapshot"
+                    | "realtime_item"
+                    | "inter_agent_communication"
+            ) {
                 diagnostics.increment_unknown_top_level(entry_type);
             }
             continue;
@@ -786,7 +877,23 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
                         }
                     }
                 }
-                let text = text_parts.join("\n").trim().to_string();
+                // Codex injects context (AGENTS.md, the environment, skills, notifications) as
+                // user messages; any such fragment makes the message context, not a prompt.
+                let contextual = role == "user"
+                    && text_parts.iter().any(|text| {
+                        is_contextual_user_text(text) && user_shell_command(text).is_none()
+                    });
+                // A command the user ran from the prompt is kept as they typed it.
+                let text = text_parts
+                    .iter()
+                    .map(|text| match user_shell_command(text) {
+                        Some(command) if role == "user" => format!("! {command}"),
+                        _ => text.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
                 if text.is_empty() && links.source_content.is_none() {
                     continue;
                 }
@@ -801,11 +908,12 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
                 }
                 // Keep injected instructions inspectable in raw transcripts. Only a
                 // standalone wrapper changes role; a bundled user request stays a user record.
-                let role = if role == "user" && is_standalone_system_instruction(&text) {
-                    "system"
-                } else {
-                    role
-                };
+                let role =
+                    if role == "user" && (contextual || is_standalone_system_instruction(&text)) {
+                        "system"
+                    } else {
+                        role
+                    };
                 emit(Record {
                     source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1064,6 +1172,47 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
                 if payload.contains_key("encrypted_content") {
                     diagnostics.encrypted_reasoning_dropped += 1;
                 }
+            }
+            // A message between agents (multi-agent v2): a subagent's answer, or the task a
+            // subagent is given, which is its prompt. Its encrypted payload is not kept.
+            "agent_message" => {
+                let text = payload
+                    .get("content")
+                    .and_then(|value| value.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                let role = if text.starts_with("Message Type: NEW_TASK\n") {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                emit(Record {
+                    source: SourceKind::Codex,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: metadata.project.clone(),
+                    session_id: metadata.session_id.clone(),
+                    turn_id,
+                    role: role.to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
             }
             _ => diagnostics.increment_unknown_semantic(payload_type),
         }
@@ -1885,6 +2034,89 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
         index += 1;
         keep
     });
+}
+
+/// Start and end markers of the fragments Codex injects into the conversation as `user`
+/// messages: codex-rs `CONTEXTUAL_USER_FRAGMENT_MATCHERS` and its frozen legacy list.
+const CONTEXTUAL_USER_MARKERS: &[(&str, &str)] = &[
+    ("# AGENTS.md instructions", "</INSTRUCTIONS>"),
+    // Older rollouts wrapped AGENTS.md in `<user_instructions>`.
+    ("<user_instructions>", "</user_instructions>"),
+    ("<environment_context>", "</environment_context>"),
+    (
+        "<agent_message_board_notification>",
+        "</agent_message_board_notification>",
+    ),
+    ("<skill>", "</skill>"),
+    ("<user_shell_command>", "</user_shell_command>"),
+    ("<turn_aborted>", "</turn_aborted>"),
+    ("<subagent_notification>", "</subagent_notification>"),
+    ("<codex_internal_context", "</codex_internal_context>"),
+    ("<goal_context>", "</goal_context>"),
+    ("<recommended_plugins>", "</recommended_plugins>"),
+    ("<hook_prompt ", "</hook_prompt>"),
+    // A review's findings handed back to the thread that asked for it.
+    ("<user_action>", "</user_action>"),
+];
+
+/// Warnings Codex once injected as `user` messages.
+const CONTEXTUAL_USER_PREFIXES: &[&str] = &[
+    "Warning: The maximum number of unified exec processes you can keep open is",
+    "Warning: apply_patch was requested via ",
+    "Warning: Your account was flagged for potentially high-risk cyber activity",
+];
+
+/// Whether user-role text is a fragment of harness-injected context rather than something the
+/// user typed (codex-rs `is_contextual_user_fragment`).
+fn is_contextual_user_text(text: &str) -> bool {
+    let text = text.trim();
+    let starts_with = |prefix: &str| {
+        text.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let ends_with = |suffix: &str| {
+        text.len() >= suffix.len()
+            && text
+                .get(text.len() - suffix.len()..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+    };
+    CONTEXTUAL_USER_MARKERS
+        .iter()
+        .any(|(start, end)| starts_with(start) && ends_with(end))
+        || CONTEXTUAL_USER_PREFIXES
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+        || text
+            .strip_prefix("<external_")
+            .and_then(|rest| rest.split_once('>'))
+            .is_some_and(|(key, _)| text.ends_with(&format!("</external_{key}>")))
+}
+
+/// The command a user ran from Codex's prompt, when `text` is the `<user_shell_command>`
+/// fragment Codex records for it: the `<command>`, without the `<result>` it printed.
+fn user_shell_command(text: &str) -> Option<&str> {
+    let body = text
+        .trim()
+        .strip_prefix("<user_shell_command>")?
+        .strip_suffix("</user_shell_command>")?;
+    let (_, rest) = body.split_once("<command>")?;
+    let (command, _) = rest.split_once("</command>")?;
+    Some(command.trim())
+}
+
+/// What Codex puts ahead of a compaction summary it hands the next model call
+/// (codex-rs `SUMMARY_PREFIX`); the summary follows it.
+const SUMMARY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process.";
+const SUMMARY_PREFIX_END: &str =
+    "use the information in this summary to assist with your own analysis:";
+
+/// The summary a `compacted` line's `message` holds, without the preamble Codex wraps it in.
+fn compaction_summary(message: &str) -> &str {
+    message
+        .strip_prefix(SUMMARY_PREFIX)
+        .and_then(|rest| rest.split_once(SUMMARY_PREFIX_END))
+        .map_or(message, |(_, summary)| summary)
+        .trim()
 }
 
 fn is_standalone_system_instruction(text: &str) -> bool {
@@ -3623,5 +3855,85 @@ not json
         // Without dependency invalidation the child would stay cached and the parent's newly
         // synced 500 would be counted twice (total 1250); re-parsing keeps it at 750.
         assert_eq!(extended.total_tokens, 750);
+    }
+
+    #[test]
+    fn injected_context_is_system_and_agent_conversation_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("rollout-2026-10-01T10-00-00-01a0d14f-ec4f-7ec1-abae-b9c7d4951878.jsonl");
+        let fixture = include_str!("../../fixtures/parse_fidelity/codex.jsonl");
+        fs::write(&path, fixture).unwrap();
+        let (records, output) = parse_transcript(&path, IndexParseState::default());
+        let roles_and_texts = |records: &[Record]| {
+            records
+                .iter()
+                .map(|record| (record.role.clone(), record.text.clone()))
+                .collect::<Vec<_>>()
+        };
+        let expected = [
+            (
+                "system",
+                "# AGENTS.md instructions for /work/memex\n\n<INSTRUCTIONS>\nRun cargo fmt before committing.\n</INSTRUCTIONS>",
+            ),
+            (
+                "system",
+                "<environment_context>\n  <cwd>/work/memex</cwd>\n  <shell>zsh</shell>\n</environment_context>",
+            ),
+            ("user", "! cargo test"),
+            (
+                "user",
+                "Message Type: NEW_TASK\nTask name: /root/helper_task\nSender: /root\nPayload:",
+            ),
+            ("user", "forked subagent task: say hi"),
+            ("assistant", "compaction: The helper said hi."),
+            ("assistant", "done"),
+            ("user", "what's failing in CI?"),
+            (
+                "assistant",
+                "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/word_reply\nPayload:\nSUBMARINE",
+            ),
+        ]
+        .map(|(role, text)| (role.to_string(), text.to_string()));
+        // History the subagent copied from its parent, compaction output and ciphertext are
+        // not indexed.
+        assert_eq!(roles_and_texts(&records), expected);
+        assert!(records.iter().all(|record| {
+            record.links.conversation_kind.as_deref() == Some("subagent")
+                && record.links.parent_session_id.as_deref()
+                    == Some("01a0d14f-eb8f-7433-9ed4-80fd3b6921fa")
+        }));
+        assert!(output.diagnostics.unknown_top_level_types.is_empty());
+        assert!(output.diagnostics.unknown_semantic_types.is_empty());
+
+        // Resumed past its start, the parser still knows which lines are inherited.
+        let second_line = fixture.find('\n').unwrap() + 1;
+        let (resumed, _) = parse_transcript(
+            &path,
+            IndexParseState {
+                offset: second_line as u64,
+                legacy_turn_id: Some(0),
+                ..IndexParseState::default()
+            },
+        );
+        assert_eq!(roles_and_texts(&resumed), expected);
+    }
+
+    #[test]
+    fn contextual_fragments_follow_codex_markers() {
+        assert!(is_contextual_user_text(
+            "<user_instructions>\nbe terse\n</user_instructions>"
+        ));
+        assert!(is_contextual_user_text(
+            "<external_slack>\nmessage\n</external_slack>"
+        ));
+        assert!(is_contextual_user_text(
+            "<turn_aborted>\nThe user interrupted.\n</turn_aborted>"
+        ));
+        assert!(!is_contextual_user_text(
+            "explain <environment_context> in codex"
+        ));
+        assert_eq!(compaction_summary("plain summary"), "plain summary");
     }
 }
