@@ -2,6 +2,7 @@ mod checkpoint;
 pub mod directories;
 pub(crate) mod discovery;
 mod execution;
+pub(crate) mod failures;
 pub mod journal;
 mod plan;
 mod publication;
@@ -100,13 +101,19 @@ pub struct IngestOptions {
 /// [`IngestOptions::embedding_budget`].
 pub const READ_REFRESH_EMBEDDING_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct IngestReport {
     pub records_added: usize,
     pub records_embedded: usize,
     pub files_scanned: usize,
     pub files_skipped: usize,
     pub diagnostics: crate::sources::ParseDiagnostics,
+    /// Files this refresh left alone because they failed to parse earlier and have neither
+    /// changed nor reached their retry time.
+    pub files_deferred: usize,
+    /// Files that failed to parse during this refresh. They were skipped, their indexed
+    /// records and checkpoints kept, and everything else published.
+    pub failed_files: Vec<failures::FileFailure>,
 }
 
 pub(crate) struct DirtyIngestReport {
@@ -414,19 +421,85 @@ fn ingest_selected(
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
     let dirty = matches!(narrowing, discovery::Narrowing::Dirty { .. });
     let pool = parser_thread_pool()?;
-    let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
-    if !dirty {
-        refresh_memories(paths, options, &repositories)?;
+    let mut failure_log = failures::FailureLog::load(&paths.state)?;
+    let mut failed_files: Vec<failures::FileFailure> = Vec::new();
+    let mut narrowing = narrowing;
+    let mut checkpoint_header = checkpoint_header;
+    let mut memories_refreshed = false;
+    for attempt in 1.. {
+        let recovered =
+            publication::recover_checkpoint(paths, index, lease, checkpoint_header.take())?;
+        if !dirty && !memories_refreshed {
+            refresh_memories(paths, options, &repositories)?;
+            memories_refreshed = true;
+        }
+        let prepared =
+            discovery::prepare_refresh(paths, index, options, &pool, recovered, narrowing, None)?;
+        let full_scan = prepared.full_scan;
+        if full_scan && dirty && !memories_refreshed {
+            refresh_memories(paths, options, &repositories)?;
+            memories_refreshed = true;
+        }
+        let selection = prepared.selection.clone();
+        let deferred = prepared.deferred_paths.clone();
+        let settled = prepared
+            .tasks
+            .iter()
+            .map(|task| task.path.to_string_lossy().into_owned())
+            .chain(prepared.delete_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        let error = match execution::execute_refresh(
+            prepared,
+            paths,
+            index,
+            options,
+            repositories.clone(),
+            &pool,
+        ) {
+            Ok(mut report) => {
+                failure_log.settle(
+                    settled.iter().map(String::as_str),
+                    full_scan.then_some(deferred.as_slice()),
+                );
+                failure_log.save(&paths.state)?;
+                // Files this refresh just failed on are reported as failures, not deferrals.
+                report.files_deferred = deferred
+                    .iter()
+                    .filter(|path| !failed_files.iter().any(|failed| failed.path == **path))
+                    .count();
+                report.failed_files = failed_files;
+                return Ok(DirtyIngestReport { report, full_scan });
+            }
+            Err(error) => error,
+        };
+        let isolated = match error.downcast::<failures::ParseFailures>() {
+            // Each attempt defers the files the previous one failed on, so retries converge
+            // unless files keep changing under the refresh.
+            Ok(isolated) if attempt < MAX_ISOLATION_ATTEMPTS => isolated,
+            Ok(isolated) => return Err(isolated.into()),
+            Err(error) => return Err(error),
+        };
+        // Nothing was published. Record the failures so discovery defers those files, then
+        // rerun the same selection without them.
+        let now = failures::now_secs();
+        for failure in isolated.0 {
+            let recorded = failure_log.record(failure, now);
+            eprintln!(
+                "warning: skipped {} transcript {}; its indexed records are kept and it is retried once it changes or after its backoff: {}",
+                recorded.source.label(),
+                recorded.path,
+                recorded.error
+            );
+            failed_files.push(recorded);
+        }
+        failure_log.save(&paths.state)?;
+        narrowing = discovery::Narrowing::Resolved(selection);
     }
-    let prepared =
-        discovery::prepare_refresh(paths, index, options, &pool, recovered, narrowing, None)?;
-    let full_scan = prepared.full_scan;
-    if full_scan && dirty {
-        refresh_memories(paths, options, &repositories)?;
-    }
-    let report = execution::execute_refresh(prepared, paths, index, options, repositories, &pool)?;
-    Ok(DirtyIngestReport { report, full_scan })
+    unreachable!("the isolation loop returns")
 }
+
+/// Refresh attempts per ingest that may isolate failing files before the failure is returned.
+const MAX_ISOLATION_ATTEMPTS: usize = 4;
 
 #[cfg(test)]
 mod tests;

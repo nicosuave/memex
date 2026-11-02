@@ -20,6 +20,14 @@
 
 The existing ingestion lease is retained across observation and execution. Checkpoints are loaded under that lease, so competing refreshes re-observe committed state. Read-only searches remain independent of the indexing writer. The [checkpoint storage contract](checkpoint-storage.md) defines sparse reads/deltas, migration, lifecycle locking, and recovery ordering.
 
+## Per-file failures
+
+A transcript or database session that fails to parse, by error or panic, is isolated instead of failing the refresh. The attempt that hit it publishes nothing and writes no publication intent; the refresh then reruns the same selection with the failing files deferred, so everything else publishes. A deferred file keeps its indexed records and its checkpoint: a parse failure is never a deletion, and the file is reparsed from its last good checkpoint once it reads again. Discovery also keeps the projections a deferred Claude agent owner would have retired, so merged agent copies stay all-or-nothing.
+
+Failures are recorded in `state/ingest-failures.json` with source, path, error, first and last attempt, attempt count, and the observed identity. Discovery defers a recorded file until its retry time, which starts at 30 seconds and doubles per failed attempt up to an hour, or until its size, timestamps, inode, or prefix identity change. The watcher treats hints for a deferred file as no-ops on the same terms. A successful parse or deletion clears the entry, and a full scan drops entries for files it no longer sees. `memex stats` (text and JSON) and `memex daemon status` list the skipped files.
+
+Tasks named by an interrupted publication intent and OpenCode sessions are not isolated: recovery must replay every path its intent names, and OpenCode sessions share database ownership, so their failure still fails the refresh.
+
 ## Cost contracts
 
 - An unchanged refresh creates no lexical staging generation, writer, commit, or merge work.

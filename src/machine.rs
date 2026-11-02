@@ -3308,13 +3308,7 @@ fn index_local(
             &lease,
             journal,
         )?
-        .unwrap_or(IngestReport {
-            records_added: 0,
-            records_embedded: 0,
-            files_scanned: 0,
-            files_skipped: 0,
-            diagnostics: Default::default(),
-        }))
+        .unwrap_or_default())
     } else {
         let report = ingest_all(paths, &index, &options, &lease)?;
         drop(lease);

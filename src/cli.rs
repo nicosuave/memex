@@ -2690,19 +2690,26 @@ fn run_event_loop(
                 }
                 match retry_after_stopping_embedder(&mut worker, || run_index_args(index, false)) {
                     Ok(()) => {
-                        service.mark_complete(FireCause::Resync);
+                        mark_watch_ingest_complete(&mut service, &paths, FireCause::Resync);
                         log_watch_stats(&service);
                     }
                     Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
                         return Err(error);
                     }
-                    Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
+                    Err(error) => {
+                        mark_watch_ingest_failed(&mut service, &paths, "resync ingest", &error)
+                    }
                 }
             }
             Some(FireCause::Dirty) => {
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
-                    Ok(false) => service.mark_skipped(),
+                    Ok(false) => {
+                        if service.is_failing() {
+                            clear_watch_ingest_failure(&paths);
+                        }
+                        service.mark_skipped();
+                    }
                     Ok(true) => match retry_after_stopping_embedder(&mut worker, || {
                         run_index_selection(index, false, Some(&dirty))
                     }) {
@@ -2712,18 +2719,22 @@ fn run_event_loop(
                             {
                                 eprintln!("watch: root refresh failed: {error:#}");
                             }
-                            service.mark_complete(if full_scan {
-                                FireCause::Resync
-                            } else {
-                                FireCause::Dirty
-                            });
+                            mark_watch_ingest_complete(
+                                &mut service,
+                                &paths,
+                                if full_scan {
+                                    FireCause::Resync
+                                } else {
+                                    FireCause::Dirty
+                                },
+                            );
                             log_watch_stats(&service);
                         }
                         Err(error) => {
                             if error.is::<crate::index::IndexCompatibilityError>() {
                                 return Err(error);
                             }
-                            eprintln!("watch: ingest failed, retrying: {error:#}");
+                            mark_watch_ingest_failed(&mut service, &paths, "ingest", &error);
                         }
                     },
                     Err(error) => {
@@ -2732,13 +2743,15 @@ fn run_event_loop(
                             run_index_args(index, false)
                         }) {
                             Ok(()) => {
-                                service.mark_complete(FireCause::Resync);
+                                mark_watch_ingest_complete(&mut service, &paths, FireCause::Resync);
                                 log_watch_stats(&service);
                             }
                             Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
                                 return Err(error);
                             }
-                            Err(error) => eprintln!("watch: ingest failed, retrying: {error:#}"),
+                            Err(error) => {
+                                mark_watch_ingest_failed(&mut service, &paths, "ingest", &error)
+                            }
                         }
                     }
                 }
@@ -2766,6 +2779,45 @@ fn run_event_loop(
     }
     worker.stop()?;
     Ok(())
+}
+
+fn mark_watch_ingest_complete(
+    service: &mut crate::watch::WatchService,
+    paths: &Paths,
+    cause: crate::watch::FireCause,
+) {
+    if service.is_failing() {
+        clear_watch_ingest_failure(paths);
+    }
+    service.mark_complete(cause);
+}
+
+fn clear_watch_ingest_failure(paths: &Paths) {
+    if let Err(error) = crate::ingest::failures::DaemonIngestStatus::clear(&paths.state) {
+        eprintln!("watch: could not clear the ingest failure status: {error:#}");
+    }
+}
+
+/// Back the failed ingest off exponentially and record the streak for `memex stats`.
+fn mark_watch_ingest_failed(
+    service: &mut crate::watch::WatchService,
+    paths: &Paths,
+    operation: &str,
+    error: &anyhow::Error,
+) {
+    let (failures, delay) = service.mark_failed(Instant::now());
+    eprintln!(
+        "watch: {operation} failed ({failures} in a row), retrying in {}s: {error:#}",
+        delay.as_secs()
+    );
+    if let Err(status_error) = crate::ingest::failures::DaemonIngestStatus::record_failure(
+        &paths.state,
+        failures,
+        error,
+        delay,
+    ) {
+        eprintln!("watch: could not record the ingest failure status: {status_error:#}");
+    }
 }
 
 /// Re-resolve watch roots (cheap; call on resync) so newly installed agent
@@ -2909,6 +2961,12 @@ fn run_index_selection(
     }
     for path in &report.diagnostics.unreadable_sources {
         eprintln!("warning: skipped unreadable source {path}; its indexed records are kept");
+    }
+    if report.files_deferred > 0 {
+        eprintln!(
+            "warning: {} previously failing file(s) left as indexed until they change or their retry is due; see `memex stats`",
+            report.files_deferred
+        );
     }
     if print_diagnostics && !report.diagnostics.is_empty() {
         println!(
@@ -7118,7 +7176,11 @@ fn run_index_service_status(
         ))
     };
     result?;
-    daemon_upgrade::print_runtime(&paths)
+    daemon_upgrade::print_runtime(&paths)?;
+    for line in crate::ingest::failures::status_lines(&paths.state)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn run_index_service_open(
