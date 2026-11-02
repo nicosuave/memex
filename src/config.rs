@@ -411,7 +411,7 @@ pub struct UserConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RedactionConfig {
     /// Redact built-in credential formats and withhold credential tool output at index time
-    /// (default true). Changing any setting here reparses indexed history.
+    /// (default false). While enabled, changing any setting here reparses indexed history.
     pub enabled: Option<bool>,
     /// Extra regexes. A `secret` capture group limits replacement to that span.
     #[serde(default)]
@@ -809,10 +809,10 @@ impl UserConfig {
         }
     }
 
-    /// Index-time redaction under `[redaction]`, or a disabled one when `enabled = false`.
+    /// Index-time redaction under `[redaction]`, or a disabled one unless `enabled = true`.
     pub fn redactor(&self) -> Result<std::sync::Arc<crate::redact::Redactor>> {
         let redaction = &self.redaction;
-        let redactor = if redaction.enabled.unwrap_or(true) {
+        let redactor = if redaction.enabled.unwrap_or(false) {
             crate::redact::Redactor::new(&redaction.patterns, &redaction.sensitive_files)?
         } else {
             crate::redact::Redactor::disabled()
@@ -1205,10 +1205,25 @@ mod tests {
     }
 
     #[test]
-    fn redaction_defaults_on_and_parses_its_table() {
+    fn redaction_is_opt_in_at_index_time_and_on_for_egress() {
         let defaults = UserConfig::default();
-        assert!(defaults.redactor().unwrap().is_enabled());
+        let redactor = defaults.redactor().unwrap();
+        assert!(!redactor.is_enabled());
         assert!(defaults.egress_redactor().unwrap().is_some());
+        // The default leaves every checkpoint version as it was before redaction existed, so
+        // upgrading reparses nothing.
+        for source in crate::types::SourceKind::ALL {
+            for include_reasoning in [false, true] {
+                let base = crate::sources::index_state_version_for(source, include_reasoning);
+                assert_eq!(redactor.fold_version(base), base, "{source:?}");
+            }
+        }
+        let opencode = crate::sources::opencode::DATABASE_STATE_VERSION;
+        assert_eq!(redactor.fold_version(opencode), opencode);
+
+        let opted_in: UserConfig = toml::from_str("[redaction]\nenabled = true\n").unwrap();
+        let base = crate::sources::index_state_version(crate::types::SourceKind::Claude);
+        assert_ne!(opted_in.redactor().unwrap().fold_version(base), base);
 
         let config: UserConfig = toml::from_str(
             r#"
@@ -1224,7 +1239,8 @@ mod tests {
         assert!(config.egress_redactor().unwrap().is_none());
         assert_eq!(config.redaction.patterns, ["corp_[a-z0-9]{12}"]);
 
-        let invalid: UserConfig = toml::from_str("[redaction]\npatterns = [\"(\"]\n").unwrap();
+        let invalid: UserConfig =
+            toml::from_str("[redaction]\nenabled = true\npatterns = [\"(\"]\n").unwrap();
         assert!(invalid.redactor().is_err());
     }
 
