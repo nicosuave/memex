@@ -42,6 +42,12 @@ memex daemon disable
 The daemon reads config defaults for its mode, interval, listeners, and log paths.
 Flags override those defaults.
 
+A refresh that fails as a whole is retried with exponential backoff from 2 seconds up to
+1 minute; changes that arrive meanwhile wait for the retry. While refreshes keep failing,
+`memex daemon status` and `memex stats` report the streak, its last error, and the next
+retry. A single transcript that cannot be parsed does not fail the refresh; see
+[per-file failures](refresh.md#per-file-failures).
+
 If an index has an incompatible schema or term dictionary format, continuous indexing
 logs the recovery error once and stays paused without retrying or exiting into a service
 manager restart loop. The daemon remains running but is not ready. Repair or explicitly

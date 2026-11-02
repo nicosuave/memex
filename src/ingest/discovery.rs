@@ -1835,6 +1835,25 @@ pub(super) struct PreparedRefresh {
     pub installed_opencode_states: HashMap<String, crate::state::OpencodeDatabaseState>,
     pub opencode_database_state_changed: bool,
     pub identities_changed: bool,
+    /// The selection this refresh resolved, so a retry that isolates failing files covers
+    /// exactly the same sources.
+    pub selection: ResolvedSelection,
+    /// Previously failing files discovery left untouched this refresh.
+    pub deferred_paths: Vec<String>,
+    /// Tasks whose parse failure must fail the refresh instead of being isolated.
+    pub pinned_paths: HashSet<PathBuf>,
+}
+
+/// What a refresh resolved its [`Narrowing`] to: the files and databases to observe (`None`
+/// for a full scan) and the journal cursor to persist with it.
+#[derive(Clone)]
+pub(super) struct ResolvedSelection {
+    selected: Option<(
+        Vec<crate::sources::SourceFile>,
+        Vec<crate::sources::SourceFile>,
+    )>,
+    journal_cursor: Option<journal::JournalCursorUpdate>,
+    journal_narrowed: bool,
 }
 
 /// How a refresh limits discovery: to event hints from a watcher or a session read, to a
@@ -1849,6 +1868,8 @@ pub(super) enum Narrowing<'a> {
         replay: journal::ReplayHandle,
         walk: bool,
     },
+    /// A selection an earlier attempt of the same refresh resolved.
+    Resolved(ResolvedSelection),
     None,
 }
 
@@ -1861,10 +1882,11 @@ pub(super) fn prepare_refresh(
     narrowing: Narrowing<'_>,
     mut scan_cache: Option<ScanCache>,
 ) -> Result<PreparedRefresh> {
-    let (dirty, journal, walk) = match narrowing {
-        Narrowing::Dirty { paths, walk } => (Some(paths), None, walk),
-        Narrowing::Journal { replay, walk } => (None, Some(replay), walk),
-        Narrowing::None => (None, None, true),
+    let (dirty, journal, walk, resolved) = match narrowing {
+        Narrowing::Dirty { paths, walk } => (Some(paths), None, walk, None),
+        Narrowing::Journal { replay, walk } => (None, Some(replay), walk, None),
+        Narrowing::Resolved(resolved) => (None, None, true, Some(resolved)),
+        Narrowing::None => (None, None, true, None),
     };
     let publication::RecoveredCheckpoint {
         mut state,
@@ -1933,6 +1955,19 @@ pub(super) fn prepare_refresh(
         }
         (selected, None) => selected,
     };
+    let (selected, journal_cursor, journal_narrowed) = match resolved {
+        Some(resolved) => (
+            resolved.selected,
+            resolved.journal_cursor,
+            resolved.journal_narrowed,
+        ),
+        None => (selected, journal_cursor, journal_narrowed),
+    };
+    let selection = ResolvedSelection {
+        selected: selected.clone(),
+        journal_cursor: journal_cursor.clone(),
+        journal_narrowed,
+    };
     let full_scan = selected.is_none();
     state.journal_cursor = journal_cursor;
 
@@ -1967,9 +2002,10 @@ pub(super) fn prepare_refresh(
     // Reuse reconstructs an unchanged directory from the rows the last successful refresh
     // persisted. Session-level deletes (pending-intent recovery) and clears must not hide files
     // that are still on disk, so they never feed the walk.
+    let failure_log = failures::FailureLog::load(&paths.state)?;
     let mut walk = if full_scan {
         let fingerprint = discovery_fingerprint(options);
-        let (previous, known) = if state.clears_files() {
+        let (previous, mut known) = if state.clears_files() {
             (HashMap::new(), Vec::new())
         } else {
             (
@@ -1977,6 +2013,9 @@ pub(super) fn prepare_refresh(
                 state.persisted_file_keys()?,
             )
         };
+        // A file that failed before it was ever indexed has no checkpoint row, so a reused
+        // directory would forget it; keep it known so it is retried.
+        known.extend(failure_log.files().map(|failure| failure.path.clone()));
         // Database-backed virtual paths are reconciled by their source adapters,
         // never by the transcript directory walk.
         let known = known.into_iter().filter(|key| {
@@ -2000,6 +2039,37 @@ pub(super) fn prepare_refresh(
         selected.as_ref().map(|(files, _)| files.as_slice()),
         walk.as_mut().map(|(walk, _)| walk),
     )?;
+    let now = failures::now_secs();
+    let pending_paths = pending_recovery
+        .iter()
+        .flat_map(|pending| pending.source_paths.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    let mut deferral = Deferral {
+        log: &failure_log,
+        now,
+        pending_paths: &pending_paths,
+        deferred: Vec::new(),
+    };
+    let mut transcripts = transcripts;
+    let superseded_projections = &mut transcripts.superseded_projections;
+    transcripts.tasks.retain(|task| {
+        if !deferral.defers(task) {
+            return true;
+        }
+        // A deferred owner keeps the projections it would have replaced: retiring them
+        // without indexing their union would drop their records.
+        for copy in &task.claude_agent_copies {
+            superseded_projections.remove(copy.path.to_string_lossy().as_ref());
+        }
+        if task.source == SourceKind::Antigravity
+            && let Some(session) = crate::sources::antigravity::projection_session_id(&task.path)
+        {
+            for projection in crate::sources::antigravity::projection_paths(&session) {
+                superseded_projections.remove(projection.to_string_lossy().as_ref());
+            }
+        }
+        false
+    });
     if let Some((walk, fingerprint)) = walk {
         crate::profiling::count!("discovery.directories_reused", walk.counters().reused);
         crate::profiling::count!(
@@ -2092,6 +2162,7 @@ pub(super) fn prepare_refresh(
             }
         }
     }
+    deferral.retain(&mut bob_tasks);
     tasks.extend(bob_tasks);
     unchanged_identities.extend(bob_unchanged_identities);
     files_scanned += bob_files_scanned;
@@ -2121,6 +2192,7 @@ pub(super) fn prepare_refresh(
             }
         }
     }
+    deferral.retain(&mut zcode.tasks);
     tasks.extend(zcode.tasks);
     unchanged_identities.extend(zcode.unchanged_identities);
     files_scanned += zcode.files_scanned;
@@ -2151,6 +2223,7 @@ pub(super) fn prepare_refresh(
             }
         }
     }
+    deferral.retain(&mut kilocode.tasks);
     tasks.extend(kilocode.tasks);
     unchanged_identities.extend(kilocode.unchanged_identities);
     files_scanned += kilocode.files_scanned;
@@ -2180,6 +2253,7 @@ pub(super) fn prepare_refresh(
             }
         }
     }
+    deferral.retain(&mut goose.tasks);
     tasks.extend(goose.tasks);
     unchanged_identities.extend(goose.unchanged_identities);
     files_scanned += goose.files_scanned;
@@ -2418,6 +2492,13 @@ pub(super) fn prepare_refresh(
         "opencode.database_deletes_scheduled",
         opencode_database_paths_to_delete.len()
     );
+    let pinned_paths = tasks
+        .iter()
+        .filter(|task| deferral.pinned(task))
+        .map(|task| task.path.clone())
+        .collect();
+    let deferred_paths = deferral.deferred;
+    files_skipped += deferred_paths.len();
     let mut identities_changed = false;
     for (path, identity) in unchanged_identities {
         if let Some(previous) = state.file(&path)
@@ -2458,7 +2539,53 @@ pub(super) fn prepare_refresh(
         installed_opencode_states,
         opencode_database_state_changed,
         identities_changed,
+        selection,
+        deferred_paths,
+        pinned_paths,
     })
+}
+
+/// Decides which previously failing tasks a refresh leaves alone. See [`failures`].
+struct Deferral<'a> {
+    log: &'a failures::FailureLog,
+    now: u64,
+    pending_paths: &'a HashSet<&'a str>,
+    deferred: Vec<String>,
+}
+
+impl Deferral<'_> {
+    /// Tasks whose failure cannot be isolated. An interrupted publication must replay every
+    /// path its intent names, or recovery would publish their deletion with no replacement.
+    /// OpenCode sessions share database ownership with sibling tasks.
+    fn pinned(&self, task: &FileTask) -> bool {
+        let path = task.path.to_string_lossy();
+        task.source == SourceKind::Opencode
+            || self.pending_paths.contains(path.as_ref())
+            || virtual_database(&task.path).is_some_and(|database| {
+                self.pending_paths
+                    .contains(database.to_string_lossy().as_ref())
+            })
+    }
+
+    fn defers(&mut self, task: &FileTask) -> bool {
+        let deferred = !self.pinned(task) && self.log.defers(task, self.now);
+        if deferred {
+            self.deferred.push(task.path.to_string_lossy().into_owned());
+        }
+        deferred
+    }
+
+    fn retain(&mut self, tasks: &mut Vec<FileTask>) {
+        tasks.retain(|task| !self.defers(task));
+    }
+}
+
+fn virtual_database(path: &Path) -> Option<PathBuf> {
+    crate::sources::bob::split_virtual_path(path)
+        .or_else(|| crate::sources::zcode::split_virtual_path(path))
+        .or_else(|| crate::sources::kilocode::split_virtual_path(path))
+        .or_else(|| crate::sources::goose::split_virtual_path(path))
+        .map(|(database, _)| database)
 }
 
 pub(super) fn can_skip_fresh_scan(

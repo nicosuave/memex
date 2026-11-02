@@ -3,8 +3,8 @@ use super::discovery::{
     modified_ns, prepare_refresh, unchanged_file_metadata,
 };
 use super::execution::{
-    RecordSender, build_parser_thread_pool, execute_refresh, finish_file_task, parse_claude_file,
-    parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
+    RecordSender, build_parser_thread_pool, catch_parser_panic, execute_refresh, finish_file_task,
+    parse_claude_file, parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
 };
 use super::publication::{
     EmbedBudget, open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
@@ -8125,4 +8125,242 @@ fn embed_budget_drops_buffered_work_once_spent() {
     budget.skip(&mut buffer, &progress);
     assert!(buffer.is_empty());
     assert_eq!(budget.skipped, 2);
+}
+
+/// Revoke read access so the parser fails on `path`. Returns false where that cannot work
+/// (running as root), so the caller can skip.
+#[cfg(unix)]
+fn make_unreadable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::File::open(path).is_err()
+}
+
+#[cfg(unix)]
+fn make_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+fn recorded_failures(paths: &Paths) -> Vec<String> {
+    failures::FailureLog::load(&paths.state)
+        .unwrap()
+        .files()
+        .map(|failure| failure.path.clone())
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn unparseable_transcript_is_isolated_reported_and_retried_after_it_is_fixed() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let good = source.join("good.jsonl");
+    let bad = source.join("bad.jsonl");
+    append_claude_message(&good, "good original");
+    append_claude_message(&bad, "bad original");
+    if !make_unreadable(&bad) {
+        return;
+    }
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let refresh = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let bad_key = bad.to_string_lossy().into_owned();
+
+    let report = refresh();
+    assert_eq!(report.records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["good original"]);
+    assert_eq!(report.failed_files.len(), 1);
+    assert_eq!(report.failed_files[0].path, bad_key);
+    assert_eq!(report.failed_files[0].attempts, 1);
+    assert_eq!(recorded_failures(&paths), std::slice::from_ref(&bad_key));
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(
+        !state.files.contains_key(&bad_key),
+        "no checkpoint for a failed file"
+    );
+    assert!(
+        failures::status_lines(&paths.state)
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(&bad_key))
+    );
+
+    // Unchanged and inside its backoff, the file is left alone instead of failing again.
+    append_claude_message(&good, "good appended");
+    let report = refresh();
+    assert_eq!(report.files_deferred, 1);
+    assert!(report.failed_files.is_empty());
+    assert_eq!(indexed_texts(&paths), ["good appended", "good original"]);
+
+    // Fixing the file changes its identity, which retries it at once.
+    make_readable(&bad);
+    let report = refresh();
+    assert_eq!(report.files_deferred, 0);
+    assert!(report.failed_files.is_empty());
+    assert_eq!(
+        indexed_texts(&paths),
+        ["bad original", "good appended", "good original"]
+    );
+    assert!(recorded_failures(&paths).is_empty());
+    assert!(!paths.state.join("ingest-failures.json").exists());
+    assert!(failures::status_lines(&paths.state).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn failing_transcript_keeps_its_indexed_records_and_checkpoint() {
+    for replace in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let good = source.join("good.jsonl");
+        let bad = source.join("bad.jsonl");
+        append_claude_message(&good, "good original");
+        append_claude_message(&bad, "bad original");
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let mut options = ingest_options(false, ModelChoice::gemma());
+        options.claude_sources = vec![source];
+        let refresh = || {
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            ingest_all(&paths, &index, &options, &lease).unwrap()
+        };
+        refresh();
+        let bad_key = bad.to_string_lossy().into_owned();
+        let state_path = paths.state.join("ingest.json");
+        let checkpoint = IngestState::load(&state_path).unwrap().files[&bad_key].clone();
+
+        // An append parses from the checkpoint offset; a rewrite deletes the old records
+        // before replaying. Neither may publish when the file cannot be read.
+        if replace {
+            fs::remove_file(&bad).unwrap();
+            append_claude_message(&bad, "bad rewritten");
+        } else {
+            append_claude_message(&bad, "bad appended");
+        }
+        append_claude_message(&good, "good appended");
+        if !make_unreadable(&bad) {
+            return;
+        }
+        let report = refresh();
+        assert_eq!(report.failed_files.len(), 1, "replace={replace}");
+        assert_eq!(
+            indexed_texts(&paths),
+            ["bad original", "good appended", "good original"],
+            "replace={replace}"
+        );
+        assert_eq!(
+            IngestState::load(&state_path).unwrap().files[&bad_key],
+            checkpoint,
+            "replace={replace}"
+        );
+
+        make_readable(&bad);
+        refresh();
+        let expected = if replace {
+            vec!["bad rewritten", "good appended", "good original"]
+        } else {
+            vec![
+                "bad appended",
+                "bad original",
+                "good appended",
+                "good original",
+            ]
+        };
+        assert_eq!(indexed_texts(&paths), expected, "replace={replace}");
+        assert!(recorded_failures(&paths).is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_transcript_is_retried_once_its_backoff_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let bad = source.join("bad.jsonl");
+    append_claude_message(&bad, "bad original");
+    if !make_unreadable(&bad) {
+        return;
+    }
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let refresh = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    assert_eq!(refresh().failed_files.len(), 1);
+    assert_eq!(refresh().files_deferred, 1);
+
+    // Expire the backoff without touching the file: the next refresh tries again and
+    // doubles the delay.
+    let log_path = paths.state.join("ingest-failures.json");
+    let mut log: serde_json::Value = serde_json::from_slice(&fs::read(&log_path).unwrap()).unwrap();
+    let entry = log["files"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    entry["retry_at"] = serde_json::json!(0);
+    fs::write(&log_path, serde_json::to_vec(&log).unwrap()).unwrap();
+    let report = refresh();
+    assert_eq!(report.files_deferred, 0);
+    assert_eq!(report.failed_files.len(), 1);
+    let failure = &report.failed_files[0];
+    assert_eq!(failure.attempts, 2);
+    assert_eq!(failure.retry_at - failure.last_seen, 60);
+    make_readable(&bad);
+}
+
+#[cfg(unix)]
+#[test]
+fn dirty_hint_for_a_deferred_transcript_needs_no_ingest() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let bad = source.join("bad.jsonl");
+    append_claude_message(&bad, "bad original");
+    if !make_unreadable(&bad) {
+        return;
+    }
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .unwrap()
+            .failed_files
+            .len(),
+        1
+    );
+    let dirty = HashSet::from([bad.clone()]);
+    assert!(!crate::watch::dirty_needs_ingest(&paths, &dirty).unwrap());
+    make_readable(&bad);
+    append_claude_message(&bad, "bad appended");
+    assert!(crate::watch::dirty_needs_ingest(&paths, &dirty).unwrap());
+}
+
+#[test]
+fn parser_panic_becomes_an_error() {
+    let error = catch_parser_panic(|| panic!("malformed line")).unwrap_err();
+    assert_eq!(error.to_string(), "parser panicked: malformed line");
+    let error = catch_parser_panic(|| panic!("{} lines", 2)).unwrap_err();
+    assert_eq!(error.to_string(), "parser panicked: 2 lines");
+    catch_parser_panic(|| Ok(())).unwrap();
 }

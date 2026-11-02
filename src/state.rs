@@ -373,7 +373,7 @@ impl PendingIngest {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let parent = parent_directory(path)?;
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
