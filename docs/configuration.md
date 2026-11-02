@@ -152,9 +152,9 @@ Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:
 
 | Provider | Platforms | Notes |
 |----------|-----------|-------|
-| auto | all | Default. Uses CoreML on macOS, CPU elsewhere |
+| auto | all | Default. Uses the CPU on every platform |
 | cpu | all | Force CPU execution |
-| coreml | macOS | Uses CoreML; `compute_units` controls ane/gpu/cpu/all |
+| coreml | macOS | Uses CoreML in float32; `compute_units` controls ane/gpu/cpu/all. Compiling the model takes several times as long as loading it on the CPU |
 | cuda | Linux/NVIDIA | Requires a binary built with `--features cuda` and CUDA 12/cuDNN runtime libraries |
 
 When `execution_provider = "cuda"`, you can optionally select a GPU with

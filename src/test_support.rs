@@ -1,11 +1,16 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// Serialize tests that change the process environment.
+///
+/// The lock guards no data, so a test that panicked while holding it leaves nothing
+/// inconsistent; recovering from the poison keeps one failure from failing every later
+/// test that takes the lock.
 pub fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock test env")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub struct EnvVarGuard {
