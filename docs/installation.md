@@ -104,7 +104,7 @@ Configure memex declaratively (generates `~/.memex/config.toml`):
             embeddings = true;
             include_reasoning = false;
             model = "minilm";
-            execution_provider = "auto"; # coreml on macOS, cpu elsewhere
+            execution_provider = "auto"; # cpu; coreml and cuda are opt-in
             cuda_device_id = 0; # optional when execution_provider = "cuda"
             cuda_library_paths = ["/usr/local/cuda/lib64"]; # optional override
             cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]; # optional override

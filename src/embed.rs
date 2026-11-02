@@ -261,21 +261,15 @@ impl ExecutionProviderChoice {
         }
     }
 
+    /// `Auto` runs on the CPU on every platform. On macOS it used to pick CoreML, whose
+    /// NeuralNetwork format runs the GPU in float16; EmbeddingGemma's activations overflow
+    /// there, so the default model returned NaN vectors. CoreML in float32 is correct
+    /// but compiles the model for several times as long as a CPU session takes to load,
+    /// without embedding faster, so it is opt-in.
     fn effective(self) -> Self {
         match self {
-            Self::Auto => Self::default_for_platform(),
+            Self::Auto => Self::Cpu,
             other => other,
-        }
-    }
-
-    fn default_for_platform() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self::CoreML
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Self::Cpu
         }
     }
 }
@@ -667,7 +661,7 @@ fn init_options_with_coreml(
     opts: InitOptions,
     runtime: &EmbedRuntimeConfig,
 ) -> Result<InitOptions> {
-    use ort::ep::coreml::{ComputeUnits, CoreML};
+    use ort::ep::coreml::{ComputeUnits, CoreML, ModelFormat};
 
     let compute_units = runtime
         .compute_units
@@ -679,15 +673,14 @@ fn init_options_with_coreml(
             _ => ComputeUnits::All,
         })
         .unwrap_or(ComputeUnits::All);
+    // The default NeuralNetwork format computes in float16 on the GPU, where EmbeddingGemma
+    // returns NaN; MLProgram computes in float32 unless low precision is allowed.
     let provider = CoreML::default()
+        .with_model_format(ModelFormat::MLProgram)
         .with_subgraphs(true)
         .with_compute_units(compute_units);
-    let dispatch = if matches!(runtime.execution_provider, ExecutionProviderChoice::CoreML) {
-        provider.build().error_on_failure()
-    } else {
-        provider.build()
-    };
-    Ok(opts.with_execution_providers(vec![dispatch]))
+    // Only an explicit `coreml` reaches here, so a provider that cannot load is an error.
+    Ok(opts.with_execution_providers(vec![provider.build().error_on_failure()]))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -771,8 +764,7 @@ impl EmbedderHandle {
             }
             ModelChoice::Local(LocalModel::Fastembed(model_type)) => {
                 let dims = TextEmbedding::get_model_info(model_type)?.dim;
-                let requested_provider = runtime.execution_provider;
-                let effective_provider = requested_provider.effective();
+                let effective_provider = runtime.execution_provider.effective();
                 if effective_provider == ExecutionProviderChoice::Cpu {
                     return Ok(Self {
                         backend: EmbedBackend::CpuFastembed(CpuTextEmbedding::try_new(model_type)?),
@@ -787,9 +779,7 @@ impl EmbedderHandle {
                          built with `--features cuda` and the required CUDA 12/cuDNN libraries are \
                          on the dynamic linker path (for example via LD_LIBRARY_PATH)"
                     ),
-                    ExecutionProviderChoice::CoreML
-                        if matches!(requested_provider, ExecutionProviderChoice::CoreML) =>
-                    {
+                    ExecutionProviderChoice::CoreML => {
                         anyhow!("failed to initialize CoreML execution provider: {err}")
                     }
                     _ => err,
@@ -861,15 +851,32 @@ impl EmbedderHandle {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        match &mut self.backend {
-            EmbedBackend::Fastembed(model) => Ok(model.embed(texts, Some(self.batch_size))?),
-            EmbedBackend::CpuFastembed(model) => model.embed(texts, self.batch_size),
+        let embeddings = match &mut self.backend {
+            EmbedBackend::Fastembed(model) => model.embed(texts, Some(self.batch_size))?,
+            EmbedBackend::CpuFastembed(model) => model.embed(texts, self.batch_size)?,
             EmbedBackend::Model2Vec(model) => {
                 let input: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
-                Ok(model.encode_with_args(&input, Some(512), self.batch_size))
+                model.encode_with_args(&input, Some(512), self.batch_size)
             }
-            EmbedBackend::Remote(embedder) => embedder.embed(texts),
-        }
+            EmbedBackend::Remote(embedder) => embedder.embed(texts)?,
+        };
+        check_finite(&embeddings)?;
+        Ok(embeddings)
+    }
+}
+
+/// Reject vectors with NaN or infinite values, which would be stored and searched as if
+/// they were valid. A local runtime that computes in reduced precision can overflow.
+fn check_finite(embeddings: &[Vec<f32>]) -> Result<()> {
+    match embeddings
+        .iter()
+        .position(|vector| vector.iter().any(|value| !value.is_finite()))
+    {
+        Some(index) => Err(anyhow!(
+            "the embedding model returned a non-finite value for text {index}; if \
+             execution_provider is \"coreml\" or \"auto\", try execution_provider = \"cpu\""
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1031,6 +1038,35 @@ mod tests {
             cosine_sim > 0.8,
             "expected high similarity, got {cosine_sim}"
         );
+    }
+
+    #[test]
+    fn non_finite_vectors_are_rejected() {
+        assert!(check_finite(&[vec![0.5, -0.5]]).is_ok());
+        let error = check_finite(&[vec![0.5], vec![f32::NAN]])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-finite value for text 1"), "{error}");
+        assert!(check_finite(&[vec![f32::INFINITY]]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "compiles a CoreML model, which takes minutes"]
+    fn coreml_gpu_embeddings_of_the_default_model_are_finite() {
+        let runtime = EmbedRuntimeConfig {
+            execution_provider: ExecutionProviderChoice::CoreML,
+            compute_units: Some("gpu".to_string()),
+            ..EmbedRuntimeConfig::default()
+        };
+        let mut embedder =
+            EmbedderHandle::with_model_and_runtime(&ModelChoice::default(), &runtime)
+                .expect("init CoreML embedder");
+        // CoreML's NeuralNetwork format returned NaN for both texts on the GPU.
+        let embeddings = embedder
+            .embed_texts(&["the cat sat on the mat", "small embedding smoke test"])
+            .expect("finite CoreML embeddings");
+        assert_eq!(embeddings.len(), 2);
     }
 
     #[test]
