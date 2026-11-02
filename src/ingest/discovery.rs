@@ -609,6 +609,19 @@ pub(super) fn prepare_file_task(
     if source == SourceKind::Kimi {
         identity.source_metadata_sha256 = Some(crate::sources::kimi::metadata_fingerprint(&path));
     }
+    if matches!(source, SourceKind::Pi | SourceKind::Omp) {
+        // A fork's projection depends on its parent file; the header naming it is re-read
+        // only when the file's prefix changed.
+        let kept_prefix = previous.filter(|previous| {
+            previous.parser_version == parser_version
+                && !plan::file_was_replaced(&previous.identity, &identity)
+        });
+        identity.source_metadata_sha256 = crate::sources::pi::lineage_fingerprint(
+            &path,
+            kept_prefix.and_then(|previous| previous.identity.source_metadata_sha256.as_deref()),
+            kept_prefix.is_some(),
+        );
+    }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
     if source == SourceKind::Hermes
         && let Ok(checkpoint) =
