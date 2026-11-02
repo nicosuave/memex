@@ -643,6 +643,7 @@ mod tests {
             tool_content_limits: IndexedToolContentLimits::default(),
             defer_merges: false,
             embedding_budget: None,
+            redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
         }
     }
 

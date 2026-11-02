@@ -225,10 +225,10 @@ pub(super) fn discover_transcripts(
                     .get(&key)
                     .expect("checkpoint path must be preloaded")
                     .as_ref();
-                let (mut task, mut skip) = prepare_file_task(
+                let (mut task, mut skip) = prepare_versioned_file_task(
                     path,
                     file.source,
-                    options.include_reasoning,
+                    options.index_state_version(file.source),
                     &metadata,
                     previous,
                 );
@@ -359,6 +359,11 @@ fn discovery_fingerprint(options: &IngestOptions) -> String {
     }
     for pattern in &options.exclude_patterns {
         feed(pattern.as_bytes());
+    }
+    // Stamps taken under other redaction settings cannot vouch that files beneath them were
+    // parsed under these. Disabled redaction keeps the fingerprint it always had.
+    if options.redaction.is_enabled() {
+        feed(&options.redaction.fold_version(0).to_le_bytes());
     }
     format!("{:x}", hash.finalize())
 }
@@ -565,10 +570,24 @@ pub(super) fn file_identity(
     }
 }
 
+#[cfg(test)]
 pub(super) fn prepare_file_task(
     path: PathBuf,
     source: SourceKind,
     include_reasoning: bool,
+    metadata: &std::fs::Metadata,
+    previous: Option<&FileState>,
+) -> (FileTask, bool) {
+    let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
+    prepare_versioned_file_task(path, source, parser_version, metadata, previous)
+}
+
+/// `parser_version` is the checkpoint version under the current settings
+/// ([`IngestOptions::index_state_version`]); a different recorded one reparses the file.
+pub(super) fn prepare_versioned_file_task(
+    path: PathBuf,
+    source: SourceKind,
+    parser_version: u32,
     metadata: &std::fs::Metadata,
     previous: Option<&FileState>,
 ) -> (FileTask, bool) {
@@ -590,7 +609,6 @@ pub(super) fn prepare_file_task(
         })
         .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
         .min(size) as usize;
-    let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let mut identity = previous
         .filter(|previous| unchanged_file_metadata(previous, metadata, parser_version))
         .map(|previous| previous.identity.clone())
@@ -839,8 +857,7 @@ pub(super) fn discover_bob(
         return Ok(result);
     }
     crate::profiling::span!("bob.discover");
-    let parser_version =
-        crate::sources::index_state_version_for(SourceKind::Bob, options.include_reasoning);
+    let parser_version = options.index_state_version(SourceKind::Bob);
     let mut readable: Vec<PathBuf> = Vec::new();
     let mut absent: Vec<PathBuf> = Vec::new();
     let mut current: HashSet<String> = HashSet::new();
@@ -1004,8 +1021,7 @@ pub(super) fn discover_zcode(
             .map(|root| root.join("cli/db/db.sqlite"))
             .collect::<Vec<_>>(),
     };
-    let parser_version =
-        crate::sources::index_state_version_for(SourceKind::Zcode, options.include_reasoning);
+    let parser_version = options.index_state_version(SourceKind::Zcode);
     for database in databases {
         let alias = database.canonicalize().ok();
         let excluded = excluder.is_excluded(&database)
@@ -1168,8 +1184,7 @@ pub(super) fn discover_kilocode(
             .map(|root| root.join("kilo.db"))
             .collect::<Vec<_>>(),
     };
-    let parser_version =
-        crate::sources::index_state_version_for(SourceKind::Kilocode, options.include_reasoning);
+    let parser_version = options.index_state_version(SourceKind::Kilocode);
     for database in databases {
         let alias = database.canonicalize().ok();
         let excluded = excluder.is_excluded(&database)
@@ -1315,8 +1330,7 @@ pub(super) fn discover_goose(
             .map(|root| root.join("sessions.db"))
             .collect::<Vec<_>>(),
     };
-    let parser_version =
-        crate::sources::index_state_version_for(SourceKind::Goose, options.include_reasoning);
+    let parser_version = options.index_state_version(SourceKind::Goose);
     for database in databases {
         let alias = database.canonicalize().ok();
         let excluded = excluder.is_excluded(&database)
@@ -1450,6 +1464,9 @@ pub(super) fn discover_opencode(
     let mut opencode_database_paths_to_delete: Vec<String> = Vec::new();
     let mut opencode_database_outcomes: HashMap<String, OpencodeDatabaseOutcome> = HashMap::new();
     let mut opencode_legacy_paths_to_delete: Vec<String> = Vec::new();
+    let opencode_state_version = options
+        .redaction
+        .fold_version(crate::sources::opencode::DATABASE_STATE_VERSION);
     if options.include_opencode && selected.is_none_or(|databases| !databases.is_empty()) {
         let database_files = if let Some(databases) = selected {
             databases.to_vec()
@@ -1486,7 +1503,18 @@ pub(super) fn discover_opencode(
             };
             files_scanned += 1;
             total_bytes += meta.len();
-            let previous = state.opencode_databases.get(&key);
+            // The scanner knows only its own state version; a checkpoint recorded under other
+            // redaction settings is presented as stale so every session rehydrates.
+            let previous = state.opencode_databases.get(&key).map(|previous| {
+                let mut previous = previous.clone();
+                previous.parser_version = if previous.parser_version == opencode_state_version {
+                    crate::sources::opencode::DATABASE_STATE_VERSION
+                } else {
+                    0
+                };
+                previous
+            });
+            let previous = previous.as_ref();
             match crate::sources::opencode::scan_database(&path, previous) {
                 Ok(scan) => {
                     if !full_scan
@@ -1638,7 +1666,7 @@ pub(super) fn discover_opencode(
             opencode_database_states.insert(
                 path,
                 crate::state::OpencodeDatabaseState {
-                    parser_version: crate::sources::opencode::DATABASE_STATE_VERSION,
+                    parser_version: opencode_state_version,
                     event_rowid: database.scan.cursor.event_rowid,
                     event_id: database.scan.cursor.event_id.clone(),
                     v2_session_ids: database
@@ -1751,10 +1779,10 @@ pub(super) fn discover_opencode(
             files_scanned += 1;
             total_bytes += meta.len();
             let key = path.to_string_lossy().to_string();
-            let (task, skip) = prepare_file_task(
+            let (task, skip) = prepare_versioned_file_task(
                 path,
                 SourceKind::Opencode,
-                options.include_reasoning,
+                options.index_state_version(SourceKind::Opencode),
                 &meta,
                 state.file(&key),
             );

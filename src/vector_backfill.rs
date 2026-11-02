@@ -1085,6 +1085,7 @@ mod tests {
                     max_retries: 0,
                 },
                 dimensions: None,
+                redaction: Default::default(),
             }),
             ..EmbedRuntimeConfig::default()
         }

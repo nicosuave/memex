@@ -299,6 +299,8 @@ pub struct RemoteEmbedConfig {
     pub endpoint: RemoteEndpoint,
     /// Sent as the API `dimensions` parameter; `None` keeps the model's native size.
     pub dimensions: Option<usize>,
+    /// Applied to every input before it is sent (`[redaction] egress`).
+    pub redaction: crate::redact::EgressRedaction,
 }
 
 impl EmbedRuntimeConfig {
@@ -891,6 +893,7 @@ fn remote_embedder(
         remote.dimensions,
         batch_size,
     )
+    .map(|embedder| embedder.with_redaction(remote.redaction.clone()))
 }
 
 fn check_dimensions(produced: usize, stored: usize) -> Result<()> {
@@ -1141,6 +1144,7 @@ mod tests {
             remote: Some(RemoteEmbedConfig {
                 endpoint: unroutable_endpoint(),
                 dimensions: None,
+                redaction: Default::default(),
             }),
             ..EmbedRuntimeConfig::default()
         };
@@ -1157,6 +1161,7 @@ mod tests {
             remote: Some(RemoteEmbedConfig {
                 endpoint: unroutable_endpoint(),
                 dimensions: Some(512),
+                redaction: Default::default(),
             }),
             ..EmbedRuntimeConfig::default()
         };
@@ -1183,6 +1188,7 @@ mod tests {
             remote: Some(RemoteEmbedConfig {
                 endpoint: unroutable_endpoint(),
                 dimensions: Some(512),
+                redaction: Default::default(),
             }),
             ..EmbedRuntimeConfig::default()
         };
@@ -1243,6 +1249,7 @@ mod tests {
             remote: Some(RemoteEmbedConfig {
                 endpoint: unroutable_endpoint(),
                 dimensions: None,
+                redaction: Default::default(),
             }),
             ..EmbedRuntimeConfig::default()
         };

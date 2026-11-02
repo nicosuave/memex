@@ -51,6 +51,9 @@ struct MemexServer {
     root: Option<PathBuf>,
     workers: Arc<Semaphore>,
     tool_router: ToolRouter<Self>,
+    /// Redaction applied to every tool response before it leaves over HTTP. It also covers
+    /// records indexed before index-time redaction, and remote machines' results.
+    egress: Option<Arc<crate::redact::Redactor>>,
 }
 
 impl MemexServer {
@@ -59,7 +62,13 @@ impl MemexServer {
             root,
             workers: Arc::new(Semaphore::new(4)),
             tool_router: Self::tool_router(),
+            egress: None,
         }
+    }
+
+    fn with_egress_redaction(mut self, redactor: Option<Arc<crate::redact::Redactor>>) -> Self {
+        self.egress = redactor;
+        self
     }
 
     async fn blocking(
@@ -87,9 +96,24 @@ impl MemexServer {
             _ = context.ct.cancelled() => return failure("request cancelled"),
             result = task => result,
         } {
-            Ok(Ok(value)) => CallToolResult::structured(value),
-            Ok(Err(error)) => failure(error),
-            Err(error) => failure(error),
+            Ok(Ok(value)) => self.success(value),
+            Ok(Err(error)) => self.failure(error),
+            Err(error) => self.failure(error),
+        }
+    }
+
+    fn success(&self, mut value: Value) -> CallToolResult {
+        if let Some(redactor) = &self.egress {
+            redactor.redact_json(&mut value);
+        }
+        CallToolResult::structured(value)
+    }
+
+    fn failure(&self, error: impl std::fmt::Display) -> CallToolResult {
+        let message = error.to_string();
+        match &self.egress {
+            Some(redactor) => failure(redactor.redact(&message).text),
+            None => failure(message),
         }
     }
 }
@@ -732,6 +756,23 @@ mod request_tests {
         assert_eq!(request.max_chars, 400);
         assert_eq!(request.machine, "mini");
         assert!(request.selector.is_empty());
+    }
+
+    #[test]
+    fn http_egress_redacts_tool_responses() {
+        // Assembled at runtime so no contiguous fake token sits in the source.
+        let token = format!("gh{}{}", "p_", "Zz9".repeat(12));
+        let value = json!({"records": [{"text": format!("pushed with {token}")}]});
+        let local = MemexServer::new(None).success(value.clone());
+        assert_eq!(local.structured_content, Some(value.clone()));
+        let redactor = Arc::new(crate::redact::Redactor::new(&[], &[]).unwrap());
+        let http = MemexServer::new(None)
+            .with_egress_redaction(Some(redactor))
+            .success(value);
+        assert_eq!(
+            http.structured_content.unwrap()["records"][0]["text"],
+            "pushed with [redacted:github-token]"
+        );
     }
 
     #[test]

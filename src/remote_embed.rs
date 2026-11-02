@@ -119,6 +119,8 @@ pub struct RemoteEmbedder {
     /// Whether `dims` came from a probe rather than [`Self::expect_dimensions`].
     dims_probed: bool,
     backoff_base: Duration,
+    /// Applied to every input before it leaves for the endpoint.
+    redaction: crate::redact::EgressRedaction,
 }
 
 impl fmt::Debug for RemoteEmbedder {
@@ -229,7 +231,14 @@ impl RemoteEmbedder {
             dims: None,
             dims_probed: false,
             backoff_base: DEFAULT_BACKOFF_BASE,
+            redaction: Default::default(),
         })
+    }
+
+    /// Redacts credentials from every input text before it is sent.
+    pub fn with_redaction(mut self, redaction: crate::redact::EgressRedaction) -> Self {
+        self.redaction = redaction;
+        self
     }
 
     /// Sends one short probe request and returns and caches the vector length.
@@ -296,9 +305,14 @@ impl RemoteEmbedder {
 
     /// Sends one validated request for `inputs`, retrying transient failures.
     fn request(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let redacted = inputs
+            .iter()
+            .map(|input| self.redaction.redact(input))
+            .collect::<Vec<_>>();
+        let redacted = redacted.iter().map(AsRef::as_ref).collect::<Vec<&str>>();
         let body = EmbeddingRequest {
             model: &self.model,
-            input: inputs,
+            input: &redacted,
             encoding_format: "float",
             dimensions: self.dimensions,
         };
@@ -720,6 +734,25 @@ mod tests {
             Ok(_) => bail!("expected an error"),
             Err(e) => Ok(format!("{e:#}")),
         }
+    }
+
+    #[test]
+    fn egress_redaction_strips_credentials_from_request_bodies() -> Result<()> {
+        let (base, server) = serve(echo)?;
+        let redactor = crate::redact::Redactor::new(&[], &[])?;
+        let mut embedder = client(&base, None, Some(3), 16, 0)?.with_redaction(
+            crate::redact::EgressRedaction::new(Some(std::sync::Arc::new(redactor))),
+        );
+        embedder.expect_dimensions(3);
+        // Assembled at runtime so no contiguous fake token sits in the source.
+        let token = format!("gh{}{}", "p_", "Zz9".repeat(12));
+        embedder.embed(&[&format!("deploy with {token}"), "plain text"])?;
+        let captured = join(server)?;
+        assert_eq!(
+            inputs(&captured[0].body),
+            ["deploy with [redacted:github-token]", "plain text"]
+        );
+        Ok(())
     }
 
     #[test]

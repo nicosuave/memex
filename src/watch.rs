@@ -896,6 +896,7 @@ mod tests {
             tool_content_limits: crate::config::IndexedToolContentLimits::default(),
             defer_merges: false,
             embedding_budget: None,
+            redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
         }
     }
 

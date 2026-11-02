@@ -140,6 +140,15 @@ pub struct ParseDiagnostics {
     pub encrypted_reasoning_dropped: u64,
     pub truncated_tool_inputs: u64,
     pub truncated_tool_outputs: u64,
+    /// Credentials replaced by index-time redaction.
+    pub redacted_secrets: u64,
+    /// Fields replaced whole because redacting them exceeded the time budget.
+    pub redaction_timeouts: u64,
+    /// Tool inputs withheld (a command carrying a credential, content written to a
+    /// sensitive file).
+    pub withheld_tool_inputs: u64,
+    /// Tool outputs withheld (credential commands, sensitive-file reads and writes).
+    pub withheld_tool_outputs: u64,
     /// Source stores discovery could not read this refresh (locked, corrupt, or on an
     /// unsupported schema). Their previously indexed records are kept until they read again.
     pub unreadable_sources: Vec<String>,
@@ -172,6 +181,10 @@ impl ParseDiagnostics {
         self.encrypted_reasoning_dropped += other.encrypted_reasoning_dropped;
         self.truncated_tool_inputs += other.truncated_tool_inputs;
         self.truncated_tool_outputs += other.truncated_tool_outputs;
+        self.redacted_secrets += other.redacted_secrets;
+        self.redaction_timeouts += other.redaction_timeouts;
+        self.withheld_tool_inputs += other.withheld_tool_inputs;
+        self.withheld_tool_outputs += other.withheld_tool_outputs;
         for (key, count) in other.unknown_top_level_types {
             *self.unknown_top_level_types.entry(key).or_default() += count;
         }

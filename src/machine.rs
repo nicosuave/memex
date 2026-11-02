@@ -3355,6 +3355,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         tool_content_limits: config.indexed_tool_content_limits()?,
         defer_merges: true,
         embedding_budget: None,
+        redaction: config.redactor()?,
     })
 }
 

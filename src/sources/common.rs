@@ -121,6 +121,7 @@ pub(crate) fn pending_tool_call(
         session_id: Some(session_id.to_string()),
         source_tool_use_id: links.source_tool_use_id.clone(),
         source_tool_assistant_uuid: links.source_tool_assistant_uuid.clone(),
+        withheld_output: None,
     }
 }
 

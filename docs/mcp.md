@@ -53,6 +53,9 @@ approve access. There is no separate login, signup, gateway, or identity provide
 Client names are supplied by the requesting app; inspect the redirect destination
 before approving. Approval grants access to the history this instance can read,
 including its configured remote machines.
+Every HTTP tool response has credentials redacted before it is sent, including records
+indexed before redaction and results from remote machines; see
+[Secret redaction](configuration.md#secret-redaction).
 
 The owner key is in `<root>/web-auth-token` (normally `~/.memex/web-auth-token`),
 the same restricted key file used by Memex's web server. Startup prints its path,

@@ -94,6 +94,20 @@ pub struct IngestOptions {
     /// `memex index embed` backfills them. Read-triggered refreshes set it so a slow
     /// embedder cannot hold the ingest lease for the whole backlog.
     pub embedding_budget: Option<std::time::Duration>,
+    /// Index-time secret redaction (`[redaction]`); its settings are part of every
+    /// checkpoint version.
+    pub redaction: Arc<crate::redact::Redactor>,
+}
+
+impl IngestOptions {
+    /// The checkpoint version a `source` file is parsed under with these options.
+    pub fn index_state_version(&self, source: SourceKind) -> u32 {
+        self.redaction
+            .fold_version(crate::sources::index_state_version_for(
+                source,
+                self.include_reasoning,
+            ))
+    }
 }
 
 /// How long a read-triggered refresh (search, session read, TUI auto-index) may spend

@@ -100,6 +100,10 @@ pub struct PendingToolCall {
     pub source_tool_use_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tool_assistant_uuid: Option<String>,
+    /// Set when redaction withholds this call's output, so a result parsed in a later
+    /// incremental pass is withheld too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld_output: Option<crate::redact::WithheldOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
