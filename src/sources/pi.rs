@@ -254,6 +254,48 @@ fn session_lineage(
     })
 }
 
+/// The lineage the `session` header of the transcript at `path` names.
+fn header_lineage(path: &Path) -> Option<SessionLineage> {
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(File::open(path).ok()?);
+    reader.split(b'\n').take(4).find_map(|line| {
+        let mut line = line.ok()?;
+        let value = simd_json::to_borrowed_value(&mut line).ok()?;
+        let header = value.as_object()?;
+        (header.get("type")?.as_str()? == "session")
+            .then(|| session_lineage(path, header))
+            .flatten()
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LineageFingerprint {
+    file: PathBuf,
+    exists: bool,
+}
+
+/// What a transcript's index projection depends on outside its own file: whether the parent
+/// session's file exists. A fork's copied history is skipped only while the parent holds it,
+/// and the parent's header names it, so the parent appearing or disappearing must reparse the
+/// transcript. The header is fixed, so `previous` is reused while the file keeps its prefix.
+/// `None` for transcripts with no parent.
+pub(crate) fn lineage_fingerprint(
+    path: &Path,
+    previous: Option<&str>,
+    reuse_previous: bool,
+) -> Option<String> {
+    let file = if reuse_previous {
+        // Without a previous lineage fingerprint, a file that kept its header has no parent.
+        serde_json::from_str::<LineageFingerprint>(previous?)
+            .ok()?
+            .file
+    } else {
+        header_lineage(path)?.file
+    };
+    let exists = file.is_file();
+    serde_json::to_string(&LineageFingerprint { file, exists }).ok()
+}
+
 /// The id in the `session` header of the transcript at `path`.
 fn header_id(path: &Path) -> Option<String> {
     use std::io::BufRead;
@@ -1260,6 +1302,30 @@ mod tests {
             records[0].links.parent_session_id.as_deref(),
             Some("parent-session")
         );
+
+        // Without the parent file the copied history is indexed, and the fingerprint change
+        // forces that reparse.
+        let present = lineage_fingerprint(&fork, None, false).unwrap();
+        assert_eq!(
+            lineage_fingerprint(&fork, Some(&present), true),
+            Some(present.clone())
+        );
+        fs::remove_file(dir.join("2026-10-13T00-00-00-000Z_parent.jsonl")).unwrap();
+        assert_ne!(
+            lineage_fingerprint(&fork, Some(&present), true),
+            Some(present)
+        );
+        let records = parse_from(&fork, IndexParseState::default(), false);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "original prompt"),
+                ("assistant", "original answer"),
+                ("user", "branch prompt"),
+                ("assistant", "branch answer"),
+            ]
+        );
+        assert_eq!(lineage_fingerprint(&fork, None, true), None);
     }
 
     #[test]
