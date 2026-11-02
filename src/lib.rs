@@ -29,6 +29,7 @@ mod search;
 pub mod session_meta;
 pub mod sources;
 pub mod state;
+mod text_window;
 pub mod transfer;
 pub mod tui;
 pub mod types;
