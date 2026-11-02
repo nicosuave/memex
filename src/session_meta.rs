@@ -294,7 +294,8 @@ pub struct AssignmentReport {
     pub session_id: String,
     /// Grouping and filtering use this project.
     pub project: String,
-    /// Where `project` comes from: `session`, `parent`, or `derived`.
+    /// Where `project` comes from: `session`, `parent` (the ancestor named in `parent`,
+    /// which is the grandparent when the parent has no project), or `derived`.
     pub project_origin: String,
     /// The repository grouping the session would have without any assignment.
     pub derived_project: String,
@@ -424,13 +425,41 @@ fn inspect(
         .first()
         .ok_or_else(|| anyhow::anyhow!("no indexed session '{session_id}'"))?;
     let assigned = store.own_assignment(source, session_id)?;
-    let parent = match latest.parent_session_id.as_deref() {
+    let mut parent = match latest.parent_session_id.as_deref() {
         Some(parent) => Some(InheritedAssignment {
             session_id: parent.to_string(),
             assignment: store.own_assignment(source, parent)?,
         }),
         None => None,
     };
+    // A nested sub-agent's parent is the agent that spawned it; like the analytics project
+    // resolution, inherit from the grandparent when the parent has no project of its own.
+    if let Some(inherited) = &parent
+        && inherited.assignment.project.is_none()
+        && let Some(grandparent) = analytics
+            .query_sessions_detailed_selected(
+                None,
+                None,
+                None,
+                None,
+                Some(crate::analytics::SessionKindFilter::All),
+                Some(&inherited.session_id),
+                None,
+                None,
+                None,
+            )?
+            .into_iter()
+            .find(|row| row.source == source)
+            .and_then(|row| row.parent_session_id)
+    {
+        let assignment = store.own_assignment(source, &grandparent)?;
+        if assignment.project.is_some() {
+            parent = Some(InheritedAssignment {
+                session_id: grandparent,
+                assignment,
+            });
+        }
+    }
     let derived_project = latest
         .repo_project
         .clone()

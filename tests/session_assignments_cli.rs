@@ -150,6 +150,46 @@ fn project_assignments_and_tags_follow_the_issue_acceptance_examples() {
 }
 
 #[test]
+fn a_nested_subagent_inherits_from_the_root_through_its_spawning_agent() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let paths = Paths::new(Some(root.to_path_buf())).unwrap();
+    let db = analytics_path(&paths.state);
+    drop(AnalyticsStore::open(&db).unwrap());
+    // A nested Claude sub-agent names the agent that spawned it as its parent.
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at, parent_session_id) values
+             ('claude', 'root', '/p/root.jsonl', 'scratch', null, 0, 1000, null),
+             ('claude', 'agent-outer', '/p/root/subagents/agent-outer.jsonl', 'scratch', null, 0, 2000, 'root'),
+             ('claude', 'agent-inner', '/p/root/subagents/agent-inner.jsonl', 'scratch', null, 0, 3000, 'agent-outer');",
+        )
+        .unwrap();
+
+    json(root, &["session", "set-project", "root", "ProjectA"]);
+    json(root, &["session", "tag", "add", "root", "tooling"]);
+    assert_eq!(
+        session_ids(root, &["--project", "ProjectA"]),
+        ["agent-inner", "agent-outer", "root"]
+    );
+    assert_eq!(
+        session_ids(root, &["--tag", "tooling"]),
+        ["agent-inner", "agent-outer", "root"]
+    );
+    let inner = json(root, &["session", "inspect", "agent-inner"]);
+    assert_eq!(inner["project"], "ProjectA");
+    assert_eq!(inner["project_origin"], "parent");
+    assert_eq!(inner["parent"]["session_id"], "root");
+
+    // The spawning agent's own assignment is nearer, so it wins.
+    json(root, &["session", "set-project", "agent-outer", "ProjectB"]);
+    let inner = json(root, &["session", "inspect", "agent-inner"]);
+    assert_eq!(inner["project"], "ProjectB");
+    assert_eq!(inner["parent"]["session_id"], "agent-outer");
+}
+
+#[test]
 fn assignments_require_an_indexed_unambiguous_session() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
