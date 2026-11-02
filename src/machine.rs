@@ -165,6 +165,9 @@ pub struct LocatedRecord {
     pub machine: String,
     pub score: f32,
     pub record: Record,
+    /// Set when search shows this child-session hit on its root session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollup: Option<crate::search::SessionRollup>,
 }
 
 /// Memory results keep document identity and provenance without acquiring a
@@ -700,6 +703,7 @@ pub fn federated_search(
                         score
                     },
                     record,
+                    rollup: None,
                 }),
         );
     }
@@ -912,6 +916,7 @@ pub fn federated_recent(
                     machine: id.clone(),
                     score,
                     record,
+                    rollup: None,
                 }));
             }
             Err(err) => failures.push((id, err.to_string())),

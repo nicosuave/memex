@@ -56,6 +56,21 @@ or candidates are exhausted. CLI record mode still returns individual records;
 use `--unique-session` to compare it with conversation views. Explicit newest/
 oldest sorts and different corpora, filters, or machine selections can differ.
 
+Matches in child sessions are attributed to the session they worked for rather
+than dropped. Under the default origins (`regular` for CLI and MCP, `interactive`
+for the TUI and web), a hit in a subagent or sidechain session is shown on its
+root parent session, following `parent_session_id` links through nested
+subagents, and dedupes with that parent's own hits in conversation views. The
+interactive origin also folds forks, branches, and compactions into their root;
+`regular` keeps those resumable children as their own rows. The record stays the
+child's own: `record_id` reads the child, and CLI/MCP results carry
+`rolled_up_to` (`session_id`, `source_path`, `matched_kind`) naming the root,
+while the TUI and web open the root and label the row with the child it matched
+in. Remote hits roll up on the record's own parent link; a parent that is not
+among the candidates has an empty `source_path`, which reads every transcript of
+that session ID. Children with no parent link keep their pre-roll-up handling,
+and `--origin subagent` or `all` lists children as their own rows.
+
 `debug eval-retrieval` evaluates the actual CLI result pipeline, including query
 fusion, filters, recency, conversation diversity and compact snippets. Evaluation
 never refreshes the index. The default is local lexical search with recency disabled

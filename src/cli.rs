@@ -385,7 +385,7 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches, rolled_up_to
     memory_id, content_version, section_ref, title, heading, cwd, mtime_ms, event_dates, start_line, end_line, document_kind, refs, freshness, changed_since_search
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
@@ -4131,6 +4131,9 @@ struct SearchHit {
     text: String,
     snippet: String,
     matches: Vec<MatchSpan>,
+    /// Root session a child-session hit is shown under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rolled_up_to: Option<crate::search::SessionRollup>,
     #[serde(flatten)]
     links: RecordLinks,
 }
@@ -4141,13 +4144,21 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
             machine,
             score,
             record,
+            rollup,
         } in results
         {
             let ts = format_ts(record.ts);
             let text = match_preview(&record.text, &render.matchers, 200);
+            let session = match rollup {
+                Some(rollup) => format!(
+                    "{} ({} of {})",
+                    record.session_id, rollup.matched_kind, rollup.session_id
+                ),
+                None => record.session_id,
+            };
             println!(
                 "[{score:.3}] {} {} {} {} {} {} {}",
-                machine, ts, record.doc_id, record.project, record.role, record.session_id, text
+                machine, ts, record.doc_id, record.project, record.role, session, text
             );
         }
         return Ok(());
@@ -4179,6 +4190,7 @@ fn project_located_results(
         machine,
         score,
         record,
+        rollup,
     } in results
     {
         let ts = format_ts(record.ts);
@@ -4293,6 +4305,11 @@ fn project_located_results(
             if fields.contains("matches") {
                 map.insert("matches".to_string(), serde_json::to_value(matches)?);
             }
+            if fields.contains("rolled_up_to")
+                && let Some(rollup) = &rollup
+            {
+                map.insert("rolled_up_to".to_string(), serde_json::to_value(rollup)?);
+            }
             Value::Object(map)
         } else {
             serde_json::to_value(SearchHit {
@@ -4309,6 +4326,7 @@ fn project_located_results(
                 text,
                 snippet,
                 matches,
+                rolled_up_to: rollup,
                 links: record.links,
             })?
         };
@@ -8210,7 +8228,7 @@ enum SortBy {
     Ts,
 }
 
-const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
+const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,rolled_up_to,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
 
 fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
     if full {

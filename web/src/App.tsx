@@ -68,6 +68,9 @@ type SearchResult = {
   score?: number | null
   snippet: string
   snippet_matches?: Array<{ start: number; end: number }>
+  // Set when the hit came from a child session (such as a subagent) and the
+  // row shows the session it worked for; record_id then names a child record.
+  matched_in?: { session_id: string; source_path: string; kind: string }
 }
 
 type SearchPayload = {
@@ -589,6 +592,10 @@ function ResultContinuation({
   )
 }
 
+function formatMatchedIn(matchedIn?: SearchResult["matched_in"]) {
+  return matchedIn ? ` · via ${matchedIn.kind} ${matchedIn.session_id.slice(0, 12)}` : ""
+}
+
 function formatTags(tags?: string[]) {
   return tags?.length ? ` · ${tags.map((tag) => `#${tag}`).join(" ")}` : ""
 }
@@ -697,12 +704,15 @@ function App() {
     },
     [locationForTarget],
   )
+  // A rolled-up hit's record lives in the child, not the session the row opens.
+  const resultRecordId = (result: SearchResult) =>
+    query.trim() && !result.matched_in ? result.record_id : undefined
   const resultHref = (result: SearchResult) =>
     locationForTarget({
       id: result.session_id,
       sourcePath: result.source_path,
       sessionSource: result.source,
-      recordId: query.trim() ? result.record_id : undefined,
+      recordId: resultRecordId(result),
     })
 
   const changeTimeRange = useCallback(
@@ -930,7 +940,7 @@ function App() {
         id: result.session_id,
         sourcePath: result.source_path,
         sessionSource: result.source,
-        recordId: query.trim() ? result.record_id : undefined,
+        recordId: resultRecordId(result),
       }
       updateLocation(next, true)
       setTarget(next)
@@ -1243,6 +1253,7 @@ function App() {
                 </span>
                 <span className="home-result-meta">
                   {result.source} · {result.role}
+                  {formatMatchedIn(result.matched_in)}
                   {formatTags(result.tags)}
                 </span>
                 <time>{formatDate(result.ts)}</time>
@@ -1359,6 +1370,7 @@ function App() {
                           </div>
                           <div className="session-meta">
                             {result.source} · {result.role}
+                            {formatMatchedIn(result.matched_in)}
                             {formatTags(result.tags)}
                             {result.score == null
                               ? ""
