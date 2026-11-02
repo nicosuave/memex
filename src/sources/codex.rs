@@ -776,6 +776,9 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
                     payload.and_then(|payload| super::common::borrowed_string(payload, "id"));
                 links.source_turn_id = metadata.source_turn_id.clone();
                 links.source_record_type = Some(entry_type.to_string());
+                // Newly retained items never held a legacy ordinal; keeping them off the
+                // ordinals keeps the identities of later legacy records stable.
+                links.source_record_offset = Some(source_record_offset);
                 emit(Record {
                     source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1197,6 +1200,7 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
                 } else {
                     "assistant"
                 };
+                links.source_record_offset = Some(source_record_offset);
                 emit(Record {
                     source: SourceKind::Codex,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -3906,6 +3910,15 @@ not json
         }));
         assert!(output.diagnostics.unknown_top_level_types.is_empty());
         assert!(output.diagnostics.unknown_semantic_types.is_empty());
+        // Records the parser did not emit before take no legacy ordinal, so the identities
+        // of later legacy records do not shift.
+        let newly_retained = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.links.source_record_offset.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(newly_retained, [3, 5, 6, 7, 8]);
 
         // Resumed past its start, the parser still knows which lines are inherited.
         let second_line = fixture.find('\n').unwrap() + 1;
