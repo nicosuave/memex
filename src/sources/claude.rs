@@ -311,6 +311,45 @@ fn copied_from<'a>(object: &'a simd_json::borrowed::Object<'_>) -> Option<&'a st
     .filter(|session| !session.is_empty())
 }
 
+/// The transcript of a fork's origin session, beside the fork in its project directory.
+fn origin_transcript(path: &Path, origin: &str) -> PathBuf {
+    path.with_file_name(format!("{origin}.jsonl"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForkFingerprint {
+    origin: PathBuf,
+    origin_exists: bool,
+}
+
+/// What a `/branch` fork's index projection depends on outside its own file. Its copied
+/// history is skipped only while the origin transcript holds it, so the origin appearing or
+/// disappearing (Claude Code deletes old transcripts) must reparse the fork. A transcript's
+/// origin is fixed by its first lines, so `previous` is reused while the file only grows.
+/// `None` for transcripts that are not forks.
+pub(crate) fn fork_fingerprint(
+    path: &Path,
+    previous: Option<&str>,
+    reuse_previous: bool,
+) -> Option<String> {
+    let origin = if reuse_previous {
+        // Without a previous fork fingerprint, a file that only grew is not a fork.
+        serde_json::from_str::<ForkFingerprint>(previous?)
+            .ok()?
+            .origin
+    } else {
+        let file = File::open(path).ok()?;
+        let bytes = super::common::map_sequential(&file).ok()?;
+        origin_transcript(path, &fork_origin(&bytes)?)
+    };
+    let origin_exists = origin.is_file();
+    serde_json::to_string(&ForkFingerprint {
+        origin,
+        origin_exists,
+    })
+    .ok()
+}
+
 /// The fork origin of a transcript: the session its first message line was copied from.
 fn fork_origin(bytes: &[u8]) -> Option<String> {
     for line in bytes.split(|byte| *byte == b'\n').take(64) {
@@ -329,28 +368,6 @@ fn fork_origin(bytes: &[u8]) -> Option<String> {
         }
     }
     None
-}
-
-/// The subagent that spawned a nested subagent. Its lines name only the root session; Claude
-/// Code records the spawner as `parentAgentId` in the `agent-<id>.meta.json` beside the
-/// transcript. Workflow copies share the metadata of the direct `subagents/` copy.
-fn spawning_agent(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    if !stem.starts_with("agent-") {
-        return None;
-    }
-    let meta_name = format!("{stem}.meta.json");
-    let mut candidates = vec![path.with_file_name(&meta_name)];
-    if let Some((subagents, _)) = agent_copy_key(path) {
-        candidates.push(subagents.join(&meta_name));
-    }
-    candidates.into_iter().find_map(|meta| {
-        let meta = serde_json::from_slice::<Value>(&std::fs::read(meta).ok()?).ok()?;
-        meta.get("parentAgentId")
-            .and_then(Value::as_str)
-            .filter(|parent| !parent.is_empty())
-            .map(|parent| format!("agent-{parent}"))
-    })
 }
 
 /// Return the human-facing title Claude stores alongside a conversation.
@@ -801,9 +818,8 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
             break;
         }
     }
-    if is_subagent_path(path) {
-        parent_session_id = spawning_agent(path).or(parent_session_id);
-    } else if !is_background
+    if !is_subagent_path(path)
+        && !is_background
         && let Some(origin) = super::common::map_sequential(&File::open(path)?)
             .ok()
             .and_then(|bytes| fork_origin(&bytes))
@@ -1010,12 +1026,14 @@ fn parse_index_bytes(
     let project = project_from_path(path);
     let session_id = session_id_from_path(path);
     let is_agent_file = is_subagent_path(path);
-    // A nested subagent's parent is the agent that spawned it; other agents name the root.
-    let spawner = is_agent_file.then(|| spawning_agent(path)).flatten();
-    // The history a `/branch` fork copied was indexed in the session it was copied from.
     let fork_parent = (!is_agent_file && !is_background)
         .then(|| fork_origin(mmap))
         .flatten();
+    // The history a `/branch` fork copied is indexed in the session it was copied from, while
+    // that transcript exists (see `fork_fingerprint`).
+    let skip_copies = fork_parent
+        .as_deref()
+        .is_some_and(|origin| origin_transcript(path, origin).is_file());
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
@@ -1035,10 +1053,10 @@ fn parse_index_bytes(
             ConversationKind::Fork => Some("fork".to_string()),
             _ => None,
         };
+        // Agent transcripts, nested ones included, name the root session: project and tag
+        // inheritance follows one parent level.
         let parent_session_id = if is_agent_file {
-            spawner
-                .clone()
-                .or_else(|| super::common::borrowed_string(object, "sessionId"))
+            super::common::borrowed_string(object, "sessionId")
         } else {
             fork_parent.clone()
         };
@@ -1110,7 +1128,7 @@ fn parse_index_bytes(
         {
             session_cwd = Some(cwd.to_string());
         }
-        if fork_parent.is_some() && copied_from(object).is_some() {
+        if skip_copies && copied_from(object).is_some() {
             continue;
         }
         let entry_type = object
@@ -1119,6 +1137,10 @@ fn parse_index_bytes(
             .unwrap_or("");
         if entry_type != "user" && entry_type != "assistant" {
             if let Some((role, text)) = side_entry(object, entry_type) {
+                // Newly retained lines never held a legacy ordinal; keeping them off the
+                // ordinals keeps the identities of later legacy records stable.
+                let mut links = links_for(object);
+                links.source_record_offset = Some(source_record_offset);
                 emit(Record {
                     source: SourceKind::Claude,
                     doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -1131,7 +1153,7 @@ fn parse_index_bytes(
                     tool_name: None,
                     tool_input: None,
                     tool_output: None,
-                    links: links_for(object),
+                    links,
                     source_path: source_path.clone(),
                 })?;
                 turn_id += 1;
@@ -1350,6 +1372,7 @@ fn parse_index_bytes(
         // The line's text records, the first carrying the line's own id. Harness-written user
         // text stays searchable as system context but is never the user's prompt.
         let mut text_records: Vec<(&str, String)> = Vec::new();
+        let mut feedback_only = false;
         let flag = |key: &str| object.get(key).and_then(|value| value.as_bool()) == Some(true);
         let joined = text_parts.join(" ").trim().to_string();
         if flag("isCompactSummary") {
@@ -1379,7 +1402,9 @@ fn parse_index_bytes(
                 typed.extend(split.typed);
                 context.extend(split.context);
             }
-            // What the user typed when rejecting a tool call is their own turn.
+            // What the user typed when rejecting a tool call is their own turn. A line with
+            // nothing else to index produced no record before, so it takes no legacy ordinal.
+            feedback_only = typed.is_empty();
             if let Some(feedback) = object
                 .get("userFeedback")
                 .and_then(|value| value.as_str())
@@ -1387,6 +1412,8 @@ fn parse_index_bytes(
                 .filter(|feedback| !feedback.is_empty())
             {
                 typed.push(feedback.to_string());
+            } else {
+                feedback_only = false;
             }
             if !typed.is_empty() {
                 text_records.push(("user", typed.join(" ")));
@@ -1421,7 +1448,7 @@ fn parse_index_bytes(
             entry_links.source_content = Some(serde_json::to_string(&display_blocks)?);
         }
         if !text.is_empty() || entry_links.source_content.is_some() {
-            if text.is_empty() {
+            if text.is_empty() || feedback_only {
                 entry_links.source_record_offset = Some(source_record_offset);
             }
             emit(Record {
@@ -1444,6 +1471,7 @@ fn parse_index_bytes(
         for (context_role, context) in text_records {
             let mut links = context_links.clone();
             links.event_id = entry_uuid.as_ref().map(|uuid| format!("{uuid}:context"));
+            links.source_record_offset = Some(source_record_offset);
             emit(Record {
                 source: SourceKind::Claude,
                 doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -2635,6 +2663,15 @@ mod tests {
         assert_eq!(records[3].links.event_id.as_deref(), Some("u04"));
         assert_eq!(records[4].links.event_id.as_deref(), Some("u04:context"));
         assert_eq!(records[7].links.event_id.as_deref(), Some("q07"));
+        // Records the parser did not emit before take no legacy ordinal, so the identities
+        // of later legacy records do not shift.
+        let newly_retained = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.links.source_record_offset.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(newly_retained, [4, 7, 8, 9, 10, 11, 12, 19]);
         // Request blobs are known bookkeeping, not drift.
         assert!(parsed.diagnostics.unknown_top_level_types.is_empty());
         assert!(
@@ -2724,6 +2761,8 @@ mod tests {
             r#"{"parentUuid":"p2","isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"user","message":{"role":"user","content":"branch prompt"},"uuid":"n1"}"#,
             "\n",
         );
+        let origin = project.join("origin.jsonl");
+        fs::write(&origin, "{}\n").unwrap();
         fs::write(&path, copied).unwrap();
         let (records, first) = parse_all(&path);
         assert!(records.is_empty());
@@ -2761,6 +2800,33 @@ mod tests {
             records[0].links.parent_session_id.as_deref(),
             Some("origin")
         );
+
+        // Once the origin transcript is gone (Claude Code deletes old ones), the fork's
+        // fingerprint changes, forcing a reparse that keeps the copied history.
+        let present = fork_fingerprint(&path, None, false).unwrap();
+        assert_eq!(
+            fork_fingerprint(&path, Some(&present), true),
+            Some(present.clone())
+        );
+        fs::remove_file(&origin).unwrap();
+        let missing = fork_fingerprint(&path, Some(&present), true).unwrap();
+        assert_ne!(missing, present);
+        let (records, _) = parse_all(&path);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "original prompt"),
+                ("assistant", "original answer"),
+                ("user", "branch prompt"),
+            ]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| { record.links.parent_session_id.as_deref() == Some("origin") })
+        );
+        // A file that only grew without a fork fingerprint is not read again.
+        assert_eq!(fork_fingerprint(&path, None, true), None);
     }
 
     #[test]
@@ -2784,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_subagent_names_the_agent_that_spawned_it() {
+    fn a_nested_subagent_names_the_root_session() {
         let temp = tempfile::tempdir().unwrap();
         let subagents = temp.path().join("-work-memex/root/subagents");
         fs::create_dir_all(&subagents).unwrap();
@@ -2816,7 +2882,9 @@ mod tests {
             );
             records[0].links.parent_session_id.clone()
         };
+        // Project and tag inheritance follows one parent level, so a nested agent keeps the
+        // root session as its parent rather than the agent that spawned it.
         assert_eq!(parent(&outer).as_deref(), Some("root"));
-        assert_eq!(parent(&inner).as_deref(), Some("agent-outer"));
+        assert_eq!(parent(&inner).as_deref(), Some("root"));
     }
 }
