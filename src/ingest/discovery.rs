@@ -236,7 +236,14 @@ pub(super) fn discover_transcripts(
                     if let Some(copies) = agent_copies.get(&task.path) {
                         task.claude_agent_copies = copies.clone();
                     }
-                    let fingerprint = (!task.claude_agent_copies.is_empty()).then(|| {
+                    let fingerprint = if task.claude_agent_copies.is_empty() {
+                        crate::sources::claude::fork_fingerprint(
+                            &task.path,
+                            previous
+                                .and_then(|state| state.identity.source_metadata_sha256.as_deref()),
+                            matches!(task.change, FileChange::Unchanged | FileChange::Append),
+                        )
+                    } else {
                         let mut hash = Sha256::new();
                         for copy in &task.claude_agent_copies {
                             let path = copy.path.as_os_str().as_encoded_bytes();
@@ -245,14 +252,16 @@ pub(super) fn discover_transcripts(
                             hash.update(copy.size.to_le_bytes());
                             hash.update(copy.metadata_sha256.as_bytes());
                         }
-                        format!("{:x}", hash.finalize())
-                    });
+                        Some(format!("{:x}", hash.finalize()))
+                    };
                     task.identity.source_metadata_sha256 = fingerprint.clone();
                     if previous.and_then(|state| state.identity.source_metadata_sha256.as_ref())
                         != fingerprint.as_ref()
                     {
                         // Either copy changed or the group gained/lost a member. A byte offset
                         // into one physical file cannot incrementally update the merged union.
+                        // For a `/branch` fork, its origin transcript appeared or disappeared,
+                        // which decides whether its copied history is indexed.
                         task.change = if previous.is_some() {
                             FileChange::Replaced
                         } else {

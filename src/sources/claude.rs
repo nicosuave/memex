@@ -17,12 +17,358 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    // Preserve pre-reader fallback IDs independently of attachment-only messages,
-    // and classify background transcripts consistently across every record.
-    index: 8,
+    // Index harness-injected user text as system context, keep queued prompts, recaps,
+    // compaction summaries and API errors, and skip history a `/branch` fork copied.
+    index: 9,
     // Reconcile content blocks and divergent workflow copies as one logical agent.
     usage: 6,
 };
+
+/// Elements Claude Code writes into user-role text that nobody typed: output it captured from a
+/// command the user ran, and context it or an IDE extension attaches to a prompt. Claude Code
+/// strips them before showing a prompt back; they are indexed as system context instead.
+const HARNESS_TAGS: [&str; 8] = [
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-stdout",
+    "bash-stderr",
+    "bash-exit-code",
+    "system-reminder",
+    "ide_opened_file",
+    "ide_selection",
+];
+
+/// Prefixes of user-role text that Claude Code wrote itself: command output, background task
+/// notifications, teammate messages, the local-command caveat, the interrupt marker and the
+/// directive a forked worker starts with.
+const INJECTED_PREFIXES: [&str; 10] = [
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "<teammate-message",
+    "<tick>",
+    "[Request interrupted by user",
+    "<fork-boilerplate>",
+];
+
+/// The sentences Claude Code puts before the model's summary on a compaction summary line,
+/// current wording first.
+const COMPACT_PREAMBLES: [&str; 2] = [
+    "The summary below covers the earlier portion of the conversation.",
+    "The conversation is summarized below:",
+];
+
+/// What Claude Code appends after the model's summary on a compaction summary line.
+const COMPACT_TRAILERS: [&str; 6] = [
+    "\n\nIf you need specific details from before compaction",
+    "\n\nRecent messages are preserved verbatim.",
+    "\n\nNote: the earliest part of the conversation was too large to include",
+    "\n\nYour REPL VM state was kept across this compaction",
+    "\nContinue the conversation from where it left off",
+    "\nPlease continue the conversation from where we left it off",
+];
+
+/// The body between the first `<name>` and its `</name>`.
+fn tag_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = text.find(&open)? + open.len();
+    let len = text[start..].find(&close)?;
+    Some(&text[start..start + len])
+}
+
+/// Where the first `<name>` or `<name attr...>` opening tag starts.
+fn open_tag(text: &str, name: &str) -> Option<usize> {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(at) = text[from..].find(&open) {
+        let start = from + at;
+        let after = start + open.len();
+        if text[after..].starts_with(|c: char| c == '>' || c.is_whitespace()) {
+            return Some(start);
+        }
+        from = after;
+    }
+    None
+}
+
+/// User-role text split into what the user typed and the harness context around it.
+#[derive(Debug, Default, PartialEq)]
+struct TypedText {
+    typed: Option<String>,
+    context: Vec<String>,
+}
+
+/// Separate [`HARNESS_TAGS`] elements (an unclosed one runs to the end) from a user prompt, and
+/// render a slash command, bash-mode input or `#` memory note as the line the user typed.
+fn typed_text(text: &str) -> TypedText {
+    let mut remaining = text.to_string();
+    let mut context = Vec::new();
+    for name in HARNESS_TAGS {
+        let close = format!("</{name}>");
+        while let Some(start) = open_tag(&remaining, name) {
+            let end = remaining[start..]
+                .find(&close)
+                .map_or(remaining.len(), |at| start + at + close.len());
+            let element = remaining[start..end].trim();
+            if !element.is_empty() {
+                context.push(element.to_string());
+            }
+            remaining.replace_range(start..end, "");
+        }
+    }
+    let trimmed = remaining.trim();
+    let typed = if trimmed.starts_with("<command-")
+        && let Some(name) = tag_body(trimmed, "command-name")
+    {
+        let args = tag_body(trimmed, "command-args").unwrap_or_default().trim();
+        Some(if args.is_empty() {
+            name.trim().to_string()
+        } else {
+            format!("{} {args}", name.trim())
+        })
+    } else if trimmed.starts_with("<bash-input>")
+        && let Some(command) = tag_body(trimmed, "bash-input")
+    {
+        Some(format!("! {}", command.trim()))
+    } else if trimmed.starts_with("<user-memory-input>")
+        && let Some(note) = tag_body(trimmed, "user-memory-input")
+    {
+        Some(format!("# {}", note.trim()))
+    } else {
+        Some(trimmed.to_string())
+    };
+    TypedText {
+        typed: typed.filter(|typed| !typed.is_empty()),
+        context,
+    }
+}
+
+/// The model-written part of a compaction summary line, without Claude Code's preamble, its
+/// pointer to the transcript and its instruction to carry on. Text in neither known shape is
+/// kept whole.
+fn compact_summary(text: &str) -> &str {
+    let Some(body) = COMPACT_PREAMBLES
+        .iter()
+        .find_map(|preamble| text.find(preamble).map(|at| &text[at + preamble.len()..]))
+    else {
+        return text.trim();
+    };
+    let end = COMPACT_TRAILERS
+        .iter()
+        .filter_map(|trailer| body.find(trailer))
+        .min();
+    let body = body[..end.unwrap_or(body.len())].trim();
+    body.strip_prefix("Summary:").map_or(body, str::trim_start)
+}
+
+/// Whether an `origin` names the user: absent, null or `{"kind": "human"}`. Any other kind
+/// (`task-notification`, `peer`, `auto-continuation`, ...) is the harness speaking.
+fn human_origin(origin: Option<&simd_json::BorrowedValue<'_>>) -> bool {
+    origin.is_none_or(|origin| {
+        origin.is_null()
+            || origin
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .is_none_or(|kind| kind == "human")
+    })
+}
+
+/// The text of every text block of `content` (or a plain string), joined.
+fn joined_text(content: Option<&simd_json::BorrowedValue<'_>>) -> Option<String> {
+    let content = content?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let texts = content
+        .as_array()?
+        .iter()
+        .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+        .collect::<Vec<_>>();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+/// A user line Claude Code wrote itself: `isMeta` (skill prompts, caveats), a non-human
+/// `origin`, or text opening with an [`INJECTED_PREFIXES`] marker. A subagent's first line is
+/// its task even when it is `isMeta` (a forked skill's prompt).
+fn injected_user_line(object: &simd_json::borrowed::Object<'_>) -> bool {
+    let flag = |key: &str| object.get(key).and_then(|value| value.as_bool()) == Some(true);
+    let task = flag("isSidechain")
+        && object
+            .get("parentUuid")
+            .is_none_or(|parent| parent.is_null());
+    let content = object
+        .get("message")
+        .and_then(|message| message.get("content"));
+    let first_text = content.and_then(|content| {
+        content.as_str().or_else(|| {
+            content
+                .as_array()
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(|text| text.as_str())
+        })
+    });
+    (flag("isMeta") && !task)
+        || !human_origin(object.get("origin"))
+        || first_text.is_some_and(|text| {
+            let text = text.trim_start();
+            INJECTED_PREFIXES
+                .iter()
+                .any(|prefix| text.starts_with(prefix))
+        })
+}
+
+/// The role and text of a conversation line that is neither a user nor an assistant message,
+/// or `None` for bookkeeping. A prompt typed while the agent was busy is only written as a
+/// `queued_command` attachment; recaps, retried API errors, safeguard notices and typed slash
+/// commands are system lines.
+fn side_entry(
+    object: &simd_json::borrowed::Object<'_>,
+    entry_type: &str,
+) -> Option<(&'static str, String)> {
+    let (role, text) = match entry_type {
+        "attachment" => {
+            let queued = object.get("attachment").filter(|attachment| {
+                attachment.get("type").and_then(|kind| kind.as_str()) == Some("queued_command")
+            })?;
+            let by_user = queued.get("isMeta").and_then(|meta| meta.as_bool()) != Some(true)
+                && queued
+                    .get("commandMode")
+                    .and_then(|mode| mode.as_str())
+                    .is_none_or(|mode| mode == "prompt")
+                && human_origin(queued.get("origin"));
+            // A message from the agent that spawned this one, or a peer, prompts it as a task.
+            let by_agent = matches!(
+                queued
+                    .get("origin")
+                    .and_then(|origin| origin.get("kind"))
+                    .and_then(|kind| kind.as_str()),
+                Some("coordinator" | "peer")
+            );
+            let prompt = joined_text(queued.get("prompt"))?;
+            if by_user || by_agent {
+                ("user", typed_text(&prompt).typed?)
+            } else {
+                ("system", prompt)
+            }
+        }
+        "system" => {
+            let subtype = object.get("subtype").and_then(|value| value.as_str());
+            let content = || joined_text(object.get("content"));
+            match subtype? {
+                "away_summary" => ("assistant", format!("recap: {}", content()?.trim())),
+                "api_error" => {
+                    let error = object.get("error")?;
+                    let text = error
+                        .get("formatted")
+                        .or_else(|| error.get("message"))
+                        .and_then(|text| text.as_str())
+                        .or_else(|| error.as_str())?;
+                    ("system", format!("API error: {text}"))
+                }
+                // Other informational notices (idle compaction, auto mode) are not part of the
+                // conversation.
+                "informational" => (
+                    "system",
+                    content().filter(|text| text.contains("safeguards"))?,
+                ),
+                "local_command" => {
+                    let text = content()?;
+                    if text.trim_start().starts_with("<command-") {
+                        ("user", typed_text(&text).typed?)
+                    } else {
+                        ("system", text)
+                    }
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some((role, text))
+}
+
+/// The session a `/branch` fork was copied from. `/branch` writes the copied history first, each
+/// line keeping its uuid and naming it in `forkedFrom: {sessionId, messageUuid}`.
+fn copied_from<'a>(object: &'a simd_json::borrowed::Object<'_>) -> Option<&'a str> {
+    let forked_from = object.get("forkedFrom")?;
+    let uuid = object.get("uuid").and_then(|value| value.as_str())?;
+    (forked_from
+        .get("messageUuid")
+        .and_then(|value| value.as_str())
+        == Some(uuid))
+    .then(|| {
+        forked_from
+            .get("sessionId")
+            .and_then(|value| value.as_str())
+    })
+    .flatten()
+    .filter(|session| !session.is_empty())
+}
+
+/// The transcript of a fork's origin session, beside the fork in its project directory.
+fn origin_transcript(path: &Path, origin: &str) -> PathBuf {
+    path.with_file_name(format!("{origin}.jsonl"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForkFingerprint {
+    origin: PathBuf,
+    origin_exists: bool,
+}
+
+/// What a `/branch` fork's index projection depends on outside its own file. Its copied
+/// history is skipped only while the origin transcript holds it, so the origin appearing or
+/// disappearing (Claude Code deletes old transcripts) must reparse the fork. A transcript's
+/// origin is fixed by its first lines, so `previous` is reused while the file only grows.
+/// `None` for transcripts that are not forks.
+pub(crate) fn fork_fingerprint(
+    path: &Path,
+    previous: Option<&str>,
+    reuse_previous: bool,
+) -> Option<String> {
+    let origin = if reuse_previous {
+        // Without a previous fork fingerprint, a file that only grew is not a fork.
+        serde_json::from_str::<ForkFingerprint>(previous?)
+            .ok()?
+            .origin
+    } else {
+        let file = File::open(path).ok()?;
+        let bytes = super::common::map_sequential(&file).ok()?;
+        origin_transcript(path, &fork_origin(&bytes)?)
+    };
+    let origin_exists = origin.is_file();
+    serde_json::to_string(&ForkFingerprint {
+        origin,
+        origin_exists,
+    })
+    .ok()
+}
+
+/// The fork origin of a transcript: the session its first message line was copied from.
+fn fork_origin(bytes: &[u8]) -> Option<String> {
+    for line in bytes.split(|byte| *byte == b'\n').take(64) {
+        let mut buffer = line.to_vec();
+        let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if matches!(
+            object.get("type").and_then(|value| value.as_str()),
+            Some("user" | "assistant")
+        ) {
+            return copied_from(object).map(str::to_string);
+        }
+    }
+    None
+}
 
 /// Return the human-facing title Claude stores alongside a conversation.
 ///
@@ -472,6 +818,15 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
             break;
         }
     }
+    if !is_subagent_path(path)
+        && !is_background
+        && let Some(origin) = super::common::map_sequential(&File::open(path)?)
+            .ok()
+            .and_then(|bytes| fork_origin(&bytes))
+    {
+        conversation_kind = ConversationKind::Fork;
+        parent_session_id = Some(origin);
+    }
 
     Ok(SourceMetadata {
         session: SessionIdentity {
@@ -671,10 +1026,63 @@ fn parse_index_bytes(
     let project = project_from_path(path);
     let session_id = session_id_from_path(path);
     let is_agent_file = is_subagent_path(path);
+    let fork_parent = (!is_agent_file && !is_background)
+        .then(|| fork_origin(mmap))
+        .flatten();
+    // The history a `/branch` fork copied is indexed in the session it was copied from, while
+    // that transcript exists (see `fork_fingerprint`).
+    let skip_copies = fork_parent
+        .as_deref()
+        .is_some_and(|origin| origin_transcript(path, origin).is_file());
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
     let mut session_cwd: Option<String> = None;
+    let links_for = |object: &simd_json::borrowed::Object<'_>| {
+        let sidechain = object
+            .get("isSidechain")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let mut kind = classify_with_session_kind(path, sidechain, is_background);
+        if fork_parent.is_some() && kind == ConversationKind::Main {
+            kind = ConversationKind::Fork;
+        }
+        let thread_source = match kind {
+            ConversationKind::Subagent => Some("subagent".to_string()),
+            ConversationKind::Sidechain => Some("sidechain".to_string()),
+            ConversationKind::Fork => Some("fork".to_string()),
+            _ => None,
+        };
+        // Agent transcripts, nested ones included, name the root session: project and tag
+        // inheritance follows one parent level.
+        let parent_session_id = if is_agent_file {
+            super::common::borrowed_string(object, "sessionId")
+        } else {
+            fork_parent.clone()
+        };
+        RecordLinks {
+            event_id: super::common::borrowed_string(object, "uuid"),
+            parent_event_id: super::common::borrowed_string(object, "parentUuid"),
+            logical_parent_event_id: super::common::borrowed_string(object, "logicalParentUuid"),
+            parent_session_id,
+            thread_source,
+            conversation_kind: Some(kind.as_str().to_string()),
+            parent_tool_use_id: super::common::borrowed_string(object, "parentToolUseID"),
+            source_tool_use_id: super::common::borrowed_string(object, "sourceToolUseID"),
+            source_tool_assistant_uuid: super::common::borrowed_string(
+                object,
+                "sourceToolAssistantUUID",
+            ),
+            ..RecordLinks::default()
+        }
+    };
+    let timestamp_of = |object: &simd_json::borrowed::Object<'_>| {
+        object
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(super::common::parse_iso_millis)
+            .unwrap_or(0)
+    };
 
     while start < mmap.len() {
         let source_record_offset = start as u64;
@@ -720,11 +1128,39 @@ fn parse_index_bytes(
         {
             session_cwd = Some(cwd.to_string());
         }
+        if skip_copies && copied_from(object).is_some() {
+            continue;
+        }
         let entry_type = object
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if entry_type != "user" && entry_type != "assistant" {
+            if let Some((role, text)) = side_entry(object, entry_type) {
+                // Newly retained lines never held a legacy ordinal; keeping them off the
+                // ordinals keeps the identities of later legacy records stable.
+                let mut links = links_for(object);
+                links.source_record_offset = Some(source_record_offset);
+                emit(Record {
+                    source: SourceKind::Claude,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp_of(object),
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: role.to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+                continue;
+            }
+            // An `api-request-blob` logs a message of an API request, repeating the
+            // conversation and the context sent with it.
             if !matches!(
                 entry_type,
                 "progress"
@@ -740,45 +1176,15 @@ fn parse_index_bytes(
                     | "permission-mode"
                     | "attachment"
                     | "mode"
+                    | "api-request-blob"
             ) {
                 diagnostics.increment_unknown_top_level(entry_type);
             }
             continue;
         }
         let entry_uuid = super::common::borrowed_string(object, "uuid");
-        let entry_parent_uuid = super::common::borrowed_string(object, "parentUuid");
-        let sidechain = object
-            .get("isSidechain")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let kind = classify_with_session_kind(path, sidechain, is_background);
-        let thread_source = match kind {
-            ConversationKind::Subagent => Some("subagent".to_string()),
-            ConversationKind::Sidechain => Some("sidechain".to_string()),
-            _ => None,
-        };
-        let entry_links = RecordLinks {
-            event_id: entry_uuid.clone(),
-            parent_event_id: entry_parent_uuid,
-            logical_parent_event_id: super::common::borrowed_string(object, "logicalParentUuid"),
-            parent_session_id: is_agent_file
-                .then(|| super::common::borrowed_string(object, "sessionId"))
-                .flatten(),
-            thread_source,
-            conversation_kind: Some(kind.as_str().to_string()),
-            parent_tool_use_id: super::common::borrowed_string(object, "parentToolUseID"),
-            source_tool_use_id: super::common::borrowed_string(object, "sourceToolUseID"),
-            source_tool_assistant_uuid: super::common::borrowed_string(
-                object,
-                "sourceToolAssistantUUID",
-            ),
-            ..RecordLinks::default()
-        };
-        let timestamp = object
-            .get("timestamp")
-            .and_then(|value| value.as_str())
-            .and_then(super::common::parse_iso_millis)
-            .unwrap_or(0);
+        let entry_links = links_for(object);
+        let timestamp = timestamp_of(object);
         let Some(message) = object.get("message").and_then(|value| value.as_object()) else {
             continue;
         };
@@ -963,7 +1369,62 @@ fn parse_index_bytes(
             }
         }
 
-        let text = text_parts.join(" ").trim().to_string();
+        // The line's text records, the first carrying the line's own id. Harness-written user
+        // text stays searchable as system context but is never the user's prompt.
+        let mut text_records: Vec<(&str, String)> = Vec::new();
+        let mut feedback_only = false;
+        let flag = |key: &str| object.get(key).and_then(|value| value.as_bool()) == Some(true);
+        let joined = text_parts.join(" ").trim().to_string();
+        if flag("isCompactSummary") {
+            let summary = compact_summary(&text_parts.join("\n")).to_string();
+            if !summary.is_empty() {
+                text_records.push(("assistant", format!("compaction: {summary}")));
+            }
+        } else if entry_type == "assistant" {
+            // Claude Code writes failed API calls as synthetic assistant lines.
+            let role = if flag("isApiErrorMessage") {
+                "system"
+            } else {
+                "assistant"
+            };
+            if !joined.is_empty() {
+                text_records.push((role, joined));
+            }
+        } else if injected_user_line(object) {
+            if !joined.is_empty() {
+                text_records.push(("system", joined));
+            }
+        } else {
+            let mut typed = Vec::new();
+            let mut context = Vec::new();
+            for part in &text_parts {
+                let split = typed_text(part);
+                typed.extend(split.typed);
+                context.extend(split.context);
+            }
+            // What the user typed when rejecting a tool call is their own turn. A line with
+            // nothing else to index produced no record before, so it takes no legacy ordinal.
+            feedback_only = typed.is_empty();
+            if let Some(feedback) = object
+                .get("userFeedback")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+            {
+                typed.push(feedback.to_string());
+            } else {
+                feedback_only = false;
+            }
+            if !typed.is_empty() {
+                text_records.push(("user", typed.join(" ")));
+            }
+            if !context.is_empty() {
+                text_records.push(("system", context.join("\n")));
+            }
+        }
+        let mut text_records = text_records.into_iter();
+        let (role, text) = text_records.next().unwrap_or((entry_type, String::new()));
+        let context_links = entry_links.clone();
         let mut entry_links = entry_links;
         if let Some(array) = content.and_then(|v| v.as_array())
             && array.iter().any(|block| {
@@ -987,7 +1448,7 @@ fn parse_index_bytes(
             entry_links.source_content = Some(serde_json::to_string(&display_blocks)?);
         }
         if !text.is_empty() || entry_links.source_content.is_some() {
-            if text.is_empty() {
+            if text.is_empty() || feedback_only {
                 entry_links.source_record_offset = Some(source_record_offset);
             }
             emit(Record {
@@ -997,12 +1458,33 @@ fn parse_index_bytes(
                 project: project.clone(),
                 session_id: session_id.clone(),
                 turn_id,
-                role: entry_type.to_string(),
+                role: role.to_string(),
                 text,
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
                 links: entry_links,
+                source_path: source_path.clone(),
+            })?;
+            turn_id += 1;
+        }
+        for (context_role, context) in text_records {
+            let mut links = context_links.clone();
+            links.event_id = entry_uuid.as_ref().map(|uuid| format!("{uuid}:context"));
+            links.source_record_offset = Some(source_record_offset);
+            emit(Record {
+                source: SourceKind::Claude,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: context_role.to_string(),
+                text: context,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links,
                 source_path: source_path.clone(),
             })?;
             turn_id += 1;
@@ -2078,5 +2560,331 @@ mod tests {
             record.text.contains("ciphertext-must-never-be-indexed")
                 || record.text.contains("signature-must-never-be-indexed")
         }));
+    }
+
+    fn parse_all(path: &Path) -> (Vec<Record>, IndexParseOutput) {
+        let mut records = Vec::new();
+        let parsed = parse_index_records(
+            path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        (records, parsed)
+    }
+
+    fn roles_and_texts(records: &[Record]) -> Vec<(&str, &str)> {
+        records
+            .iter()
+            .map(|record| (record.role.as_str(), record.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn harness_written_user_text_is_system_context_and_side_lines_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s1.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../fixtures/parse_fidelity/claude.jsonl"),
+        )
+        .unwrap();
+        let (records, parsed) = parse_all(&path);
+
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                (
+                    "system",
+                    "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>"
+                ),
+                ("user", "/model opus"),
+                (
+                    "system",
+                    "<local-command-stdout>Set model to opus</local-command-stdout>"
+                ),
+                ("user", "fix the parser"),
+                (
+                    "system",
+                    "<system-reminder>\nThe date is Monday.\n</system-reminder>"
+                ),
+                (
+                    "system",
+                    "Base directory for this skill: /work/.claude/skills/review\n\n# Review checklist"
+                ),
+                ("assistant", "Reading the parser now."),
+                ("user", "also check forks please"),
+                (
+                    "system",
+                    "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"
+                ),
+                (
+                    "assistant",
+                    "recap: You asked to fix the parser. Next, run the fixture tests."
+                ),
+                ("system", "API error: Connection dropped (ECONNRESET)"),
+                (
+                    "system",
+                    "Opus 5.5's safeguards stopped the response above · continuing once with that noted"
+                ),
+                ("user", "/cost"),
+                (
+                    "assistant",
+                    "compaction: We fixed the parser and added fixtures."
+                ),
+                ("system", "API Error: 529 Overloaded"),
+                ("system", "[Request interrupted by user]"),
+                (
+                    "system",
+                    "<task-notification>\n<task-id>b2</task-id>\n<summary>Background build finished</summary>\n</task-notification>"
+                ),
+                (
+                    "tool_use",
+                    r#"{"file_path":"/work/memex/src/a.rs","old_string":"a","new_string":"b"}"#
+                ),
+                (
+                    "tool_result",
+                    "The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\nuse rstest instead"
+                ),
+                ("user", "use rstest instead"),
+                ("user", "! cargo test"),
+                (
+                    "system",
+                    "<bash-stdout>test result: ok</bash-stdout><bash-stderr></bash-stderr>"
+                ),
+            ]
+        );
+        // The prompt and the reminder attached to it keep distinct ids.
+        assert_eq!(records[3].links.event_id.as_deref(), Some("u04"));
+        assert_eq!(records[4].links.event_id.as_deref(), Some("u04:context"));
+        assert_eq!(records[7].links.event_id.as_deref(), Some("q07"));
+        // Records the parser did not emit before take no legacy ordinal, so the identities
+        // of later legacy records do not shift.
+        let newly_retained = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.links.source_record_offset.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(newly_retained, [4, 7, 8, 9, 10, 11, 12, 19]);
+        // Request blobs are known bookkeeping, not drift.
+        assert!(parsed.diagnostics.unknown_top_level_types.is_empty());
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.text.contains("request blob"))
+        );
+    }
+
+    #[test]
+    fn a_forked_skill_subagent_task_stays_the_users_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("project/s1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-a1.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":true,"agentId":"a1","sessionId":"s1","type":"user","message":{"role":"user","content":"You are reviewing for recall."},"isMeta":true,"uuid":"d1"}"#,
+                "\n",
+                r#"{"parentUuid":"d1","isSidechain":true,"agentId":"a1","sessionId":"s1","type":"user","message":{"role":"user","content":"Base directory for this skill"},"isMeta":true,"uuid":"d2"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let (records, _) = parse_all(&path);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "You are reviewing for recall."),
+                ("system", "Base directory for this skill"),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_text_separates_harness_context_and_renders_commands() {
+        let typed = |text: &str| typed_text(text);
+        assert_eq!(
+            typed("<ide_selection lines=\"1-2\">fn main()</ide_selection>explain"),
+            TypedText {
+                typed: Some("explain".into()),
+                context: vec!["<ide_selection lines=\"1-2\">fn main()</ide_selection>".into()],
+            }
+        );
+        assert_eq!(
+            typed("hi <bash-stdout>unclosed output").typed.as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            typed("<command-message>login</command-message>\n<command-name>/login</command-name>\n<command-args></command-args>")
+                .typed
+                .as_deref(),
+            Some("/login")
+        );
+        assert_eq!(
+            typed("<user-memory-input>prefer rstest</user-memory-input>")
+                .typed
+                .as_deref(),
+            Some("# prefer rstest")
+        );
+        assert_eq!(
+            typed("<ide_other>kept</ide_other>").typed.as_deref(),
+            Some("<ide_other>kept</ide_other>")
+        );
+        let reminder_only = typed("<system-reminder>context</system-reminder>");
+        assert_eq!(reminder_only.typed, None);
+        assert_eq!(
+            reminder_only.context,
+            ["<system-reminder>context</system-reminder>"]
+        );
+    }
+
+    #[test]
+    fn a_branch_fork_skips_copied_history_and_names_its_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("-work-memex");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("fork.jsonl");
+        let copied = concat!(
+            r#"{"parentUuid":null,"isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"user","message":{"role":"user","content":"original prompt"},"uuid":"p1","forkedFrom":{"sessionId":"origin","messageUuid":"p1"}}"#,
+            "\n",
+            r#"{"parentUuid":"p1","isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"original answer"}]},"uuid":"p2","forkedFrom":{"sessionId":"origin","messageUuid":"p2"}}"#,
+            "\n",
+        );
+        let appended = concat!(
+            r#"{"parentUuid":"p2","isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"user","message":{"role":"user","content":"branch prompt"},"uuid":"n1"}"#,
+            "\n",
+        );
+        let origin = project.join("origin.jsonl");
+        fs::write(&origin, "{}\n").unwrap();
+        fs::write(&path, copied).unwrap();
+        let (records, first) = parse_all(&path);
+        assert!(records.is_empty());
+
+        let metadata = probe(&path).unwrap();
+        assert_eq!(metadata.session.conversation_kind, ConversationKind::Fork);
+        assert_eq!(
+            metadata.session.parent_session_id.as_deref(),
+            Some("origin")
+        );
+
+        // An incremental parse still knows the transcript is a fork.
+        fs::write(&path, format!("{copied}{appended}")).unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState {
+                offset: first.offset,
+                turn_id: first.turn_id,
+                legacy_turn_id: first.legacy_turn_id,
+                pending_tool_calls: first.pending_tool_calls,
+            },
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(roles_and_texts(&records), [("user", "branch prompt")]);
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("fork"));
+        assert_eq!(records[0].links.thread_source.as_deref(), Some("fork"));
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("origin")
+        );
+
+        // Once the origin transcript is gone (Claude Code deletes old ones), the fork's
+        // fingerprint changes, forcing a reparse that keeps the copied history.
+        let present = fork_fingerprint(&path, None, false).unwrap();
+        assert_eq!(
+            fork_fingerprint(&path, Some(&present), true),
+            Some(present.clone())
+        );
+        fs::remove_file(&origin).unwrap();
+        let missing = fork_fingerprint(&path, Some(&present), true).unwrap();
+        assert_ne!(missing, present);
+        let (records, _) = parse_all(&path);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "original prompt"),
+                ("assistant", "original answer"),
+                ("user", "branch prompt"),
+            ]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| { record.links.parent_session_id.as_deref() == Some("origin") })
+        );
+        // A file that only grew without a fork fingerprint is not read again.
+        assert_eq!(fork_fingerprint(&path, None, true), None);
+    }
+
+    #[test]
+    fn a_resumed_copy_without_branch_markers_is_indexed_whole() {
+        // `--fork-session` copies lines without `forkedFrom`; and a marker naming another
+        // line is not a copy of this one.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resumed.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"sessionId":"resumed","type":"user","message":{"role":"user","content":"kept prompt"},"uuid":"r1","forkedFrom":{"sessionId":"origin","messageUuid":"other"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let (records, _) = parse_all(&path);
+        assert_eq!(roles_and_texts(&records), [("user", "kept prompt")]);
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+        assert_eq!(records[0].links.parent_session_id, None);
+    }
+
+    #[test]
+    fn a_nested_subagent_names_the_root_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("-work-memex/root/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let line = |agent: &str| {
+            format!(
+                r#"{{"parentUuid":null,"isSidechain":true,"agentId":"{agent}","sessionId":"root","type":"user","message":{{"role":"user","content":"task for {agent}"}},"uuid":"{agent}-1"}}"#
+            ) + "\n"
+        };
+        let outer = subagents.join("agent-outer.jsonl");
+        let inner = subagents.join("agent-inner.jsonl");
+        fs::write(&outer, line("outer")).unwrap();
+        fs::write(&inner, line("inner")).unwrap();
+        fs::write(
+            subagents.join("agent-outer.meta.json"),
+            r#"{"agentType":"general-purpose"}"#,
+        )
+        .unwrap();
+        fs::write(
+            subagents.join("agent-inner.meta.json"),
+            r#"{"agentType":"Explore","parentAgentId":"outer"}"#,
+        )
+        .unwrap();
+
+        let parent = |path: &Path| {
+            let (records, _) = parse_all(path);
+            assert_eq!(
+                probe(path).unwrap().session.parent_session_id,
+                records[0].links.parent_session_id
+            );
+            records[0].links.parent_session_id.clone()
+        };
+        // Project and tag inheritance follows one parent level, so a nested agent keeps the
+        // root session as its parent rather than the agent that spawned it.
+        assert_eq!(parent(&outer).as_deref(), Some("root"));
+        assert_eq!(parent(&inner).as_deref(), Some("root"));
     }
 }
