@@ -135,6 +135,31 @@ impl SessionKindFilter {
             }
         }
     }
+
+    /// Child kinds whose search hits this filter attributes to the parent
+    /// session instead of listing or dropping them. Helpers (subagents and
+    /// sidechains) always work for a parent, so the default filters show
+    /// their matches on that parent. The interactive filter also folds forks,
+    /// branches, and compactions into their root because it lists only root
+    /// conversations; the regular filter keeps those resumable children as
+    /// their own rows. Explicit subagent and all filters list children as-is.
+    pub fn rolls_up(self, kind: Option<&str>) -> bool {
+        match self {
+            SessionKindFilter::Primary => {
+                kind.is_some_and(|kind| kind != "main" && kind != "guardian_review")
+            }
+            SessionKindFilter::Regular => matches!(kind, Some("subagent" | "sidechain")),
+            SessionKindFilter::Subagent | SessionKindFilter::All => false,
+        }
+    }
+}
+
+/// Stored kind and parent link for one session transcript.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLineage {
+    pub source_path: String,
+    pub conversation_kind: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 /// A session row with every stored column, for `memex sessions`.
@@ -844,6 +869,49 @@ impl AnalyticsStore {
             .flatten()
             .flatten()
             .filter(|kind| !kind.is_empty())
+    }
+
+    /// Kind and parent link of one stored transcript.
+    pub fn session_lineage(
+        &self,
+        source: &str,
+        session_id: &str,
+        source_path: &str,
+    ) -> Option<SessionLineage> {
+        self.lineage_row(
+            "SELECT source_path, conversation_kind, parent_session_id FROM sessions
+             WHERE source = ?1 AND session_id = ?2 AND source_path = ?3",
+            params![source, session_id, source_path],
+        )
+    }
+
+    /// Kind and parent link of a session known only by id, as a child's parent
+    /// link names it. A main transcript wins over other transcripts sharing the
+    /// id, then the most recently active one.
+    pub fn session_lineage_by_id(&self, source: &str, session_id: &str) -> Option<SessionLineage> {
+        self.lineage_row(
+            "SELECT source_path, conversation_kind, parent_session_id FROM sessions
+             WHERE source = ?1 AND session_id = ?2
+             ORDER BY (conversation_kind IS NULL OR conversation_kind IN ('', 'main')) DESC,
+                      last_at DESC, source_path
+             LIMIT 1",
+            params![source, session_id],
+        )
+    }
+
+    fn lineage_row(&self, sql: &str, params: impl rusqlite::Params) -> Option<SessionLineage> {
+        let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
+        self.conn
+            .query_row(sql, params, |row| {
+                Ok(SessionLineage {
+                    source_path: row.get(0)?,
+                    conversation_kind: non_empty(row.get(1)?),
+                    parent_session_id: non_empty(row.get(2)?),
+                })
+            })
+            .optional()
+            .ok()
+            .flatten()
     }
 
     /// Aggregate in SQLite rather than materializing every session in the client.

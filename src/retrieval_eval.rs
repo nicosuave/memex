@@ -848,6 +848,7 @@ mod tests {
                 links: RecordLinks::default(),
                 source_path: source_path.to_string(),
             },
+            rollup: None,
         }
     }
 

@@ -1509,6 +1509,27 @@ struct SessionSummary {
     score: Option<f32>,
     snippet: String,
     snippet_matches: Vec<SnippetMatch>,
+    /// Child session the hit came from when search shows it on this session;
+    /// `record_id` then names a record of that child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_in: Option<MatchedChild>,
+}
+
+#[derive(Serialize)]
+struct MatchedChild {
+    session_id: String,
+    source_path: String,
+    kind: String,
+}
+
+impl MatchedChild {
+    fn of(record: &crate::types::Record, rollup: &crate::search::SessionRollup) -> Self {
+        Self {
+            session_id: record.session_id.clone(),
+            source_path: record.source_path.clone(),
+            kind: rollup.matched_kind.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1546,13 +1567,17 @@ pub(crate) fn evaluate_search(
     for summary in payload.results {
         let source = crate::types::SourceKind::from_label(&summary.source)
             .ok_or_else(|| anyhow!("unknown result source: {}", summary.source))?;
+        let record_session = summary
+            .matched_in
+            .map_or(summary.session_id, |child| child.session_id);
         let selector = crate::retrieval::ContextSelector::record_id(summary.record_id)
-            .with_scope(Some(summary.session_id), Some(source));
+            .with_scope(Some(record_session), Some(source));
         let record = crate::retrieval::resolve_record(&index, &selector)?;
         hits.push(crate::machine::LocatedRecord {
             machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             score: summary.score.unwrap_or_default(),
             record,
+            rollup: None,
         });
         snippets.push(summary.snippet);
     }
@@ -1601,25 +1626,19 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
             .skip(params.offset)
             .take(params.limit)
             .map(|located| {
-                let record = located.record;
                 let snippet = if params.query.is_empty() {
-                    summarize(&record.text, 360)
+                    summarize(&located.record.text, 360)
                 } else {
-                    crate::cli::match_preview(&record.text, &matchers, 160)
+                    crate::cli::match_preview(&located.record.text, &matchers, 160)
                 };
-                SessionSummary {
-                    record_id: crate::retrieval::canonical_record_id(&record),
-                    session_id: record.session_id,
-                    source_path: record.source_path,
-                    project: record.project,
-                    tags: Vec::new(),
-                    source: record.source.label().to_string(),
-                    role: record.role,
-                    ts: record.ts,
-                    score: Some(located.score),
-                    snippet_matches: snippet_match_spans(&snippet, &matchers),
+                let snippet_matches = snippet_match_spans(&snippet, &matchers);
+                session_summary(
+                    located.record,
+                    located.rollup,
+                    Some(located.score),
                     snippet,
-                }
+                    snippet_matches,
+                )
             })
             .collect();
         attach_assignments(paths, &mut results, false);
@@ -1652,6 +1671,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         limit,
     };
     let mut main_scope_cache = HashMap::new();
+    let rollup_store = AnalyticsStore::open_read_only(analytics_path(&paths.state)).ok();
     let summaries = loop {
         let records: Vec<(Option<f32>, crate::types::Record)> = match params.sort {
             SearchSort::Relevance => unreachable!("relevance returns through shared search"),
@@ -1743,22 +1763,46 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 }
             }
         }
+        // Query matches in child sessions show on their root session, like the
+        // relevance path; the recent listing keeps listing sessions as-is.
+        let roll_up = !params.query.is_empty() && params.origin != SessionKindFilter::All;
+        let mut rollups = crate::search::Rollups::new(
+            records
+                .iter()
+                .filter(|_| roll_up)
+                .map(|(_, record)| (crate::machine::LOCAL_MACHINE_ID, record)),
+            params.origin,
+            rollup_store.as_ref(),
+        );
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
         for (score, record) in records {
-            let session_key = (
+            let mut session_key = (
                 record.source.storage_label().to_string(),
                 record.session_id.clone(),
                 record.source_path.clone(),
             );
-            if !seen.insert(session_key.clone()) {
+            let kind = group_kind
+                .get(&session_key)
+                .and_then(|kind| kind.as_deref());
+            let rollup = if kind == Some("main") {
+                None
+            } else if roll_up {
+                let Some(rollup) = rollups.attribute(crate::machine::LOCAL_MACHINE_ID, &record)
+                else {
+                    continue;
+                };
+                if let Some(rollup) = &rollup {
+                    session_key.1.clone_from(&rollup.session_id);
+                    session_key.2.clone_from(&rollup.source_path);
+                }
+                rollup
+            } else if params.origin.matches_kind(kind) {
+                None
+            } else {
                 continue;
-            }
-            if !params.origin.matches_kind(
-                group_kind
-                    .get(&session_key)
-                    .and_then(|kind| kind.as_deref()),
-            ) {
+            };
+            if !seen.insert(session_key) {
                 continue;
             }
             let snippet = if params.query.is_empty() {
@@ -1767,19 +1811,13 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 crate::cli::match_preview(&record.text, &matchers, 160)
             };
             let snippet_matches = snippet_match_spans(&snippet, &matchers);
-            summaries.push(SessionSummary {
-                record_id: crate::retrieval::canonical_record_id(&record),
-                session_id: record.session_id,
-                source_path: record.source_path,
-                project: record.project,
-                tags: Vec::new(),
-                source: record.source.label().to_string(),
-                role: record.role,
-                ts: record.ts,
+            summaries.push(session_summary(
+                record,
+                rollup,
                 score,
                 snippet,
                 snippet_matches,
-            });
+            ));
             if summaries.len() == target {
                 break;
             }
@@ -1806,6 +1844,38 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         has_more,
         results,
     })
+}
+
+/// One result row. A rolled-up child hit is listed on its root session, which
+/// is what opening the row reaches; the child stays named in `matched_in`.
+fn session_summary(
+    record: crate::types::Record,
+    rollup: Option<crate::search::SessionRollup>,
+    score: Option<f32>,
+    snippet: String,
+    snippet_matches: Vec<SnippetMatch>,
+) -> SessionSummary {
+    let matched_in = rollup
+        .as_ref()
+        .map(|rollup| MatchedChild::of(&record, rollup));
+    let (session_id, source_path) = match rollup {
+        Some(rollup) => (rollup.session_id, rollup.source_path),
+        None => (record.session_id.clone(), record.source_path.clone()),
+    };
+    SessionSummary {
+        record_id: crate::retrieval::canonical_record_id(&record),
+        session_id,
+        source_path,
+        project: record.project,
+        tags: Vec::new(),
+        source: record.source.label().to_string(),
+        role: record.role,
+        ts: record.ts,
+        score,
+        snippet,
+        snippet_matches,
+        matched_in,
+    }
 }
 
 /// Sessions a project or tag filter selects when the index alone cannot answer it:
@@ -4070,6 +4140,90 @@ mod tests {
         let mut regular = ids(payload_for(SessionKindFilter::Regular));
         regular.sort();
         assert_eq!(regular, vec!["session-main", "session-sub"]);
+    }
+
+    #[test]
+    fn search_payload_shows_child_only_matches_on_the_parent() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        for (doc_id, session_id, kind, parent, text) in [
+            (1, "parent", "main", None, "plan the release"),
+            (
+                2,
+                "agent-a",
+                "subagent",
+                Some("parent"),
+                "fix the flaky widget",
+            ),
+        ] {
+            index
+                .add_record(
+                    &mut writer,
+                    &Record {
+                        source: SourceKind::Claude,
+                        doc_id,
+                        ts: doc_id * 1_000,
+                        project: "memex".to_string(),
+                        session_id: session_id.to_string(),
+                        turn_id: doc_id as u32,
+                        role: "assistant".to_string(),
+                        text: text.to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: RecordLinks {
+                            conversation_kind: Some(kind.to_string()),
+                            parent_session_id: parent.map(str::to_string),
+                            ..RecordLinks::default()
+                        },
+                        source_path: format!("/tmp/{session_id}.jsonl"),
+                    },
+                )
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+
+        for origin in [SessionKindFilter::Primary, SessionKindFilter::Regular] {
+            for sort in [SearchSort::Relevance, SearchSort::Newest] {
+                let payload = search_payload(
+                    &paths,
+                    &SearchRequest {
+                        query: "flaky".to_string(),
+                        source: None,
+                        project: None,
+                        tags: Vec::new(),
+                        offset: 0,
+                        limit: 30,
+                        origin,
+                        range: TimeRange::All,
+                        sort,
+                    },
+                )
+                .unwrap();
+                let rows = payload
+                    .results
+                    .iter()
+                    .map(|result| {
+                        let child = result.matched_in.as_ref().expect("child attribution");
+                        (
+                            result.session_id.as_str(),
+                            child.session_id.as_str(),
+                            child.kind.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    rows,
+                    vec![("parent", "agent-a", "subagent")],
+                    "{origin:?} {sort:?}"
+                );
+            }
+        }
     }
 
     #[test]
