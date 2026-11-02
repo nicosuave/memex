@@ -487,6 +487,7 @@ fn finish_parsed_source(
 }
 pub(super) fn parse_opencode_file(
     task: &FileTask,
+    include_reasoning: bool,
     tx_record: &RecordSender,
     tx_update: &Sender<FileUpdate>,
     next_doc_id: &AtomicU64,
@@ -502,6 +503,7 @@ pub(super) fn parse_opencode_file(
             legacy_turn_id: task.legacy_turn_id,
             pending_tool_calls: task.pending_tool_calls.clone(),
         },
+        include_reasoning,
         opencode_session_links,
         next_doc_id,
         |record| {
@@ -979,6 +981,7 @@ impl ParserContext<'_> {
                 }
                 SourceKind::Opencode => parse_opencode_file(
                     task,
+                    self.options.include_reasoning,
                     self.records,
                     self.updates,
                     self.next_id,
