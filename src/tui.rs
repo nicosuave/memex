@@ -1224,6 +1224,7 @@ impl App {
                     tool_content_limits,
                     defer_merges: true,
                     embedding_budget: Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET),
+                    redaction: config.redactor()?,
                 };
                 let journal = crate::ingest::discovery::start_journal_replay(&paths, &opts);
                 journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);

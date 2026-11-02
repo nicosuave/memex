@@ -1211,6 +1211,8 @@ pub(super) struct RecordSender {
     sender: Sender<Record>,
     limits: IndexedToolContentLimits,
     diagnostics: Arc<Mutex<crate::sources::ParseDiagnostics>>,
+    redactor: Arc<crate::redact::Redactor>,
+    verdicts: Arc<crate::redact::ToolVerdicts>,
 }
 
 impl RecordSender {
@@ -1220,6 +1222,7 @@ impl RecordSender {
             sender,
             limits,
             Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default())),
+            Arc::new(crate::redact::Redactor::disabled()),
         )
     }
 
@@ -1227,21 +1230,35 @@ impl RecordSender {
         sender: Sender<Record>,
         limits: IndexedToolContentLimits,
         diagnostics: Arc<Mutex<crate::sources::ParseDiagnostics>>,
+        redactor: Arc<crate::redact::Redactor>,
     ) -> Self {
         Self {
             sender,
             limits,
             diagnostics,
+            redactor,
+            verdicts: Arc::default(),
         }
     }
 
+    /// Withheld-output verdicts of tool calls whose results this ingest has not sent yet.
+    pub(super) fn verdicts(&self) -> Arc<crate::redact::ToolVerdicts> {
+        self.verdicts.clone()
+    }
+
     pub(super) fn send(&self, mut record: Record) -> Result<()> {
+        // Redact the whole field before clipping, so no secret survives split by the marker.
+        let redaction = self.redactor.redact_record(&mut record, &self.verdicts);
         let (input_truncated, output_truncated) =
             limit_record_tool_content(&mut record, self.limits);
-        if input_truncated || output_truncated {
+        if input_truncated || output_truncated || !redaction.is_empty() {
             let mut diagnostics = self.diagnostics.lock().unwrap();
             diagnostics.truncated_tool_inputs += u64::from(input_truncated);
             diagnostics.truncated_tool_outputs += u64::from(output_truncated);
+            diagnostics.redacted_secrets += redaction.secrets;
+            diagnostics.redaction_timeouts += redaction.timeouts;
+            diagnostics.withheld_tool_inputs += redaction.withheld_inputs;
+            diagnostics.withheld_tool_outputs += redaction.withheld_outputs;
         }
         self.sender.send(record)?;
         Ok(())
@@ -1602,7 +1619,12 @@ pub(super) fn execute_refresh(
         raw_tx_record,
         options.tool_content_limits,
         shared_diagnostics.clone(),
+        options.redaction.clone(),
     );
+    let verdicts = tx_record.verdicts();
+    for task in &tasks {
+        verdicts.seed(&task.path.to_string_lossy(), &task.pending_tool_calls);
+    }
     let (tx_update, rx_update) = unbounded::<FileUpdate>();
 
     let mut affected_paths = delete_paths.clone();
@@ -1812,7 +1834,8 @@ pub(super) fn execute_refresh(
 
         let mut diagnostics = shared_diagnostics.lock().unwrap().clone();
         let mut updated_files = HashMap::new();
-        for update in updates {
+        for mut update in updates {
+            verdicts.persist(&update.path, &mut update.state.pending_tool_calls);
             updated_files.insert(update.path.clone(), update.state.clone());
             diagnostics.merge(update.diagnostics);
         }

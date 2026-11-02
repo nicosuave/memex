@@ -87,9 +87,65 @@ daemon. Switching provider with the same model name and size is not detected; ru
 `memex embed` after such a switch.
 
 memex sends transcript text (user and assistant messages, each truncated to 8192 bytes) and
-memory documents to the endpoint. Plain `http://` to a non-loopback host is rejected when a
+memory documents to the endpoint, with credentials redacted first (see
+[Secret redaction](#secret-redaction)). Plain `http://` to a non-loopback host is rejected when a
 key is set and warned about otherwise; `HTTP_PROXY`, `HTTPS_PROXY`, and `ALL_PROXY` are
 honored.
+
+## Secret redaction
+
+memex removes credentials from what it sends off the machine and, if you opt in, from what it
+indexes. Source transcripts are never modified; redaction is a property of the derived index.
+
+```toml
+[redaction]
+enabled = true          # opt in to index-time redaction (default false)
+egress = true           # MCP over HTTP and remote embedding requests (default true)
+patterns = ["corp_[A-Za-z0-9]{32}", "acct=(?<secret>\\d{10})"]
+sensitive_files = ["*.secret", "~/work/creds/**"]
+```
+
+With `enabled = true`, every record's text, tool input and tool output is scanned at index
+time, before tool payloads are clipped, for known credential formats: provider API keys and
+tokens (Anthropic, OpenAI, GitHub, GitLab, Slack, Stripe, Google, AWS, Hugging Face, npm, PyPI,
+Vault, and others), private key blocks, JWTs, `Bearer` and `Authorization` headers, passwords
+in URLs and connection strings, and literal values assigned to names such as `DEPLOY_TOKEN` or
+`"client_secret"`. Only the value is replaced, with a marker such as `[redacted:github-token]`,
+so the surrounding text stays searchable (search `redacted` to find them). `patterns` adds
+regexes; a pattern with a `secret` capture group replaces only that group, otherwise the whole
+match. An invalid pattern is a config error.
+
+Tool calls are also judged by what they do. The output of commands that print credentials (`gh
+auth token`, `kubectl get secret`, `aws configure export-credentials`, `op read`, `vault kv get`,
+`printenv`, and similar, including inside `bash -c`) and of reads of sensitive files is replaced
+with `[output withheld: ...]`; the call itself, its tool name and its result record stay indexed.
+Sensitive files are `.env*`, `*.env`, `.envrc`, SSH private keys, `*.pem`, `*.key`, `*.tfvars`,
+`*.tfstate`, `.netrc`, `.npmrc`, `.pypirc`, `~/.aws/credentials`, `~/.kube/config`, and the
+agents' own logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, OpenCode and Pi
+`auth.json`), but not templates (`*.example`, `*.sample`, `*.template`, `*.dist`) or public keys
+(`*.pub`). `sensitive_files` adds globs: one without `/` matches a file name anywhere, one with
+`/` matches a path (`~/` is the home directory). A write or patch to a sensitive file keeps the
+path and replaces the written content; a shell command that itself contains a credential, or
+writes into a sensitive file, has its input replaced. All other tool output stays fully
+indexed and searchable.
+
+A field whose redaction takes longer than a second is replaced with `[redaction timed out]`.
+`memex index` reports `redacted_secrets`, `withheld_tool_inputs`, `withheld_tool_outputs`, and
+`redaction_timeouts` with its other diagnostics.
+
+Index-time redaction is off by default. Off, records are indexed as parsed and every file's
+index checkpoint is the same as in memex releases without redaction, so upgrading reparses
+nothing. Turning it on reparses all indexed history on the next index run and, with embeddings
+enabled, re-embeds it; expect it to take as long as a first index. While it is on, so does
+changing `patterns` or `sensitive_files`, or upgrading to a memex release whose built-in rules
+changed. Turning it off again re-derives the unredacted records the same way.
+
+`egress` is on by default and never reparses. It applies the same patterns (not the tool rules)
+to MCP responses served over HTTP, including results proxied from other machines and records
+indexed while index-time redaction is off, and to every remote embedding request. It is
+independent of `enabled`, so the local index can stay exact while nothing unredacted leaves the
+machine; `patterns` apply to egress whether or not `enabled` is set. The stdio MCP server, the
+CLI, the TUI, and the loopback web UI read the index as it is.
 ## Execution provider
 
 Select via `execution_provider` in config or `MEMEX_EXECUTION_PROVIDER`:

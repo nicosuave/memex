@@ -3073,6 +3073,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 name = "memex"
 version = "0.31.1"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "axum",
  "base64 0.22.1",
@@ -3111,6 +3112,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "signal-hook",
  "simd-json",
  "subtle",

@@ -159,7 +159,10 @@ pub(super) async fn run(
         let cancellation = config.cancellation_token.clone();
         // Every HTTP request gets an SDK handler, but all handlers share the same
         // retrieval semaphore so opening more connections cannot bypass the limit.
-        let server = MemexServer::new(root);
+        // Responses leave the machine (possibly to a hosted client over OAuth), so they are
+        // redacted regardless of what the index holds.
+        let egress = crate::config::UserConfig::load(&paths)?.egress_redactor()?;
+        let server = MemexServer::new(root).with_egress_redaction(egress);
         let service = StreamableHttpService::<MemexServer, NeverSessionManager>::new(
             move || Ok(server.clone()),
             Default::default(),

@@ -65,6 +65,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
         embedding_budget: None,
+        redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     }
 }
 
@@ -2940,6 +2941,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
         embedding_budget: None,
+        redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     };
 
     let lease = ingest_lease(&paths);
@@ -3440,6 +3442,7 @@ fn unroutable_remote_runtime(dimensions: Option<usize>) -> EmbedRuntimeConfig {
                 max_retries: 0,
             },
             dimensions,
+            redaction: Default::default(),
         }),
         ..EmbedRuntimeConfig::default()
     }
@@ -3721,6 +3724,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
         embedding_budget: None,
+        redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     };
 
     let lease = ingest_lease(&paths);
@@ -8045,6 +8049,7 @@ fn budgeted_embedding_writer(
                     max_retries: 0,
                 },
                 dimensions: None,
+                redaction: Default::default(),
             }),
             ..EmbedRuntimeConfig::default()
         },
@@ -8363,4 +8368,97 @@ fn parser_panic_becomes_an_error() {
     let error = catch_parser_panic(|| panic!("{} lines", 2)).unwrap_err();
     assert_eq!(error.to_string(), "parser panicked: 2 lines");
     catch_parser_panic(|| Ok(())).unwrap();
+}
+
+#[test]
+fn redaction_applies_before_indexing_across_incremental_passes_and_settings() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("claude-projects");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join("session.jsonl");
+    // Assembled at runtime so no contiguous fake token sits in the source.
+    let token = format!("gh{}{}", "p_", "Zz9".repeat(12));
+    let call = serde_json::json!({
+        "type": "assistant",
+        "uuid": "a1",
+        "message": {"content": [
+            {"type": "text", "text": format!("I will push with {token}")},
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "cat .env"}},
+        ]},
+    });
+    let result = serde_json::json!({
+        "type": "user",
+        "uuid": "u2",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "PLAIN_VALUE=abc123xyz"},
+        ]},
+    });
+    let mut writer = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(writer, "{call}").unwrap();
+
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![root];
+    options.redaction = Arc::new(crate::redact::Redactor::new(&[], &[]).unwrap());
+    let ingest = |options: &IngestOptions| {
+        ingest_all(&paths, &open_search_index(&paths), options, &lease).unwrap()
+    };
+    let texts = || {
+        let mut texts = Vec::new();
+        open_search_index(&paths)
+            .for_each_record(|record| {
+                texts.push(record.text.clone());
+                Ok(())
+            })
+            .unwrap();
+        texts.sort();
+        texts
+    };
+    let saved_state = || {
+        IngestState::load(&paths.state.join("ingest.json"))
+            .unwrap()
+            .files[&path.to_string_lossy().into_owned()]
+            .clone()
+    };
+
+    let report = ingest(&options);
+    assert_eq!(report.diagnostics.redacted_secrets, 1);
+    assert_eq!(
+        saved_state().pending_tool_calls["toolu_1"].withheld_output,
+        Some(crate::redact::WithheldOutput::SensitiveFile)
+    );
+    // The result arrives in a later pass than its call.
+    writeln!(writer, "{result}").unwrap();
+    let report = ingest(&options);
+    assert_eq!(report.diagnostics.withheld_tool_outputs, 1);
+    let redacted = texts();
+    assert!(redacted.contains(&"I will push with [redacted:github-token]".to_string()));
+    assert!(redacted.contains(&"[output withheld: sensitive file]".to_string()));
+    assert!(redacted.iter().any(|text| text.contains("cat .env")));
+    assert!(
+        redacted
+            .iter()
+            .all(|text| !text.contains(&token) && !text.contains("abc123xyz"))
+    );
+    assert_eq!(ingest(&options).records_added, 0);
+
+    // Turning redaction off changes the checkpoint version, so history is re-derived raw.
+    options.redaction = Arc::new(crate::redact::Redactor::disabled());
+    ingest(&options);
+    let raw = texts();
+    assert!(raw.iter().any(|text| text.contains(&token)));
+    assert!(raw.contains(&"PLAIN_VALUE=abc123xyz".to_string()));
+    assert_eq!(
+        saved_state().parser_version,
+        crate::sources::index_state_version(SourceKind::Claude)
+    );
 }

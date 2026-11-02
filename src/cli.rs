@@ -2905,6 +2905,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         tool_content_limits,
         defer_merges: false,
         embedding_budget: None,
+        redaction: config.redactor()?,
     })
 }
 

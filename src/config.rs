@@ -401,6 +401,28 @@ pub struct UserConfig {
     /// Shared MCP HTTP configuration for standalone and background service modes.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Secret redaction settings.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
+}
+
+/// `[redaction]`: secrets removed from indexed transcript content and from content that leaves
+/// the machine. Source transcripts are never modified.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RedactionConfig {
+    /// Redact built-in credential formats and withhold credential tool output at index time
+    /// (default false). While enabled, changing any setting here reparses indexed history.
+    pub enabled: Option<bool>,
+    /// Extra regexes. A `secret` capture group limits replacement to that span.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Extra globs for files whose reads and writes are withheld: no `/` matches a file name,
+    /// otherwise a path (`~/` is the home directory).
+    #[serde(default)]
+    pub sensitive_files: Vec<String>,
+    /// Redact MCP HTTP responses and remote embedding requests (default true), independent
+    /// of `enabled`.
+    pub egress: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -731,6 +753,7 @@ impl UserConfig {
         Ok(RemoteEmbedConfig {
             endpoint,
             dimensions: self.embedding_dimensions,
+            redaction: crate::redact::EgressRedaction::new(self.egress_redactor()?),
         })
     }
 
@@ -784,6 +807,30 @@ impl UserConfig {
                 "invalid index_freshness: {other} (expected \"strict\", \"bounded\" or \"none\")"
             )),
         }
+    }
+
+    /// Index-time redaction under `[redaction]`, or a disabled one unless `enabled = true`.
+    pub fn redactor(&self) -> Result<std::sync::Arc<crate::redact::Redactor>> {
+        let redaction = &self.redaction;
+        let redactor = if redaction.enabled.unwrap_or(false) {
+            crate::redact::Redactor::new(&redaction.patterns, &redaction.sensitive_files)?
+        } else {
+            crate::redact::Redactor::disabled()
+        };
+        Ok(std::sync::Arc::new(redactor))
+    }
+
+    /// Redaction for content leaving the machine (MCP over HTTP, remote embeddings), or
+    /// `None` when `[redaction] egress = false`.
+    pub fn egress_redactor(&self) -> Result<Option<std::sync::Arc<crate::redact::Redactor>>> {
+        let redaction = &self.redaction;
+        if !redaction.egress.unwrap_or(true) {
+            return Ok(None);
+        }
+        Ok(Some(std::sync::Arc::new(crate::redact::Redactor::new(
+            &redaction.patterns,
+            &redaction.sensitive_files,
+        )?)))
     }
 
     pub fn indexed_tool_content_limits(&self) -> Result<IndexedToolContentLimits> {
@@ -1155,6 +1202,46 @@ mod tests {
         };
 
         assert!(config.token_usage_enabled());
+    }
+
+    #[test]
+    fn redaction_is_opt_in_at_index_time_and_on_for_egress() {
+        let defaults = UserConfig::default();
+        let redactor = defaults.redactor().unwrap();
+        assert!(!redactor.is_enabled());
+        assert!(defaults.egress_redactor().unwrap().is_some());
+        // The default leaves every checkpoint version as it was before redaction existed, so
+        // upgrading reparses nothing.
+        for source in crate::types::SourceKind::ALL {
+            for include_reasoning in [false, true] {
+                let base = crate::sources::index_state_version_for(source, include_reasoning);
+                assert_eq!(redactor.fold_version(base), base, "{source:?}");
+            }
+        }
+        let opencode = crate::sources::opencode::DATABASE_STATE_VERSION;
+        assert_eq!(redactor.fold_version(opencode), opencode);
+
+        let opted_in: UserConfig = toml::from_str("[redaction]\nenabled = true\n").unwrap();
+        let base = crate::sources::index_state_version(crate::types::SourceKind::Claude);
+        assert_ne!(opted_in.redactor().unwrap().fold_version(base), base);
+
+        let config: UserConfig = toml::from_str(
+            r#"
+            [redaction]
+            enabled = false
+            egress = false
+            patterns = ["corp_[a-z0-9]{12}"]
+            sensitive_files = ["*.secret"]
+            "#,
+        )
+        .unwrap();
+        assert!(!config.redactor().unwrap().is_enabled());
+        assert!(config.egress_redactor().unwrap().is_none());
+        assert_eq!(config.redaction.patterns, ["corp_[a-z0-9]{12}"]);
+
+        let invalid: UserConfig =
+            toml::from_str("[redaction]\nenabled = true\npatterns = [\"(\"]\n").unwrap();
+        assert!(invalid.redactor().is_err());
     }
 
     #[test]
