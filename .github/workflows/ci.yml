@@ -75,6 +75,12 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    env:
+      # Default and profiling tests keep separate binaries on the same runner.
+      # Omit debug symbols and incremental state to keep both within its disk budget.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -85,7 +91,7 @@ jobs:
         uses: jdx/mr-boxington-action@a20e1ffcd962370fb2b6045c13b7b349f7b03386
         with:
           version: 1.11.0
-          cache-generation: build-v1
+          cache-generation: build-v2
 
       - name: Build
         run: mbx build --verbose
@@ -96,11 +102,11 @@ jobs:
 
       - name: Test profiling feature
         timeout-minutes: 10
-        run: cargo test --features profiling --verbose -- --test-threads=1
+        run: mbx test --features profiling --verbose -- --test-threads=1
 
       - name: Smoke test Criterion benchmarks
         timeout-minutes: 10
-        run: cargo bench --bench index --profile dev -- --test
+        run: mbx bench --bench index --profile dev -- --test
 
   # homebrew/core autobumps memex from release tags. Build this checkout with the
   # live core formula so a change that breaks its recipe (system ONNX Runtime and
