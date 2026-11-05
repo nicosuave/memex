@@ -411,7 +411,7 @@ fn inspect(
         None,
         None,
         Some(crate::analytics::SessionKindFilter::All),
-        Some(session_id),
+        &[session_id],
         None,
         None,
         None,

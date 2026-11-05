@@ -44,6 +44,7 @@ The plugin is backed by two new CLI surfaces that work anywhere:
 
 ```bash
 memex sessions --cwd . --limit 5     # JSONL: session_id, cwd, git_root, resume_cmd, ...
+memex sessions --session-id A --session-id B   # rows for several exact session IDs
 memex herdr resume-last --cwd .      # resume the newest session for this repo into a herdr tab,
                                      # or focus its pane when it is already open
 ```
