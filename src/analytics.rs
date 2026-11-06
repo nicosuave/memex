@@ -651,7 +651,15 @@ impl AnalyticsStore {
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
         self.query_sessions_detailed_selected(
-            source, project, cwd, since_ms, kind, None, None, None, limit,
+            source,
+            project,
+            cwd,
+            since_ms,
+            kind,
+            &[],
+            None,
+            None,
+            limit,
         )
     }
 
@@ -664,7 +672,7 @@ impl AnalyticsStore {
         cwd: Option<&str>,
         since_ms: Option<u64>,
         kind: Option<SessionKindFilter>,
-        session_id: Option<&str>,
+        session_ids: &[&str],
         source_path: Option<&str>,
         profile: Option<&str>,
         limit: Option<usize>,
@@ -683,7 +691,7 @@ impl AnalyticsStore {
             cwd,
             since_ms,
             kind,
-            session_id,
+            session_ids,
             source_path,
             profile,
             &self.tags,
@@ -751,7 +759,7 @@ impl AnalyticsStore {
         cwd: Option<&str>,
     ) -> Result<Vec<crate::index::SessionScopeKey>> {
         let (mut predicate, mut values) =
-            session_selection_sql(None, None, cwd, None, None, None, None, None, &self.tags);
+            session_selection_sql(None, None, cwd, None, None, &[], None, None, &self.tags);
         if let Some(project) = project {
             predicate.push_str(if predicate.is_empty() {
                 " WHERE "
@@ -794,7 +802,7 @@ impl AnalyticsStore {
             cwd,
             since_ms,
             kind,
-            session_id,
+            session_id.as_slice(),
             source_path,
             profile,
             &self.tags,
@@ -2669,7 +2677,7 @@ fn session_selection_sql(
     cwd: Option<&str>,
     since_ms: Option<u64>,
     kind: Option<SessionKindFilter>,
-    session_id: Option<&str>,
+    session_ids: &[&str],
     source_path: Option<&str>,
     profile: Option<&str>,
     tags: &[String],
@@ -2686,9 +2694,16 @@ fn session_selection_sql(
         values.push(rusqlite::types::Value::Text(profile.to_string()));
     }
 
-    if let Some(session_id) = session_id {
-        clauses.push("session_id = ?".to_string());
-        values.push(rusqlite::types::Value::Text(session_id.to_string()));
+    if !session_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("session_id IN ({placeholders})"));
+        values.extend(
+            session_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::Text((*id).to_string())),
+        );
     }
     if let Some(source_path) = source_path {
         clauses.push("source_path = ?".to_string());
@@ -2943,7 +2958,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    &[],
                     None,
                     Some(profile),
                     Some(1),
@@ -2973,7 +2988,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    &[],
                     None,
                     Some("work"),
                     Some(0),
@@ -2998,7 +3013,7 @@ mod tests {
              ('codex', 'other', '/old', 'target', 3, 3),
              ('claude', 'shared', '/old', 'target', 4, 4);",
         ).unwrap();
-        let query = |session_id, source_path| {
+        let query = |session_id: Option<&str>, source_path| {
             store
                 .query_sessions_detailed_selected(
                     Some(SourceFilter::Codex),
@@ -3006,7 +3021,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    session_id,
+                    session_id.as_slice(),
                     source_path,
                     None,
                     Some(1),
@@ -3029,7 +3044,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some("shared"),
+                    &["shared"],
                     Some("/old"),
                     None,
                     Some(1),

@@ -30,6 +30,7 @@ identify the mechanism or task shape; topic similarity alone is insufficient.
 | --- | --- |
 | Known record or session | Read it directly; skip discovery |
 | Recent work or resumption | `memex sessions --cwd . --limit 20 --format json`; use its `resume_cmd` |
+| `last_at` or `resume_cmd` for known session IDs | `memex sessions --session-id ID1 --session-id ID2 --format json`; one row per indexed match, any order |
 | Exact path, symbol, error, command, PR, URL, or quoted phrase | Lexical search |
 | Uncertain wording with some literal anchors | `--mode hybrid` |
 | Abstract similarity with few literal anchors | `--mode semantic` |

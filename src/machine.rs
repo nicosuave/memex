@@ -354,6 +354,9 @@ pub struct SessionListSpec {
     pub origin: Option<SessionKindFilter>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Further exact session IDs matched alongside `session_id`; older peers ignore them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_ids: Vec<String>,
     #[serde(default)]
     pub source_path: Option<String>,
     pub source: Option<SourceFilter>,
@@ -2346,7 +2349,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             input: SessionsInput::Request { request },
         } => Ok(RpcPayload::Sessions {
             sessions: crate::cli::collect_sessions(
-                request.session_id,
+                request.session_id.as_slice(),
                 request.source_path,
                 request.cwd.map(std::path::PathBuf::from),
                 request.project,
@@ -2530,7 +2533,12 @@ fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionLi
         cwd.as_deref(),
         spec.since_ms,
         spec.origin,
-        spec.session_id.as_deref(),
+        &spec
+            .session_id
+            .iter()
+            .chain(&spec.session_ids)
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         spec.source_path.as_deref(),
         spec.profile.as_deref(),
         Some(spec.limit),
