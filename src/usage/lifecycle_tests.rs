@@ -1000,3 +1000,96 @@ fn kiro_credit_warning_needs_kiro_usage() {
     lock_merged().clear();
     assert!(kiro_warning(&scan_usage(&UsageQuery::default()).unwrap()));
 }
+
+#[test]
+fn codex_usage_includes_compressed_rollouts_once() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let sessions = temp.path().join("sessions/2026/09/30");
+    let archived = temp.path().join("archived_sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&archived).unwrap();
+    let rollout = |id: &str, tokens: u64| {
+        serde_json::json!({"type":"session_meta", "timestamp":"2026-09-30T09:00:00Z",
+            "payload":{"id":id,"cwd":"/repo/memex"}})
+        .to_string()
+            + "\n"
+            + &serde_json::json!({"type":"event_msg", "timestamp":"2026-09-30T09:00:01Z",
+            "payload":{"type":"token_count", "info":{
+                "last_token_usage":{"input_tokens":tokens},
+                "total_token_usage":{"input_tokens":tokens}
+            }}})
+            .to_string()
+            + "\n"
+    };
+    let compress = |path: std::path::PathBuf, contents: &str| {
+        fs::write(&path, zstd::encode_all(contents.as_bytes(), 3).unwrap()).unwrap();
+        path
+    };
+    let plain_id = "019a0000-0000-7000-8000-000000000011";
+    let archived_id = "019a0000-0000-7000-8000-000000000012";
+    let compressing_id = "019a0000-0000-7000-8000-000000000013";
+    fs::write(
+        sessions.join(format!("rollout-{plain_id}.jsonl")),
+        rollout(plain_id, 100),
+    )
+    .unwrap();
+    compress(
+        archived.join(format!("rollout-{archived_id}.jsonl.zst")),
+        &rollout(archived_id, 20),
+    );
+    // Codex writes the archive before it removes the original.
+    let compressing = sessions.join(format!("rollout-{compressing_id}.jsonl"));
+    fs::write(&compressing, rollout(compressing_id, 3)).unwrap();
+    let compressed = compress(
+        sessions.join(format!("rollout-{compressing_id}.jsonl.zst")),
+        &rollout(compressing_id, 3),
+    );
+    let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(temp.path().as_os_str()))]);
+    let query = UsageQuery {
+        source: Some(SourceFilter::Codex),
+        cache_path: Some(temp.path().join("cache.sqlite3")),
+        include_events: true,
+        memo_ttl_ms: 60_000,
+        ..UsageQuery::default()
+    };
+    let session_paths = |report: &UsageReport| {
+        let mut paths = report
+            .details
+            .iter()
+            .map(|event| {
+                (
+                    event.session_id.clone().unwrap(),
+                    event.source_path.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    };
+
+    let report = scan_usage(&query).unwrap();
+    assert_eq!(report.total_tokens, 123);
+    let paths = session_paths(&report);
+    assert_eq!(paths.len(), 3, "{paths:?}");
+    assert!(
+        paths
+            .iter()
+            .any(|(id, path)| id == archived_id && path.ends_with(".jsonl.zst"))
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|(id, path)| id == compressing_id && path == &compressing.to_string_lossy())
+    );
+
+    fs::remove_file(&compressing).unwrap();
+    expire(&query);
+    let report = scan_usage(&query).unwrap();
+    assert_eq!(report.total_tokens, 123);
+    assert!(
+        session_paths(&report)
+            .iter()
+            .any(|(id, path)| id == compressing_id && path == &compressed.to_string_lossy())
+    );
+}

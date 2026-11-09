@@ -210,6 +210,9 @@ fn classify(root: &Root, path: &Path) -> Match {
             (jsonl && (!subagents || name.starts_with("agent-")) && (parts.len() <= 2 || subagents))
                 .then_some(SourceKind::Claude)
         }
+        Shape::Jsonl(SourceKind::Codex) => {
+            sources::codex::is_rollout_transcript(path).then_some(SourceKind::Codex)
+        }
         Shape::Jsonl(source) => jsonl.then_some(source),
         Shape::CodexHome => {
             return if relative == Path::new("history.jsonl") {
@@ -584,10 +587,7 @@ pub(super) fn codex_session_ids(
         .filter(|path| {
             rollout_roots.iter().any(|root| {
                 root.remap(path).is_some_and(|mapped| {
-                    mapped
-                        .extension()
-                        .is_some_and(|extension| extension == "jsonl")
-                        && !excluder.is_excluded(&mapped)
+                    sources::codex::is_rollout_transcript(&mapped) && !excluder.is_excluded(&mapped)
                 })
             })
         })
@@ -817,6 +817,11 @@ mod tests {
             (
                 Shape::Jsonl(SourceKind::Codex),
                 "2026/rollout.jsonl",
+                SourceKind::Codex,
+            ),
+            (
+                Shape::Jsonl(SourceKind::Codex),
+                "2026/rollout.jsonl.zst",
                 SourceKind::Codex,
             ),
             (Shape::CodexHome, "history.jsonl", SourceKind::Codex),

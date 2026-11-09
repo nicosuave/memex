@@ -31,6 +31,54 @@ pub(crate) fn map_sequential(file: &std::fs::File) -> std::io::Result<memmap2::M
     Ok(mmap)
 }
 
+/// A transcript's bytes for one sequential pass: mapped as stored, or decompressed in memory
+/// when the agent archived the file as zstd. Byte offsets always address the uncompressed text.
+pub(crate) enum TranscriptBytes {
+    Mapped(memmap2::Mmap),
+    Decoded(Vec<u8>),
+}
+
+impl std::ops::Deref for TranscriptBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mmap) => mmap,
+            Self::Decoded(bytes) => bytes,
+        }
+    }
+}
+
+pub(crate) fn is_zstd(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "zst")
+}
+
+/// Reads a transcript that may be zstd-compressed. Plain files keep the sequential mapping
+/// from [`map_sequential`]; compressed ones are stream-decoded into memory.
+pub(crate) fn read_sequential(path: &Path) -> std::io::Result<TranscriptBytes> {
+    let file = std::fs::File::open(path)?;
+    if !is_zstd(path) {
+        return map_sequential(&file).map(TranscriptBytes::Mapped);
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    zstd::stream::read::Decoder::new(file)?.read_to_end(&mut bytes)?;
+    crate::profiling::count!("sources.zstd_decoded_bytes", bytes.len());
+    Ok(TranscriptBytes::Decoded(bytes))
+}
+
+/// A line reader over a transcript that may be zstd-compressed.
+pub(crate) fn open_lines(path: &Path) -> std::io::Result<Box<dyn std::io::BufRead>> {
+    let file = std::fs::File::open(path)?;
+    Ok(if is_zstd(path) {
+        Box::new(std::io::BufReader::new(zstd::stream::read::Decoder::new(
+            file,
+        )?))
+    } else {
+        Box::new(std::io::BufReader::new(file))
+    })
+}
+
 pub fn home() -> PathBuf {
     BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())

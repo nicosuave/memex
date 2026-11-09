@@ -346,7 +346,7 @@ pub(super) fn parse_codex_session(
     progress: &Arc<Progress>,
 ) -> Result<()> {
     let source_path = task.path.to_string_lossy().to_string();
-    let (parsed, metadata_offsets) =
+    let (mut parsed, metadata_offsets) =
         crate::sources::codex::parse_index_records_with_metadata_offsets(
             &task.path,
             crate::sources::IndexParseState {
@@ -363,6 +363,14 @@ pub(super) fn parse_codex_session(
                 tx_record.send(record)
             },
         )?;
+    let metadata_offsets = if crate::sources::codex::is_compressed_rollout(&task.path) {
+        // Offsets into the decoded text cannot be compared with the compressed file's size,
+        // so the checkpoint keeps that size as its change marker and nothing to resume from.
+        parsed.offset = task.size;
+        None
+    } else {
+        Some(metadata_offsets)
+    };
     finish_source_parse_with_codex_metadata(
         task,
         tx_update,
@@ -370,7 +378,7 @@ pub(super) fn parse_codex_session(
         SourceKind::Codex,
         source_path,
         parsed,
-        Some(metadata_offsets),
+        metadata_offsets,
     )
 }
 

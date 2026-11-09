@@ -1582,8 +1582,7 @@ fn cwd_from_jsonl(path: &Path) -> Option<PathBuf> {
 }
 
 fn cwd_from_codex_session(path: &Path) -> Option<PathBuf> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
+    let reader = crate::sources::common::open_lines(path).ok()?;
     for line in reader.lines().map_while(std::result::Result::ok) {
         let value: Value = serde_json::from_str(&line).ok()?;
         if value.get("type").and_then(Value::as_str) != Some("session_meta") {
