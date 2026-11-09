@@ -154,7 +154,7 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
         files: files.len() as u64,
         ..SourceAudit::default()
     };
-    for file in files {
+    for path in files {
         if matches!(
             source,
             SourceKind::Hermes
@@ -170,13 +170,13 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
             // content.
             continue;
         }
-        if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(file) {
+        if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(path) {
             // Conversation stores are SQLite; audit must not reinterpret the
             // database as JSON. The overview.txt / transcript.jsonl projections
             // are JSONL and audit normally below.
             continue;
         }
-        let Ok(file) = std::fs::File::open(file) else {
+        let Ok(file) = std::fs::File::open(path) else {
             audit.unreadable_files += 1;
             continue;
         };
@@ -190,7 +190,17 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
             audit_jcode_file(file, &mut audit);
             continue;
         }
-        let reader = std::io::BufReader::new(file);
+        let reader: Box<dyn BufRead> = if super::common::is_zstd(path) {
+            match zstd::stream::read::Decoder::new(file) {
+                Ok(decoder) => Box::new(std::io::BufReader::new(decoder)),
+                Err(_) => {
+                    audit.unreadable_files += 1;
+                    continue;
+                }
+            }
+        } else {
+            Box::new(std::io::BufReader::new(file))
+        };
         for line in reader.lines() {
             let Ok(line) = line else {
                 audit.malformed_json_lines += 1;

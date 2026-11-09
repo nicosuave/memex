@@ -4927,6 +4927,191 @@ fn targeted_ingest_codex_history_uses_known_rollouts_without_discovery() {
     assert_eq!(indexed_texts(&paths), ["history only", "rollout original"]);
 }
 
+fn codex_rollout(id: &str, text: &str) -> String {
+    format!(
+        "{}\n{}\n",
+        serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp"}}),
+        serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}}),
+    )
+}
+
+fn compress_rollout(path: &Path, contents: &str) -> PathBuf {
+    let compressed = PathBuf::from(format!("{}.zst", path.display()));
+    fs::write(
+        &compressed,
+        zstd::encode_all(contents.as_bytes(), 3).expect("compress rollout"),
+    )
+    .unwrap();
+    compressed
+}
+
+fn session_source_paths(paths: &Paths, session_id: &str) -> Vec<String> {
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut source_paths = index
+        .records_by_session_id(session_id)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.source_path)
+        .collect::<Vec<_>>();
+    source_paths.sort();
+    source_paths
+}
+
+#[test]
+fn codex_compressed_rollouts_are_indexed_under_their_real_path() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("codex");
+    let sessions = home.join("sessions/2026/09/30");
+    let archived = home.join("archived_sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&archived).unwrap();
+    let active_id = "019a0000-0000-7000-8000-000000000001";
+    let archived_id = "019a0000-0000-7000-8000-000000000002";
+    let active = compress_rollout(
+        &sessions.join(format!("rollout-2026-09-30T10-00-00-{active_id}.jsonl")),
+        &codex_rollout(active_id, "compressed active"),
+    );
+    let archived = compress_rollout(
+        &archived.join(format!("rollout-2026-09-01T10-00-00-{archived_id}.jsonl")),
+        &codex_rollout(archived_id, "compressed archived"),
+    );
+    let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.include_codex = true;
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.files_skipped, 0);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["compressed active", "compressed archived"]
+    );
+    for (id, path) in [(active_id, &active), (archived_id, &archived)] {
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(session_source_paths(&paths, id), [path]);
+    }
+    let reader = SearchIndex::open_or_create(&paths.index).unwrap();
+    let source_path = active.to_string_lossy().into_owned();
+    let (page, _) = reader
+        .records_by_session_path_page(active_id, Some(&source_path), 0, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].text, "compressed active");
+    assert_eq!(
+        crate::sources::codex::probe(&active)
+            .unwrap()
+            .session
+            .session_id,
+        active_id
+    );
+    drop(reader);
+
+    // The checkpoint keeps the compressed size, so an unchanged archive is not reparsed.
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.records_added, 0);
+    assert_eq!(report.files_skipped, report.files_scanned);
+}
+
+#[test]
+fn codex_rollout_compressed_in_place_keeps_one_session() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("codex");
+    let sessions = home.join("sessions/2026/09/30");
+    fs::create_dir_all(&sessions).unwrap();
+    let id = "019a0000-0000-7000-8000-000000000003";
+    let plain = sessions.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+    let contents = codex_rollout(id, "rollout before compression");
+    fs::write(&plain, &contents).unwrap();
+    let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.include_codex = true;
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let plain_path = plain.to_string_lossy().into_owned();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+
+    // Codex writes the archive beside the original before removing it. Neither a watcher
+    // hint for the archive nor a full scan may index the session a second time.
+    let compressed = compress_rollout(&plain, &contents);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([compressed.clone()]),
+    )
+    .unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+
+    // Once the original is gone, the archive takes over without losing the session.
+    fs::remove_file(&plain).unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let result = ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([plain])).unwrap();
+    assert!(result.full_scan);
+    let compressed_path = compressed.to_string_lossy().into_owned();
+    assert_eq!(session_source_paths(&paths, id), [compressed_path.clone()]);
+    assert_eq!(indexed_texts(&paths), ["rollout before compression"]);
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(!state.files.contains_key(&plain_path));
+    assert!(state.files.contains_key(&compressed_path));
+
+    // A plain copy that reappears beside the indexed archive takes the session back.
+    let restored = PathBuf::from(&plain_path);
+    fs::write(&restored, &contents).unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([restored])).unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(state.files.contains_key(&plain_path));
+    assert!(!state.files.contains_key(&compressed_path));
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path]);
+}
+
+#[test]
+fn growth_of_a_compressed_codex_rollout_reparses_it_whole() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let id = "019a0000-0000-7000-8000-000000000004";
+    let path = compress_rollout(
+        &tmp.path().join(format!("rollout-{id}.jsonl")),
+        &codex_rollout(id, "first"),
+    );
+    let metadata = path.metadata().unwrap();
+    let (task, _) =
+        discovery::prepare_file_task(path.clone(), SourceKind::Codex, false, &metadata, None);
+    let state = execution::completed_file_state(&task, metadata.len(), 2, Some(2), HashMap::new());
+
+    // A second zstd frame grows the file in place without touching its prefix, which is
+    // what a plain transcript's append looks like to change detection.
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&zstd::encode_all(codex_rollout(id, "second").as_bytes(), 3).unwrap())
+        .unwrap();
+    drop(file);
+    let grown = path.metadata().unwrap();
+    assert!(grown.len() > metadata.len());
+    let (task, skip) =
+        discovery::prepare_file_task(path, SourceKind::Codex, false, &grown, Some(&state));
+    assert!(!skip);
+    assert!(task.change.replaces_records(), "{:?}", task.change);
+    assert_eq!(task.offset, 0);
+    assert_eq!(task.legacy_turn_id, Some(0));
+}
+
 #[test]
 fn full_reconciliation_removes_confirmed_missing_transcript_everywhere() {
     let tmp = tempfile::tempdir().unwrap();

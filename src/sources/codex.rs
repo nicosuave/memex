@@ -72,16 +72,84 @@ pub fn rollout_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Codex compresses older rollouts in place, replacing `rollout-*.jsonl` with
+/// `rollout-*.jsonl.zst`.
+const COMPRESSED_ROLLOUT_SUFFIX: &str = ".jsonl.zst";
+
+/// A rollout transcript, plain or compressed.
+pub fn is_rollout_transcript(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(COMPRESSED_ROLLOUT_SUFFIX))
+}
+
+pub fn is_compressed_rollout(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(COMPRESSED_ROLLOUT_SUFFIX))
+}
+
+/// The plain `.jsonl` a compressed rollout was made from.
+fn uncompressed_rollout(path: &Path) -> Option<PathBuf> {
+    is_compressed_rollout(path).then(|| path.with_extension(""))
+}
+
+/// The compressed copy Codex makes of a plain rollout.
+pub fn compressed_rollout(plain: &Path) -> PathBuf {
+    let mut name = plain.as_os_str().to_owned();
+    name.push(".zst");
+    PathBuf::from(name)
+}
+
+/// The one path a rollout is indexed under. While Codex compresses a rollout, the plain file
+/// and the `.zst` being written exist side by side; the plain file is complete until it is
+/// removed, so it keeps ownership and the session is never indexed twice.
+pub fn preferred_rollout(path: PathBuf) -> PathBuf {
+    match uncompressed_rollout(&path) {
+        Some(plain) if plain.is_file() => plain,
+        _ => path,
+    }
+}
+
 pub fn discover_rollouts(
     walk: Option<&mut crate::ingest::directories::StampedWalk>,
 ) -> Vec<SourceFile> {
-    super::common::jsonl_files_with(rollout_roots(), walk)
+    discover_rollouts_with_shadowed(walk).0
+}
+
+/// Every rollout under [`rollout_roots`] at its [`preferred_rollout`] path, plus the
+/// compressed copies left out because their plain original is still present.
+pub fn discover_rollouts_with_shadowed(
+    mut walk: Option<&mut crate::ingest::directories::StampedWalk>,
+) -> (Vec<SourceFile>, Vec<PathBuf>) {
+    let mut paths = Vec::new();
+    for root in rollout_roots() {
+        if root.exists() {
+            paths.extend(
+                super::common::files_under(&root, walk.as_deref_mut())
+                    .into_iter()
+                    .filter(|path| is_rollout_transcript(path)),
+            );
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let plain = paths
+        .iter()
+        .filter(|path| !is_compressed_rollout(path))
+        .cloned()
+        .collect::<HashSet<_>>();
+    let (shadowed, paths): (Vec<_>, Vec<_>) = paths.into_iter().partition(|path| {
+        uncompressed_rollout(path).is_some_and(|plain_path| plain.contains(&plain_path))
+    });
+    let files = paths
         .into_iter()
         .map(|path| SourceFile {
             source: SourceKind::Codex,
             path,
         })
-        .collect()
+        .collect();
+    (files, shadowed)
 }
 
 pub fn history_paths() -> Vec<PathBuf> {
@@ -386,8 +454,7 @@ fn read_meta_until(path: &Path, limit: u64) -> Result<SessionMeta> {
     if limit == 0 {
         return Ok(fallback_meta(path));
     }
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
+    let mmap = super::common::read_sequential(path)?;
     let limit = (limit as usize).min(mmap.len());
     Ok(read_meta_prefix(path, &mmap[..limit], None).0)
 }
@@ -467,6 +534,10 @@ pub(crate) fn cwd_with_metadata_checkpoint(
     offset: u64,
     metadata_offsets: &[u64],
 ) -> Result<Option<PathBuf>> {
+    // A compressed rollout is always parsed whole, so its checkpoint holds no decoded boundary.
+    if super::common::is_zstd(path) {
+        return Ok(read_meta_until(path, u64::MAX)?.cwd);
+    }
     let file = File::open(path)?;
     let length = file.metadata()?.len();
     if length < offset || length == 0 {
@@ -508,7 +579,12 @@ fn apply_meta_line(line: &mut [u8], metadata: &mut SessionMeta) -> bool {
 }
 
 pub fn probe(path: &Path) -> Result<SourceMetadata> {
-    let limit = path.metadata()?.len();
+    // A compressed rollout's size on disk is not the length of the transcript it holds.
+    let limit = if super::common::is_zstd(path) {
+        u64::MAX
+    } else {
+        path.metadata()?.len()
+    };
     let metadata = read_meta_until(path, limit)?;
     let kind = match metadata.links.conversation_kind.as_deref() {
         Some("subagent") => ConversationKind::Subagent,
@@ -565,8 +641,7 @@ pub(crate) fn parse_index_records_with_metadata_offsets(
         }
         emit(record)
     };
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
+    let mmap = super::common::read_sequential(path)?;
     let mut start = super::jsonl::resume_offset(&mmap, state.offset, |line| {
         simd_json::to_borrowed_value(&mut line.to_vec()).is_ok()
     });
@@ -1751,8 +1826,7 @@ fn usage_parent_session_id(payload: &BorrowedValue<'_>) -> Option<String> {
 fn total_usage_snapshots(path: &Path) -> Result<Vec<(u64, UsageTokens)>> {
     static TOKEN_COUNT_NEEDLE: Lazy<memmem::Finder<'static>> =
         Lazy::new(|| memmem::Finder::new(b"token_count"));
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
+    let mmap = super::common::read_sequential(path)?;
     let mut start = 0usize;
     let mut buffer = Vec::new();
     let mut snapshots = Vec::new();
@@ -1812,8 +1886,7 @@ pub(crate) fn parse_usage_file(
     let mut event_index = 0u64;
     let mut unresolved_fork_baseline_seen = false;
     let mut events = Vec::new();
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
+    let mmap = super::common::read_sequential(path)?;
     let mut start = 0usize;
     let mut line_index = 0u64;
     let mut buffer = Vec::new();

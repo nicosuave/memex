@@ -32,10 +32,13 @@ pub(super) fn discover_transcripts(
             )?);
         }
     }
+    // Compressed rollouts whose plain original is still on disk and owns the session.
+    let mut shadowed_rollouts = Vec::new();
     if options.include_codex && full_scan {
-        files.extend(crate::sources::codex::discover_rollouts(
-            walk.as_deref_mut(),
-        ));
+        let (rollouts, shadowed) =
+            crate::sources::codex::discover_rollouts_with_shadowed(walk.as_deref_mut());
+        files.extend(rollouts);
+        shadowed_rollouts = shadowed;
         files.extend(
             crate::sources::codex::history_paths()
                 .into_iter()
@@ -82,9 +85,33 @@ pub(super) fn discover_transcripts(
         files.extend(crate::sources::kimi::discover());
     }
 
+    // A hint can name a compressed rollout while Codex is still writing it beside the plain
+    // original, which keeps ownership until it is removed.
+    if !full_scan {
+        for file in &mut files {
+            if file.source != SourceKind::Codex
+                || crate::sources::codex::is_history_path(&file.path)
+            {
+                continue;
+            }
+            file.path = crate::sources::codex::preferred_rollout(std::mem::take(&mut file.path));
+            let compressed = crate::sources::codex::compressed_rollout(&file.path);
+            if !crate::sources::codex::is_compressed_rollout(&file.path) && compressed.is_file() {
+                shadowed_rollouts.push(compressed);
+            }
+        }
+    }
+
     // A watcher hint names the file that changed, not necessarily the projection
     // that owns its conversation. Resolve ownership here for both scan modes.
     let mut superseded_projections = HashSet::new();
+    // A session indexed from its archive moves back to a plain original that reappears.
+    superseded_projections.extend(
+        shadowed_rollouts
+            .into_iter()
+            .filter(|path| !excluder.is_excluded(&path.with_extension("")))
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
     for file in &mut files {
         if file.source != SourceKind::Antigravity {
             continue;
@@ -324,7 +351,8 @@ pub(super) fn discover_transcripts(
 /// Directory stamps are only reusable while the roots and filters that produced them hold.
 fn discovery_fingerprint(options: &IngestOptions) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"memex-directory-stamps-v2");
+    // v3: listings reused under v2 omitted compressed Codex rollouts (`.jsonl.zst`).
+    hash.update(b"memex-directory-stamps-v3");
     let mut feed = |bytes: &[u8]| {
         hash.update((bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
@@ -684,7 +712,12 @@ pub(super) fn prepare_versioned_file_task(
     let kimi_retraction = source == SourceKind::Kimi
         && change == FileChange::Append
         && crate::sources::kimi::has_retraction_since(&path, offset, size).unwrap_or(true);
-    if claude.reparse || kimi_retraction {
+    // A compressed Codex rollout has no byte offset to resume from: its checkpoint records
+    // the compressed size only as a change marker, so any growth reparses the whole file.
+    let compressed_rollout = source == SourceKind::Codex
+        && change == FileChange::Append
+        && crate::sources::codex::is_compressed_rollout(&path);
+    if claude.reparse || kimi_retraction || compressed_rollout {
         change = FileChange::Replaced;
         offset = 0;
         turn_id = 0;
@@ -2110,6 +2143,10 @@ pub(super) fn prepare_refresh(
         // without indexing their union would drop their records.
         for copy in &task.claude_agent_copies {
             superseded_projections.remove(copy.path.to_string_lossy().as_ref());
+        }
+        if task.source == SourceKind::Codex {
+            let compressed = crate::sources::codex::compressed_rollout(&task.path);
+            superseded_projections.remove(compressed.to_string_lossy().as_ref());
         }
         if task.source == SourceKind::Antigravity
             && let Some(session) = crate::sources::antigravity::projection_session_id(&task.path)

@@ -1805,8 +1805,7 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd.to_string_lossy().to_string());
     }
-    let file = std::fs::File::open(source_path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    let reader = crate::sources::common::open_lines(Path::new(source_path)).ok()?;
     let mut fallback: Option<String> = None;
     for line in std::io::BufRead::lines(reader).map_while(std::result::Result::ok) {
         let value: serde_json::Value = match serde_json::from_str(&line) {
@@ -2410,8 +2409,8 @@ fn human_agent_title(path: &str) -> Option<String> {
 
 fn codex_assignment_title(source_path: &str) -> Option<String> {
     use std::io::BufRead;
-    let file = std::fs::File::open(source_path).ok()?;
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+    let reader = crate::sources::common::open_lines(std::path::Path::new(source_path)).ok()?;
+    for line in reader.lines().map_while(Result::ok) {
         // The task body may be encrypted; only read its public routing metadata.
         if !line.contains("agent_message") || !line.contains("NEW_TASK") {
             continue;

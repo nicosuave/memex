@@ -48,6 +48,7 @@ usearch = "2"
 toml = "0.8"
 toml_edit = "0.22"
 walkdir = "2.5"
+zstd = { version = "0.13", default-features = false }
 globset = "0.4"
 notify = "8"
 gix = { version = "0.84", default-features = false, features = ["sha1", "sha256"] }

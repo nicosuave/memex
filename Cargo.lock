@@ -3130,6 +3130,7 @@ dependencies = [
  "url",
  "usearch",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]
