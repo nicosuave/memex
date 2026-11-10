@@ -53,6 +53,13 @@ memex usage --machine local --machine mini
 memex sessions --machine local --machine mini --limit 20
 ```
 
+Lexical search, the default, merges machines by relevance score: every machine scores with
+the same ranking, so a strong match on one machine ranks above a weak match on another. Keep
+peers on the same memex version, since a ranking change alters the score scale. Each machine
+computes term rarity over its own index, so a very rare term cannot score as high in a small
+index as in a large one. Semantic and hybrid search fuse each machine's ranks instead,
+because a machine without embeddings answers with lexical scores.
+
 `memex sessions` uses the configured default machines, merges sessions by latest activity,
 and includes `machine` in every row. The limit applies across the merged results; exact
 `--source`, `--session-id`, `--source-path`, and `--profile` selectors apply on each machine.
