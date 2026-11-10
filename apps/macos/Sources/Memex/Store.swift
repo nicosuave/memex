@@ -134,7 +134,12 @@ final class Store {
         let records: [TranscriptRecord]
         let offset: Int
         let total: Int
+        let loadedAt: Date
     }
+    /// Matches the web client: a cached transcript is shown as-is for this
+    /// long, then shown while it is revalidated against the latest page.
+    var readerCacheLifetime: TimeInterval = 30
+    private var recordsLoadedAt = Date.distantPast
     private var readerWindows: [String: ReaderWindow] = [:]
     private var readerWindowOrder: [String] = []
     var hasMoreSessions = false
@@ -558,6 +563,7 @@ final class Store {
         async let count: Void = loadSessionCount()
         _ = await (sessions, projects, machines, count)
         await loadSelectedSessionMetadata()
+        await revalidateRecords()
     }
 
     func refreshHomeIfStale(isVisible: Bool, now: Date = Date()) async {
@@ -739,7 +745,7 @@ final class Store {
 
     private func cacheReaderWindow() {
         guard let key = loadedReaderKey else { return }
-        readerWindows[key] = ReaderWindow(records: records, offset: recordsOffset, total: recordsTotal)
+        readerWindows[key] = ReaderWindow(records: records, offset: recordsOffset, total: recordsTotal, loadedAt: recordsLoadedAt)
         readerWindowOrder.removeAll { $0 == key }
         readerWindowOrder.append(key)
         while readerWindowOrder.count > 20 { readerWindows.removeValue(forKey: readerWindowOrder.removeFirst()) }
@@ -752,6 +758,7 @@ final class Store {
 
     func loadRecords() async {
         cacheReaderWindow()
+        // Invalidate any page still loading for the previous conversation.
         let generation = UUID()
         readerGeneration = generation
         let request = readerRequestID
@@ -786,26 +793,59 @@ final class Store {
             records = window.records
             recordsOffset = window.offset
             recordsTotal = window.total
+            recordsLoadedAt = window.loadedAt
             loadedReaderKey = key
             updateRecordBounds()
             loadingRecords = false
-            return
+            guard Date().timeIntervalSince(window.loadedAt) >= readerCacheLifetime else { return }
         }
+        await fetchInitialRecords(for: selected)
+    }
+
+    /// Refetches the open conversation, keeping the loaded window when the
+    /// session is unchanged. Nothing loaded yet means a full load instead.
+    func revalidateRecords() async {
+        guard let selected, !loadingRecords else { return }
+        if loadedReaderKey == readerPositionKey { await fetchInitialRecords(for: selected) }
+        else { await loadRecords() }
+    }
+
+    private func fetchInitialRecords(for selected: Session) async {
+        let generation = UUID()
+        readerGeneration = generation
+        let request = readerRequestID
+        let key = readerPositionKey
         loadingRecords = true
+        readerError = nil
+        failedPageWasEarlier = nil
         defer { if readerGeneration == generation { loadingRecords = false } }
         let anchor = readerAnchorID
         do {
             let page = try await client.initialRecords(for: selected, anchor: anchor)
             try Task.checkCancellation()
             guard readerGeneration == generation, readerRequestID == request else { return }
-            records = page.records
-            recordsOffset = page.offset
-            recordsTotal = page.total
-            loadedReaderKey = key
-            updateRecordBounds()
+            // Pages the reader already appended stay when the session is unchanged.
+            if loadedReaderKey != key || !windowMatches(page) {
+                records = page.records
+                recordsOffset = page.offset
+                recordsTotal = page.total
+                loadedReaderKey = key
+                updateRecordBounds()
+            }
+            recordsLoadedAt = Date()
             cacheReaderWindow()
         } catch is CancellationError {} catch {
             if readerGeneration == generation, readerRequestID == request { readerError = error.localizedDescription }
+        }
+    }
+
+    /// The native transports carry no snapshot version, so an unchanged total
+    /// and identical overlapping records stand in for the web client's check.
+    private func windowMatches(_ page: TranscriptPage) -> Bool {
+        guard page.total == recordsTotal else { return false }
+        return page.records.enumerated().allSatisfy { index, record in
+            let position = page.offset + index - recordsOffset
+            return !records.indices.contains(position) || records[position] == record
         }
     }
 
@@ -832,6 +872,7 @@ final class Store {
             records = page.records
             recordsOffset = page.offset
             recordsTotal = page.total
+            recordsLoadedAt = Date()
             loadedReaderKey = key
             updateRecordBounds()
             cacheReaderWindow()

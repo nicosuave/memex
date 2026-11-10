@@ -42,7 +42,9 @@ memex sessions --machine local --machine mini --limit 20
 
 `memex sessions` uses the configured default machines, merges sessions by latest activity,
 and includes `machine` in every row. The limit applies across the merged results; exact
-`--source`, `--session-id`, and `--source-path` selectors apply on each machine. Use
+`--source`, `--session-id`, `--source-path`, and `--profile` selectors apply on each machine.
+A machine too old to filter by profile has its rows filtered locally, after its own limit,
+so its list can be short. Use
 `--machine local` for only this machine. Each machine resolves `--cwd` against its own
 filesystem. `sessions --count` retains its single-machine
 behavior and defaults to local. Both peers need a version supporting federated session lists.

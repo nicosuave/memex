@@ -1,7 +1,7 @@
 [package]
 name = "memex"
 default-run = "memex"
-version = "0.28.0"
+version = "0.33.1"
 edition = "2024"
 build = "build.rs"
 description = "CLI tool for indexing and searching local agent conversation history"
@@ -25,7 +25,10 @@ directories = "5.0"
 fastembed = { version = "5.17.4", default-features = false, features = ["hf-hub-native-tls"] }
 model2vec-rs = "0.1.4"
 # Keeps ort's download-binaries default off under feature unification.
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "api-22"] }
+ndarray = { version = "0.17", default-features = false }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "native-tls"] }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 crossbeam-channel = "0.5"
 once_cell = "1.19"
 memchr = "2.7"
@@ -33,6 +36,8 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 memmap2 = "0.9"
 rayon = "1.10"
 regex = "1.10"
+aho-corasick = "1.1"
+shlex = "1.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
@@ -44,6 +49,7 @@ usearch = "2"
 toml = "0.8"
 toml_edit = "0.22"
 walkdir = "2.5"
+zstd = { version = "0.13", default-features = false }
 globset = "0.4"
 notify = "8"
 gix = { version = "0.84", default-features = false, features = ["sha1", "sha256"] }

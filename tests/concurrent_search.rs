@@ -46,6 +46,8 @@ fn concurrent_searches_coalesce_stale_auto_indexing() {
             "--no-muse",
             "--no-kiro",
             "--no-kilocode",
+            "--no-kimi",
+            "--no-goose",
             "--no-embeddings",
         ])
         .arg("--root")
@@ -144,6 +146,7 @@ fn isolated_memex(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
     command
         .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("CODEX_HOME", home.join(".codex"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local").join("share"))

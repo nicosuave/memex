@@ -160,7 +160,7 @@ Resolver output derives from the enabled-source flags in `IngestOptions`:
 
 | Source | Roots to watch | Notes |
 | ------ | -------------- | ----- |
-| Claude | `default_claude_sources()` (`CLAUDE_CONFIG_DIR` or `~/.claude/projects`, `~/.config/claude/projects`) + explicit `--claude-path` | Watch the `projects` dirs, not `$HOME`. |
+| Claude | `UserConfig::claude_sources()` (`claude_paths`, else `CLAUDE_CONFIG_DIR`, else `~/.claude/projects`, `~/.config/claude/projects`) + explicit `--claude-path` | Watch the `projects` dirs, not `$HOME`. |
 | Codex | `CODEX_HOME` (`~/.codex`): `sessions/`, rollout roots, history file parents | History files are single files — watch parent dir. |
 | OpenCode | `OPENCODE_DATA_DIR` / `~/.local/share/opencode`: storage root, message/parts roots, `opencode*.db` parents | Route WAL events to their main DB path: committed writes may change only the WAL. Ignore `-shm`/`-journal` noise. Cursor logic (`event_rowid`/`event_id` in `scan_database`) stays authoritative. |
 | Cursor | `~/.cursor/projects` | |

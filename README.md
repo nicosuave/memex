@@ -13,7 +13,7 @@ over SSH, and track token usage from local logs.
 ## Install
 
 ```bash
-brew install nicosuave/tap/memex
+brew install memex
 ```
 
 Or use the installer:
@@ -73,8 +73,10 @@ tool. **Import into** creates a conversation in another tool using the
 | IBM Bob | Yes | Yes | Yes | No | No |
 | ZCode | Yes | Yes | No | No | No |
 | KiloCode CLI | Yes | Yes | Yes | No | No |
+| Kimi Code | Yes | Yes | Yes | No | No |
 | Kiro CLI | Yes | Credits only | No | No | No |
 | Hermes | Yes | Yes | No | No | No |
+| goose | Yes | Yes | Yes | No | No |
 
 - **History coverage depends on the local records a tool saves.** Cursor history
   comes from agent transcripts; its usage data comes from local databases.
@@ -85,6 +87,11 @@ tool. **Import into** creates a conversation in another tool using the
   Kiro reads `~/.kiro/sessions`; set `KIRO_SESSIONS_DIR` for copied sessions.
   KiloCode CLI reads `~/.local/share/kilo/kilo.db` (`$XDG_DATA_HOME/kilo/kilo.db`);
   set `KILO_DATA_DIR` (comma-separated) to index extra stores.
+  Kimi Code reads `~/.kimi-code/sessions` (`KIMI_CODE_HOME` relocates it); every
+  agent journal, subagents included, is indexed as its own session with the parent recorded.
+  goose keeps every session in one SQLite store under its data directory
+  (`~/.local/share/goose/sessions/sessions.db`), relocatable with `GOOSE_PATH_ROOT`;
+  per-turn context messages and `hidden` CLI sessions are skipped.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
   not subscription charges or quota balances. Hermes history and usage are read from
   its local `state.db`; plaintext reasoning is indexed only with `--include-reasoning`.
@@ -97,6 +104,10 @@ tool. **Import into** creates a conversation in another tool using the
 - **Saved memories are separate from transcripts.** Only Claude project memories
   and Codex memory files are discovered. Search them with `--content memories`, or
   combine them with conversations using `--content all`.
+- **Dreaming is opt-in and model-driven.** `memex dream` sends redacted excerpts of recent
+  sessions and saved memories to the `claude` or `codex` CLI and stores what it concludes,
+  as cited dreams, under `~/.memex/dreams/`. Nothing runs and search returns no dreams
+  until you set `[dream] enabled = true`.
 
 See [source discovery and memory retrieval](docs/search.md) and
 [usage details](docs/usage.md) for formats, paths, and limitations.
@@ -113,6 +124,7 @@ See [source discovery and memory retrieval](docs/search.md) and
 | [MCP server](docs/mcp.md) | Give agents structured search and transcript retrieval tools |
 | [Search skill](#agent-integration) | Teach agents to use the Memex CLI for source-backed recall |
 | [herdr plugin](docs/herdr.md) | Browse and resume sessions from a herdr pane |
+| [Rex module](docs/rex.md) | Browse and resume sessions from a Rex pane |
 
 The interfaces share Memex's data, but expose different workflows. The native app
 READMEs describe their capabilities and platform requirements.
@@ -162,12 +174,41 @@ Search results identify the session, source, and machine so you can retrieve the
 original records. Transcript reads are bounded by default and return continuation
 information for longer content.
 
+Assign sessions to projects or tag them; both survive reindexing and rebuilds:
+
+```bash
+memex session set-project SESSION_ID ProjectA
+memex session tag add SESSION_ID tooling
+memex sessions --tag tooling
+```
+
+See [projects and tags](docs/projects.md).
+
 For semantic or hybrid search, first generate local embeddings:
 
 ```bash
 memex index --embeddings
 memex search "how we handled retries" --mode hybrid --format text
 ```
+
+## Dream
+
+Consolidate recent history across agents into a small set of dreams: single statements,
+each citing the transcript records it rests on, such as corrections you keep giving,
+recurring mistakes, and saved memories that recent work contradicts. Opt in first with
+`[dream] enabled = true` in `config.toml`.
+
+```bash
+memex dream --dry-run
+memex dream
+memex dream show
+memex search "package manager" --content all
+```
+
+Dreams come back from `--content all` beside the conversations and memories they were drawn
+from, so an agent recalling prior decisions gets them without a separate query. Each run
+publishes a new generation with a diff, and Claude and Codex memory files are never
+written. See [dreaming](docs/dreaming.md).
 
 See [search and reading](docs/search.md) for filters, output formats, pagination,
 reasoning inclusion, and memory retrieval; see [embeddings and configuration](docs/configuration.md)
@@ -276,10 +317,13 @@ destination can reproduce the original session's behavior.
 | --- | --- |
 | [Installation and updates](docs/installation.md) | Package managers, source builds, Nix, skill updates, daemon upgrade migration |
 | [Indexing, search, and reading](docs/search.md) | Sources, memories, filters, formats, record budgets, pagination |
+| [Dreaming](docs/dreaming.md) | Cited dreams from history, executors, citations, lint, scheduling |
 | [Configuration and embeddings](docs/configuration.md) | Config file, models, execution providers, exclusions, resume templates |
+| [Projects and tags](docs/projects.md) | Project assignments, tags, inheritance, storage |
 | [Background indexing and Web UI](docs/daemon.md) | Services, browser authentication, index cleanup |
 | [Multiple machines](docs/machines.md) | SSH setup, remote reads, batch retrieval |
 | [MCP server](docs/mcp.md) | Transports, authentication, client setup, retrieval tools |
 | [Token usage](docs/usage.md) | Counters, pricing, cache estimates, Hermes coverage |
 | [herdr integration](docs/herdr.md) | Installation, actions, key bindings |
+| [Rex integration](docs/rex.md) | Installation, actions, key bindings |
 | [Developer profiling](docs/profiling.md) | Index/search traces and flamegraphs |

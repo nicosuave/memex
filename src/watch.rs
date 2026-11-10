@@ -161,6 +161,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_kiro {
         roots.push(crate::sources::kiro::sessions_root());
     }
+    if options.include_kimi {
+        roots.push(crate::sources::kimi::sessions_root());
+    }
     if options.include_muse {
         roots.push(crate::sources::muse::sessions_root());
     }
@@ -175,6 +178,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     }
     if options.include_kilocode {
         roots.extend(crate::sources::kilocode::db_dirs());
+    }
+    if options.include_goose {
+        roots.extend(crate::sources::goose::db_dirs());
     }
     roots.sort();
     roots.dedup();
@@ -225,6 +231,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                     || crate::sources::bob::is_configured_database(&database)
                     || crate::sources::zcode::db_paths().contains(&database)
                     || crate::sources::kilocode::db_paths().contains(&database)
+                    || crate::sources::goose::db_paths().contains(&database)
                     || crate::sources::hermes::is_configured_database(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
@@ -293,8 +300,21 @@ pub(crate) fn dirty_needs_ingest(paths: &Paths, dirty: &HashSet<PathBuf>) -> Res
         let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
         reader.load_files(&keys, FileLoadScope::Targeted)?
     };
+    let failures = crate::ingest::failures::FailureLog::load(&paths.state)?;
+    let now = crate::ingest::failures::now_secs();
+    // A file that failed to parse keeps its old checkpoint, so it looks changed until the
+    // ingest that retries it. Until it changes again or its backoff expires, discovery would
+    // only defer it, so its hint alone does not warrant a refresh.
+    let deferred = |key: &str, path: &Path| {
+        !failures.is_empty()
+            && std::fs::metadata(path)
+                .is_ok_and(|metadata| failures.defers_metadata(key, &metadata, now))
+    };
     for path in dirty {
         let key = path.to_string_lossy().into_owned();
+        if deferred(&key, path) {
+            continue;
+        }
         let Some(previous) = states.get(&key).and_then(Option::as_ref) else {
             return Ok(true);
         };
@@ -348,6 +368,9 @@ pub(crate) struct WatchService {
     config: WatchConfig,
     stats: WatchStats,
     hot_databases: HashMap<PathBuf, Option<DatabaseSnapshot>>,
+    /// Consecutive failed ingests, and when the next attempt may fire.
+    failure_streak: u32,
+    retry_at: Option<Instant>,
 }
 
 /// Filesystem observation for an OpenCode database or its WAL.
@@ -422,12 +445,14 @@ pub(crate) fn sweep_candidates(
             && file.identity.bob_database.is_none()
             && file.identity.zcode_database.is_none()
             && file.identity.kilocode_database.is_none()
+            && file.identity.goose_database.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
     databases.extend(reader.bob_database_paths()?);
     databases.extend(reader.zcode_database_paths()?);
     databases.extend(reader.kilocode_database_paths()?);
+    databases.extend(reader.goose_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -467,6 +492,8 @@ impl WatchService {
             config,
             stats: WatchStats::default(),
             hot_databases: HashMap::new(),
+            failure_streak: 0,
+            retry_at: None,
         };
         service.sort_pending();
         service.activate_pending();
@@ -507,6 +534,7 @@ impl WatchService {
     pub(crate) fn mark_complete(&mut self, cause: FireCause) {
         self.dirty.clear();
         self.batch_start = None;
+        self.clear_failures();
         self.last_fire = Some(Instant::now());
         match cause {
             FireCause::Dirty => self.stats.fires_dirty += 1,
@@ -523,7 +551,32 @@ impl WatchService {
     pub(crate) fn mark_skipped(&mut self) {
         self.dirty.clear();
         self.batch_start = None;
+        self.clear_failures();
         self.stats.noop_skips += 1;
+    }
+
+    /// Record a failed ingest. Its dirty set and resync request stay for the retry, which
+    /// waits out an exponential backoff instead of re-firing on the next tick. Returns the
+    /// streak length and the delay.
+    pub(crate) fn mark_failed(&mut self, now: Instant) -> (u32, Duration) {
+        self.failure_streak = self.failure_streak.saturating_add(1);
+        let delay = crate::ingest::failures::backoff(
+            self.failure_streak,
+            crate::ingest::failures::DAEMON_RETRY_BASE,
+            crate::ingest::failures::DAEMON_RETRY_MAX,
+        );
+        self.retry_at = Some(now + delay);
+        (self.failure_streak, delay)
+    }
+
+    /// Whether the last ingest failed, so a success has a failure streak to end.
+    pub(crate) fn is_failing(&self) -> bool {
+        self.failure_streak > 0
+    }
+
+    fn clear_failures(&mut self) {
+        self.failure_streak = 0;
+        self.retry_at = None;
     }
 
     /// Reconcile watches with freshly resolved roots (cheap; call on resync).
@@ -646,6 +699,9 @@ impl WatchService {
         {
             return None;
         }
+        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return None;
+        }
         if self.resync_needed || now >= self.resync_due {
             return Some(FireCause::Resync);
         }
@@ -746,6 +802,7 @@ impl WatchService {
             .into_iter()
             .chain(crate::sources::zcode::db_paths())
             .chain(crate::sources::kilocode::db_paths())
+            .chain(crate::sources::goose::db_paths())
         {
             if database.is_file()
                 && crate::sources::bob::canonical_alias(&database)
@@ -826,6 +883,8 @@ mod tests {
             include_bob: true,
             include_zcode: true,
             include_kilocode: true,
+            include_goose: true,
+            include_kimi: true,
             include_kiro: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -836,6 +895,8 @@ mod tests {
                 .expect("default embed runtime"),
             tool_content_limits: crate::config::IndexedToolContentLimits::default(),
             defer_merges: false,
+            embedding_budget: None,
+            redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
         }
     }
 
@@ -889,6 +950,7 @@ mod tests {
             ("JCODE_HOME", Some("/tmp/memex-watch-test-jcode")),
             ("MUSE_HOME", Some("/tmp/memex-watch-test-muse")),
             ("KIRO_SESSIONS_DIR", None),
+            ("KIMI_CODE_HOME", None),
             ("XDG_DATA_HOME", None),
         ]);
 
@@ -913,6 +975,7 @@ mod tests {
             "jcode/sessions",
             "muse/sessions",
             ".kiro/sessions",
+            ".kimi-code/sessions",
         ] {
             assert!(
                 rendered.iter().any(|root| root.contains(expected)),
@@ -945,7 +1008,9 @@ mod tests {
         options.include_bob = false;
         options.include_zcode = false;
         options.include_kilocode = false;
+        options.include_goose = false;
         options.include_kiro = false;
+        options.include_kimi = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
     }
@@ -1265,6 +1330,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_ingests_back_off_exponentially_until_one_succeeds() {
+        let _guard = env_lock();
+        let mut service = test_service();
+        service.config.min_spacing = Duration::ZERO;
+        let start = Instant::now();
+        service.request_resync();
+        assert_eq!(service.fire_decision(start), Some(FireCause::Resync));
+        let mut now = start;
+        for expected in [2, 4, 8, 16, 32, 60, 60] {
+            let (_, delay) = service.mark_failed(now);
+            assert_eq!(delay, Duration::from_secs(expected));
+            // The failed work is kept, but it waits out the delay.
+            assert_eq!(service.fire_decision(now + delay / 2), None);
+            now += delay;
+            assert_eq!(service.fire_decision(now), Some(FireCause::Resync));
+        }
+        assert!(service.is_failing());
+        service.mark_complete(FireCause::Resync);
+        assert!(!service.is_failing());
+        assert_eq!(service.mark_failed(now), (1, Duration::from_secs(2)));
+    }
+
+    #[test]
     fn resync_timer_fires_when_idle() {
         let _guard = env_lock();
         let options = test_options();
@@ -1460,6 +1548,7 @@ mod tests {
                 bob_database: None,
                 zcode_database: None,
                 kilocode_database: None,
+                goose_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,

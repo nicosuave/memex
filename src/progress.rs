@@ -353,7 +353,9 @@ fn progress_label(source: SourceKind) -> &'static str {
         SourceKind::Bob => "bob",
         SourceKind::Zcode => "zcode",
         SourceKind::Kilocode => "kilocode",
+        SourceKind::Goose => "goose",
         SourceKind::Kiro => "kiro",
+        SourceKind::Kimi => "kimi",
     }
 }
 

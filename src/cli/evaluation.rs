@@ -239,6 +239,7 @@ fn search(
             additional_queries: queries[1..].to_vec(),
             cwd: case.cwd.as_ref().map(Into::into),
             project: filters.project.clone(),
+            tags: Vec::new(),
             role: filters.role.clone(),
             tool: None,
             session: filters.session.clone(),

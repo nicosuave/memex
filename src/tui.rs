@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionRow, analytics_path};
-use crate::config::{Paths, UserConfig, default_claude_sources};
+use crate::config::{Paths, UserConfig};
 use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
@@ -421,6 +421,8 @@ enum SourceChoice {
     Zcode,
     Kiro,
     Kilocode,
+    Kimi,
+    Goose,
 }
 
 impl SourceChoice {
@@ -443,7 +445,9 @@ impl SourceChoice {
             SourceChoice::Bob => SourceChoice::Zcode,
             SourceChoice::Zcode => SourceChoice::Kiro,
             SourceChoice::Kiro => SourceChoice::Kilocode,
-            SourceChoice::Kilocode => SourceChoice::All,
+            SourceChoice::Kilocode => SourceChoice::Kimi,
+            SourceChoice::Kimi => SourceChoice::Goose,
+            SourceChoice::Goose => SourceChoice::All,
         }
     }
 
@@ -467,6 +471,8 @@ impl SourceChoice {
             SourceChoice::Zcode => Some(SourceFilter::Zcode),
             SourceChoice::Kiro => Some(SourceFilter::Kiro),
             SourceChoice::Kilocode => Some(SourceFilter::Kilocode),
+            SourceChoice::Kimi => Some(SourceFilter::Kimi),
+            SourceChoice::Goose => Some(SourceFilter::Goose),
         }
     }
 
@@ -490,6 +496,8 @@ impl SourceChoice {
             SourceChoice::Zcode => "zcode",
             SourceChoice::Kiro => "kiro",
             SourceChoice::Kilocode => "kilocode",
+            SourceChoice::Kimi => "kimi",
+            SourceChoice::Goose => "goose",
         }
     }
 
@@ -512,6 +520,8 @@ impl SourceChoice {
             SourceKind::Zcode => SourceChoice::Zcode,
             SourceKind::Kiro => SourceChoice::Kiro,
             SourceKind::Kilocode => SourceChoice::Kilocode,
+            SourceKind::Kimi => SourceChoice::Kimi,
+            SourceKind::Goose => SourceChoice::Goose,
         }
     }
 }
@@ -519,6 +529,9 @@ impl SourceChoice {
 #[derive(Clone, Debug)]
 struct SessionSummary {
     best_record_id: Option<String>,
+    /// Child session the best hit came from when search rolled it up to this
+    /// session; `best_record_id` then names a record of that child.
+    matched_in: Option<MatchedChild>,
     best_record_source: Option<SourceKind>,
     machine: String,
     session_id: String,
@@ -533,6 +546,12 @@ struct SessionSummary {
     source_dir: String,
     label: Option<String>,
     conversation_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatchedChild {
+    session_id: String,
+    kind: String,
 }
 
 #[derive(Clone, Debug)]
@@ -893,6 +912,16 @@ impl StdIoRedirect {
     }
 }
 
+/// The freshness a TUI refresh runs under. `force` is the user asking for one, which runs as
+/// `strict` whatever `index_freshness` says; automatic refreshes follow `index_freshness`.
+fn index_refresh_freshness(config: &UserConfig, force: bool) -> Result<crate::ingest::Freshness> {
+    if force {
+        Ok(crate::ingest::Freshness::Strict)
+    } else {
+        config.index_freshness()
+    }
+}
+
 fn open_tui_index(paths: &Paths, auto_index: bool) -> Result<SearchIndex> {
     if SearchIndex::exists(&paths.index) {
         return SearchIndex::open_or_create(&paths.index);
@@ -913,7 +942,7 @@ pub fn run(
 ) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let auto_index = config.auto_index_on_search_default();
+    let auto_index = config.index_freshness()? != crate::ingest::Freshness::None;
     if auto_index {
         paths.ensure_dirs()?;
     }
@@ -1148,7 +1177,8 @@ impl App {
     }
 
     fn kickoff_index_refresh(&mut self, force: bool) {
-        if (!force && !self.config.auto_index_on_search_default())
+        let freshness = index_refresh_freshness(&self.config, force);
+        if matches!(freshness, Ok(crate::ingest::Freshness::None))
             || self.index_state == IndexState::Loading
         {
             return;
@@ -1165,7 +1195,7 @@ impl App {
                 let model_choice = config.resolve_model(None)?;
                 let tool_content_limits = config.indexed_tool_content_limits()?;
                 let opts = IngestOptions {
-                    claude_sources: default_claude_sources(),
+                    claude_sources: config.claude_sources(),
                     include_agents: false,
                     include_reasoning: config.include_reasoning_default(),
                     include_codex: true,
@@ -1183,6 +1213,8 @@ impl App {
                     include_bob: true,
                     include_zcode: true,
                     include_kilocode: true,
+                    include_kimi: true,
+                    include_goose: true,
                     include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
@@ -1191,6 +1223,8 @@ impl App {
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
                     defer_merges: true,
+                    embedding_budget: Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET),
+                    redaction: config.redactor()?,
                 };
                 let journal = crate::ingest::discovery::start_journal_replay(&paths, &opts);
                 journal.wait_until_streaming(crate::ingest::journal::REPLAY_BUDGET);
@@ -1202,14 +1236,7 @@ impl App {
                     Ok(index) if !index.is_writable() => index,
                     _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
                 };
-                ingest_if_stale(
-                    &paths,
-                    &index,
-                    &opts,
-                    config.scan_cache_ttl(),
-                    &lease,
-                    Some(journal),
-                )
+                ingest_if_stale(&paths, &index, &opts, freshness?, &lease, Some(journal))
             })();
             match result {
                 Ok(Some(report)) => {
@@ -1460,7 +1487,7 @@ impl App {
         let machines = self.selected_machines();
         let source = self.source.as_filter();
         let session_kind = self.session_kind;
-        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
         let range = self.home_activity_range;
@@ -1551,7 +1578,7 @@ impl App {
         let config = self.config.clone();
         let machines = self.selected_machines();
         let source = self.source.as_filter();
-        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
         let session_keys = home_token_session_keys(&self.query, &self.results);
         let local_session_keys = session_keys.as_ref().map(|keys| {
@@ -1563,7 +1590,10 @@ impl App {
         let session_kind = self.session_kind;
         let mut query = home_token_usage_query(
             self.source,
-            &self.project,
+            split_project_filter(&self.project)
+                .0
+                .as_deref()
+                .unwrap_or(""),
             self.project_display.grouping(),
             local_session_keys,
             self.home_activity_range,
@@ -1571,6 +1601,7 @@ impl App {
             self.paths.state.join("usage-cache.sqlite3"),
         );
         query.include_reviews = session_kind == crate::analytics::SessionKindFilter::All;
+        query.claude_sources = Some(config.claude_sources());
         std::thread::spawn(move || {
             if !config.machines.is_empty() {
                 let result = federated_usage_activity(
@@ -1703,7 +1734,9 @@ impl App {
                 }
                 let mut projects: Vec<(String, u64)> = latest.into_iter().collect();
                 projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                Ok((sources, projects.into_iter().map(|(p, _)| p).collect()))
+                let mut projects: Vec<String> = projects.into_iter().map(|(p, _)| p).collect();
+                projects.extend(tag_filter_options(&store));
+                Ok((sources, projects))
             })()
             .unwrap_or_default();
             let _ = tx.send(SearchUpdate::HomeFilters {
@@ -2631,9 +2664,24 @@ impl App {
             };
             cwd
         } else {
-            crate::resume::resume_cwd(resolve_session_cwd(&session), &session.source_dir)
+            crate::resume::resume_cwd(
+                resolve_session_cwd(&session),
+                &session.source_dir,
+                &self.config.claude_sources(),
+            )
         };
-        let local_command = expand_resume_template(&template, &session, &cwd);
+        // Only this machine's roots locate a config directory; a remote session resumes in the
+        // remote environment's own.
+        let claude_config_dir = (!remote)
+            .then(|| {
+                crate::resume::claude_config_dir(
+                    session.source,
+                    &session.source_path,
+                    &self.config.claude_sources(),
+                )
+            })
+            .flatten();
+        let local_command = expand_resume_template(&template, &session, &cwd, claude_config_dir);
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)
                 .ok_or_else(|| anyhow::anyhow!("unknown machine '{}'", session.machine))?;
@@ -2646,6 +2694,17 @@ impl App {
         if crate::herdr::inside_herdr() {
             let placement = crate::herdr::resume_placement(&self.config);
             if placement != crate::herdr::ResumePlacement::Off {
+                // Already open in a herdr pane: jump there instead of opening a duplicate.
+                if !remote
+                    && let Some(pane_id) = crate::herdr::pane_running_session(&session.session_id)
+                    && crate::herdr::focus_pane(&pane_id).is_ok()
+                {
+                    self.set_status(format!(
+                        "{} is already open; focused herdr pane {pane_id}",
+                        session.session_id
+                    ));
+                    return Ok(());
+                }
                 let herdr_cwd = (!remote).then_some(cwd.as_str());
                 match crate::herdr::open_resume_pane(
                     placement,
@@ -2667,6 +2726,48 @@ impl App {
                     }
                     Err(err) => {
                         self.set_status(format!("herdr resume failed ({err}); running inline"));
+                    }
+                }
+            }
+        } else if let Some(rex_session) = crate::rex::current_session() {
+            // Inside a Rex terminal, the same: a new Rex tab/split, or the block
+            // already running the session.
+            let placement = crate::rex::resume_placement(&self.config);
+            if placement != crate::rex::ResumePlacement::Off {
+                if !remote
+                    && let Some(block_id) =
+                        crate::rex::block_running_session(&rex_session, &session.session_id)
+                    && crate::rex::focus_block(&rex_session, &block_id).is_ok()
+                {
+                    self.set_status(format!(
+                        "{} is already open; focused Rex block {block_id}",
+                        session.session_id
+                    ));
+                    return Ok(());
+                }
+                let rex_cwd = (!remote).then_some(cwd.as_str());
+                match crate::rex::open_resume_block(
+                    placement,
+                    &rex_session,
+                    crate::rex::current_block().as_deref(),
+                    rex_cwd,
+                    &session.project,
+                    &command,
+                ) {
+                    Ok(_) => {
+                        self.set_status(format!(
+                            "resumed {} in a new Rex {}",
+                            session.session_id,
+                            if placement == crate::rex::ResumePlacement::Split {
+                                "split"
+                            } else {
+                                "tab"
+                            }
+                        ));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        self.set_status(format!("Rex resume failed ({err}); running inline"));
                     }
                 }
             }
@@ -2710,6 +2811,8 @@ impl App {
             SourceKind::Zcode => "zcode",
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kiro => "kiro",
+            SourceKind::Kimi => "kimi",
+            SourceKind::Goose => "goose",
         };
         let source_path = session.source_path.clone();
 
@@ -3826,6 +3929,7 @@ fn home_token_usage_query(
         include_events: false,
         include_reviews: false,
         cache_path: Some(cache_path),
+        claude_sources: None,
         // Keystrokes and result updates re-run this query with different post-assembly
         // filters; reuse the assembled scan between them instead of re-reading logs. On a
         // large corpus assembly takes seconds even warm, so favor staleness (the chart lags
@@ -4187,6 +4291,8 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Bob => label == "bob",
         SourceChoice::Zcode => label == "zcode",
         SourceChoice::Kilocode => label == "kilocode",
+        SourceChoice::Kimi => label == "kimi",
+        SourceChoice::Goose => label == "goose",
         SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
@@ -4210,6 +4316,8 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Bob => Color::Rgb(100, 150, 255),
         SourceKind::Zcode => Color::Rgb(96, 222, 228),
         SourceKind::Kilocode => Color::Rgb(255, 122, 189),
+        SourceKind::Kimi => Color::Rgb(86, 170, 255),
+        SourceKind::Goose => Color::Rgb(255, 173, 66),
         SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }
@@ -4316,15 +4424,36 @@ fn session_result_line(
         }
     } else {
         let snippet = strip_ansi_and_controls(&session.snippet);
-        if is_subagent {
+        let badge = match &session.matched_in {
+            // The hit came from a child rolled up onto this session.
+            Some(child) => Some(format!("[via {}] ", short_kind(&child.kind))),
+            None => is_subagent.then(|| "[sub] ".to_string()),
+        };
+        let mut snippet_width = detail_width;
+        if let Some(badge) = badge {
+            snippet_width = snippet_width.saturating_sub(badge.chars().count());
             spans.push(Span::styled(
-                "[sub] ",
+                badge,
                 Style::default().fg(Color::Rgb(160, 120, 80)),
             ));
         }
-        spans.extend(match_context_spans(&snippet, matchers, detail_width, theme));
+        spans.extend(match_context_spans(
+            &snippet,
+            matchers,
+            snippet_width,
+            theme,
+        ));
     }
     Line::from(spans)
+}
+
+fn short_kind(kind: &str) -> &str {
+    match kind {
+        "subagent" => "sub",
+        "sidechain" => "side",
+        "compaction" => "compact",
+        other => other,
+    }
 }
 
 fn displayed_project(session: &SessionSummary) -> String {
@@ -5337,6 +5466,31 @@ fn session_activity(sessions: &[SessionSummary]) -> Vec<HomeChartPoint> {
         .collect()
 }
 
+/// The project filter doubles as the tag filter: `#tag` selects sessions carrying that
+/// user tag instead of a project.
+fn split_project_filter(value: &str) -> (Option<String>, Vec<String>) {
+    let value = value.trim();
+    if let Some(tag) = value.strip_prefix('#') {
+        return (
+            None,
+            crate::session_meta::normalize_tag(tag)
+                .into_iter()
+                .collect(),
+        );
+    }
+    ((!value.is_empty()).then(|| value.to_string()), Vec::new())
+}
+
+/// Tag entries for the project dropdowns, most used first.
+fn tag_filter_options(store: &AnalyticsStore) -> Vec<String> {
+    store
+        .query_tags()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(tag, _)| format!("#{tag}"))
+        .collect()
+}
+
 fn sessions_from_recent(
     index: &SearchIndex,
     source: Option<SourceFilter>,
@@ -5421,6 +5575,7 @@ fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Optio
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
     SessionSummary {
         best_record_id: None,
+        matched_in: None,
         best_record_source: None,
         machine: LOCAL_MACHINE_ID.to_string(),
         session_id: row.session_id,
@@ -5525,10 +5680,11 @@ fn collect_projects_from_analytics(
     grouping: ProjectGrouping,
 ) -> Result<Vec<String>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    let projects = store.query_projects(source, grouping)?;
+    let mut projects = store.query_projects(source, grouping)?;
     if projects.is_empty() {
         anyhow::bail!("no analytics projects");
     }
+    projects.extend(tag_filter_options(&store));
     Ok(projects)
 }
 
@@ -5605,6 +5761,7 @@ fn add_record_to_session(
         .entry(record.session_id.clone())
         .or_insert(SessionSummary {
             best_record_id: Some(crate::retrieval::canonical_record_id(&record)),
+            matched_in: None,
             best_record_source: Some(record.source),
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: record.session_id.clone(),
@@ -5653,18 +5810,38 @@ fn add_located_record_to_session(
     let machine = located.machine;
     let score = located.score;
     let record = located.record;
+    // A rolled-up child hit is listed on its root session, which is what
+    // opening and resuming the row reach; the child stays named on the row.
+    let (session_id, source_path, matched_in, record_kind) = match located.rollup {
+        Some(rollup) => (
+            rollup.session_id,
+            rollup.source_path,
+            Some(MatchedChild {
+                session_id: record.session_id.clone(),
+                kind: rollup.matched_kind,
+            }),
+            None,
+        ),
+        None => (
+            record.session_id.clone(),
+            record.source_path.clone(),
+            None,
+            record.links.conversation_kind.clone(),
+        ),
+    };
     let key = format!(
         "{}\0{}\0{}\0{}",
         machine,
         record.source.storage_label(),
-        record.session_id,
-        record.source_path
+        session_id,
+        source_path
     );
     let entry = sessions.entry(key).or_insert(SessionSummary {
         best_record_id: Some(crate::retrieval::canonical_record_id(&record)),
+        matched_in: matched_in.clone(),
         best_record_source: Some(record.source),
         machine,
-        session_id: record.session_id.clone(),
+        session_id,
         project: record.project.clone(),
         source: record.source,
         last_ts: record.ts,
@@ -5672,31 +5849,29 @@ fn add_located_record_to_session(
         top_score: score,
         title: String::new(),
         snippet: crate::cli::match_preview(&record.text, matchers, 160),
-        source_path: record.source_path.clone(),
-        source_dir: parent_dir(&record.source_path),
+        source_path: source_path.clone(),
+        source_dir: parent_dir(&source_path),
         label: None,
-        conversation_kind: record.links.conversation_kind.clone(),
+        conversation_kind: record_kind.clone(),
     });
     entry.hit_count += 1;
     // Prefer an explicit "main": sidechain/compaction lines inside a primary
     // session must not determine the grouped kind (mirrors the analytics
     // accumulator).
-    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
-    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
-    {
-        entry.conversation_kind = record.links.conversation_kind.clone();
+    let main_claim = record_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record_kind.is_some() {
+        entry.conversation_kind = record_kind;
     }
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
         entry.best_record_id = Some(crate::retrieval::canonical_record_id(&record));
         entry.best_record_source = Some(record.source);
+        entry.matched_in = matched_in;
         let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
         }
-        entry.source_path = record.source_path;
-        entry.source_dir = parent_dir(&entry.source_path);
     }
 }
 
@@ -5781,8 +5956,11 @@ pub(crate) fn evaluate_search(
         let id = session
             .best_record_id
             .ok_or_else(|| anyhow::anyhow!("TUI search result has no representative record"))?;
+        let record_session = session
+            .matched_in
+            .map_or(session.session_id, |child| child.session_id);
         let selector = crate::retrieval::ContextSelector::record_id(id)
-            .with_scope(Some(session.session_id), session.best_record_source);
+            .with_scope(Some(record_session), session.best_record_source);
         let record = if session.machine == LOCAL_MACHINE_ID {
             crate::retrieval::resolve_record(&index, &selector)?
         } else {
@@ -5792,6 +5970,7 @@ pub(crate) fn evaluate_search(
             machine: session.machine,
             score: session.top_score,
             record,
+            rollup: None,
         });
         snippets.push(session.snippet);
     }
@@ -5804,7 +5983,9 @@ fn run_search_request(
     index: &SearchIndex,
     request: SearchRequest,
 ) -> SearchRequestResult {
-    if !request.query.is_empty() {
+    let (project, tags) = split_project_filter(&request.project);
+    // Tags live only in the assignment store; the shared search path scopes them.
+    if !request.query.is_empty() || !tags.is_empty() {
         let result = crate::search::collect(
             paths,
             config,
@@ -5812,7 +5993,7 @@ fn run_search_request(
             std::slice::from_ref(&request.query),
             &SearchSpec {
                 query: request.query.clone(),
-                project: (!request.project.is_empty()).then(|| request.project.clone()),
+                project,
                 role: None,
                 tool: None,
                 session_id: None,
@@ -5828,6 +6009,7 @@ fn run_search_request(
                 min_score: None,
                 project_grouping: Some(request.grouping),
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+                tags,
             },
             &crate::search::Selection::conversations(RESULT_LIMIT, request.kind),
             false,
@@ -5844,7 +6026,7 @@ fn run_search_request(
             .collect();
         return Ok((sessions, result.failures));
     }
-    let project = (!request.project.is_empty()).then_some(request.project.as_str());
+    let project = project.as_deref();
     if !config.machines.is_empty() {
         let federated = federated_recent(
             paths,
@@ -5992,6 +6174,12 @@ fn build_detail_lines_from_records(
         let snippet = strip_ansi_and_controls(&session.snippet);
         lines.push(PreviewLine::Text(format!("top hit: {snippet}")));
     }
+    if let Some(child) = &session.matched_in {
+        lines.push(PreviewLine::Text(format!(
+            "matched in {} {}",
+            child.kind, child.session_id
+        )));
+    }
     lines.push(PreviewLine::Empty);
 
     match mode {
@@ -6075,7 +6263,12 @@ fn build_detail_lines_from_records(
     Ok(lines)
 }
 
-fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -> String {
+fn expand_resume_template(
+    template: &str,
+    session: &SessionSummary,
+    cwd: &str,
+    claude_config_dir: Option<PathBuf>,
+) -> String {
     crate::resume::expand_resume_template(
         template,
         &crate::resume::ResumeSession {
@@ -6084,6 +6277,7 @@ fn expand_resume_template(template: &str, session: &SessionSummary, cwd: &str) -
             project: &session.project,
             source_path: &session.source_path,
             source_dir: &session.source_dir,
+            claude_config_dir,
         },
         cwd,
     )
@@ -7321,6 +7515,32 @@ mod tests {
     }
 
     #[test]
+    fn manual_refreshes_always_run_and_automatic_ones_follow_index_freshness() {
+        use crate::ingest::Freshness;
+        let off = UserConfig {
+            auto_index_on_search: Some(false),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            index_refresh_freshness(&off, false).unwrap(),
+            Freshness::None
+        );
+        assert_eq!(
+            index_refresh_freshness(&off, true).unwrap(),
+            Freshness::Strict
+        );
+        let bounded = UserConfig {
+            index_freshness: Some("bounded".to_string()),
+            scan_cache_ttl: Some(60),
+            ..off
+        };
+        assert_eq!(
+            index_refresh_freshness(&bounded, false).unwrap(),
+            Freshness::Bounded { ttl_seconds: 60 }
+        );
+    }
+
+    #[test]
     fn text_selection_handles_reverse_multiline_and_wide_glyphs() {
         use ratatui::{buffer::Buffer, layout::Position};
         let buffer = Buffer::with_lines(["hello   outside", "界e\u{301}nd   outside"]);
@@ -7453,6 +7673,7 @@ mod tests {
         .expect("write transcript");
         let session = SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
@@ -7646,6 +7867,48 @@ mod tests {
     }
 
     #[test]
+    fn rolled_up_hits_list_the_root_session_and_name_the_child() {
+        let matchers = crate::cli::build_matchers("widget").unwrap();
+        let mut child = record("assistant", "fix the flaky widget");
+        child.session_id = "agent-a".to_string();
+        child.source_path = "agent-a.jsonl".to_string();
+        child.links.conversation_kind = Some("subagent".to_string());
+        let child_id = crate::retrieval::canonical_record_id(&child);
+        let mut sessions = HashMap::new();
+        add_located_record_to_session(
+            &mut sessions,
+            crate::machine::LocatedRecord {
+                machine: "remote".to_string(),
+                score: 1.0,
+                record: child,
+                rollup: Some(crate::search::SessionRollup {
+                    session_id: "parent".to_string(),
+                    source_path: "parent.jsonl".to_string(),
+                    matched_kind: "subagent".to_string(),
+                }),
+            },
+            &matchers,
+        );
+        let summary = sessions.values().next().unwrap();
+        assert_eq!(
+            (summary.session_id.as_str(), summary.source_path.as_str()),
+            ("parent", "parent.jsonl")
+        );
+        assert_eq!(
+            summary.conversation_kind, None,
+            "no [sub] badge on the root"
+        );
+        assert_eq!(summary.best_record_id.as_deref(), Some(child_id.as_str()));
+        assert_eq!(
+            summary.matched_in,
+            Some(MatchedChild {
+                session_id: "agent-a".to_string(),
+                kind: "subagent".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn grouped_search_previews_keep_late_matches_visible() {
         let theme = Theme::new();
         let matchers = crate::cli::build_matchers("fireduck").unwrap();
@@ -7667,6 +7930,7 @@ mod tests {
                             machine: "remote".to_string(),
                             score,
                             record: hit,
+                            rollup: None,
                         },
                         &matchers,
                     );
@@ -7965,6 +8229,7 @@ mod tests {
     fn recent_session_row_shows_title_instead_of_uuid() {
         let session = SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "01a00000-0000-0000-0000-000000000000".to_string(),
@@ -8002,6 +8267,7 @@ mod tests {
 
         let session = SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
@@ -8038,6 +8304,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         app.results.push(SessionSummary {
             best_record_id: None,
+            matched_in: None,
             best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
@@ -8193,6 +8460,7 @@ mod tests {
             request_id: 3,
             sessions: vec![SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "session".to_string(),
@@ -8382,6 +8650,7 @@ mod tests {
         let sessions = vec![
             SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
@@ -8399,6 +8668,7 @@ mod tests {
             },
             SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
@@ -8416,6 +8686,7 @@ mod tests {
             },
             SessionSummary {
                 best_record_id: None,
+                matched_in: None,
                 best_record_source: None,
                 machine: "mini".into(),
                 session_id: "shared".into(),

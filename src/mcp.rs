@@ -37,6 +37,7 @@ pub use http::HttpOptions;
 const INSTRUCTIONS: &str = "Recover the smallest set of source-grounded records or memory documents that answers the question. \
 Read known record/session/memory IDs directly. Otherwise search using exact anchors first, hybrid for uncertain wording, \
 and semantic for abstract similarity. Select conversations, memories, or all; source independently selects the provider. \
+Where the user enabled dreaming, content all also returns dreams (kind dream): statements a model consolidated from history, such as repeated corrections and standing preferences; dreams returns them alone. A dream is a conclusion, not a source: read its cited record_id with show before relying on it, and prefer dreams whose evidence is supported. \
 Scope by repository, source, machine and time when known; diversify conversations by session and memories by document. \
 Inspect show/context before making claims; use session or hydrate when conversation chronology or several pages are needed. \
 Preserve machine and record/session/memory identifiers and memory content versions. next_offset advances records; \
@@ -51,6 +52,9 @@ struct MemexServer {
     root: Option<PathBuf>,
     workers: Arc<Semaphore>,
     tool_router: ToolRouter<Self>,
+    /// Redaction applied to every tool response before it leaves over HTTP. It also covers
+    /// records indexed before index-time redaction, and remote machines' results.
+    egress: Option<Arc<crate::redact::Redactor>>,
 }
 
 impl MemexServer {
@@ -59,7 +63,13 @@ impl MemexServer {
             root,
             workers: Arc::new(Semaphore::new(4)),
             tool_router: Self::tool_router(),
+            egress: None,
         }
+    }
+
+    fn with_egress_redaction(mut self, redactor: Option<Arc<crate::redact::Redactor>>) -> Self {
+        self.egress = redactor;
+        self
     }
 
     async fn blocking(
@@ -87,9 +97,24 @@ impl MemexServer {
             _ = context.ct.cancelled() => return failure("request cancelled"),
             result = task => result,
         } {
-            Ok(Ok(value)) => CallToolResult::structured(value),
-            Ok(Err(error)) => failure(error),
-            Err(error) => failure(error),
+            Ok(Ok(value)) => self.success(value),
+            Ok(Err(error)) => self.failure(error),
+            Err(error) => self.failure(error),
+        }
+    }
+
+    fn success(&self, mut value: Value) -> CallToolResult {
+        if let Some(redactor) = &self.egress {
+            redactor.redact_json(&mut value);
+        }
+        CallToolResult::structured(value)
+    }
+
+    fn failure(&self, error: impl std::fmt::Display) -> CallToolResult {
+        let message = error.to_string();
+        match &self.egress {
+            Some(redactor) => failure(redactor.redact(&message).text),
+            None => failure(message),
         }
     }
 }
@@ -101,7 +126,7 @@ fn failure(error: impl std::fmt::Display) -> CallToolResult {
 #[tool_router]
 impl MemexServer {
     #[tool(
-        description = "Search agent conversation history, memory documents, or both with lexical, hybrid or semantic queries. The content corpus and provider source are independent filters. Returns compact references; use show/context to verify conversation evidence and show with memory_id to read bounded memory content. Results diversify conversations by session and memories by document. May auto-index according to each machine's configuration.",
+        description = "Search agent conversation history, memory documents, or both with lexical, hybrid or semantic queries. The content corpus and provider source are independent filters. Returns compact references; use show/context to verify conversation evidence and show with memory_id to read bounded memory content. Results diversify conversations by session and memories by document. Where dreaming is enabled, content all also returns dreams (kind dream): consolidated statements with citations to their source records; content dreams returns them alone. Dreams are matched lexically from the local store. May auto-index according to each machine's configuration.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn search(
@@ -224,6 +249,13 @@ impl MemexServer {
             let budget = read_limit(request.max_chars)?;
             let page = request.page.validate()?;
             let (paths, config) = load(root)?;
+            if request.page.machine == machine::LOCAL_MACHINE_ID {
+                machine::refresh_local_sessions(
+                    &paths,
+                    &config,
+                    machine::session_keys(std::slice::from_ref(&page)),
+                )?;
+            }
             let result = machine::read_session_pages(
                 &paths,
                 &config,
@@ -461,6 +493,20 @@ fn hydrate_pages(root: Option<PathBuf>, request: HydrateRequest) -> Result<Value
         .map(PageRequest::validate)
         .collect::<Result<Vec<_>>>()?;
     let (paths, config) = load(root)?;
+    // One refresh covers every local request; when a strict refresh fails, only the local
+    // pages report it.
+    let local_refresh = machine::refresh_local_sessions(
+        &paths,
+        &config,
+        request
+            .requests
+            .iter()
+            .zip(&requests)
+            .filter(|(r, _)| r.machine == machine::LOCAL_MACHINE_ID)
+            .map(|(_, page)| (page.session_id.as_str(), page.source_path.as_str())),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
     let mut pages = Vec::new();
     let mut failures = Vec::new();
     let mut position = 0;
@@ -472,6 +518,16 @@ fn hydrate_pages(root: Option<PathBuf>, request: HydrateRequest) -> Result<Value
                 .take_while(|r| &r.machine == machine)
                 .count();
         let batch = &requests[position..end];
+        if machine == machine::LOCAL_MACHINE_ID
+            && let Some(error) = &local_refresh
+        {
+            for (i, page_request) in batch.iter().enumerate() {
+                failures.push(json!({"request_index":position+i,"machine":machine,"session_id":page_request.session_id,
+                    "source_path":page_request.source_path,"offset":page_request.offset,"error":error}));
+            }
+            position = end;
+            continue;
+        }
         match machine::read_session_pages(&paths, &config, machine, batch, Some(remaining)) {
             Ok(results) => {
                 for page in results {
@@ -701,6 +757,23 @@ mod request_tests {
         assert_eq!(request.max_chars, 400);
         assert_eq!(request.machine, "mini");
         assert!(request.selector.is_empty());
+    }
+
+    #[test]
+    fn http_egress_redacts_tool_responses() {
+        // Assembled at runtime so no contiguous fake token sits in the source.
+        let token = format!("gh{}{}", "p_", "Zz9".repeat(12));
+        let value = json!({"records": [{"text": format!("pushed with {token}")}]});
+        let local = MemexServer::new(None).success(value.clone());
+        assert_eq!(local.structured_content, Some(value.clone()));
+        let redactor = Arc::new(crate::redact::Redactor::new(&[], &[]).unwrap());
+        let http = MemexServer::new(None)
+            .with_egress_redaction(Some(redactor))
+            .success(value);
+        assert_eq!(
+            http.structured_content.unwrap()["records"][0]["text"],
+            "pushed with [redacted:github-token]"
+        );
     }
 
     #[test]

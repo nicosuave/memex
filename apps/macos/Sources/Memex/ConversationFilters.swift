@@ -70,7 +70,7 @@ enum ConversationOrigin: String, CaseIterable, Codable, Sendable {
 /// The provider filters supported by the bundled CLI, independent of which
 /// providers happen to appear in the first loaded page of conversations.
 enum ConversationProvider: String, CaseIterable, Codable, Sendable {
-    case all, claude, codex, cursor, opencode, pi, omp, openclaw, copilot, grok, hermes, jcode, muse, antigravity, bob, zcode, kiro, kilocode
+    case all, claude, codex, cursor, opencode, pi, omp, openclaw, copilot, grok, hermes, jcode, muse, antigravity, bob, zcode, kiro, kilocode, kimi, goose
     var argument: String? { self == .all ? nil : rawValue }
     var title: String {
         switch self {
@@ -89,9 +89,11 @@ enum ConversationProvider: String, CaseIterable, Codable, Sendable {
         case .muse: "Muse"
         case .antigravity: "Antigravity"
         case .bob: "IBM Bob"
-        case .zcode: "Zcode"
+        case .zcode: "ZCode"
         case .kiro: "Kiro"
         case .kilocode: "KiloCode"
+        case .kimi: "Kimi Code"
+        case .goose: "goose"
         }
     }
 }

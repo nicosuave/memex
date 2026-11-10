@@ -1331,3 +1331,25 @@ test("search filters the chart and clearing restores the baseline despite stale 
   await expect(page.getByText("200 sessions", { exact: true })).toBeVisible()
   expect(api.activityCalls().at(-1)?.searchParams.has("q")).toBe(false)
 })
+
+test("home tag filter scopes search and shows session tags", async ({ page }) => {
+  const api = await mockApi(page, (url) => {
+    if (url.pathname === "/api/tags")
+      return { body: { tags: [{ tag: "tooling", session_count: 1 }] } }
+    if (url.pathname === "/api/search")
+      return searchReply(
+        url.searchParams.get("tag") === "tooling"
+          ? [{ ...result("tagged", "ProjectA"), tags: ["tooling"] }]
+          : [result("plain")],
+      )
+  })
+  await page.goto("/")
+  const home = page.locator("#home-results")
+  await expect(home.getByText("Project plain", { exact: true })).toBeVisible()
+  await page.getByRole("combobox", { name: "Tag" }).click()
+  await page.getByRole("option", { name: "#tooling", exact: true }).click()
+  await expect(home.getByText("ProjectA", { exact: true })).toBeVisible()
+  await expect(home.getByText("codex · assistant · #tooling")).toBeVisible()
+  expect(api.searchCalls().at(-1)?.searchParams.get("tag")).toBe("tooling")
+  expect(new URL(page.url()).searchParams.get("tag")).toBe("tooling")
+})

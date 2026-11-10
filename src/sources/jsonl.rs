@@ -117,7 +117,7 @@ mod tests {
     // captured and retries a tail only when the JSON error is truncation, so that a late
     // `sessionKind: "bg"` marker can still reclassify the whole transcript. Its own tests
     // cover that contract.
-    const SOURCES: [&str; 9] = [
+    const SOURCES: [&str; 10] = [
         "codex",
         "codex_history",
         "pi",
@@ -127,6 +127,7 @@ mod tests {
         "grok",
         "copilot",
         "cursor",
+        "kimi",
     ];
 
     fn message(source: &str, text: &str) -> String {
@@ -150,6 +151,9 @@ mod tests {
             ),
             "copilot" => format!(r#"{{"type":"user.message","data":{{"content":{text}}}}}"#),
             "cursor" => format!(r#"{{"role":"user","message":{{"content":{text}}}}}"#),
+            "kimi" => format!(
+                r#"{{"type":"context.append_message","agentId":"main","message":{{"role":"user","origin":{{"kind":"user"}},"toolCalls":[],"content":[{{"type":"text","text":{text}}}]}}}}"#
+            ),
             _ => unreachable!(),
         }
     }
@@ -178,6 +182,7 @@ mod tests {
             "grok" => sources::grok::parse_index_records(path, state, false, &ids, emit),
             "copilot" => sources::copilot::parse_index_records(path, state, &ids, emit),
             "cursor" => sources::cursor::parse_index_records(path, 1, state, &ids, emit),
+            "kimi" => sources::kimi::parse_index_records(path, state, false, &ids, emit),
             _ => unreachable!(),
         }
         .unwrap()
@@ -221,6 +226,10 @@ mod tests {
             "cursor" => (
                 r#"{"role":"assistant","message":{"content":[{"type":"tool_use","id":"call","name":"shell","input":{"cmd":"pwd"}}]}}"#,
                 r#"{"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":"done"}]}}"#,
+            ),
+            "kimi" => (
+                r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.call","toolCallId":"call","name":"shell","args":{"cmd":"pwd"}}}"#,
+                r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"tool.result","toolCallId":"call","result":{"output":"done"}}}"#,
             ),
             _ => unreachable!(),
         }

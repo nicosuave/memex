@@ -18,7 +18,9 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     // Bumped for the worker-sandbox cwd rule: forces a full re-parse so
     // bare-/tmp-cwd sessions reclassify on next index.
     index: 5,
-    usage: 1,
+    // Bumped for the session `created_at` timestamp fallback and
+    // parent-derived sidechain flag on usage events.
+    usage: 2,
 };
 
 pub fn matches_path(path: &str) -> bool {
@@ -555,6 +557,14 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    // Mirror the index parser: child sessions carry a parent, and messages
+    // without their own timestamp fall back to the session's creation time.
+    let sidechain = value
+        .get("parent_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|parent| !parent.is_empty());
+    let default_timestamp = value.get("created_at").map(timestamp_millis).unwrap_or(0);
+
     let source_path: Arc<str> = Arc::from(path.to_string_lossy());
     let mut events = Vec::new();
     let messages = value.get("messages").and_then(|v| v.as_array());
@@ -595,7 +605,11 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let timestamp_ms = msg_obj.get("timestamp").map(timestamp_millis).unwrap_or(0);
+            let timestamp_ms = msg_obj
+                .get("timestamp")
+                .map(timestamp_millis)
+                .filter(|t| *t > 0)
+                .unwrap_or(default_timestamp);
 
             events.push(UsageEvent {
                 source: "jcode",
@@ -616,7 +630,7 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<Vec<UsageEvent>> {
                 dedupe_confidence: "exact",
                 conservative_undercount: false,
                 cache_chain_excluded: false,
-                sidechain: false,
+                sidechain,
                 permission_review: false,
                 source_order: 0,
             });
@@ -717,6 +731,45 @@ mod tests {
             Some("muse-spark-1.2-contributor")
         );
         assert_eq!(events[0].provider.as_deref(), Some("meta-muse"));
+        assert_eq!(events[0].timestamp_ms, 1788338819456);
+        assert!(!events[0].sidechain);
+    }
+
+    #[test]
+    fn child_session_usage_is_sidechain_and_falls_back_to_created_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_child.json");
+        let doc = serde_json::json!({
+            "id": "session_child",
+            "parent_id": "session_parent",
+            "created_at": 1788338812,
+            "messages": [{
+                "id": "msg_001",
+                "role": "assistant",
+                "content": "done",
+                "token_usage": {"input_tokens": 10, "output_tokens": 5},
+            }],
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let mut timestamps = Vec::new();
+        let next_doc_id = AtomicU64::new(1);
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &next_doc_id,
+            |rec| {
+                timestamps.push(rec.ts);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let events = parse_usage_file(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].sidechain);
+        assert_eq!(events[0].timestamp_ms, 1788338812000);
+        assert_eq!(timestamps, vec![events[0].timestamp_ms]);
     }
 
     fn kind_for_user_texts(texts: &[&str]) -> Option<String> {

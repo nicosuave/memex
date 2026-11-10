@@ -40,6 +40,13 @@ pub(crate) struct PartitionEntry {
     pub(crate) fact_generation: Option<String>,
     pub(crate) assembly: Arc<UsageAssembly>,
     pub(crate) warnings: Arc<Vec<String>>,
+    pub(crate) claude_sources: Vec<PathBuf>,
+}
+
+impl PartitionEntry {
+    pub(crate) fn matches_roots(&self, filter: SourceFilter, claude_sources: &[PathBuf]) -> bool {
+        filter != SourceFilter::Claude || self.claude_sources == claude_sources
+    }
 }
 
 /// Bounded per-source snapshot store. Alternating between filters reuses instead of
@@ -62,10 +69,10 @@ pub(crate) struct MergedSnapshot {
 pub(crate) struct MergedEntry {
     checked_at: Instant,
     snapshot: MergedSnapshot,
+    claude_sources: Vec<PathBuf>,
 }
 
-/// Retained combined views, keyed by cache alone: every combined query shares one
-/// merged order instead of each rebuilding a full assembly.
+/// Retained combined views share a merged order while their cache and Claude roots match.
 pub(crate) static MERGED: Lazy<Mutex<HashMap<Option<PathBuf>, MergedEntry>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -103,14 +110,17 @@ pub(crate) fn ensure_snapshot(query: &UsageQuery) -> Result<Snapshot> {
         // One-shot queries never publish or evict another caller's snapshot.
         return Ok(oneshot_snapshot(query));
     }
+    let claude_sources = query.claude_roots();
     match query.source {
         Some(filter) => {
-            let (assembly, warnings) = ensure_partition(filter, query.cache_path.clone(), ttl);
+            let (assembly, warnings) =
+                ensure_partition(filter, query.cache_path.clone(), ttl, &claude_sources);
             Ok(Snapshot::Partition(assembly, warnings))
         }
         None => Ok(Snapshot::Merged(ensure_merged(
             query.cache_path.clone(),
             ttl,
+            &claude_sources,
         ))),
     }
 }
@@ -126,12 +136,14 @@ pub(crate) fn oneshot_snapshot(query: &UsageQuery) -> Snapshot {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let assembly_start = Instant::now();
+    let claude_sources = query.claude_roots();
     let snapshot = match query.source {
         Some(filter) => {
-            let (assembly, warnings) = oneshot_partition(filter, query.cache_path.clone());
+            let (assembly, warnings) =
+                oneshot_partition(filter, query.cache_path.clone(), &claude_sources);
             Snapshot::Partition(assembly, warnings)
         }
-        None => Snapshot::Merged(oneshot_merged(&query.cache_path)),
+        None => Snapshot::Merged(oneshot_merged(&query.cache_path, &claude_sources)),
     };
     let events = match &snapshot {
         Snapshot::Partition(assembly, _) => assembly.len(),
@@ -149,37 +161,43 @@ pub(crate) fn oneshot_snapshot(query: &UsageQuery) -> Snapshot {
 fn oneshot_partition(
     filter: SourceFilter,
     cache_path: Option<PathBuf>,
+    claude_sources: &[PathBuf],
 ) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
     let key = (filter, cache_path.clone());
-    let previous = lock_partitions().get(&key).map(|entry| {
-        (
-            entry.fingerprint.clone(),
-            entry.fact_generation.clone(),
-            entry.assembly.clone(),
-            entry.warnings.clone(),
-        )
-    });
+    let previous = lock_partitions()
+        .get(&key)
+        .filter(|entry| entry.matches_roots(filter, claude_sources))
+        .map(|entry| {
+            (
+                entry.fingerprint.clone(),
+                entry.fact_generation.clone(),
+                entry.assembly.clone(),
+                entry.warnings.clone(),
+            )
+        });
     if let Some((fingerprint, generation, assembly, warnings)) = previous
         && check_snapshot_valid(
             filter,
             key.1.as_deref(),
             &fingerprint,
             generation.as_deref(),
+            claude_sources,
         )
     {
         return (assembly, warnings);
     }
-    let entry = rebuild_partition(filter, &cache_path, None, None);
+    let entry = rebuild_partition(filter, &cache_path, None, None, claude_sources);
     (entry.assembly, entry.warnings)
 }
 
 /// Fresh merged view without retention: per-source reuse-or-rebuild plus a
 /// merged order, never published to the merged store.
-fn oneshot_merged(cache_path: &Option<PathBuf>) -> MergedSnapshot {
+fn oneshot_merged(cache_path: &Option<PathBuf>, claude_sources: &[PathBuf]) -> MergedSnapshot {
     let mut parts = Vec::with_capacity(SCANNERS.len());
     let mut warnings = Vec::new();
     for (filter, _) in SCANNERS {
-        let (assembly, partition_warnings) = oneshot_partition(filter, cache_path.clone());
+        let (assembly, partition_warnings) =
+            oneshot_partition(filter, cache_path.clone(), claude_sources);
         warnings.extend(partition_warnings.iter().cloned());
         parts.push(assembly);
     }
@@ -196,6 +214,7 @@ pub(crate) fn ensure_partition(
     filter: SourceFilter,
     cache_path: Option<PathBuf>,
     ttl: Duration,
+    claude_sources: &[PathBuf],
 ) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
     let key = (filter, cache_path);
     loop {
@@ -203,7 +222,10 @@ pub(crate) fn ensure_partition(
             let lock_start = Instant::now();
             let store = lock_partitions();
             usage_timing(lock_start, || "lock wait".to_string());
-            match store.get(&key) {
+            match store
+                .get(&key)
+                .filter(|entry| entry.matches_roots(filter, claude_sources))
+            {
                 Some(entry) if entry.checked_at.elapsed() < ttl => {
                     return (entry.assembly.clone(), entry.warnings.clone());
                 }
@@ -216,11 +238,12 @@ pub(crate) fn ensure_partition(
                 // Another thread may have refreshed between our check and acquiring
                 // the refresh lock; re-check before doing any I/O.
                 if let Some(entry) = lock_partitions().get(&key)
+                    && entry.matches_roots(filter, claude_sources)
                     && entry.checked_at.elapsed() < ttl
                 {
                     return (entry.assembly.clone(), entry.warnings.clone());
                 }
-                return refresh_partition(&key);
+                return refresh_partition(&key, claude_sources);
             }
             Err(_) => {
                 // A refresh is already running: serve the previous snapshot instead
@@ -238,12 +261,16 @@ pub(crate) fn ensure_partition(
 }
 
 /// Revalidates or rebuilds one partition. Callers must hold `USAGE_SCAN_LOCK`.
-pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
+pub(crate) fn refresh_partition(
+    key: &PartitionKey,
+    claude_sources: &[PathBuf],
+) -> (Arc<UsageAssembly>, Arc<Vec<String>>) {
     let (filter, cache_path) = (key.0, key.1.clone());
     let previous = {
         let store = lock_partitions();
         store
             .get(key)
+            .filter(|entry| entry.matches_roots(filter, claude_sources))
             .map(|entry| (entry.fingerprint.clone(), entry.fact_generation.clone()))
     };
     let check_start = Instant::now();
@@ -253,6 +280,7 @@ pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<
             cache_path.as_deref(),
             fingerprint,
             generation.as_deref(),
+            claude_sources,
         )
     });
     usage_timing(check_start, || {
@@ -274,7 +302,7 @@ pub(crate) fn refresh_partition(key: &PartitionKey) -> (Arc<UsageAssembly>, Arc<
     // Rebuild. The previous snapshot stays published while scanning, so
     // concurrent queries keep serving it; it is taken for buffer reuse only for
     // the compaction window below.
-    let entry = rebuild_partition(filter, &cache_path, Some(key), None);
+    let entry = rebuild_partition(filter, &cache_path, Some(key), None, claude_sources);
     let result = (entry.assembly.clone(), entry.warnings.clone());
     let mut store = lock_partitions();
     if store.len() >= MAX_PARTITIONS {
@@ -290,15 +318,19 @@ pub(crate) fn populate_after_failed_validation(
     filter: SourceFilter,
     cache_path: &Path,
     fingerprint: FileFingerprint,
+    claude_sources: &[PathBuf],
 ) {
     let Ok(_refresh) = USAGE_SCAN_LOCK.try_lock() else {
         return;
     };
     let key = (filter, Some(cache_path.to_path_buf()));
-    if lock_partitions().contains_key(&key) {
+    if lock_partitions()
+        .get(&key)
+        .is_some_and(|entry| entry.matches_roots(filter, claude_sources))
+    {
         return;
     }
-    let entry = rebuild_partition(filter, &key.1, None, Some(fingerprint));
+    let entry = rebuild_partition(filter, &key.1, None, Some(fingerprint), claude_sources);
     let mut store = lock_partitions();
     if store.len() >= MAX_PARTITIONS {
         evict_oldest(&mut store, &key, |entry| entry.checked_at);
@@ -315,6 +347,7 @@ fn rebuild_partition(
     cache_path: &Option<PathBuf>,
     previous_key: Option<&PartitionKey>,
     observed_fingerprint: Option<FileFingerprint>,
+    claude_sources: &[PathBuf],
 ) -> PartitionEntry {
     let mut warnings = Vec::new();
     let mut cache = match cache_path
@@ -337,13 +370,15 @@ fn rebuild_partition(
     });
     let (events, fingerprint) = match (cache.as_mut(), stored_warnings) {
         (Some(cache), Some(stored)) if !reconciles_cross_file(filter) => {
-            match refresh_partition_from_facts(filter, cache, stored, &mut warnings) {
+            match refresh_partition_from_facts(filter, cache, stored, &mut warnings, claude_sources)
+            {
                 Ok(done) => done,
                 Err(_) => legacy_refresh_partition(
                     filter,
                     Some(cache),
                     &mut warnings,
                     observed_fingerprint,
+                    claude_sources,
                 ),
             }
         }
@@ -351,7 +386,13 @@ fn rebuild_partition(
         // sources need raw reconciliation to recover deleted/weakened winners;
         // skip rediscovery merely to reject their facts path. Cursor also needs
         // current transcript-derived project attribution on unchanged DB rows.
-        (cache, _) => legacy_refresh_partition(filter, cache, &mut warnings, observed_fingerprint),
+        (cache, _) => legacy_refresh_partition(
+            filter,
+            cache,
+            &mut warnings,
+            observed_fingerprint,
+            claude_sources,
+        ),
     };
     let fact_generation = cache
         .as_ref()
@@ -373,6 +414,7 @@ fn rebuild_partition(
         warnings: Arc::new(warnings),
         fingerprint,
         fact_generation,
+        claude_sources: claude_sources.to_vec(),
     }
 }
 
@@ -386,6 +428,7 @@ pub(crate) fn legacy_refresh_partition(
     mut cache: Option<&mut UsageCache>,
     warnings: &mut Vec<String>,
     observed_fingerprint: Option<FileFingerprint>,
+    claude_sources: &[PathBuf],
 ) -> (Vec<UsageEvent>, FileFingerprint) {
     let scanner = SCANNERS
         .iter()
@@ -393,8 +436,15 @@ pub(crate) fn legacy_refresh_partition(
         .expect("scanner for every source filter");
     // Stamp the inputs before scanning. A source that changes during the scan
     // must not get a checkpoint describing bytes the assembly never read.
-    let fingerprint = observed_fingerprint.unwrap_or_else(|| discovery_fingerprint(filter));
-    let mut events = run_partition_scanner(filter, scanner, warnings, cache.as_deref_mut());
+    let fingerprint =
+        observed_fingerprint.unwrap_or_else(|| discovery_fingerprint(filter, claude_sources));
+    let mut events = run_partition_scanner(
+        filter,
+        scanner,
+        warnings,
+        cache.as_deref_mut(),
+        claude_sources,
+    );
     publish_scan_progress(None);
     let sort_start = Instant::now();
     sort_usage_events(&mut events);
@@ -409,7 +459,7 @@ pub(crate) fn legacy_refresh_partition(
         if let Err(error) = written {
             warnings.push(format!("{} facts write failed: {error:#}", filter.as_str()));
             let _ = cache.invalidate_facts(filter.as_str());
-        } else if fingerprint != discovery_fingerprint(filter) {
+        } else if fingerprint != discovery_fingerprint(filter, claude_sources) {
             let _ = cache.invalidate_facts(filter.as_str());
         }
         usage_timing(facts_start, || {
@@ -430,6 +480,7 @@ fn reconciles_cross_file(filter: SourceFilter) -> bool {
             | SourceFilter::Cursor
             | SourceFilter::Copilot
             | SourceFilter::Opencode
+            | SourceFilter::Kiro
     )
 }
 
@@ -443,10 +494,11 @@ pub(crate) fn refresh_partition_from_facts(
     cache: &mut UsageCache,
     stored_warnings: Vec<String>,
     warnings: &mut Vec<String>,
+    claude_sources: &[PathBuf],
 ) -> Result<(Vec<UsageEvent>, FileFingerprint)> {
     let name = filter.as_str();
     let spec = source_spec(filter);
-    let files = source_files(filter);
+    let files = source_files(filter, claude_sources);
     let parents = (filter == SourceFilter::Codex)
         .then(|| crate::sources::codex::UsageParentIndex::new(&files));
     let now_ms = epoch_ms_now();
@@ -583,23 +635,19 @@ pub(crate) fn refresh_partition_from_facts(
             changed.push(event.clone());
         }
     }
-    // Stored warnings describe unchanged files; new warnings describe this
-    // refresh's parses. Union them deduplicated (see write_fact_sync).
-    let mut stored = stored_warnings;
-    for warning in warnings.iter() {
-        if !stored.contains(warning) {
-            stored.push(warning.clone());
-        }
-    }
+    // This refresh's warnings replace the stored ones (see write_fact_sync):
+    // a file that failed to stat or parse never becomes a hit, so every
+    // per-file warning is recomputed above, and transient cache failures from
+    // an earlier build no longer apply.
     let upsert_start = Instant::now();
-    if !removed.is_empty() {
+    if !removed.is_empty() || *warnings != stored_warnings {
         cache
             .upsert_file_facts(
                 filter,
                 &removed.into_iter().collect::<Vec<_>>(),
                 &changed,
                 &fingerprint,
-                &stored,
+                warnings,
             )
             .map_err(|_| anyhow::anyhow!("{name} facts write failed"))?;
     }
@@ -610,18 +658,24 @@ pub(crate) fn refresh_partition_from_facts(
             changed.len()
         )
     });
-    *warnings = stored;
     Ok((events, fingerprint))
 }
 
 /// Returns the fresh merged view over all source partitions, rebuilding the order
 /// only when some partition changed. Combined queries reference the same per-source
 /// snapshots instead of requiring a separate full assembly.
-pub(crate) fn ensure_merged(cache_path: Option<PathBuf>, ttl: Duration) -> MergedSnapshot {
+pub(crate) fn ensure_merged(
+    cache_path: Option<PathBuf>,
+    ttl: Duration,
+    claude_sources: &[PathBuf],
+) -> MergedSnapshot {
     loop {
         let stale = {
             let store = lock_merged();
-            match store.get(&cache_path) {
+            match store
+                .get(&cache_path)
+                .filter(|entry| entry.claude_sources == claude_sources)
+            {
                 Some(entry) if entry.checked_at.elapsed() < ttl => {
                     return clone_merged(&entry.snapshot);
                 }
@@ -632,11 +686,12 @@ pub(crate) fn ensure_merged(cache_path: Option<PathBuf>, ttl: Duration) -> Merge
         match USAGE_SCAN_LOCK.try_lock() {
             Ok(_refresh) => {
                 if let Some(entry) = lock_merged().get(&cache_path)
+                    && entry.claude_sources == claude_sources
                     && entry.checked_at.elapsed() < ttl
                 {
                     return clone_merged(&entry.snapshot);
                 }
-                return refresh_merged(&cache_path);
+                return refresh_merged(&cache_path, claude_sources);
             }
             Err(_) => {
                 if let Some(stale) = stale {
@@ -661,17 +716,22 @@ pub(crate) fn clone_merged(snapshot: &MergedSnapshot) -> MergedSnapshot {
 /// Brings every partition up to date, then reuses or rebuilds the merged order.
 /// Callers must hold `USAGE_SCAN_LOCK`; partition refreshes reuse the same lock
 /// instead of their own try-lock, so this never deadlocks.
-pub(crate) fn refresh_merged(cache_path: &Option<PathBuf>) -> MergedSnapshot {
+pub(crate) fn refresh_merged(
+    cache_path: &Option<PathBuf>,
+    claude_sources: &[PathBuf],
+) -> MergedSnapshot {
     let mut parts = Vec::with_capacity(SCANNERS.len());
     let mut warnings = Vec::new();
     for (filter, _) in SCANNERS {
-        let (assembly, partition_warnings) = refresh_partition(&(filter, cache_path.clone()));
+        let (assembly, partition_warnings) =
+            refresh_partition(&(filter, cache_path.clone()), claude_sources);
         warnings.extend(partition_warnings.iter().cloned());
         parts.push(assembly);
     }
     let current: Vec<Arc<UsageAssembly>> = parts;
     let mut store = lock_merged();
     if let Some(entry) = store.get_mut(cache_path)
+        && entry.claude_sources == claude_sources
         && entry.snapshot.parts.len() == current.len()
         && entry
             .snapshot
@@ -697,6 +757,7 @@ pub(crate) fn refresh_merged(cache_path: &Option<PathBuf>) -> MergedSnapshot {
         MergedEntry {
             checked_at: Instant::now(),
             snapshot: clone_merged(&snapshot),
+            claude_sources: claude_sources.to_vec(),
         },
     );
     snapshot
@@ -741,16 +802,18 @@ pub(crate) fn check_partition_valid(
     filter: SourceFilter,
     cache_path: Option<&Path>,
     previous_fingerprint: Option<&[(String, u64, i64)]>,
+    claude_sources: &[PathBuf],
 ) -> bool {
-    valid_partition_fingerprint(filter, cache_path, previous_fingerprint).is_some()
+    valid_partition_fingerprint(filter, cache_path, previous_fingerprint, claude_sources).is_some()
 }
 
 pub(crate) fn valid_partition_fingerprint(
     filter: SourceFilter,
     cache_path: Option<&Path>,
     previous_fingerprint: Option<&[(String, u64, i64)]>,
+    claude_sources: &[PathBuf],
 ) -> Option<FileFingerprint> {
-    let observed = validate_partition(filter, cache_path, previous_fingerprint)?;
+    let observed = validate_partition(filter, cache_path, previous_fingerprint, claude_sources)?;
     observed.valid.then_some(observed.fingerprint)
 }
 
@@ -764,8 +827,9 @@ pub(crate) fn validate_partition(
     filter: SourceFilter,
     cache_path: Option<&Path>,
     previous_fingerprint: Option<&[(String, u64, i64)]>,
+    claude_sources: &[PathBuf],
 ) -> Option<PartitionValidation> {
-    let files = source_files(filter);
+    let files = source_files(filter, claude_sources);
     let mut fingerprint = Vec::with_capacity(files.len());
     let mut observed_metadata = Vec::with_capacity(files.len());
     for path in &files {
@@ -863,8 +927,9 @@ fn check_snapshot_valid(
     cache_path: Option<&Path>,
     fingerprint: &FileFingerprint,
     generation: Option<&str>,
+    claude_sources: &[PathBuf],
 ) -> bool {
-    if !check_partition_valid(filter, cache_path, Some(fingerprint)) {
+    if !check_partition_valid(filter, cache_path, Some(fingerprint), claude_sources) {
         return false;
     }
     let Some(path) = cache_path else {
@@ -894,10 +959,13 @@ fn append_source_context(filter: SourceFilter, fingerprint: &mut FileFingerprint
 }
 
 /// Current discovery fingerprint for one source, sorted by path.
-pub(crate) fn discovery_fingerprint(filter: SourceFilter) -> FileFingerprint {
+pub(crate) fn discovery_fingerprint(
+    filter: SourceFilter,
+    claude_sources: &[PathBuf],
+) -> FileFingerprint {
     let start = Instant::now();
     let mut fingerprint = Vec::new();
-    for path in source_files(filter) {
+    for path in source_files(filter, claude_sources) {
         if let Ok(metadata) = usage_file_metadata(&path) {
             fingerprint.push((path.to_string_lossy().to_string(), metadata.0, metadata.1));
         }

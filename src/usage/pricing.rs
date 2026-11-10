@@ -304,7 +304,24 @@ fn rates_for(provider: Option<&str>, model: &str) -> Option<Rates> {
 
     let anthropic = provider.is_empty() || provider.contains("anthropic");
     if anthropic {
+        if exact_or_snapshot("claude-fable-5-1") {
+            return Some(claude_rates(10_000, 12_500, 20_000, 250, 50_000));
+        }
+        if exact_or_snapshot("claude-fable-5") {
+            return Some(claude_rates(10_000, 12_500, 20_000, 1_000, 50_000));
+        }
+        if exact_or_snapshot("claude-opus-5-5") {
+            return Some(claude_rates(4_000, 5_000, 8_000, 200, 20_000));
+        }
+        if exact_or_snapshot("claude-sonnet-5-5") {
+            return Some(claude_rates(2_000, 2_500, 4_000, 200, 10_000));
+        }
+        if exact_or_snapshot("claude-haiku-5-5") {
+            // Prompts up to 100K tokens; longer prompts bill at five times these rates.
+            return Some(claude_rates(100, 125, 200, 10, 500));
+        }
         if [
+            "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-opus-4-6",
@@ -632,6 +649,42 @@ mod tests {
         };
         // 100*3 + 40*.3 + 20*3.75 + 10*6 + 20*15 = $0.000747
         assert_eq!(calculated_cost_nanos(&event), Some(747_000));
+    }
+
+    #[test]
+    fn current_claude_models_are_priced_without_matching_their_predecessors() {
+        let cost = |model: &str| {
+            let event = UsageEvent {
+                source: "claude",
+                source_path: "x".into(),
+                source_record_id: None,
+                session_id: None,
+                request_id: None,
+                message_id: None,
+                timestamp_ms: 0,
+                project: None,
+                provider: Some("anthropic".into()),
+                model: Some(model.into()),
+                tokens: TokenBuckets::disjoint(1_000_000, 0, 0, 0),
+                credits: None,
+                token_usage_available: true,
+                source_cost_usd: None,
+                cost_authoritative: false,
+                dedupe_confidence: "exact",
+                conservative_undercount: false,
+                cache_chain_excluded: false,
+                sidechain: false,
+                permission_review: false,
+                source_order: 0,
+            };
+            calculated_cost_nanos(&event)
+        };
+        // One million uncached input tokens, priced at each model's list input rate.
+        assert_eq!(cost("claude-opus-5-5"), Some(4_000_000_000));
+        assert_eq!(cost("claude-opus-5"), Some(5_000_000_000));
+        assert_eq!(cost("claude-fable-5-1"), Some(10_000_000_000));
+        assert_eq!(cost("claude-sonnet-5-5"), Some(2_000_000_000));
+        assert_eq!(cost("claude-haiku-5-5"), Some(100_000_000));
     }
 
     #[test]

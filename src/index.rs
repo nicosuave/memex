@@ -1017,9 +1017,15 @@ impl SearchIndex {
         fsync_directory(&pending.index_root.join(GENERATIONS_DIR))?;
         atomic_write_current(&pending.index_root, &pending.generation_name)?;
         pending.published.store(true, AtomicOrdering::Release);
-        prune_superseded_generations(&pending.index_root, &pending.generation_name)?;
-        prune_legacy_index_files(&pending.index_root)?;
-        storage::collect_unreachable(&pending.index_root, false)?;
+        // CURRENT already names the new generation, so publication has succeeded. Reporting a
+        // cleanup failure as an error would make callers redo the ingest, leaving another
+        // unreclaimable generation behind on every retry.
+        let cleanup = prune_superseded_generations(&pending.index_root, &pending.generation_name)
+            .and_then(|()| prune_legacy_index_files(&pending.index_root))
+            .and_then(|()| storage::collect_unreachable(&pending.index_root, false).map(drop));
+        if let Err(error) = cleanup {
+            eprintln!("warning: index cleanup failed; run `memex index gc`: {error:#}");
+        }
         Ok(())
     }
 
@@ -1529,7 +1535,8 @@ impl SearchIndex {
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.fields.session_id, session_id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
-        let limit = searcher.num_docs() as usize;
+        // TopDocs rejects a zero limit, which an empty index would otherwise pass.
+        let limit = (searcher.num_docs() as usize).max(1);
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
         let mut records = Vec::with_capacity(top_docs.len());
         for (_score, addr) in top_docs {
@@ -1537,6 +1544,31 @@ impl SearchIndex {
             records.push(record_from_doc(&self.fields, &doc));
         }
         Ok(records)
+    }
+
+    /// Every source path indexed under `session_id`, read from identity fast fields where the
+    /// index has them.
+    pub fn session_source_paths(&self, session_id: &str) -> Result<HashSet<String>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let schema = self.index.schema();
+        let fast_session_identity = self.fields.source.is_some_and(|source| {
+            [source, self.fields.session_id, self.fields.source_path]
+                .into_iter()
+                .all(|field| schema.get_field_entry(field).is_fast())
+        });
+        let query = session_query(&self.fields, session_id, None, None, None);
+        let scopes = searcher.search(
+            &query,
+            &SessionScopeCollector {
+                fields: self.fields.clone(),
+                fast_session_identity,
+            },
+        )??;
+        Ok(scopes
+            .into_iter()
+            .map(|(_, _, source_path)| source_path)
+            .collect())
     }
 
     /// Resolve up to two exact identities for a session with bounded document hydration.
@@ -3027,6 +3059,26 @@ impl Query for UnscoredQuery {
     }
 }
 
+/// Parse free text as query syntax, or as literal words when it is not valid syntax.
+/// Pasted URLs, `TODO:` notes, `std::fs` paths, and stray quotes would otherwise read
+/// as unknown fields or unbalanced phrases and fail the whole search.
+pub(crate) fn parse_text_query(
+    parser: &tantivy::query::QueryParser,
+    text: &str,
+) -> Result<Box<dyn Query>> {
+    if let Ok(query) = parser.parse_query(text) {
+        return Ok(query);
+    }
+    let literals = text
+        .split_whitespace()
+        .map(|word| word.replace(['"', '\\'], ""))
+        .filter(|word| !word.is_empty())
+        .map(|word| format!("\"{word}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(parser.parse_query(&literals)?)
+}
+
 fn build_query(
     fields: &IndexFields,
     options: &QueryOptions,
@@ -3038,7 +3090,7 @@ fn build_query(
         clauses.push((Occur::Must, Box::new(AllQuery)));
     } else {
         let parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
-        let text_query = parser.parse_query(&options.query)?;
+        let text_query = parse_text_query(&parser, &options.query)?;
         clauses.push((Occur::Must, text_query));
     }
 
@@ -4172,6 +4224,38 @@ mod tests {
     }
 
     #[test]
+    fn publishing_survives_a_failing_post_publication_cleanup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
+        let mut writer = first.writer().expect("first writer");
+        first
+            .add_record(&mut writer, &test_record(1, "first"))
+            .expect("add first");
+        writer.commit().expect("commit first");
+        writer.wait_merging_threads().expect("finish first writer");
+        first.publish_generation().expect("publish first");
+        fs::write(tmp.path().join("segments").join("stray"), b"unexpected").unwrap();
+
+        let second = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("second generation");
+        let mut writer = second.writer().expect("second writer");
+        second
+            .add_record(&mut writer, &test_record(2, "second"))
+            .expect("add second");
+        writer.commit().expect("commit second");
+        writer.wait_merging_threads().expect("finish second writer");
+        second
+            .publish_generation()
+            .expect("cleanup failure must not fail publication");
+        assert_eq!(
+            SearchIndex::open_or_create(tmp.path())
+                .expect("reader after publish")
+                .doc_count()
+                .expect("count after publish"),
+            2
+        );
+    }
+
+    #[test]
     fn publishing_generation_atomically_advances_new_readers() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = SearchIndex::open_or_create_for_ingest(tmp.path()).expect("first generation");
@@ -4575,6 +4659,28 @@ mod tests {
         assert_eq!(search_text_count(&index, "migrated"), 1);
         assert_eq!(search_text_count(&index, "Databases"), 1);
         assert_eq!(search_text_count(&index, "rollback"), 0);
+    }
+
+    #[test]
+    fn text_that_is_not_query_syntax_searches_as_literal_words() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(
+                &mut writer,
+                &test_record(
+                    1,
+                    "see https://github.com/foo/bar and TODO: fix std::fs::read",
+                ),
+            )
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "https://github.com/foo/bar"), 1);
+        assert_eq!(search_text_count(&index, "TODO: fix"), 1);
+        assert_eq!(search_text_count(&index, "std::fs::read"), 1);
+        assert_eq!(search_text_count(&index, "it's \"unclosed fix"), 1);
     }
 
     #[test]

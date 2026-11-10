@@ -7,8 +7,9 @@ use directories::BaseDirs;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fmt;
+use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -45,41 +46,30 @@ impl Paths {
     }
 }
 
+/// Claude Code `projects` directories named by the environment: the comma-separated
+/// `CLAUDE_CONFIG_DIR`, else `~/.claude/projects` and `~/.config/claude/projects`.
+/// `UserConfig::claude_sources` applies the configured `claude_paths` first.
 pub fn default_claude_sources() -> Vec<PathBuf> {
     if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        let mut roots: Vec<_> = value
-            .to_string_lossy()
-            .split(',')
-            .filter_map(|value| {
-                let value = value.trim();
-                if value.is_empty() {
-                    None
-                } else {
-                    let root = PathBuf::from(value);
-                    Some(
-                        if root.file_name().and_then(|name| name.to_str()) == Some("projects") {
-                            root
-                        } else {
-                            root.join("projects")
-                        },
-                    )
-                }
-            })
-            .collect();
-        let mut seen = HashSet::new();
-        roots.retain(|root| seen.insert(root.clone()));
+        let roots = unique_roots(
+            value
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| claude_projects_dir(PathBuf::from(value)))
+                .collect(),
+        );
         if !roots.is_empty() {
             return roots;
         }
     }
 
-    let home = directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    vec![
+    let home = crate::sources::common::home();
+    unique_roots(vec![
         home.join(".claude").join("projects"),
         home.join(".config").join("claude").join("projects"),
-    ]
+    ])
 }
 
 pub fn default_claude_source() -> PathBuf {
@@ -87,6 +77,89 @@ pub fn default_claude_source() -> PathBuf {
         .into_iter()
         .next()
         .expect("default Claude sources are never empty")
+}
+
+/// Expand `claude_paths` entries. `~` is the home directory, and an entry names a Claude
+/// config directory or its `projects` directory. A glob entry yields the matching
+/// directories that hold a `projects` directory now; a literal entry is kept even while it
+/// is missing, like the defaults, so the watcher notices when it appears.
+fn expand_claude_paths(patterns: &[String], home: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for pattern in patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+    {
+        let path = match pattern.strip_prefix('~') {
+            Some("") => home.to_path_buf(),
+            Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
+            _ => PathBuf::from(pattern),
+        };
+        if path_has_glob(&path) {
+            roots.extend(
+                glob_directories(&path)
+                    .into_iter()
+                    .map(claude_projects_dir)
+                    .filter(|root| root.is_dir()),
+            );
+        } else {
+            roots.push(claude_projects_dir(path));
+        }
+    }
+    unique_roots(roots)
+}
+
+fn claude_projects_dir(root: PathBuf) -> PathBuf {
+    if root.file_name().and_then(|name| name.to_str()) == Some("projects") {
+        root
+    } else {
+        root.join("projects")
+    }
+}
+
+/// Drop roots that repeat an earlier one. Resolved paths are compared, so a symlinked config
+/// directory is read once.
+fn unique_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    roots.retain(|root| seen.insert(fs::canonicalize(root).unwrap_or_else(|_| root.clone())));
+    roots
+}
+
+fn component_has_glob(component: &str) -> bool {
+    component.contains(['*', '?', '[', '{'])
+}
+
+fn path_has_glob(path: &Path) -> bool {
+    path.components()
+        .any(|component| component_has_glob(&component.as_os_str().to_string_lossy()))
+}
+
+/// Directories matching `pattern`, resolving one glob component at a time. Components are
+/// validated when the config loads.
+fn glob_directories(pattern: &Path) -> Vec<PathBuf> {
+    let mut matches = vec![PathBuf::new()];
+    for component in pattern.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if !component_has_glob(&text) {
+            for path in &mut matches {
+                path.push(component);
+            }
+            continue;
+        }
+        let Ok(glob) = globset::Glob::new(&text) else {
+            return Vec::new();
+        };
+        let matcher = glob.compile_matcher();
+        matches = matches
+            .iter()
+            .filter_map(|directory| fs::read_dir(directory).ok())
+            .flat_map(|entries| entries.flatten())
+            .filter(|entry| matcher.is_match(entry.file_name()) && entry.path().is_dir())
+            .map(|entry| entry.path())
+            .collect();
+    }
+    matches.sort();
+    matches
 }
 
 const DEFAULT_EMBEDDING_TIMEOUT_SECS: u64 = 60;
@@ -236,9 +309,13 @@ pub struct UserConfig {
     pub cudnn_library_paths: Option<Vec<PathBuf>>,
     /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
     pub compute_units: Option<String>,
-    /// Scan cache TTL in seconds. If a scan was done within this time,
-    /// skip re-scanning on search. Default: 3600 seconds (1 hour).
+    /// Scan cache TTL in seconds. Under "bounded" freshness, a read whose journal replay
+    /// cannot name the changes walks only once the last walk is older than this.
+    /// Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
+    /// How far reads may trail the transcripts on disk: "strict", "bounded" or "none".
+    /// Default: "bounded", or "none" when `auto_index_on_search` is false.
+    pub index_freshness: Option<String>,
     /// Maximum indexed bytes for tool-call input.
     pub max_indexed_tool_input_bytes: Option<usize>,
     /// Maximum indexed bytes for tool-call output.
@@ -300,11 +377,21 @@ pub struct UserConfig {
     pub bob_resume_cmd: Option<String>,
     /// Resume command template for KiloCode CLI sessions.
     pub kilocode_resume_cmd: Option<String>,
+    /// Resume command template for Kimi Code CLI sessions.
+    pub kimi_resume_cmd: Option<String>,
+    /// Resume command template for goose sessions.
+    pub goose_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
     pub herdr_resume: Option<String>,
+    /// How resume behaves inside a Rex terminal: "tab" (default), "split", or "off".
+    pub rex_resume: Option<String>,
     /// Glob patterns matched against transcript source paths; matched files are
     /// never indexed. Applied during source discovery, not at query time.
     pub exclude_paths: Option<Vec<String>>,
+    /// Claude Code config or `projects` directories to read, replacing `CLAUDE_CONFIG_DIR`
+    /// and the defaults. Entries may start with `~/` and use one-level globs, such as
+    /// `~/.claude-profiles/*`, which every full scan re-expands.
+    pub claude_paths: Option<Vec<String>>,
     /// Multi-machine search and control defaults.
     #[serde(default)]
     pub multi_machine: MultiMachineConfig,
@@ -314,6 +401,105 @@ pub struct UserConfig {
     /// Shared MCP HTTP configuration for standalone and background service modes.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Secret redaction settings.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
+    /// Dream settings.
+    #[serde(default)]
+    pub dream: DreamConfig,
+}
+
+/// `[redaction]`: secrets removed from indexed transcript content and from content that leaves
+/// the machine. Source transcripts are never modified.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RedactionConfig {
+    /// Redact built-in credential formats and withhold credential tool output at index time
+    /// (default false). While enabled, changing any setting here reparses indexed history.
+    pub enabled: Option<bool>,
+    /// Extra regexes. A `secret` capture group limits replacement to that span.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Extra globs for files whose reads and writes are withheld: no `/` matches a file name,
+    /// otherwise a path (`~/` is the home directory).
+    #[serde(default)]
+    pub sensitive_files: Vec<String>,
+    /// Redact MCP HTTP responses and remote embedding requests (default true), independent
+    /// of `enabled`.
+    pub egress: Option<bool>,
+}
+
+/// `[dream]`: the offline pass that consolidates agent history into cited dreams. Opt-in:
+/// nothing here has any effect until `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DreamConfig {
+    /// Master switch (default false). Off, no dream run starts, the daemon schedules none,
+    /// and search returns no dreams, whatever the other keys say.
+    pub enabled: Option<bool>,
+    /// Let the daemon start dream runs when the gate below opens (default false). Needs
+    /// `enabled`.
+    pub auto: Option<bool>,
+    /// Agent CLI that judges a dream run: "claude" or "codex". Unset picks whichever is on PATH.
+    pub executor: Option<String>,
+    /// Custom executor argv, replacing `executor`: prompt on stdin, answer on stdout.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Model name passed to the claude or codex CLI.
+    pub model: Option<String>,
+    /// Longest an executor run may take, in seconds (default 900).
+    pub timeout_secs: Option<u64>,
+    /// New sessions since the last dream run before the daemon starts one (default 5).
+    pub min_new_sessions: Option<usize>,
+    /// Shortest time between daemon-started runs, in hours (default 24).
+    pub min_interval_hours: Option<u64>,
+    /// Minutes without session activity before the daemon starts a run (default 30).
+    pub idle_minutes: Option<u64>,
+    /// How far back the first run reads, in days (default 7).
+    pub lookback_days: Option<u64>,
+    /// Most sessions one run reads, newest first (default 40).
+    pub max_sessions: Option<usize>,
+    /// Prompt size budget in characters (default 240000).
+    pub max_prompt_chars: Option<usize>,
+    /// Machines whose sessions a run reads (default: this machine only).
+    #[serde(default)]
+    pub machines: Vec<String>,
+}
+
+impl DreamConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn auto(&self) -> bool {
+        self.auto.unwrap_or(false)
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.unwrap_or(900).max(10))
+    }
+
+    pub fn min_new_sessions(&self) -> usize {
+        self.min_new_sessions.unwrap_or(5).max(1)
+    }
+
+    pub fn min_interval(&self) -> Duration {
+        Duration::from_secs(self.min_interval_hours.unwrap_or(24) * 3600)
+    }
+
+    pub fn idle(&self) -> Duration {
+        Duration::from_secs(self.idle_minutes.unwrap_or(30) * 60)
+    }
+
+    pub fn lookback(&self) -> Duration {
+        Duration::from_secs(self.lookback_days.unwrap_or(7).max(1) * 86_400)
+    }
+
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions.unwrap_or(40).clamp(1, 500)
+    }
+
+    pub fn max_prompt_chars(&self) -> usize {
+        self.max_prompt_chars.unwrap_or(240_000).max(20_000)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -403,7 +589,31 @@ impl UserConfig {
         }
         let contents = std::fs::read_to_string(path)?;
         let config: UserConfig = toml::from_str(&contents)?;
+        for pattern in config.claude_paths.iter().flatten() {
+            for component in Path::new(pattern.trim()).components() {
+                let text = component.as_os_str().to_string_lossy();
+                if text.contains("**") {
+                    return Err(anyhow!(
+                        "claude_paths entry {pattern:?}: `**` is not supported; each glob component matches one directory"
+                    ));
+                }
+                if component_has_glob(&text) {
+                    globset::Glob::new(&text)
+                        .map_err(|error| anyhow!("claude_paths entry {pattern:?}: {error}"))?;
+                }
+            }
+        }
         Ok(config)
+    }
+
+    /// Claude Code `projects` directories to read: `claude_paths`, else
+    /// `default_claude_sources`. Globs expand on every call, so the next full scan finds a
+    /// profile directory created after startup.
+    pub fn claude_sources(&self) -> Vec<PathBuf> {
+        match &self.claude_paths {
+            Some(patterns) => expand_claude_paths(patterns, &crate::sources::common::home()),
+            None => default_claude_sources(),
+        }
     }
 
     pub fn embeddings_mode(&self) -> EmbeddingsMode {
@@ -620,6 +830,7 @@ impl UserConfig {
         Ok(RemoteEmbedConfig {
             endpoint,
             dimensions: self.embedding_dimensions,
+            redaction: crate::redact::EgressRedaction::new(self.egress_redactor()?),
         })
     }
 
@@ -651,6 +862,52 @@ impl UserConfig {
 
     pub fn scan_cache_ttl(&self) -> u64 {
         self.scan_cache_ttl.unwrap_or(3600)
+    }
+
+    pub fn index_freshness(&self) -> Result<crate::ingest::Freshness> {
+        use crate::ingest::Freshness;
+        let bounded = Freshness::Bounded {
+            ttl_seconds: self.scan_cache_ttl(),
+        };
+        let Some(value) = self.index_freshness.as_deref() else {
+            return Ok(if self.auto_index_on_search_default() {
+                bounded
+            } else {
+                Freshness::None
+            });
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => Ok(Freshness::Strict),
+            "bounded" => Ok(bounded),
+            "none" => Ok(Freshness::None),
+            other => Err(anyhow!(
+                "invalid index_freshness: {other} (expected \"strict\", \"bounded\" or \"none\")"
+            )),
+        }
+    }
+
+    /// Index-time redaction under `[redaction]`, or a disabled one unless `enabled = true`.
+    pub fn redactor(&self) -> Result<std::sync::Arc<crate::redact::Redactor>> {
+        let redaction = &self.redaction;
+        let redactor = if redaction.enabled.unwrap_or(false) {
+            crate::redact::Redactor::new(&redaction.patterns, &redaction.sensitive_files)?
+        } else {
+            crate::redact::Redactor::disabled()
+        };
+        Ok(std::sync::Arc::new(redactor))
+    }
+
+    /// Redaction for content leaving the machine (MCP over HTTP, remote embeddings), or
+    /// `None` when `[redaction] egress = false`.
+    pub fn egress_redactor(&self) -> Result<Option<std::sync::Arc<crate::redact::Redactor>>> {
+        let redaction = &self.redaction;
+        if !redaction.egress.unwrap_or(true) {
+            return Ok(None);
+        }
+        Ok(Some(std::sync::Arc::new(crate::redact::Redactor::new(
+            &redaction.patterns,
+            &redaction.sensitive_files,
+        )?)))
     }
 
     pub fn indexed_tool_content_limits(&self) -> Result<IndexedToolContentLimits> {
@@ -782,6 +1039,94 @@ mod tests {
             default_claude_source(),
             PathBuf::from("/tmp/claude-one/projects")
         );
+    }
+
+    #[test]
+    fn claude_paths_expand_home_globs_and_config_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for directory in [
+            ".claude/projects",
+            ".claude-profiles/work/projects",
+            ".claude-profiles/personal/projects",
+            // Shared configuration, not a profile: it has no transcripts directory.
+            ".claude-profiles/shared/agents",
+        ] {
+            fs::create_dir_all(home.join(directory)).unwrap();
+        }
+        let patterns = [
+            "~/.claude",
+            "~/.claude-profiles/*",
+            "~/.claude-profiles/*/projects",
+            "/missing/claude/projects",
+            " ",
+        ]
+        .map(String::from);
+
+        assert_eq!(
+            expand_claude_paths(&patterns, home),
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-profiles/personal/projects"),
+                home.join(".claude-profiles/work/projects"),
+                PathBuf::from("/missing/claude/projects"),
+            ]
+        );
+
+        fs::create_dir_all(home.join(".claude-profiles/new/projects")).unwrap();
+        assert!(
+            expand_claude_paths(&patterns, home)
+                .contains(&home.join(".claude-profiles/new/projects"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_paths_read_a_symlinked_config_directory_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for directory in [
+            ".claude-profiles/personal/projects",
+            ".claude-profiles/work/projects",
+        ] {
+            fs::create_dir_all(home.join(directory)).unwrap();
+        }
+        std::os::unix::fs::symlink(home.join(".claude-profiles/personal"), home.join(".claude"))
+            .unwrap();
+
+        assert_eq!(
+            expand_claude_paths(
+                &["~/.claude", "~/.claude-profiles/*"].map(String::from),
+                home
+            ),
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-profiles/work/projects"),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_paths_reject_invalid_globs_when_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("config.toml"),
+            "claude_paths = [\"~/.claude-profiles/[/projects\"]\n",
+        )
+        .unwrap();
+        let error = UserConfig::load(&Paths::new(Some(temp.path().to_path_buf())).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("claude_paths entry"), "{error}");
+        fs::write(
+            temp.path().join("config.toml"),
+            "claude_paths = [\"~/accounts/**/projects\"]\n",
+        )
+        .unwrap();
+        let error = UserConfig::load(&Paths::new(Some(temp.path().to_path_buf())).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("one directory"), "{error}");
     }
 
     #[test]
@@ -934,6 +1279,46 @@ mod tests {
         };
 
         assert!(config.token_usage_enabled());
+    }
+
+    #[test]
+    fn redaction_is_opt_in_at_index_time_and_on_for_egress() {
+        let defaults = UserConfig::default();
+        let redactor = defaults.redactor().unwrap();
+        assert!(!redactor.is_enabled());
+        assert!(defaults.egress_redactor().unwrap().is_some());
+        // The default leaves every checkpoint version as it was before redaction existed, so
+        // upgrading reparses nothing.
+        for source in crate::types::SourceKind::ALL {
+            for include_reasoning in [false, true] {
+                let base = crate::sources::index_state_version_for(source, include_reasoning);
+                assert_eq!(redactor.fold_version(base), base, "{source:?}");
+            }
+        }
+        let opencode = crate::sources::opencode::DATABASE_STATE_VERSION;
+        assert_eq!(redactor.fold_version(opencode), opencode);
+
+        let opted_in: UserConfig = toml::from_str("[redaction]\nenabled = true\n").unwrap();
+        let base = crate::sources::index_state_version(crate::types::SourceKind::Claude);
+        assert_ne!(opted_in.redactor().unwrap().fold_version(base), base);
+
+        let config: UserConfig = toml::from_str(
+            r#"
+            [redaction]
+            enabled = false
+            egress = false
+            patterns = ["corp_[a-z0-9]{12}"]
+            sensitive_files = ["*.secret"]
+            "#,
+        )
+        .unwrap();
+        assert!(!config.redactor().unwrap().is_enabled());
+        assert!(config.egress_redactor().unwrap().is_none());
+        assert_eq!(config.redaction.patterns, ["corp_[a-z0-9]{12}"]);
+
+        let invalid: UserConfig =
+            toml::from_str("[redaction]\nenabled = true\npatterns = [\"(\"]\n").unwrap();
+        assert!(invalid.redactor().is_err());
     }
 
     #[test]

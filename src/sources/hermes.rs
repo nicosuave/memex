@@ -18,7 +18,7 @@ use std::time::Duration;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 4,
+    index: 5,
     usage: 7,
 };
 
@@ -311,8 +311,9 @@ pub(crate) fn parse_index_records(
             .map(super::common::project_from_path)
             .unwrap_or_else(|| SourceKind::Hermes.label().to_string());
         let links = row_links(row);
-        let base_turn = row.id.min((u32::MAX / 8) as u64).saturating_mul(8) as u32;
-        let mut component = 0u32;
+        // A row's records share its id as their turn; equal turn and timestamp leave them
+        // in emission (doc id) order, and no row's records can reach into the next row's.
+        let turn_id = row.id.min(u32::MAX as u64) as u32;
 
         match row.role.as_str() {
             "user" => {
@@ -324,7 +325,7 @@ pub(crate) fn parse_index_records(
                         ts: row.timestamp_ms,
                         project,
                         session_id: row.session_id.clone(),
-                        turn_id: base_turn + component,
+                        turn_id,
                         role: "user".to_string(),
                         text,
                         tool_name: None,
@@ -346,7 +347,7 @@ pub(crate) fn parse_index_records(
                         ts: row.timestamp_ms,
                         project: project.clone(),
                         session_id: row.session_id.clone(),
-                        turn_id: base_turn + component,
+                        turn_id,
                         role: "reasoning".to_string(),
                         text: reasoning,
                         tool_name: None,
@@ -355,7 +356,6 @@ pub(crate) fn parse_index_records(
                         links: reasoning_links,
                         source_path: source_path.clone(),
                     })?;
-                    component += 1;
                 }
 
                 let text = assistant_text(row, &mut diagnostics);
@@ -366,7 +366,7 @@ pub(crate) fn parse_index_records(
                         ts: row.timestamp_ms,
                         project: project.clone(),
                         session_id: row.session_id.clone(),
-                        turn_id: base_turn + component,
+                        turn_id,
                         role: "assistant".to_string(),
                         text,
                         tool_name: None,
@@ -375,7 +375,6 @@ pub(crate) fn parse_index_records(
                         links: links.clone(),
                         source_path: source_path.clone(),
                     })?;
-                    component += 1;
                 }
 
                 for call in planned_calls.remove(&row.id).unwrap_or_default() {
@@ -405,7 +404,7 @@ pub(crate) fn parse_index_records(
                         ts: row.timestamp_ms,
                         project: project.clone(),
                         session_id: row.session_id.clone(),
-                        turn_id: base_turn + component,
+                        turn_id,
                         role: "tool_use".to_string(),
                         text: call.arguments.clone(),
                         tool_name: call.name,
@@ -414,7 +413,6 @@ pub(crate) fn parse_index_records(
                         links: call_links,
                         source_path: source_path.clone(),
                     })?;
-                    component += 1;
                 }
             }
             "tool" => {
@@ -455,7 +453,7 @@ pub(crate) fn parse_index_records(
                     ts: row.timestamp_ms,
                     project,
                     session_id: row.session_id.clone(),
-                    turn_id: base_turn,
+                    turn_id,
                     role: "tool_result".to_string(),
                     text: output.clone(),
                     tool_name,
@@ -1431,6 +1429,51 @@ mod tests {
             assert!(records.iter().all(|record| record.role == "assistant"));
             assert_eq!(parsed.diagnostics.malformed_json_lines, 1);
         }
+    }
+
+    #[test]
+    fn many_tool_calls_in_one_row_stay_ahead_of_the_next_rows_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let connection = transcript_db(&path);
+        let calls = (0..10)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("call-{index}"),
+                    "function": {"name": "terminal", "arguments": format!("{{\"n\":{index}}}")}
+                })
+            })
+            .collect::<Vec<_>>();
+        connection
+            .execute(
+                "INSERT INTO messages(id, session_id, role, content, tool_calls, timestamp)
+                 VALUES (1, 'hermes-session', 'assistant', 'Running ten commands.', ?1, 1)",
+                params![serde_json::to_string(&calls).unwrap()],
+            )
+            .unwrap();
+        for index in 0..10 {
+            connection
+                .execute(
+                    "INSERT INTO messages(id, session_id, role, content, tool_call_id, tool_name, timestamp)
+                     VALUES (?1, 'hermes-session', 'tool', ?2, ?3, 'terminal', 2)",
+                    params![index + 2, format!("output {index}"), format!("call-{index}")],
+                )
+                .unwrap();
+        }
+        let (mut records, parsed) = parse_transcript(&path, IndexParseState::default());
+        assert!(parsed.pending_tool_calls.is_empty());
+        // Session views order records by (turn, timestamp, doc id).
+        records.sort_by_key(|record| (record.turn_id, record.ts, record.doc_id));
+        let mut expected = vec!["assistant"];
+        expected.extend(["tool_use"; 10]);
+        expected.extend(["tool_result"; 10]);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.role.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

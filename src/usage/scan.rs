@@ -144,14 +144,22 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::kilocode::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Kimi => SourceSpec {
+            parser_version: crate::sources::kimi::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
+        SourceFilter::Goose => SourceSpec {
+            parser_version: crate::sources::goose::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
     }
 }
 
 /// The file listing each source scans. Freshness checks use the same listing so a
 /// new, removed, or replaced file invalidates exactly when a rescan would reparse.
-pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
+pub(crate) fn source_files(filter: SourceFilter, claude_sources: &[PathBuf]) -> Vec<PathBuf> {
     match filter {
-        SourceFilter::Claude => crate::sources::claude::usage_files(),
+        SourceFilter::Claude => crate::sources::claude::usage_files(claude_sources),
         SourceFilter::Codex => crate::sources::codex::discover_rollouts(None)
             .into_iter()
             .map(|file| file.path)
@@ -189,6 +197,8 @@ pub(crate) fn source_files(filter: SourceFilter) -> Vec<PathBuf> {
             .map(|file| file.path)
             .collect(),
         SourceFilter::Kilocode => crate::sources::kilocode::usage_files(),
+        SourceFilter::Kimi => crate::sources::kimi::usage_files(),
+        SourceFilter::Goose => crate::sources::goose::usage_files(),
     }
 }
 
@@ -453,8 +463,9 @@ pub(crate) fn scan_claude(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Claude);
+    let files = source_files(SourceFilter::Claude, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "claude",
@@ -507,6 +518,10 @@ pub(crate) fn parse_source_file(
         SourceFilter::Bob => crate::sources::bob::parse_usage_file(path).map(FileParse::cacheable),
         SourceFilter::Zcode => crate::sources::zcode::parse_usage_file(path),
         SourceFilter::Kilocode => crate::sources::kilocode::parse_usage_file(path),
+        SourceFilter::Goose => crate::sources::goose::parse_usage_file(path),
+        SourceFilter::Kimi => {
+            crate::sources::kimi::parse_usage_file(path).map(FileParse::cacheable)
+        }
         SourceFilter::Jcode => {
             crate::sources::jcode::parse_usage_file(path).map(FileParse::cacheable)
         }
@@ -559,8 +574,9 @@ pub(crate) fn scan_codex(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Codex);
+    let files = source_files(SourceFilter::Codex, claude_sources);
     let parents = crate::sources::codex::UsageParentIndex::new(&files);
     scan_files_cached_with(
         SourceScan {
@@ -582,8 +598,9 @@ pub(crate) fn scan_pi(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Pi);
+    let files = source_files(SourceFilter::Pi, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "pi",
@@ -603,8 +620,9 @@ pub(crate) fn scan_omp(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Omp);
+    let files = source_files(SourceFilter::Omp, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "omp",
@@ -624,8 +642,9 @@ pub(crate) fn scan_openclaw(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::OpenClaw);
+    let files = source_files(SourceFilter::OpenClaw, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "openclaw",
@@ -645,8 +664,9 @@ pub(crate) fn scan_opencode(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Opencode);
+    let files = source_files(SourceFilter::Opencode, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "opencode",
@@ -666,8 +686,9 @@ pub(crate) fn scan_cursor(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let databases = source_files(SourceFilter::Cursor);
+    let databases = source_files(SourceFilter::Cursor, claude_sources);
     let start = out.len();
     scan_files_cached(
         SourceScan {
@@ -692,8 +713,9 @@ pub(crate) fn scan_copilot(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Copilot);
+    let files = source_files(SourceFilter::Copilot, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "copilot",
@@ -713,8 +735,9 @@ pub(crate) fn scan_grok(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Grok);
+    let files = source_files(SourceFilter::Grok, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "grok",
@@ -734,8 +757,9 @@ pub(crate) fn scan_hermes(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Hermes);
+    let files = source_files(SourceFilter::Hermes, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "hermes",
@@ -755,8 +779,9 @@ pub(crate) fn scan_jcode(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Jcode);
+    let files = source_files(SourceFilter::Jcode, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "jcode",
@@ -776,8 +801,9 @@ pub(crate) fn scan_muse(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Muse);
+    let files = source_files(SourceFilter::Muse, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "muse",
@@ -797,8 +823,9 @@ pub(crate) fn scan_antigravity(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Antigravity);
+    let files = source_files(SourceFilter::Antigravity, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "antigravity",
@@ -818,6 +845,7 @@ fn scan_bob(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    _claude_sources: &[PathBuf],
 ) -> Result<()> {
     let files = crate::sources::bob::usage_files();
     scan_files_cached(
@@ -841,8 +869,9 @@ fn scan_zcode(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Zcode);
+    let files = source_files(SourceFilter::Zcode, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "zcode",
@@ -864,8 +893,9 @@ fn scan_kilocode(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Kilocode);
+    let files = source_files(SourceFilter::Kilocode, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "kilocode",
@@ -883,12 +913,59 @@ fn scan_kilocode(
     Ok(())
 }
 
+fn scan_goose(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
+) -> Result<()> {
+    let files = source_files(SourceFilter::Goose, claude_sources);
+    scan_files_cached(
+        SourceScan {
+            source: "goose",
+            parser_version: crate::sources::goose::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        // WAL-aware like KiloCode: the parse result carries the -wal fingerprint
+        // and is only cached when the WAL did not move during the read.
+        crate::sources::goose::parse_usage_file,
+    );
+    Ok(())
+}
+
+fn scan_kimi(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
+) -> Result<()> {
+    let files = source_files(SourceFilter::Kimi, claude_sources);
+    scan_files_cached(
+        SourceScan {
+            source: "kimi",
+            parser_version: crate::sources::kimi::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::kimi::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
 fn scan_kiro(
     out: &mut Vec<UsageEvent>,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Result<()> {
-    let files = source_files(SourceFilter::Kiro);
+    let files = source_files(SourceFilter::Kiro, claude_sources);
     scan_files_cached(
         SourceScan {
             source: "kiro",
@@ -901,16 +978,19 @@ fn scan_kiro(
         out,
         crate::sources::kiro::parse_usage_file,
     );
-    warnings.push("Kiro reports credits; token usage and dollar costs are unavailable.".into());
+    // Only a report that actually holds Kiro credits is missing token data.
+    if !out.is_empty() {
+        warnings.push("Kiro reports credits; token usage and dollar costs are unavailable.".into());
+    }
     Ok(())
 }
 
 pub(crate) type SourceScanner =
-    fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
+    fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>, &[PathBuf]) -> Result<()>;
 
 /// Scanner ordinals double as merge tiebreaks: partitions are laid out and merged in
 /// this order, reproducing the combined assembly's stable sort exactly.
-pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 17] = [
+pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 19] = [
     (SourceFilter::Claude, scan_claude),
     (SourceFilter::Codex, scan_codex),
     (SourceFilter::Opencode, scan_opencode),
@@ -928,6 +1008,8 @@ pub(crate) const SCANNERS: [(SourceFilter, SourceScanner); 17] = [
     (SourceFilter::Zcode, scan_zcode),
     (SourceFilter::Kiro, scan_kiro),
     (SourceFilter::Kilocode, scan_kilocode),
+    (SourceFilter::Kimi, scan_kimi),
+    (SourceFilter::Goose, scan_goose),
 ];
 
 /// Scan and reconcile one source partition. Shared by combined assembly and
@@ -939,12 +1021,13 @@ pub(crate) fn run_partition_scanner(
     scanner: SourceScanner,
     warnings: &mut Vec<String>,
     cache: Option<&mut UsageCache>,
+    claude_sources: &[PathBuf],
 ) -> Vec<UsageEvent> {
     let scanner_start = Instant::now();
     // Reconcile each source's partition before combining so Claude's keep
     // bitmap and multi-pass scans cover only its own events, not all history.
     let mut partition = Vec::new();
-    let result = scanner(&mut partition, warnings, cache);
+    let result = scanner(&mut partition, warnings, cache, claude_sources);
     if let Err(error) = result {
         warnings.push(format!("{} scanner: {error:#}", filter.as_str()));
         partition.clear();

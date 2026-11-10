@@ -125,7 +125,7 @@ cat >&2 <<EOF
 $NAME: could not obtain a memex binary.
 
 Install memex yourself, then reinstall the plugin:
-  brew install nicosuave/tap/memex
+  brew install memex
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/setup.sh | sh
 Or install a Rust toolchain (https://rustup.rs) so this step can build from source.
 EOF

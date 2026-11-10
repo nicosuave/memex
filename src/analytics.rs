@@ -9,14 +9,78 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-// Reconcile legacy catalogs that survived a rebuilt search index.
-const SCHEMA_VERSION: i64 = 7;
+// Backfill parent session IDs so assignments can be inherited.
+const SCHEMA_VERSION: i64 = 8;
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
-const REPOSITORY_PROJECT_SQL: &str = "COALESCE(NULLIF(repo_project, ''), 'Unfiled')";
+// The one place a session's project is resolved. A user assignment wins, first the
+// session's own and then its parent's (continuations and sub-agents inherit unless
+// they have their own); derived facts follow. Assignments live in the attached
+// assignment store (see `crate::session_meta`), so rebuilds never drop them.
+static ASSIGNED_PROJECT_SQL: LazyLock<String> = LazyLock::new(|| {
+    let lookup = |key: &str| {
+        format!(
+            "(SELECT o.project FROM session_projects o WHERE o.machine = 'local'
+                AND o.source = {CANONICAL_SOURCE_SQL} AND o.session_id = sessions.{key})"
+        )
+    };
+    format!(
+        "COALESCE({}, {})",
+        lookup("session_id"),
+        lookup("parent_session_id")
+    )
+});
+static REPOSITORY_PROJECT_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "COALESCE({}, NULLIF(repo_project, ''), '{UNFILED_PROJECT}')",
+        *ASSIGNED_PROJECT_SQL
+    )
+});
+static FLAT_PROJECT_SQL: LazyLock<String> =
+    LazyLock::new(|| format!("COALESCE({}, project)", *ASSIGNED_PROJECT_SQL));
+// Assignments are keyed by canonical provider label; legacy Codex rows keep theirs.
+const CANONICAL_SOURCE_SQL: &str = "(CASE WHEN sessions.source IN ('codex-session', 'codex-history') THEN 'codex' ELSE sessions.source END)";
+// Tags a session carries directly or inherits from its parent.
+static SESSION_TAGS_FROM_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "session_tags t WHERE t.machine = 'local' AND t.source = {CANONICAL_SOURCE_SQL}
+            AND t.session_id IN (sessions.session_id, sessions.parent_session_id)"
+    )
+});
+static SESSION_TAGS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "(SELECT group_concat(tag, ',') FROM (SELECT DISTINCT t.tag FROM {} ORDER BY t.tag))",
+        *SESSION_TAGS_FROM_SQL
+    )
+});
+static TAG_FILTER_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "EXISTS (SELECT 1 FROM {} AND t.tag = ?)",
+        *SESSION_TAGS_FROM_SQL
+    )
+});
+
+pub(crate) fn project_sql(grouping: ProjectGrouping) -> &'static str {
+    match grouping {
+        ProjectGrouping::Flat => &FLAT_PROJECT_SQL,
+        ProjectGrouping::Repository => &REPOSITORY_PROJECT_SQL,
+    }
+}
+
+/// One AND-ed tag predicate per requested tag.
+fn push_tag_clauses(
+    tags: &[String],
+    clauses: &mut Vec<String>,
+    values: &mut Vec<rusqlite::types::Value>,
+) {
+    for tag in tags {
+        clauses.push(TAG_FILTER_SQL.clone());
+        values.push(rusqlite::types::Value::Text(tag.clone()));
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +135,31 @@ impl SessionKindFilter {
             }
         }
     }
+
+    /// Child kinds whose search hits this filter attributes to the parent
+    /// session instead of listing or dropping them. Helpers (subagents and
+    /// sidechains) always work for a parent, so the default filters show
+    /// their matches on that parent. The interactive filter also folds forks,
+    /// branches, and compactions into their root because it lists only root
+    /// conversations; the regular filter keeps those resumable children as
+    /// their own rows. Explicit subagent and all filters list children as-is.
+    pub fn rolls_up(self, kind: Option<&str>) -> bool {
+        match self {
+            SessionKindFilter::Primary => {
+                kind.is_some_and(|kind| kind != "main" && kind != "guardian_review")
+            }
+            SessionKindFilter::Regular => matches!(kind, Some("subagent" | "sidechain")),
+            SessionKindFilter::Subagent | SessionKindFilter::All => false,
+        }
+    }
+}
+
+/// Stored kind and parent link for one session transcript.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLineage {
+    pub source_path: String,
+    pub conversation_kind: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 /// A session row with every stored column, for `memex sessions`.
@@ -93,10 +182,44 @@ pub struct SessionDetailRow {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_kind: Option<String>,
+    /// Claude config directory the session was read from; derived from `source_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// User project assignment (the session's own, else its parent's). Overrides
+    /// `repo_project` for grouping and filtering without replacing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_project: Option<String>,
+    /// User tags, including those inherited from the parent session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+fn split_tags(joined: Option<String>) -> Vec<String> {
+    joined
+        .map(|joined| {
+            joined
+                .split(',')
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The Claude config directory (`work` for `~/.claude-profiles/work/projects/...`) a
+/// session's transcript lives in. Other sources have no profile.
+pub fn session_profile(source: SourceKind, source_path: &str) -> Option<String> {
+    (source == SourceKind::Claude)
+        .then(|| crate::sources::claude::profile_from_path(Path::new(source_path)))
+        .flatten()
 }
 
 pub struct AnalyticsStore {
     conn: Connection,
+    /// Every session query on this handle requires all of these tags.
+    tags: Vec<String>,
 }
 
 pub struct AnalyticsWriter {
@@ -125,6 +248,7 @@ struct SessionAccumulator {
     first_user_text: Option<String>,
     first_user_order: Option<(u32, u64, u64)>,
     conversation_kind: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,19 +268,72 @@ impl AnalyticsStore {
         }
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(2))?;
-        let store = Self { conn };
+        crate::session_meta::attach(&conn, state_dir_of(path), false)?;
+        let store = Self {
+            conn,
+            tags: Vec::new(),
+        };
         store.init()?;
         Ok(store)
     }
 
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let conn = Connection::open_with_flags(
             path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
         )?;
         conn.busy_timeout(Duration::from_secs(2))?;
+        crate::session_meta::attach(&conn, state_dir_of(path), true)?;
         conn.pragma_update(None, "query_only", true)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            tags: Vec::new(),
+        })
+    }
+
+    /// Restrict every session query on this handle to sessions carrying all `tags`
+    /// (directly or through their parent session).
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Distinct user tags with the number of sessions carrying each, most used first.
+    pub fn query_tags(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tag, count(*) FROM session_tags WHERE machine = 'local'
+             GROUP BY tag ORDER BY count(*) DESC, tag",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Providers that have indexed a session with this ID.
+    pub fn session_sources(&self, session_id: &str) -> Result<Vec<SourceKind>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source FROM sessions WHERE session_id = ?1 ORDER BY source",
+        )?;
+        let labels = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut sources = labels
+            .iter()
+            .filter_map(|label| SourceKind::from_label(label))
+            .collect::<Vec<_>>();
+        sources.dedup();
+        Ok(sources)
+    }
+
+    /// Whether any session has a user project assignment.
+    pub fn has_project_assignments(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_projects WHERE machine = 'local')",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     fn init(&self) -> Result<()> {
@@ -185,6 +362,7 @@ impl AnalyticsStore {
                 resolution_status TEXT NOT NULL DEFAULT '',
                 label TEXT,
                 conversation_kind TEXT,
+                parent_session_id TEXT,
                 PRIMARY KEY (source, session_id, source_path)
             );
             CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
@@ -200,13 +378,15 @@ impl AnalyticsStore {
         for sql in [
             "ALTER TABLE sessions ADD COLUMN label TEXT",
             "ALTER TABLE sessions ADD COLUMN conversation_kind TEXT",
+            "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
         ] {
             let _ = self.conn.execute(sql, []);
         }
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
              CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
-             CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);",
+             CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);
+             CREATE INDEX IF NOT EXISTS sessions_session_id_idx ON sessions(session_id);",
         )?;
         let previous_schema_version: Option<i64> = self
             .conn
@@ -350,9 +530,10 @@ impl AnalyticsStore {
     ) -> Result<Vec<SessionRow>> {
         let mut sql = format!(
             "SELECT source, session_id, source_path, project,
-                    {REPOSITORY_PROJECT_SQL} AS display_project,
+                    {} AS display_project,
                     cwd, last_at, message_count, label, conversation_kind
-             FROM sessions"
+             FROM sessions",
+            project_sql(grouping)
         );
         let mut clauses = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -374,12 +555,7 @@ impl AnalyticsStore {
             values.push(rusqlite::types::Value::Integer(since_ms as i64));
         }
         if let Some(project) = project {
-            match grouping {
-                ProjectGrouping::Flat => clauses.push("project = ?".to_string()),
-                ProjectGrouping::Repository => {
-                    clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"))
-                }
-            }
+            clauses.push(format!("{} = ?", project_sql(grouping)));
             values.push(rusqlite::types::Value::Text(project.to_string()));
         }
         if let Some(kind) = kind {
@@ -403,6 +579,7 @@ impl AnalyticsStore {
                 SessionKindFilter::All => {}
             }
         }
+        push_tag_clauses(&self.tags, &mut clauses, &mut values);
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
@@ -418,11 +595,7 @@ impl AnalyticsStore {
             let source_label: String = row.get(0)?;
             let source = SourceKind::from_label(&source_label).unwrap_or(SourceKind::Claude);
             let project: String = row.get(3)?;
-            let raw_display_project: String = match grouping {
-                ProjectGrouping::Flat => project.clone(),
-                ProjectGrouping::Repository => row.get(4)?,
-            };
-            let display_project = display_project_name(&raw_display_project);
+            let display_project = display_project_name(&row.get::<_, String>(4)?);
             Ok(SessionRow {
                 source,
                 session_id: row.get(1)?,
@@ -478,7 +651,15 @@ impl AnalyticsStore {
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
         self.query_sessions_detailed_selected(
-            source, project, cwd, since_ms, kind, None, None, limit,
+            source,
+            project,
+            cwd,
+            since_ms,
+            kind,
+            &[],
+            None,
+            None,
+            limit,
         )
     }
 
@@ -491,14 +672,18 @@ impl AnalyticsStore {
         cwd: Option<&str>,
         since_ms: Option<u64>,
         kind: Option<SessionKindFilter>,
-        session_id: Option<&str>,
+        session_ids: &[&str],
         source_path: Option<&str>,
+        profile: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT source, session_id, source_path, project, repo_project,
-                    cwd, git_root, started_at, last_at, message_count, label, conversation_kind
+                    cwd, git_root, started_at, last_at, message_count, label, conversation_kind,
+                    parent_session_id, {assigned}, {tags}
              FROM sessions",
+            assigned = *ASSIGNED_PROJECT_SQL,
+            tags = *SESSION_TAGS_SQL,
         );
         let (predicate, mut values) = session_selection_sql(
             source,
@@ -506,12 +691,14 @@ impl AnalyticsStore {
             cwd,
             since_ms,
             kind,
-            session_id,
+            session_ids,
             source_path,
+            profile,
+            &self.tags,
         );
         sql.push_str(&predicate);
         sql.push_str(" ORDER BY last_at DESC");
-        if let Some(limit) = limit {
+        if let Some(limit) = limit.filter(|_| profile.is_none()) {
             sql.push_str(" LIMIT ?");
             values.push(rusqlite::types::Value::Integer(limit as i64));
         }
@@ -521,10 +708,12 @@ impl AnalyticsStore {
             let source_label: String = row.get(0)?;
             let source = SourceKind::from_label(&source_label).unwrap_or(SourceKind::Claude);
             let repo_project: Option<String> = row.get(4)?;
+            let source_path: String = row.get(2)?;
             Ok(SessionDetailRow {
                 source,
                 session_id: row.get(1)?,
-                source_path: row.get(2)?,
+                profile: session_profile(source, &source_path),
+                source_path,
                 project: row.get(3)?,
                 repo_project: repo_project.filter(|value| !value.is_empty()),
                 cwd: row.get::<_, Option<String>>(5)?.filter(|v| !v.is_empty()),
@@ -534,12 +723,21 @@ impl AnalyticsStore {
                 message_count: row.get::<_, i64>(9)?.max(0) as u64,
                 label: row.get::<_, Option<String>>(10)?.filter(|v| !v.is_empty()),
                 conversation_kind: row.get::<_, Option<String>>(11)?.filter(|v| !v.is_empty()),
+                parent_session_id: row.get::<_, Option<String>>(12)?.filter(|v| !v.is_empty()),
+                assigned_project: row.get(13)?,
+                tags: split_tags(row.get::<_, Option<String>>(14)?),
             })
         })?;
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            if limit.is_some_and(|limit| out.len() >= limit) {
+                break;
+            }
+            let row = row?;
+            if profile.is_none() || row.profile.as_deref() == profile {
+                out.push(row);
+            }
         }
         let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
         for row in &mut out {
@@ -556,11 +754,21 @@ impl AnalyticsStore {
     /// Resolve search scopes from cached metadata without opening source transcripts for titles.
     pub(crate) fn query_search_scopes(
         &self,
-        repository_project: Option<&str>,
+        project: Option<&str>,
+        grouping: ProjectGrouping,
         cwd: Option<&str>,
     ) -> Result<Vec<crate::index::SessionScopeKey>> {
-        let (predicate, values) =
-            session_selection_sql(None, repository_project, cwd, None, None, None, None);
+        let (mut predicate, mut values) =
+            session_selection_sql(None, None, cwd, None, None, &[], None, None, &self.tags);
+        if let Some(project) = project {
+            predicate.push_str(if predicate.is_empty() {
+                " WHERE "
+            } else {
+                " AND "
+            });
+            predicate.push_str(&format!("{} = ?", project_sql(grouping)));
+            values.push(rusqlite::types::Value::Text(project.to_string()));
+        }
         let mut statement = self.conn.prepare(&format!(
             "select source, session_id, source_path from sessions{predicate}"
         ))?;
@@ -586,6 +794,7 @@ impl AnalyticsStore {
         kind: Option<SessionKindFilter>,
         session_id: Option<&str>,
         source_path: Option<&str>,
+        profile: Option<&str>,
     ) -> Result<u64> {
         let (predicate, values) = session_selection_sql(
             source,
@@ -593,14 +802,27 @@ impl AnalyticsStore {
             cwd,
             since_ms,
             kind,
-            session_id,
+            session_id.as_slice(),
             source_path,
+            profile,
+            &self.tags,
         );
-        Ok(self.conn.query_row(
-            &format!("SELECT count(*) FROM sessions{predicate}"),
-            params_from_iter(values),
-            |row| row.get(0),
-        )?)
+        let Some(profile) = profile else {
+            return Ok(self.conn.query_row(
+                &format!("SELECT count(*) FROM sessions{predicate}"),
+                params_from_iter(values),
+                |row| row.get(0),
+            )?);
+        };
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT source_path FROM sessions{predicate}"))?;
+        let mut count = 0;
+        for path in stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))? {
+            count +=
+                u64::from(session_profile(SourceKind::Claude, &path?).as_deref() == Some(profile));
+        }
+        Ok(count)
     }
 
     /// Count indexed identities using canonical whole-session origin metadata.
@@ -657,6 +879,49 @@ impl AnalyticsStore {
             .filter(|kind| !kind.is_empty())
     }
 
+    /// Kind and parent link of one stored transcript.
+    pub fn session_lineage(
+        &self,
+        source: &str,
+        session_id: &str,
+        source_path: &str,
+    ) -> Option<SessionLineage> {
+        self.lineage_row(
+            "SELECT source_path, conversation_kind, parent_session_id FROM sessions
+             WHERE source = ?1 AND session_id = ?2 AND source_path = ?3",
+            params![source, session_id, source_path],
+        )
+    }
+
+    /// Kind and parent link of a session known only by id, as a child's parent
+    /// link names it. A main transcript wins over other transcripts sharing the
+    /// id, then the most recently active one.
+    pub fn session_lineage_by_id(&self, source: &str, session_id: &str) -> Option<SessionLineage> {
+        self.lineage_row(
+            "SELECT source_path, conversation_kind, parent_session_id FROM sessions
+             WHERE source = ?1 AND session_id = ?2
+             ORDER BY (conversation_kind IS NULL OR conversation_kind IN ('', 'main')) DESC,
+                      last_at DESC, source_path
+             LIMIT 1",
+            params![source, session_id],
+        )
+    }
+
+    fn lineage_row(&self, sql: &str, params: impl rusqlite::Params) -> Option<SessionLineage> {
+        let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
+        self.conn
+            .query_row(sql, params, |row| {
+                Ok(SessionLineage {
+                    source_path: row.get(0)?,
+                    conversation_kind: non_empty(row.get(1)?),
+                    parent_session_id: non_empty(row.get(2)?),
+                })
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
     /// Aggregate in SQLite rather than materializing every session in the client.
     /// One stored row is one (source, session_id, source_path) session identity.
     /// Match repository grouping and the default regular-session filter.
@@ -666,12 +931,17 @@ impl AnalyticsStore {
     ) -> Result<Vec<ProjectSummary>> {
         let mut sql = format!(
             "with project_sessions as (
-                select {REPOSITORY_PROJECT_SQL} as project,
+                select {project} as project,
                        last_at
                 from sessions
                 where (conversation_kind is null or conversation_kind != 'guardian_review')",
+            project = *REPOSITORY_PROJECT_SQL,
         );
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        for tag in &self.tags {
+            sql.push_str(&format!(" and {}", *TAG_FILTER_SQL));
+            values.push(rusqlite::types::Value::Text(tag.clone()));
+        }
         if let Some(source) = source {
             let labels = source.storage_labels();
             let placeholders = std::iter::repeat_n("?", labels.len())
@@ -708,23 +978,26 @@ impl AnalyticsStore {
         source: Option<SourceFilter>,
         grouping: ProjectGrouping,
     ) -> Result<Vec<String>> {
-        let project_expr = match grouping {
-            ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
-        };
+        let project_expr = project_sql(grouping);
         let mut sql = format!("SELECT DISTINCT {project_expr} FROM sessions");
+        let mut clauses = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(source) = source {
             let labels = source.storage_labels();
             let placeholders = std::iter::repeat_n("?", labels.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            sql.push_str(&format!(" WHERE source IN ({placeholders})"));
+            clauses.push(format!("source IN ({placeholders})"));
             values.extend(
                 labels
                     .iter()
                     .map(|label| rusqlite::types::Value::Text((*label).to_string())),
             );
+        }
+        push_tag_clauses(&self.tags, &mut clauses, &mut values);
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
         }
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?;
@@ -793,10 +1066,7 @@ impl AnalyticsStore {
             values.push(rusqlite::types::Value::Integer(until_ms as i64));
         }
         if let Some(project) = project {
-            let project_expr = match grouping {
-                ProjectGrouping::Flat => "project",
-                ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
-            };
+            let project_expr = project_sql(grouping);
             clauses.push(format!("{project_expr} = ?"));
             values.push(rusqlite::types::Value::Text(project.to_string()));
         }
@@ -821,6 +1091,7 @@ impl AnalyticsStore {
                 SessionKindFilter::All => {}
             }
         }
+        push_tag_clauses(&self.tags, &mut clauses, &mut values);
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
@@ -859,10 +1130,7 @@ impl AnalyticsStore {
         since_ms: Option<u64>,
         grouping: ProjectGrouping,
     ) -> Result<Vec<(String, u64)>> {
-        let project_expr = match grouping {
-            ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
-        };
+        let project_expr = project_sql(grouping);
         let mut sql = format!("SELECT {project_expr}, last_at FROM sessions");
         let mut clauses = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
@@ -882,10 +1150,12 @@ impl AnalyticsStore {
             clauses.push("last_at >= ?".to_string());
             values.push(rusqlite::types::Value::Integer(since_ms as i64));
         }
+        push_tag_clauses(&self.tags, &mut clauses, &mut values);
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
+        sql.push_str(" ORDER BY last_at");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             Ok((
@@ -908,10 +1178,7 @@ impl AnalyticsStore {
         source_path: &str,
         grouping: ProjectGrouping,
     ) -> Result<Option<String>> {
-        let display_expr = match grouping {
-            ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
-        };
+        let display_expr = project_sql(grouping);
         let project: Option<String> = self
             .conn
             .query_row(
@@ -926,6 +1193,31 @@ impl AnalyticsStore {
         Ok(project.map(|project| display_project_name(&project)))
     }
 
+    /// User tags (own and inherited) for each requested session that has any.
+    pub fn query_session_tags(
+        &self,
+        sessions: &[(SourceKind, String, String)],
+    ) -> Result<HashMap<(SourceKind, String, String), Vec<String>>> {
+        let mut out = HashMap::new();
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM sessions WHERE source = ?1 AND session_id = ?2 AND source_path = ?3",
+            *SESSION_TAGS_SQL
+        ))?;
+        for key in sessions {
+            let tags = stmt
+                .query_row(params![key.0.storage_label(), key.1, key.2], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .optional()?
+                .flatten();
+            let tags = split_tags(tags);
+            if !tags.is_empty() {
+                out.insert(key.clone(), tags);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn query_session_projects(
         &self,
         sessions: &[(SourceKind, String, String)],
@@ -934,10 +1226,7 @@ impl AnalyticsStore {
         if sessions.is_empty() {
             return Ok(HashMap::new());
         }
-        let display_expr = match grouping {
-            ProjectGrouping::Flat => "project",
-            ProjectGrouping::Repository => REPOSITORY_PROJECT_SQL,
-        };
+        let display_expr = project_sql(grouping);
         let conditions = std::iter::repeat_n(
             "(source = ? AND session_id = ? AND source_path = ?)",
             sessions.len(),
@@ -1056,6 +1345,7 @@ impl AnalyticsWriter {
                 first_user_text: None,
                 first_user_order: None,
                 conversation_kind: None,
+                parent_session_id: None,
             });
         if record.ts < entry.started_at {
             entry.started_at = record.ts;
@@ -1067,6 +1357,13 @@ impl AnalyticsWriter {
             }
         }
         entry.message_count = entry.message_count.saturating_add(1);
+        if entry.parent_session_id.is_none()
+            && let Some(parent) = record.links.parent_session_id.as_deref()
+            && !parent.is_empty()
+            && parent != record.session_id
+        {
+            entry.parent_session_id = Some(parent.to_string());
+        }
         let order = (record.turn_id, record.ts, record.doc_id);
         if entry
             .first_user_order
@@ -1258,9 +1555,9 @@ impl PreparedAnalytics<'_> {
                 INSERT INTO sessions(
                     source, session_id, source_path, project, cwd, git_root, git_common_dir,
                     repo_project, started_at, last_at, message_count, resolution_status,
-                    label, conversation_kind
+                    label, conversation_kind, parent_session_id
                 )
-                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                 ON CONFLICT(source, session_id, source_path) DO UPDATE SET
                     project = excluded.project,
                     cwd = excluded.cwd,
@@ -1276,7 +1573,8 @@ impl PreparedAnalytics<'_> {
                     -- records. Corrections flow through parser-version bumps,
                     -- which delete the row first (delete_first) and recompute.
                     label = COALESCE(sessions.label, excluded.label),
-                    conversation_kind = COALESCE(sessions.conversation_kind, excluded.conversation_kind)
+                    conversation_kind = COALESCE(sessions.conversation_kind, excluded.conversation_kind),
+                    parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id)
                 "#)?;
             for PreparedSession {
                 session,
@@ -1300,6 +1598,7 @@ impl PreparedAnalytics<'_> {
                     metadata.resolution_status,
                     label,
                     conversation_kind,
+                    session.parent_session_id,
                 ])?;
             }
         }
@@ -1473,6 +1772,9 @@ fn resolve_session_cwd_from_parts(
     if source == SourceKind::Kiro {
         return crate::sources::kiro::session_cwd(Path::new(source_path));
     }
+    if source == SourceKind::Kimi {
+        return crate::sources::kimi::session_cwd(Path::new(source_path));
+    }
     if source == SourceKind::Muse
         && let Some(cwd) = crate::sources::muse::cwd_from_muse_session(Path::new(source_path))
     {
@@ -1498,8 +1800,12 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd.to_string_lossy().to_string());
     }
-    let file = std::fs::File::open(source_path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    if source == SourceKind::Goose
+        && let Some(cwd) = crate::sources::goose::session_cwd(Path::new(source_path), session_id)
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
+    let reader = crate::sources::common::open_lines(Path::new(source_path)).ok()?;
     let mut fallback: Option<String> = None;
     for line in std::io::BufRead::lines(reader).map_while(std::result::Result::ok) {
         let value: serde_json::Value = match serde_json::from_str(&line) {
@@ -2103,8 +2409,8 @@ fn human_agent_title(path: &str) -> Option<String> {
 
 fn codex_assignment_title(source_path: &str) -> Option<String> {
     use std::io::BufRead;
-    let file = std::fs::File::open(source_path).ok()?;
-    for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+    let reader = crate::sources::common::open_lines(std::path::Path::new(source_path)).ok()?;
+    for line in reader.lines().map_while(Result::ok) {
         // The task body may be encrypted; only read its public routing metadata.
         if !line.contains("agent_message") || !line.contains("NEW_TASK") {
             continue;
@@ -2191,6 +2497,22 @@ fn extract_session_label(
                 first_user_text?.to_string()
             }
         }
+        SourceKind::Goose => {
+            if let Some(title) =
+                crate::sources::goose::session_title(Path::new(source_path), session_id)
+            {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Kimi => {
+            if let Some(title) = crate::sources::kimi::session_title(Path::new(source_path)) {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
         _ => first_user_text?.to_string(),
     };
     let label = sanitize_label(&raw);
@@ -2263,6 +2585,11 @@ fn infer_session_kind(
 
 pub fn analytics_path(state_dir: &Path) -> PathBuf {
     state_dir.join("analytics.sqlite")
+}
+
+/// The analytics cache lives directly in the state directory.
+fn state_dir_of(analytics: &Path) -> &Path {
+    analytics.parent().unwrap_or(Path::new("."))
 }
 
 pub fn rebuild_from_records(
@@ -2349,15 +2676,33 @@ fn session_selection_sql(
     cwd: Option<&str>,
     since_ms: Option<u64>,
     kind: Option<SessionKindFilter>,
-    session_id: Option<&str>,
+    session_ids: &[&str],
     source_path: Option<&str>,
+    profile: Option<&str>,
+    tags: &[String],
 ) -> (String, Vec<rusqlite::types::Value>) {
     let mut clauses = Vec::new();
     let mut values: Vec<rusqlite::types::Value> = Vec::new();
 
-    if let Some(session_id) = session_id {
-        clauses.push("session_id = ?".to_string());
-        values.push(rusqlite::types::Value::Text(session_id.to_string()));
+    if let Some(profile) = profile {
+        // A superset of the rows whose `session_profile` is `profile`; callers apply it exactly.
+        clauses.push("source = ? AND instr(source_path, ?) > 0".to_string());
+        values.push(rusqlite::types::Value::Text(
+            SourceKind::Claude.storage_label().to_string(),
+        ));
+        values.push(rusqlite::types::Value::Text(profile.to_string()));
+    }
+
+    if !session_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("session_id IN ({placeholders})"));
+        values.extend(
+            session_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::Text((*id).to_string())),
+        );
     }
     if let Some(source_path) = source_path {
         clauses.push("source_path = ?".to_string());
@@ -2377,9 +2722,10 @@ fn session_selection_sql(
         );
     }
     if let Some(project) = project {
-        clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"));
+        clauses.push(format!("{} = ?", *REPOSITORY_PROJECT_SQL));
         values.push(rusqlite::types::Value::Text(project.to_string()));
     }
+    push_tag_clauses(tags, &mut clauses, &mut values);
     if let Some(cwd) = cwd {
         let root = cwd.trim_end_matches('/').to_string();
         // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
@@ -2477,6 +2823,185 @@ mod tests {
     }
 
     #[test]
+    fn user_assignments_override_grouping_and_survive_rebuilds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let path = |name: &str| tmp.path().join(format!("{name}.jsonl"));
+        let mut child = record("scratch", "child", &path("child"), 30);
+        child.links.parent_session_id = Some("one".to_string());
+        let records = || {
+            vec![
+                record("scratch", "one", &path("one"), 10),
+                record("repo-a", "two", &path("two"), 20),
+                child.clone(),
+                record("scratch", "other", &path("other"), 40),
+            ]
+        };
+        rebuild_from_records(&db, records()).unwrap();
+        let seed = AnalyticsStore::open(&db).unwrap();
+        seed.conn
+            .execute(
+                "UPDATE sessions SET repo_project = 'ProjectA' WHERE session_id = 'two'",
+                [],
+            )
+            .unwrap();
+        drop(seed);
+
+        let meta = crate::session_meta::SessionMetaStore::open(tmp.path()).unwrap();
+        meta.set_project(SourceKind::Codex, "one", "ProjectA")
+            .unwrap();
+        meta.add_tags(SourceKind::Codex, "two", &["tooling".to_string()])
+            .unwrap();
+        meta.add_tags(SourceKind::Codex, "one", &["scratch".to_string()])
+            .unwrap();
+
+        let check = |store: &AnalyticsStore| {
+            let project_a = store
+                .query_sessions_detailed(None, Some("ProjectA"), None, None, None)
+                .unwrap();
+            let ids = project_a
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>();
+            // The sub-agent inherits its parent's assignment; unrelated sessions do not.
+            assert_eq!(ids, ["child", "two", "one"]);
+            let one = project_a
+                .iter()
+                .find(|row| row.session_id == "one")
+                .unwrap();
+            assert_eq!(one.assigned_project.as_deref(), Some("ProjectA"));
+            assert_eq!(one.repo_project, None, "derived facts stay untouched");
+            let summaries = store.query_project_summaries(None).unwrap();
+            assert_eq!(summaries[0].project, UNFILED_PROJECT);
+            assert_eq!(summaries[0].session_count, 1);
+            assert_eq!(summaries[1].project, "ProjectA");
+            assert_eq!(summaries[1].session_count, 3);
+        };
+        check(&AnalyticsStore::open_read_only(&db).unwrap());
+
+        // A rebuild replaces every analytics row; assignments live elsewhere.
+        rebuild_from_records(&db, records()).unwrap();
+        let store = AnalyticsStore::open(&db).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET repo_project = 'ProjectA' WHERE session_id = 'two'",
+                [],
+            )
+            .unwrap();
+        check(&store);
+
+        let tagged = AnalyticsStore::open_read_only(&db)
+            .unwrap()
+            .with_tags(vec!["tooling".to_string()]);
+        let rows = tagged
+            .query_sessions_detailed(None, Some("ProjectA"), None, None, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "two");
+        assert_eq!(rows[0].tags, ["tooling"]);
+        let child_tags = AnalyticsStore::open_read_only(&db)
+            .unwrap()
+            .with_tags(vec!["scratch".to_string()])
+            .query_sessions(None, None, None, ProjectGrouping::Repository, None)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(child_tags, ["child", "one"]);
+        assert_eq!(
+            tagged.query_tags().unwrap(),
+            vec![("scratch".to_string(), 1), ("tooling".to_string(), 1)]
+        );
+
+        // Removing the override restores derived grouping for it and its child only.
+        meta.clear_project(SourceKind::Codex, "one").unwrap();
+        let summaries = store.query_project_summaries(None).unwrap();
+        assert_eq!(summaries[0].project, UNFILED_PROJECT);
+        assert_eq!(summaries[0].session_count, 3);
+        assert_eq!(summaries[1].session_count, 1);
+    }
+
+    #[test]
+    fn read_only_store_without_assignments_still_resolves_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(&db, [record("p", "s", &tmp.path().join("s.jsonl"), 1)]).unwrap();
+        std::fs::remove_file(crate::session_meta::session_meta_path(tmp.path())).unwrap();
+        let store = AnalyticsStore::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .query_projects(None, ProjectGrouping::Repository)
+                .unwrap(),
+            vec![UNFILED_PROJECT]
+        );
+        assert!(!crate::session_meta::session_meta_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn profile_filter_matches_the_reported_profile_before_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
+             ('claude', 'decoy', '/home/u/work/.claude/projects/-x/decoy.jsonl', 'p', 1, 4),
+             ('claude', 'nested', '/home/u/projects/dotfiles/claude/projects/-x/nested.jsonl', 'p', 1, 3),
+             ('claude', 'work', '/home/u/.claude-profiles/work/projects/-x/work.jsonl', 'p', 1, 2),
+             ('codex', 'other', '/home/u/.codex/work/projects/other.jsonl', 'p', 1, 1);",
+        ).unwrap();
+        let listed = |profile| {
+            store
+                .query_sessions_detailed_selected(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    Some(profile),
+                    Some(1),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.session_id, row.profile.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let count = |profile| {
+            store
+                .count_sessions_selected(None, None, None, None, None, None, None, Some(profile))
+                .unwrap()
+        };
+
+        assert_eq!(listed("work"), [("work".to_string(), "work".to_string())]);
+        assert_eq!(
+            listed("claude"),
+            [("nested".to_string(), "claude".to_string())]
+        );
+        assert!(listed("u").is_empty());
+        assert!(
+            store
+                .query_sessions_detailed_selected(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    Some("work"),
+                    Some(0),
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            (count("work"), count("claude"), count(".claude"), count("u")),
+            (1, 1, 1, 0)
+        );
+    }
+
+    #[test]
     fn detailed_sessions_exact_selectors_apply_before_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
@@ -2487,7 +3012,7 @@ mod tests {
              ('codex', 'other', '/old', 'target', 3, 3),
              ('claude', 'shared', '/old', 'target', 4, 4);",
         ).unwrap();
-        let query = |session_id, source_path| {
+        let query = |session_id: Option<&str>, source_path| {
             store
                 .query_sessions_detailed_selected(
                     Some(SourceFilter::Codex),
@@ -2495,8 +3020,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    session_id,
+                    session_id.as_slice(),
                     source_path,
+                    None,
                     Some(1),
                 )
                 .unwrap()
@@ -2517,8 +3043,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some("shared"),
+                    &["shared"],
                     Some("/old"),
+                    None,
                     Some(1),
                 )
                 .unwrap()
@@ -2866,6 +3393,7 @@ mod tests {
                     None,
                     None,
                     Some(target.to_string_lossy().as_ref()),
+                    None,
                     None,
                     None,
                     None,

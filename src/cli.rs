@@ -1,5 +1,5 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
-use crate::config::{Paths, UserConfig, default_claude_sources};
+use crate::config::{Paths, UserConfig};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
 use crate::index::{IndexRevision, QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_dirty};
@@ -9,7 +9,7 @@ use crate::machine::{
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
     SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_sessions,
     federated_usage, read_context, read_memory, read_record, read_session_pages,
-    session_page_context,
+    refresh_local_sessions, session_page_context,
 };
 use crate::memory::MemoryStore;
 use crate::memory_search::{
@@ -49,12 +49,18 @@ use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
 mod daemon_upgrade;
+mod dream;
 mod evaluation;
 mod stats;
 mod surface;
+use crate::dream::search::{DreamSearchHit, DreamSearchOptions, search_dreams};
+use dream::{
+    DreamCommand, DreamRunArgs, DreamSearchArgs, collect_dream_search, project_dream_hit,
+    run_dream_command,
+};
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, EvaluationArgs, IndexCommand, IndexSource,
-    OutputArgs, OutputFormat, OutputOptions, SessionCommand, WebCommand,
+    OutputArgs, OutputFormat, OutputOptions, SessionCommand, TagCommand, WebCommand,
 };
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -63,7 +69,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n  dream        Consolidate history into cited dreams\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  rex          Install the Rex module\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -88,14 +94,14 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 struct IndexArgs {
-    /// Path to Claude projects directory [default: CLAUDE_CONFIG_DIR or ~/.claude/projects]
+    /// Claude projects directory (repeatable) [default: claude_paths from config, else CLAUDE_CONFIG_DIR, else ~/.claude/projects]
     #[arg(
         long = "claude-path",
         alias = "source",
         value_name = "PATH",
         help_heading = "Sources"
     )]
-    source: Option<PathBuf>,
+    source: Vec<PathBuf>,
     /// Index only these providers (repeatable); exclusions take precedence
     #[arg(long, value_enum, value_name = "SOURCE", help_heading = "Sources")]
     only_source: Vec<IndexSource>,
@@ -202,6 +208,18 @@ struct IndexArgs {
     /// Skip indexing KiloCode CLI sessions
     #[arg(long = "no-kilocode", default_value_t = false, hide = true)]
     no_kilocode: bool,
+    /// Index Kimi Code CLI sessions from ~/.kimi-code/sessions [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kimi: bool,
+    /// Skip indexing Kimi Code CLI sessions
+    #[arg(long = "no-kimi", default_value_t = false, hide = true)]
+    no_kimi: bool,
+    /// Index goose sessions from ~/.local/share/goose/sessions/sessions.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    goose: bool,
+    /// Skip indexing goose sessions
+    #[arg(long = "no-goose", default_value_t = false, hide = true)]
+    no_goose: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -222,6 +240,62 @@ struct IndexArgs {
     /// `exclude_paths` in ~/.memex/config.toml.
     #[arg(long = "exclude", value_name = "GLOB", help_heading = "Sources")]
     exclude: Vec<String>,
+}
+
+/// `memex sessions` arguments. A separate struct keeps their parser builders out of the
+/// stack frame that builds every subcommand, which debug test threads can barely hold.
+#[derive(Args)]
+struct SessionsArgs {
+    /// Return one exact count object instead of session rows (unavailable totals are null)
+    #[arg(long)]
+    count: bool,
+    /// Count conversations matching this lexical query; requires --count
+    #[arg(long, requires = "count", conflicts_with = "cwd")]
+    query: Option<String>,
+    /// Query these machines (repeatable; defaults to configured machines)
+    #[arg(long)]
+    machine: Vec<String>,
+    /// Match this exact session ID; repeat to match several
+    #[arg(long)]
+    session_id: Vec<String>,
+    /// Match this exact indexed source path
+    #[arg(long)]
+    source_path: Option<String>,
+    /// Only sessions whose cwd is this path, lives under it, or whose git root is it
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Filter by project (repository grouping, after user assignments)
+    #[arg(long)]
+    project: Option<String>,
+    /// Only sessions with this user tag (repeatable; all must match)
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
+    /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
+    #[arg(long)]
+    source: Option<SourceFilter>,
+    /// Only Claude sessions from this config directory, such as `work` for ~/.claude-profiles/work
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+    /// Only include sessions active on or after this date/timestamp
+    #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
+    since: Option<String>,
+    /// Maximum number of sessions [default: 20, or 20 per --session-id]
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
+    #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
+    origin: SessionOrigin,
+    /// Only show interactive sessions (alias for --origin interactive)
+    #[arg(long, conflicts_with = "origin", hide = true)]
+    interactive_only: bool,
+    /// Emit one JSON array instead of JSON Lines
+    #[arg(long, hide = true)]
+    json_array: bool,
+    /// Path to memex data directory [default: ~/.memex]
+    #[arg(long)]
+    root: Option<PathBuf>,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[derive(Subcommand)]
@@ -307,6 +381,7 @@ EXAMPLES:
     memex search \"error handling\"
     memex search \"release checklist\" --content memories
     memex search \"authentication decision\" --content all
+    memex search \"package manager\" --content dreams
     memex search \"API design\" --source claude --limit 50
     memex search \"auth\" --since 2024-01-01T00:00:00Z --mode semantic
     memex search \"bug\" --fields score,session_id,snippet --format json
@@ -317,14 +392,15 @@ TIMESTAMP FORMAT:
     Unix milliseconds: 1705315800000
 
 OUTPUT FIELDS (--fields):
-    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches
+    kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches, rolled_up_to
     memory_id, content_version, section_ref, title, heading, cwd, mtime_ms, event_dates, start_line, end_line, document_kind, refs, freshness, changed_since_search
+    dream_id, dream_kind, status, evidence, generation, reinforced, supersedes, superseded_by, citation_count, citations (--content dreams)
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
-        /// Content corpus to search (conversation history by default)
+        /// Content corpus to search (conversation history by default); `all` adds memories and dreams from `memex dream`, `dreams` is dreams alone
         #[arg(long, value_enum, default_value_t = SearchContent::Conversations, help_heading = "Search")]
         content: SearchContent,
         /// Additional independent query view to fuse with reciprocal-rank fusion (repeatable)
@@ -336,6 +412,9 @@ OUTPUT FIELDS (--fields):
         /// Filter by project name
         #[arg(long, help_heading = "Filters")]
         project: Option<String>,
+        /// Only sessions with this user tag (repeatable; all must match)
+        #[arg(long = "tag", value_name = "TAG", help_heading = "Filters")]
+        tags: Vec<String>,
         /// Filter by role (user, assistant, tool_use, tool_result)
         #[arg(long, help_heading = "Filters")]
         role: Option<String>,
@@ -345,7 +424,7 @@ OUTPUT FIELDS (--fields):
         /// Filter by session ID
         #[arg(long, help_heading = "Filters")]
         session: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
         #[arg(long, help_heading = "Filters")]
         source: Option<SourceFilter>,
         /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
@@ -591,6 +670,26 @@ The input contains at most 32 requests; each page is limited to 500 records."
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// Consolidate agent history into cited dreams
+    #[command(
+        args_conflicts_with_subcommands = true,
+        after_help = "\
+EXAMPLES:
+    memex dream --dry-run            # Judge new sessions, show proposed dreams, write nothing
+    memex dream                      # Publish a new generation of dreams
+    memex dream show                 # Read the current dreams with their citations
+    memex dream lint                 # Re-resolve citations; mark lost evidence
+    memex search \"package manager\" --content dreams
+
+Opt-in: set `[dream] enabled = true` in config.toml first. A dream run sends redacted excerpts of recent sessions and saved memories to the executor
+(the claude or codex CLI, or [dream] command). See docs/dreaming.md."
+    )]
+    Dream {
+        #[command(subcommand)]
+        action: Option<DreamCommand>,
+        #[command(flatten)]
+        run: DreamRunArgs,
+    },
     /// Developer diagnostics and retrieval evaluation
     Debug {
         #[command(subcommand)]
@@ -645,6 +744,9 @@ The input contains at most 32 requests; each page is limited to 500 records."
         /// Filter by source
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Count only sessions with this user tag (repeatable; all must match)
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
         /// Read one machine (defaults to local; ignores configured search defaults)
         #[arg(long)]
         machine: Option<String>,
@@ -660,58 +762,23 @@ EXAMPLES:
     memex sessions                        # 20 most recent sessions as JSONL
     memex sessions --cwd .                # sessions from the current repo
     memex sessions --source claude --limit 5
+    memex sessions --session-id ID1 --session-id ID2   # rows for several exact IDs
     memex sessions --format json")]
-    Sessions {
-        /// Return one exact count object instead of session rows (unavailable totals are null)
-        #[arg(long)]
-        count: bool,
-        /// Count conversations matching this lexical query; requires --count
-        #[arg(long, requires = "count", conflicts_with = "cwd")]
-        query: Option<String>,
-        /// Query these machines (repeatable; defaults to configured machines)
-        #[arg(long)]
-        machine: Vec<String>,
-        /// Match this exact session ID
-        #[arg(long)]
-        session_id: Option<String>,
-        /// Match this exact indexed source path
-        #[arg(long)]
-        source_path: Option<String>,
-        /// Only sessions whose cwd is this path, lives under it, or whose git root is it
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Filter by project (repository grouping)
-        #[arg(long)]
-        project: Option<String>,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
-        #[arg(long)]
-        source: Option<SourceFilter>,
-        /// Only include sessions active on or after this date/timestamp
-        #[arg(long, value_name = "DATE_OR_TIMESTAMP")]
-        since: Option<String>,
-        /// Maximum number of sessions
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Filter by origin: regular (default), interactive, subagent, or all (includes permission reviews)
-        #[arg(long, value_enum, default_value_t = SessionOrigin::Regular)]
-        origin: SessionOrigin,
-        /// Only show interactive sessions (alias for --origin interactive)
-        #[arg(long, conflicts_with = "origin", hide = true)]
-        interactive_only: bool,
-        /// Emit one JSON array instead of JSON Lines
-        #[arg(long, hide = true)]
-        json_array: bool,
-        /// Path to memex data directory [default: ~/.memex]
-        #[arg(long)]
-        root: Option<PathBuf>,
-        #[command(flatten)]
-        output: OutputArgs,
-    },
+    Sessions(SessionsArgs),
     /// Herdr plugin helpers (used by herdr/plugin.sh)
     #[command(hide = true)]
     Herdr {
         #[command(subcommand)]
         action: HerdrCommand,
+    },
+    /// Rex integration: install the memex module for Rex's init.lua
+    #[command(after_help = "\
+EXAMPLES:
+    memex rex install                     # write memex.lua beside Rex's init.lua
+    memex rex install --dir ~/dotfiles/rex")]
+    Rex {
+        #[command(subcommand)]
+        action: RexCommand,
     },
     /// Show index statistics, vector state, and indexing config
     #[command(hide = true)]
@@ -933,7 +1000,7 @@ enum HerdrCommand {
         /// Refuse when no resumable session exists in --cwd instead of using another project
         #[arg(long)]
         strict_cwd: bool,
-        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, or kiro
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
         #[arg(long)]
         source: Option<SourceFilter>,
         /// Path to memex data directory [default: ~/.memex]
@@ -950,6 +1017,59 @@ enum HerdrCommand {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RexCommand {
+    /// Write memex.lua beside Rex's init.lua (rerun after upgrading memex)
+    Install {
+        /// Directory to write memex.lua to [default: the directory of Rex's init.lua]
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Replace a memex.lua that `memex rex install` did not write
+        #[arg(long)]
+        force: bool,
+    },
+    /// Resume the most recent resumable session, opening a new Rex tab
+    #[command(hide = true)]
+    ResumeLast {
+        /// Prefer sessions from this directory (falls back to the global latest unless strict)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Refuse when no resumable session exists in --cwd instead of using another project
+        #[arg(long)]
+        strict_cwd: bool,
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Rex session to open the tab in [default: $REX_SESSION]
+        #[arg(long)]
+        rex_session: Option<String>,
+        /// Rex block a split opens beside [default: $REX_BLOCK]
+        #[arg(long)]
+        rex_block: Option<String>,
+    },
+    /// Resume a specific session by id, opening a new Rex tab
+    #[command(hide = true)]
+    Resume {
+        /// Session ID (from `memex sessions` or search results)
+        session_id: String,
+        /// Filter by source when a session id appears in multiple backends
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Rex session to open the tab in [default: $REX_SESSION]
+        #[arg(long)]
+        rex_session: Option<String>,
+        /// Rex block a split opens beside [default: $REX_BLOCK]
+        #[arg(long)]
+        rex_block: Option<String>,
     },
 }
 
@@ -1025,6 +1145,7 @@ pub(crate) enum SearchContent {
     Conversations,
     Memories,
     All,
+    Dreams,
 }
 
 impl From<McpSearchMode> for SearchMode {
@@ -1078,7 +1199,7 @@ fn default_recency_half_life_days() -> f32 {
 pub(crate) struct SearchRequest {
     /// Keywords or natural-language query.
     pub(crate) query: String,
-    /// Search conversations, memories, or both. Defaults to conversations.
+    /// Search conversations, memories, or all: conversations, memories, and the dreams `memex dream` consolidated from them (kind dream, each citing source records). dreams returns dreams alone. Defaults to conversations.
     #[serde(default)]
     pub(crate) content: SearchContent,
     /// Additional query views fused with reciprocal-rank fusion.
@@ -1088,6 +1209,9 @@ pub(crate) struct SearchRequest {
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to search.
     pub(crate) project: Option<String>,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tags: Vec<String>,
     /// Record role such as user, assistant, tool_use, or tool_result.
     pub(crate) role: Option<String>,
     /// Tool name such as Read, Edit, or Bash.
@@ -1144,8 +1268,14 @@ pub(crate) struct SessionsRequest {
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to list.
     pub(crate) project: Option<String>,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tags: Vec<String>,
     /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
     pub(crate) source: Option<String>,
+    /// Claude config directory name, such as `work` for `~/.claude-profiles/work`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
     /// Earliest activity timestamp (RFC3339, date, unix seconds, or unix milliseconds).
     pub(crate) since: Option<String>,
     /// Session origin: regular (default) excludes permission reviews; all includes them. Interactive and subagent select ordinary session subsets.
@@ -1416,6 +1546,7 @@ pub fn run() -> Result<()> {
             additional_queries,
             cwd,
             project,
+            tags,
             role,
             tool,
             session,
@@ -1449,6 +1580,7 @@ pub fn run() -> Result<()> {
                 additional_queries,
                 cwd,
                 project,
+                tags,
                 role,
                 tool,
                 session,
@@ -1621,7 +1753,11 @@ pub fn run() -> Result<()> {
             }
         },
         Commands::Session {
-            action: _,
+            action: Some(action),
+            ..
+        } => run_session_assignment(action)?,
+        Commands::Session {
+            action: None,
             session_id,
             machine,
             source_path,
@@ -1750,6 +1886,7 @@ pub fn run() -> Result<()> {
         | Commands::EvalRetrieval { evaluation } => {
             evaluation::run(evaluation)?;
         }
+        Commands::Dream { action, run } => run_dream_command(action, run)?,
         Commands::Machines { root, output } => {
             let paths = Paths::new(root)?;
             let config = UserConfig::load(&paths)?;
@@ -1816,19 +1953,21 @@ pub fn run() -> Result<()> {
         }
         Commands::Projects {
             source,
+            tags,
             machine,
             root,
             output,
         } => {
             let paths = Paths::new(root)?;
+            let tags = normalize_tags(&tags)?;
             let mut items = if let Some(id) = machine
                 .as_deref()
                 .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
             {
                 let config = UserConfig::load(&paths)?;
-                crate::machine::remote_project_summaries(&config, id, source)?
+                crate::machine::remote_project_summaries(&config, id, source, tags)?
             } else {
-                collect_projects(&paths, source)?
+                collect_projects(&paths, source, tags)?
             };
             if let Some(machine) = machine {
                 for item in &mut items {
@@ -1839,7 +1978,7 @@ pub fn run() -> Result<()> {
                 .resolve(OutputFormat::Jsonl, None, false)?
                 .print_values(items)?;
         }
-        Commands::Sessions {
+        Commands::Sessions(SessionsArgs {
             count,
             query,
             machine,
@@ -1847,7 +1986,9 @@ pub fn run() -> Result<()> {
             source_path,
             cwd,
             project,
+            tags,
             source,
+            profile,
             since,
             limit,
             origin,
@@ -1855,20 +1996,27 @@ pub fn run() -> Result<()> {
             json_array,
             output,
             root,
-        } => {
+        }) => {
             let origin = if interactive_only {
                 SessionOrigin::Interactive
             } else {
                 origin
             };
+            let limit = limit.unwrap_or(SESSIONS_DEFAULT_LIMIT * session_id.len().max(1));
             if count {
+                anyhow::ensure!(
+                    session_id.len() <= 1,
+                    "--count accepts at most one --session-id"
+                );
                 let paths = Paths::new(root)?;
                 let request = SessionsRequest {
-                    session_id,
+                    session_id: session_id.into_iter().next(),
                     source_path,
                     cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                     project,
+                    tags,
                     source: source.map(|value| value.as_str().to_string()),
+                    profile,
                     since,
                     limit,
                     origin,
@@ -1899,7 +2047,9 @@ pub fn run() -> Result<()> {
                 source_path,
                 cwd,
                 project,
+                tags,
                 source,
+                profile,
                 since,
                 limit,
                 origin,
@@ -1927,6 +2077,36 @@ pub fn run() -> Result<()> {
                 root,
             } => {
                 run_herdr_resume(Some(session_id), None, false, source, root)?;
+            }
+        },
+        Commands::Rex { action } => match action {
+            RexCommand::Install { dir, force } => run_rex_install(dir, force)?,
+            RexCommand::ResumeLast {
+                cwd,
+                strict_cwd,
+                source,
+                root,
+                rex_session,
+                rex_block,
+            } => {
+                let target = RexTarget {
+                    session: rex_session,
+                    block: rex_block,
+                };
+                run_rex_resume(None, cwd, strict_cwd, source, root, target)?;
+            }
+            RexCommand::Resume {
+                session_id,
+                source,
+                root,
+                rex_session,
+                rex_block,
+            } => {
+                let target = RexTarget {
+                    session: rex_session,
+                    block: rex_block,
+                };
+                run_rex_resume(Some(session_id), None, false, source, root, target)?;
             }
         },
         Commands::Stats { json, root, output } => {
@@ -1967,7 +2147,8 @@ pub fn run() -> Result<()> {
             run_analytics_backfill(root)?;
         }
         Commands::SourceAudit { source } => {
-            let audits = crate::sources::audit::audit_installed_sources(source)?;
+            let claude_sources = UserConfig::load(&Paths::new(None)?)?.claude_sources();
+            let audits = crate::sources::audit::audit_installed_sources(source, &claude_sources)?;
             println!("{}", serde_json::to_string_pretty(&audits)?);
         }
         Commands::Skill { command } => {
@@ -2404,6 +2585,7 @@ fn run_poll_loop(
     let mut worker = EmbeddingWorker::default();
     let mut worker_spec = None;
     let mut vector_work = VectorWorkState::default();
+    let mut dreams = crate::dream::schedule::DreamScheduler::new(index.root.clone());
 
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
@@ -2429,7 +2611,11 @@ fn run_poll_loop(
 
         let deadline = Instant::now() + Duration::from_secs(interval_secs);
         while Instant::now() < deadline && !shutdown.load(AtomicOrdering::Relaxed) {
-            upgrade.check(|| worker.stop());
+            dreams.service(&paths);
+            upgrade.check(|| {
+                dreams.stop();
+                worker.stop()
+            });
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(1));
@@ -2488,6 +2674,7 @@ fn run_event_loop(
     let mut worker = EmbeddingWorker::default();
     let mut worker_spec = None;
     let mut vector_work = VectorWorkState::default();
+    let mut dreams = crate::dream::schedule::DreamScheduler::new(index.root.clone());
 
     use crate::watch::{
         FireCause, HOT_SWEEP_INTERVAL, HOT_WINDOW, WatchConfig, WatchService, dirty_needs_ingest,
@@ -2537,7 +2724,11 @@ fn run_event_loop(
             &mut vector_work,
         )?;
 
-        upgrade.check(|| worker.stop());
+        dreams.service(&paths);
+        upgrade.check(|| {
+            dreams.stop();
+            worker.stop()
+        });
         match service.poll() {
             Some(FireCause::Resync) => {
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
@@ -2545,19 +2736,26 @@ fn run_event_loop(
                 }
                 match retry_after_stopping_embedder(&mut worker, || run_index_args(index, false)) {
                     Ok(()) => {
-                        service.mark_complete(FireCause::Resync);
+                        mark_watch_ingest_complete(&mut service, &paths, FireCause::Resync);
                         log_watch_stats(&service);
                     }
                     Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
                         return Err(error);
                     }
-                    Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
+                    Err(error) => {
+                        mark_watch_ingest_failed(&mut service, &paths, "resync ingest", &error)
+                    }
                 }
             }
             Some(FireCause::Dirty) => {
                 let dirty = service.dirty_paths();
                 match dirty_needs_ingest(&paths, &dirty) {
-                    Ok(false) => service.mark_skipped(),
+                    Ok(false) => {
+                        if service.is_failing() {
+                            clear_watch_ingest_failure(&paths);
+                        }
+                        service.mark_skipped();
+                    }
                     Ok(true) => match retry_after_stopping_embedder(&mut worker, || {
                         run_index_selection(index, false, Some(&dirty))
                     }) {
@@ -2567,18 +2765,22 @@ fn run_event_loop(
                             {
                                 eprintln!("watch: root refresh failed: {error:#}");
                             }
-                            service.mark_complete(if full_scan {
-                                FireCause::Resync
-                            } else {
-                                FireCause::Dirty
-                            });
+                            mark_watch_ingest_complete(
+                                &mut service,
+                                &paths,
+                                if full_scan {
+                                    FireCause::Resync
+                                } else {
+                                    FireCause::Dirty
+                                },
+                            );
                             log_watch_stats(&service);
                         }
                         Err(error) => {
                             if error.is::<crate::index::IndexCompatibilityError>() {
                                 return Err(error);
                             }
-                            eprintln!("watch: ingest failed, retrying: {error:#}");
+                            mark_watch_ingest_failed(&mut service, &paths, "ingest", &error);
                         }
                     },
                     Err(error) => {
@@ -2587,13 +2789,15 @@ fn run_event_loop(
                             run_index_args(index, false)
                         }) {
                             Ok(()) => {
-                                service.mark_complete(FireCause::Resync);
+                                mark_watch_ingest_complete(&mut service, &paths, FireCause::Resync);
                                 log_watch_stats(&service);
                             }
                             Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
                                 return Err(error);
                             }
-                            Err(error) => eprintln!("watch: ingest failed, retrying: {error:#}"),
+                            Err(error) => {
+                                mark_watch_ingest_failed(&mut service, &paths, "ingest", &error)
+                            }
                         }
                     }
                 }
@@ -2621,6 +2825,45 @@ fn run_event_loop(
     }
     worker.stop()?;
     Ok(())
+}
+
+fn mark_watch_ingest_complete(
+    service: &mut crate::watch::WatchService,
+    paths: &Paths,
+    cause: crate::watch::FireCause,
+) {
+    if service.is_failing() {
+        clear_watch_ingest_failure(paths);
+    }
+    service.mark_complete(cause);
+}
+
+fn clear_watch_ingest_failure(paths: &Paths) {
+    if let Err(error) = crate::ingest::failures::DaemonIngestStatus::clear(&paths.state) {
+        eprintln!("watch: could not clear the ingest failure status: {error:#}");
+    }
+}
+
+/// Back the failed ingest off exponentially and record the streak for `memex stats`.
+fn mark_watch_ingest_failed(
+    service: &mut crate::watch::WatchService,
+    paths: &Paths,
+    operation: &str,
+    error: &anyhow::Error,
+) {
+    let (failures, delay) = service.mark_failed(Instant::now());
+    eprintln!(
+        "watch: {operation} failed ({failures} in a row), retrying in {}s: {error:#}",
+        delay.as_secs()
+    );
+    if let Err(status_error) = crate::ingest::failures::DaemonIngestStatus::record_failure(
+        &paths.state,
+        failures,
+        error,
+        delay,
+    ) {
+        eprintln!("watch: could not record the ingest failure status: {status_error:#}");
+    }
 }
 
 /// Re-resolve watch roots (cheap; call on resync) so newly installed agent
@@ -2673,14 +2916,12 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         "embeddings",
     )?;
     Ok(IngestOptions {
-        claude_sources: if index.source_enabled(IndexSource::Claude) {
-            index
-                .source
-                .clone()
-                .map(|source| vec![source])
-                .unwrap_or_else(default_claude_sources)
-        } else {
+        claude_sources: if !index.source_enabled(IndexSource::Claude) {
             Vec::new()
+        } else if index.source.is_empty() {
+            config.claude_sources()
+        } else {
+            index.source.clone()
         },
         include_agents: index.include_agents,
         include_reasoning,
@@ -2699,6 +2940,8 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_bob: index.source_enabled(IndexSource::Bob),
         include_zcode: index.source_enabled(IndexSource::Zcode),
         include_kilocode: index.source_enabled(IndexSource::Kilocode),
+        include_kimi: index.source_enabled(IndexSource::Kimi),
+        include_goose: index.source_enabled(IndexSource::Goose),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -2707,6 +2950,8 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         embed_runtime,
         tool_content_limits,
         defer_merges: false,
+        embedding_budget: None,
+        redaction: config.redactor()?,
     })
 }
 
@@ -2763,6 +3008,12 @@ fn run_index_selection(
     }
     for path in &report.diagnostics.unreadable_sources {
         eprintln!("warning: skipped unreadable source {path}; its indexed records are kept");
+    }
+    if report.files_deferred > 0 {
+        eprintln!(
+            "warning: {} previously failing file(s) left as indexed until they change or their retry is due; see `memex stats`",
+            report.files_deferred
+        );
     }
     if print_diagnostics && !report.diagnostics.is_empty() {
         println!(
@@ -2986,6 +3237,7 @@ fn run_search(
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3030,12 +3282,40 @@ fn run_search(
     } else {
         SearchMode::Lexical
     };
+    if content == SearchContent::Dreams {
+        if trace {
+            return Err(anyhow!(
+                "retrieval traces currently record conversation searches only"
+            ));
+        }
+        let values = collect_dream_search(DreamSearchArgs {
+            query: joined_queries(query, additional_queries),
+            project,
+            source,
+            since,
+            until,
+            limit,
+            sort_by_timestamp: sort == SortBy::Ts,
+            mode,
+            conversation_filters: cwd.is_some()
+                || role.is_some()
+                || tool.is_some()
+                || session.is_some()
+                || !tags.is_empty()
+                || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All),
+            machines,
+            fields: if full { None } else { parse_fields(fields)? },
+            root,
+        })?;
+        return render_unified_search(values, format, pretty);
+    }
     if content != SearchContent::Conversations {
         return run_search_with_memories(MemorySurfaceSearchArgs {
             query,
             additional_queries,
             cwd,
             project,
+            tags,
             role,
             tool,
             session,
@@ -3065,6 +3345,7 @@ fn run_search(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3123,11 +3404,20 @@ fn run_search(
     render_located_results(collected.results, &collected.render)
 }
 
+/// Dream search has one query view; further views widen it instead of being fused by rank.
+fn joined_queries(query: String, additional: Vec<String>) -> String {
+    std::iter::once(query)
+        .chain(additional)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 struct MemorySurfaceSearchArgs {
     query: String,
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3155,6 +3445,7 @@ struct MemorySurfaceSearchArgs {
 enum UnifiedSearchResult {
     Conversation(Box<LocatedRecord>),
     Memory(Box<LocatedMemoryHit>),
+    Dream(Box<DreamSearchHit>),
 }
 
 impl UnifiedSearchResult {
@@ -3162,6 +3453,7 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => result.score,
             Self::Memory(result) => result.hit.score,
+            Self::Dream(result) => result.score,
         }
     }
 
@@ -3169,6 +3461,7 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => result.score = score,
             Self::Memory(result) => result.hit.score = score,
+            Self::Dream(result) => result.score = score,
         }
     }
 
@@ -3176,6 +3469,7 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => result.record.ts,
             Self::Memory(result) => result.hit.mtime_ms,
+            Self::Dream(result) => result.ts,
         }
     }
 
@@ -3183,9 +3477,14 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => (&result.machine, &result.record.session_id),
             Self::Memory(result) => (&result.machine, &result.hit.section_ref),
+            Self::Dream(result) => (&result.machine, &result.dream_id),
         }
     }
 }
+
+/// Dreams returned alongside conversations and memories. The dream store is small, so
+/// an uncapped keyword match over it would crowd source records out of a mixed page.
+const MIXED_DREAM_HITS: usize = 5;
 
 fn run_search_with_memories(args: MemorySurfaceSearchArgs) -> Result<()> {
     let format = args.format;
@@ -3205,6 +3504,7 @@ fn collect_search_with_memories(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3234,10 +3534,11 @@ fn collect_search_with_memories(
     let conversation_only_filters = role.is_some()
         || tool.is_some()
         || session.is_some()
+        || !tags.is_empty()
         || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All);
     if content == SearchContent::Memories && conversation_only_filters {
         return Err(anyhow!(
-            "--role, --tool, --session, and --origin filter conversations; use --content conversations or all"
+            "--role, --tool, --session, --tag, and --origin filter conversations; use --content conversations or all"
         ));
     }
     if trace {
@@ -3252,6 +3553,37 @@ fn collect_search_with_memories(
     let mut failures = Vec::new();
     let include_conversations = content == SearchContent::All;
     let include_memories = !conversation_only_filters;
+    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
+    // Once dreaming is enabled, recall over everything includes what it concluded. Dreams live in
+    // this machine's store and are matched by keyword whatever the mode; `--cwd` scopes
+    // them by the repository it names.
+    let dream_options = if include_conversations
+        && include_memories
+        && config.dream.enabled()
+        && selected_machines
+            .iter()
+            .any(|machine| machine == crate::machine::LOCAL_MACHINE_ID)
+    {
+        Some(DreamSearchOptions {
+            query: joined_queries(query.clone(), additional_queries.clone()),
+            project: project.clone().or_else(|| {
+                let cwd = memory_cwd.as_ref()?.to_string_lossy();
+                crate::analytics::repository_project_for_cwd(&cwd).or_else(|| {
+                    Path::new(cwd.as_ref())
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                })
+            }),
+            source: source.and_then(|value| crate::types::SourceKind::from_label(value.as_str())),
+            since: parse_ts_millis(since.clone())?,
+            until: parse_ts_millis(until.clone())?,
+            limit: limit.min(MIXED_DREAM_HITS),
+            sort_by_timestamp: sort == SortBy::Ts,
+            include_inactive: false,
+        })
+    } else {
+        None
+    };
     let mut conversation_results = Vec::new();
     if include_conversations {
         let collected = collect_search(SearchCollectRequest {
@@ -3259,6 +3591,7 @@ fn collect_search_with_memories(
             additional_queries: additional_queries.clone(),
             cwd: cwd.clone(),
             project: project.clone(),
+            tags,
             role,
             tool,
             session,
@@ -3330,15 +3663,34 @@ fn collect_search_with_memories(
         }
     }
 
+    let mut dream_results = Vec::new();
+    if let Some(options) = &dream_options {
+        // A damaged dream store must not take conversation and memory recall down with it.
+        match search_dreams(&paths, options) {
+            Ok(hits) => dream_results = hits,
+            Err(error) => failures.push(format!(
+                "{}: dream search: {error:#}",
+                crate::machine::LOCAL_MACHINE_ID
+            )),
+        }
+    }
+
     let mut results = if content == SearchContent::Memories {
         memory_results
             .into_iter()
             .map(|result| UnifiedSearchResult::Memory(Box::new(result)))
             .collect::<Vec<_>>()
     } else {
-        // Scores from independent conversation and memory indexes are not comparable. Rank each
-        // corpus with reciprocal-rank fusion before merging them.
-        let mut merged = Vec::with_capacity(conversation_results.len() + memory_results.len());
+        // Scores from independent conversation, memory, and dream indexes are not comparable.
+        // Rank each corpus with reciprocal-rank fusion before merging them.
+        let mut merged = Vec::with_capacity(
+            conversation_results.len() + memory_results.len() + dream_results.len(),
+        );
+        for (rank, result) in dream_results.into_iter().enumerate() {
+            let mut result = UnifiedSearchResult::Dream(Box::new(result));
+            result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
+            merged.push(result);
+        }
         for (rank, result) in conversation_results.into_iter().enumerate() {
             let mut result = UnifiedSearchResult::Conversation(Box::new(result));
             result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
@@ -3391,9 +3743,11 @@ fn collect_search_with_memories(
                 }
                 values.push(projected);
             }
+            UnifiedSearchResult::Dream(result) => {
+                values.push(project_dream_hit(*result, &fields)?);
+            }
         }
     }
-    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
     Ok((values, failures, selected_machines))
 }
 
@@ -3445,6 +3799,7 @@ fn render_unified_search(values: Vec<Value>, format: SearchFormat, pretty: bool)
                     });
                 let identity = value
                     .get("memory_id")
+                    .or_else(|| value.get("dream_id"))
                     .or_else(|| value.get("record_id"))
                     .and_then(Value::as_str)
                     .unwrap_or("-");
@@ -3461,6 +3816,7 @@ struct SearchCollectRequest {
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3553,9 +3909,9 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
         Operation::Projects { machine } => {
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
-                collect_projects(paths, None)?
+                collect_projects(paths, None, Vec::new())?
             } else {
-                crate::machine::remote_project_summaries(&config, &machine, None)?
+                crate::machine::remote_project_summaries(&config, &machine, None, Vec::new())?
             };
             Ok(tag(items, machine))
         }
@@ -3567,11 +3923,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
                 collect_sessions(
-                    filters.session_id,
+                    filters.session_id.as_slice(),
                     filters.source_path,
                     filters.cwd.map(PathBuf::from),
                     filters.project,
+                    filters.tags,
                     parse_source_filter(filters.source)?,
+                    filters.profile,
                     filters.since,
                     filters.limit,
                     filters.origin,
@@ -3618,6 +3976,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     query,
                     additional_queries: Vec::new(),
                     cwd: None,
+                    tags: Vec::new(),
                     project,
                     role: None,
                     tool: None,
@@ -3663,6 +4022,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             limit,
         } => {
             check_index(&machine)?;
+            if machine == crate::machine::LOCAL_MACHINE_ID {
+                refresh_local_sessions(
+                    paths,
+                    &config,
+                    [(session_id.as_str(), source_path.as_str())],
+                )?;
+            }
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -3694,6 +4060,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             max_chars,
         } => {
             check_index(&machine)?;
+            if machine == crate::machine::LOCAL_MACHINE_ID {
+                refresh_local_sessions(
+                    paths,
+                    &config,
+                    [(session_id.as_str(), source_path.as_str())],
+                )?;
+            }
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -3733,6 +4106,7 @@ fn collect_search_with_auto_index(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3827,6 +4201,7 @@ fn collect_search_with_auto_index(
             min_score,
             project_grouping: None,
             text_limit,
+            tags: normalize_tags(&tags)?,
         },
         &crate::search::Selection {
             sort: if sort == SortBy::Score {
@@ -3900,6 +4275,9 @@ struct SearchHit {
     text: String,
     snippet: String,
     matches: Vec<MatchSpan>,
+    /// Root session a child-session hit is shown under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rolled_up_to: Option<crate::search::SessionRollup>,
     #[serde(flatten)]
     links: RecordLinks,
 }
@@ -3910,13 +4288,21 @@ fn render_located_results(results: Vec<LocatedRecord>, render: &RenderOptions) -
             machine,
             score,
             record,
+            rollup,
         } in results
         {
             let ts = format_ts(record.ts);
             let text = match_preview(&record.text, &render.matchers, 200);
+            let session = match rollup {
+                Some(rollup) => format!(
+                    "{} ({} of {})",
+                    record.session_id, rollup.matched_kind, rollup.session_id
+                ),
+                None => record.session_id,
+            };
             println!(
                 "[{score:.3}] {} {} {} {} {} {} {}",
-                machine, ts, record.doc_id, record.project, record.role, record.session_id, text
+                machine, ts, record.doc_id, record.project, record.role, session, text
             );
         }
         return Ok(());
@@ -3948,6 +4334,7 @@ fn project_located_results(
         machine,
         score,
         record,
+        rollup,
     } in results
     {
         let ts = format_ts(record.ts);
@@ -4062,6 +4449,11 @@ fn project_located_results(
             if fields.contains("matches") {
                 map.insert("matches".to_string(), serde_json::to_value(matches)?);
             }
+            if fields.contains("rolled_up_to")
+                && let Some(rollup) = &rollup
+            {
+                map.insert("rolled_up_to".to_string(), serde_json::to_value(rollup)?);
+            }
             Value::Object(map)
         } else {
             serde_json::to_value(SearchHit {
@@ -4078,6 +4470,7 @@ fn project_located_results(
                 text,
                 snippet,
                 matches,
+                rolled_up_to: rollup,
                 links: record.links,
             })?
         };
@@ -4089,12 +4482,39 @@ fn project_located_results(
 pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Result<Value> {
     validate_mcp_search_request(&request)?;
     let source = parse_source_filter(request.source)?;
+    if request.content == SearchContent::Dreams {
+        let results = collect_dream_search(DreamSearchArgs {
+            query: joined_queries(request.query, request.additional_queries),
+            project: request.project,
+            source,
+            since: request.since,
+            until: request.until,
+            limit: request.limit,
+            sort_by_timestamp: request.sort == McpSearchSort::Ts,
+            mode: request.mode.into(),
+            conversation_filters: request.cwd.is_some()
+                || request.role.is_some()
+                || request.tool.is_some()
+                || request.session.is_some()
+                || !request.tags.is_empty()
+                || !matches!(request.origin, SessionOrigin::Regular | SessionOrigin::All),
+            machines: request.machines,
+            fields: None,
+            root,
+        })?;
+        return Ok(serde_json::json!({
+            "results": results,
+            "failures": [],
+            "selected_machines": [crate::machine::LOCAL_MACHINE_ID],
+        }));
+    }
     if request.content != SearchContent::Conversations {
         let (results, failures, selected_machines) =
             collect_search_with_memories(MemorySurfaceSearchArgs {
                 query: request.query,
                 additional_queries: request.additional_queries,
                 cwd: request.cwd.map(PathBuf::from),
+                tags: request.tags,
                 project: request.project,
                 role: request.role,
                 tool: request.tool,
@@ -4129,6 +4549,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
         query: request.query,
         additional_queries: request.additional_queries,
         cwd: request.cwd.map(PathBuf::from),
+        tags: request.tags,
         project: request.project,
         role: request.role,
         tool: request.tool,
@@ -4443,6 +4864,18 @@ fn run_hydrate(
             )
         })
         .collect();
+    // One refresh covers every local request; when a strict refresh fails, only the local
+    // pages report it.
+    let local_refresh = refresh_local_sessions(
+        &paths,
+        &config,
+        requests
+            .iter()
+            .filter(|(machine, _)| machine == crate::machine::LOCAL_MACHINE_ID)
+            .map(|(_, request)| (request.session_id.as_str(), request.source_path.as_str())),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
     let mut writer = output.writer();
     let mut remaining = budget.remaining();
     let mut position = 0;
@@ -4457,6 +4890,15 @@ fn run_hydrate(
             .iter()
             .map(|(_, request)| request.clone())
             .collect();
+        if machine == crate::machine::LOCAL_MACHINE_ID
+            && let Some(error) = &local_refresh
+        {
+            for request in &batch {
+                writer.write(hydrate_error_value(machine, request, error)?)?;
+            }
+            position = end;
+            continue;
+        }
         match read_session_pages(&paths, &config, machine, &batch, remaining) {
             Ok(pages) => {
                 for page in pages {
@@ -4654,6 +5096,13 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let source_path = source_path.unwrap_or_default();
+    if machine == crate::machine::LOCAL_MACHINE_ID {
+        refresh_local_sessions(
+            &paths,
+            &config,
+            [(session_id.as_str(), source_path.as_str())],
+        )?;
+    }
     let (records, page) = collect_session_page(
         &paths,
         &config,
@@ -4969,6 +5418,7 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
         include_reviews: origin == SessionOrigin::All,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: 0,
+        claude_sources: Some(config.claude_sources()),
     };
     // A cold usage cache re-parses whole log corpora, which can take minutes; narrate the
     // parse phase on stderr so the scan doesn't read as a hang. Rendered with the same
@@ -5222,6 +5672,12 @@ fn format_usd(value: f64) -> String {
     }
 }
 
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
+    tags.iter()
+        .map(|tag| crate::session_meta::normalize_tag(tag))
+        .collect()
+}
+
 fn open_analytics_read_only(paths: &Paths) -> Result<AnalyticsStore> {
     let db = analytics_path(&paths.state);
     if !db.exists() {
@@ -5313,12 +5769,13 @@ fn source_dir_of(source_path: &str) -> String {
 pub(crate) fn session_resume_command(
     config: &UserConfig,
     row: &crate::analytics::SessionDetailRow,
+    claude_sources: &[PathBuf],
 ) -> Option<(String, String)> {
     let template = crate::resume::resume_template(config, row.source, false)?;
     let source_dir = source_dir_of(&row.source_path);
     // Transcript stores are never workspaces: falling back into one makes the
     // resumed CLI ask the user to trust an agent's internal state directory.
-    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir);
+    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir, claude_sources);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {
@@ -5327,19 +5784,28 @@ pub(crate) fn session_resume_command(
             project: &row.project,
             source_path: &row.source_path,
             source_dir: &source_dir,
+            claude_config_dir: crate::resume::claude_config_dir(
+                row.source,
+                &row.source_path,
+                claude_sources,
+            ),
         },
         &cwd,
     );
     Some((command, cwd))
 }
 
+const SESSIONS_DEFAULT_LIMIT: usize = 20;
+
 #[allow(clippy::too_many_arguments)]
 fn run_sessions(
-    session_id: Option<String>,
+    session_ids: Vec<String>,
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     source: Option<SourceFilter>,
+    profile: Option<String>,
     since: Option<String>,
     limit: usize,
     origin: SessionOrigin,
@@ -5356,6 +5822,7 @@ fn run_sessions(
         &SessionListSpec {
             source,
             project,
+            tags: normalize_tags(&tags)?,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             since_ms: parse_ts_millis(since)?,
             limit,
@@ -5363,8 +5830,10 @@ fn run_sessions(
                 SessionOrigin::All => None,
                 other => Some(other.into()),
             },
-            session_id,
+            session_id: session_ids.first().cloned(),
+            session_ids: session_ids.into_iter().skip(1).collect(),
             source_path,
+            profile,
         },
     )?;
     for (machine, error) in result.failures {
@@ -5386,8 +5855,12 @@ fn run_sessions(
     output.print_values(items)
 }
 
-pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> Result<Vec<Value>> {
-    let store = open_analytics_read_only(paths)?;
+pub(crate) fn collect_projects(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    tags: Vec<String>,
+) -> Result<Vec<Value>> {
+    let store = open_analytics_read_only(paths)?.with_tags(tags);
     Ok(store.query_project_summaries(source)?.into_iter().map(|row| {
         let last_at = row.last_at.and_then(|timestamp| {
             let formatted = format_ts(timestamp);
@@ -5399,11 +5872,13 @@ pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> R
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_sessions(
-    session_id: Option<String>,
+    session_ids: &[String],
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     source: Option<SourceFilter>,
+    profile: Option<String>,
     since: Option<String>,
     limit: usize,
     origin: SessionOrigin,
@@ -5411,7 +5886,8 @@ pub(crate) fn collect_sessions(
 ) -> Result<Vec<Value>> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
-    let store = open_analytics_read_only(&paths)?;
+    let claude_sources = config.claude_sources();
+    let store = open_analytics_read_only(&paths)?.with_tags(normalize_tags(&tags)?);
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
     let kind_filter = match origin {
@@ -5424,14 +5900,16 @@ pub(crate) fn collect_sessions(
         cwd_filter.as_deref(),
         since_ms,
         kind_filter,
-        session_id.as_deref(),
+        &session_ids.iter().map(String::as_str).collect::<Vec<_>>(),
         source_path.as_deref(),
+        profile.as_deref(),
         Some(limit),
     )?;
 
     let mut items = Vec::new();
     for row in &rows {
-        let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
+        let resume_cmd =
+            session_resume_command(&config, row, &claude_sources).map(|(command, _)| command);
         let mut value = serde_json::to_value(row)?;
         let object = value
             .as_object_mut()
@@ -5469,6 +5947,9 @@ pub(crate) fn collect_session_count(
         if request.cwd.is_some() {
             return Err(anyhow!("--query count does not support --cwd"));
         }
+        if !request.tags.is_empty() {
+            return Err(anyhow!("--query count does not support --tag"));
+        }
         if !SearchIndex::exists(&paths.index) {
             return Ok(SessionCount {
                 total: None,
@@ -5497,6 +5978,11 @@ pub(crate) fn collect_session_count(
         if let Some(path) = request.source_path {
             scopes.retain(|scope| scope.2 == path);
         }
+        if let Some(profile) = &request.profile {
+            scopes.retain(|(source, _, path)| {
+                crate::analytics::session_profile(*source, path).as_ref() == Some(profile)
+            });
+        }
         if scopes.is_empty() || kind == crate::analytics::SessionKindFilter::All {
             return Ok(SessionCount {
                 total: Some(scopes.len() as u64),
@@ -5520,7 +6006,7 @@ pub(crate) fn collect_session_count(
                 .then(|| "canonical session metadata incomplete".into()),
         })
     } else {
-        let store = open_analytics_read_only(paths)?;
+        let store = open_analytics_read_only(paths)?.with_tags(normalize_tags(&request.tags)?);
         let cwd = canonical_cwd_filter(request.cwd.map(PathBuf::from));
         let total = store.count_sessions_selected(
             source,
@@ -5530,6 +6016,7 @@ pub(crate) fn collect_session_count(
             Some(kind),
             request.session_id.as_deref(),
             request.source_path.as_deref(),
+            request.profile.as_deref(),
         )?;
         Ok(SessionCount {
             total: Some(total),
@@ -5542,11 +6029,13 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
     validate_mcp_limit(request.limit)?;
     let source = parse_source_filter(request.source)?;
     let mut results = collect_sessions(
-        request.session_id,
+        request.session_id.as_slice(),
         request.source_path,
         request.cwd.map(PathBuf::from),
         request.project,
+        request.tags,
         source,
+        request.profile,
         request.since,
         request.limit,
         request.origin,
@@ -5562,16 +6051,24 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
     }))
 }
 
-fn run_herdr_resume(
+/// What `memex herdr|rex resume[-last]` resumes: the session, its resume
+/// command, and the directory to run it in.
+struct ResumeTarget {
+    row: crate::analytics::SessionDetailRow,
+    command: String,
+    cwd: String,
+}
+
+fn resume_target(
+    paths: &Paths,
+    config: &UserConfig,
     session_id: Option<String>,
     cwd: Option<PathBuf>,
     strict_cwd: bool,
     source: Option<SourceFilter>,
-    root: Option<PathBuf>,
-) -> Result<()> {
-    let paths = Paths::new(root)?;
-    let config = UserConfig::load(&paths)?;
-    let store = open_analytics_read_only(&paths)?;
+) -> Result<ResumeTarget> {
+    let claude_sources = config.claude_sources();
+    let store = open_analytics_read_only(paths)?;
     let cwd_filter = canonical_cwd_filter(cwd);
 
     let mut rows =
@@ -5594,31 +6091,76 @@ fn run_herdr_resume(
         // selection falls through to the global fallback or reports none.
         rows.retain(&interactive);
         if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
-            // The public CLI keeps its historical global fallback unless the Herdr plugin
-            // explicitly requires the focused directory to match.
+            // The public CLI keeps its historical global fallback unless the herdr or Rex
+            // plugin explicitly requires the focused directory to match.
             rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
             rows.retain(&interactive);
         }
     }
 
-    let Some((row, command, cwd)) = rows
-        .iter()
-        .find_map(|row| session_resume_command(&config, row).map(|(cmd, cwd)| (row, cmd, cwd)))
-    else {
-        return Err(anyhow!("no resumable session found"));
-    };
+    rows.into_iter()
+        .find_map(|row| {
+            let (command, cwd) = session_resume_command(config, &row, &claude_sources)?;
+            Some(ResumeTarget { row, command, cwd })
+        })
+        .ok_or_else(|| anyhow!("no resumable session found"))
+}
+
+/// Outside a terminal multiplexer, run the resume command directly.
+fn run_resume_inline(target: &ResumeTarget) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .args(["-lc", &target.command])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("resume command exited with {status}"));
+    }
+    println!(
+        "resumed {} ({})",
+        target.row.session_id,
+        target.row.source.label()
+    );
+    Ok(())
+}
+
+fn resume_label(row: &crate::analytics::SessionDetailRow) -> String {
+    row.repo_project
+        .clone()
+        .unwrap_or_else(|| row.project.clone())
+}
+
+fn run_herdr_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    strict_cwd: bool,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let target = resume_target(&paths, &config, session_id, cwd, strict_cwd, source)?;
+    let ResumeTarget { row, command, cwd } = &target;
 
     if crate::herdr::inside_herdr() {
         let placement = crate::herdr::resume_placement(&config);
         if placement == crate::herdr::ResumePlacement::Off {
             return Err(anyhow!("herdr resume is disabled (herdr_resume = \"off\")"));
         }
-        let label = row
-            .repo_project
-            .clone()
-            .unwrap_or_else(|| row.project.clone());
-        let pane_id =
-            crate::herdr::open_resume_pane(placement, Some(cwd.as_str()), &label, &command)?;
+        if let Some(pane_id) = crate::herdr::pane_running_session(&row.session_id)
+            && crate::herdr::focus_pane(&pane_id).is_ok()
+        {
+            println!(
+                "{} ({}) is already open; focused herdr pane {pane_id}",
+                row.session_id,
+                row.source.label()
+            );
+            return Ok(());
+        }
+        let pane_id = crate::herdr::open_resume_pane(
+            placement,
+            Some(cwd.as_str()),
+            &resume_label(row),
+            command,
+        )?;
         println!(
             "resumed {} ({}) in herdr pane {pane_id}",
             row.session_id,
@@ -5627,15 +6169,181 @@ fn run_herdr_resume(
         return Ok(());
     }
 
-    // Outside herdr, run the resume command directly.
-    let status = std::process::Command::new("sh")
-        .args(["-lc", &command])
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("resume command exited with {status}"));
+    run_resume_inline(&target)
+}
+
+/// Where `memex rex resume[-last]` opens the session. The Rex module passes
+/// both from its action context; from a shell they default to the terminal's
+/// own `REX_SESSION` and `REX_BLOCK`.
+struct RexTarget {
+    session: Option<String>,
+    block: Option<String>,
+}
+
+fn run_rex_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    strict_cwd: bool,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+    rex: RexTarget,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let target = resume_target(&paths, &config, session_id, cwd, strict_cwd, source)?;
+    let ResumeTarget { row, command, cwd } = &target;
+
+    // A block id only means something in the session it came from.
+    let (rex_session, rex_block) = match rex.session {
+        Some(session) => (Some(session), rex.block),
+        None => (
+            crate::rex::current_session(),
+            rex.block.or_else(crate::rex::current_block),
+        ),
+    };
+    let Some(rex_session) = rex_session else {
+        return run_resume_inline(&target);
+    };
+    let placement = crate::rex::resume_placement(&config);
+    if placement == crate::rex::ResumePlacement::Off {
+        return Err(anyhow!("Rex resume is disabled (rex_resume = \"off\")"));
     }
-    println!("resumed {} ({})", row.session_id, row.source.label());
+    if let Some(block_id) = crate::rex::block_running_session(&rex_session, &row.session_id)
+        && crate::rex::focus_block(&rex_session, &block_id).is_ok()
+    {
+        println!(
+            "{} ({}) is already open; focused Rex block {block_id}",
+            row.session_id,
+            row.source.label()
+        );
+        return Ok(());
+    }
+    let block_id = crate::rex::open_resume_block(
+        placement,
+        &rex_session,
+        rex_block.as_deref(),
+        Some(cwd.as_str()),
+        &resume_label(row),
+        command,
+    )?;
+    println!(
+        "resumed {} ({}) in Rex block {block_id}",
+        row.session_id,
+        row.source.label()
+    );
     Ok(())
+}
+
+fn run_rex_install(dir: Option<PathBuf>, force: bool) -> Result<()> {
+    let dir = match dir {
+        Some(dir) => dir,
+        None => crate::rex::config_dir()
+            .ok_or_else(|| anyhow!("cannot locate Rex's config directory; pass --dir"))?,
+    };
+    let path = dir.join("memex.lua");
+    let contents = crate::rex::module_contents();
+    let status = match std::fs::read_to_string(&path) {
+        Ok(existing) if existing == contents => "unchanged",
+        Ok(existing) if !force && !existing.starts_with(crate::rex::MODULE_MARKER) => {
+            return Err(anyhow!(
+                "{} was not written by memex; pass --force to replace it",
+                path.display()
+            ));
+        }
+        Ok(_) => "updated",
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "created",
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    if status != "unchanged" {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        std::fs::write(&path, &contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    println!("{status} {}", path.display());
+
+    let init = dir.join("init.lua");
+    let loaded = std::fs::read_to_string(&init).is_ok_and(|text| {
+        [
+            "require(\"memex\")",
+            "require('memex')",
+            "require \"memex\"",
+        ]
+        .iter()
+        .any(|call| text.contains(call))
+    });
+    if loaded {
+        println!(
+            "\n{} already loads it; run `rex config reload` to apply.",
+            init.display()
+        );
+    } else {
+        println!(
+            "\nAdd to {}:\n\n  require(\"memex\").setup{{}}\n  rex.bind(\"cmd+shift+m\", \"memex_palette\")\n\nthen run `rex config reload`.",
+            init.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_session_assignment(command: SessionCommand) -> Result<()> {
+    use crate::session_meta::{AssignmentAction, AssignmentRequest};
+    let (session_id, action, target) = match command {
+        SessionCommand::Batch { .. } => unreachable!("batch normalizes to hydrate"),
+        SessionCommand::SetProject {
+            session_id,
+            project,
+            target,
+        } => (session_id, AssignmentAction::SetProject { project }, target),
+        SessionCommand::ClearProject { session_id, target } => {
+            (session_id, AssignmentAction::ClearProject, target)
+        }
+        SessionCommand::Inspect { session_id, target } => {
+            (session_id, AssignmentAction::Inspect, target)
+        }
+        SessionCommand::Tag { action } => match action {
+            TagCommand::Add {
+                session_id,
+                tags,
+                target,
+            } => (session_id, AssignmentAction::AddTags { tags }, target),
+            TagCommand::Rm {
+                session_id,
+                tags,
+                target,
+            } => (session_id, AssignmentAction::RemoveTags { tags }, target),
+            TagCommand::Ls { root, output } => {
+                let paths = Paths::new(root)?;
+                let store = open_analytics_read_only(&paths)?;
+                let output = output.resolve(OutputFormat::Jsonl, None, false)?;
+                return output.print_values(
+                    store
+                        .query_tags()?
+                        .into_iter()
+                        .map(|(tag, sessions)| serde_json::json!({"tag": tag, "session_count": sessions}))
+                        .collect(),
+                );
+            }
+        },
+    };
+    let paths = Paths::new(target.root)?;
+    let config = UserConfig::load(&paths)?;
+    let report = crate::machine::session_assignment(
+        &paths,
+        &config,
+        &target.machine,
+        &AssignmentRequest {
+            session_id,
+            source: target.source.map(|source| source.as_str().to_string()),
+            action,
+        },
+    )?;
+    target
+        .output
+        .resolve(OutputFormat::Json, None, false)?
+        .print_value(&serde_json::to_value(report)?)
 }
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
@@ -5974,6 +6682,8 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Zcode => "zcode",
         crate::types::SourceKind::Kiro => "kiro",
         crate::types::SourceKind::Kilocode => "kilocode",
+        crate::types::SourceKind::Kimi => "kimi",
+        crate::types::SourceKind::Goose => "goose",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -5989,6 +6699,11 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     if record.source == crate::types::SourceKind::Kilocode {
         return Err(anyhow!(
             "sharing is not supported for KiloCode sessions: {source_path} is a database, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Goose {
+        return Err(anyhow!(
+            "sharing is not supported for goose sessions: {source_path} is a database entry, not a transcript file"
         ));
     }
 
@@ -6055,7 +6770,7 @@ fn run_transfer(
     Ok(())
 }
 
-fn find_in_path(binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(binary: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(binary);
@@ -6652,7 +7367,11 @@ fn run_index_service_status(
         ))
     };
     result?;
-    daemon_upgrade::print_runtime(&paths)
+    daemon_upgrade::print_runtime(&paths)?;
+    for line in crate::ingest::failures::status_lines(&paths.state)? {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn run_index_service_open(
@@ -7257,7 +7976,7 @@ fn build_index_command_args(
     let mut args = Vec::new();
     args.push("index".to_string());
 
-    if let Some(source) = &index.source {
+    for source in &index.source {
         args.push("--claude-path".to_string());
         args.push(source.to_string_lossy().to_string());
     }
@@ -7322,6 +8041,9 @@ fn build_index_command_args(
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
     }
+    if !index.antigravity || index.no_antigravity {
+        args.push("--no-antigravity".to_string());
+    }
     if !index.bob || index.no_bob {
         args.push("--no-bob".to_string());
     }
@@ -7330,6 +8052,12 @@ fn build_index_command_args(
     }
     if !index.kilocode || index.no_kilocode {
         args.push("--no-kilocode".to_string());
+    }
+    if !index.kimi || index.no_kimi {
+        args.push("--no-kimi".to_string());
+    }
+    if !index.goose || index.no_goose {
+        args.push("--no-goose".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -7519,11 +8247,11 @@ fn build_systemd_service(
     continuous: bool,
     env_vars: &[(String, String)],
 ) -> String {
-    let exec_start = if program_args.is_empty() {
-        exe_path.to_string()
-    } else {
-        format!("{} {}", exe_path, program_args.join(" "))
-    };
+    let exec_start = std::iter::once(exe_path)
+        .chain(program_args.iter().map(String::as_str))
+        .map(systemd_exec_word)
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let mut out = String::new();
     out.push_str("[Unit]\n");
@@ -7551,6 +8279,34 @@ fn build_systemd_service(
     if continuous {
         out.push_str("WantedBy=default.target\n");
     }
+    out
+}
+
+/// One ExecStart argument. systemd splits on whitespace, expands `%` specifiers and
+/// `$` variables, and reads C escapes inside double quotes, so anything that is not a
+/// plain word is quoted rather than split or turned into another unit directive.
+fn systemd_exec_word(input: &str) -> String {
+    let escaped = input.replace('%', "%%").replace('$', "$$");
+    let plain = !escaped.is_empty()
+        && !escaped.chars().any(|ch| {
+            ch.is_whitespace() || ch.is_control() || matches!(ch, '"' | '\'' | '\\' | ';')
+        });
+    if plain {
+        return escaped;
+    }
+    let mut out = String::from("\"");
+    for ch in escaped.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_ascii_control() => out.push_str(&format!("\\x{:02x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -7645,7 +8401,7 @@ enum SortBy {
     Ts,
 }
 
-const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
+const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,rolled_up_to,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search,dream_id,dream_kind,status,evidence,generation,reinforced,supersedes,superseded_by,citation_count,citations";
 
 fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
     if full {
@@ -7751,17 +8507,19 @@ pub(crate) fn build_matchers(query: &str) -> Result<Vec<regex::Regex>> {
         .collect()
 }
 
-// Preview the earliest literal hit; semantic-only hits fall back to a compact prefix.
+/// Characters of context a preview shows before its first literal hit.
+const PREVIEW_LEAD_CHARS: usize = 80;
+
+// Preview the window with the most specific literal hits, such as an identifier past an
+// early common word; semantic-only hits fall back to a compact prefix.
 pub(crate) fn match_preview(text: &str, matchers: &[regex::Regex], max_chars: usize) -> String {
-    let first = matchers
-        .iter()
-        .filter_map(|matcher| matcher.find(text))
-        .min_by_key(|m| m.start());
-    let Some(hit) = first else {
+    let Some(anchor) =
+        crate::text_window::best_anchor(text, matchers, max_chars, PREVIEW_LEAD_CHARS)
+    else {
         return summarize(text, max_chars);
     };
-    let prefix = take_last_chars(&text[..hit.start()], 80);
-    let start = hit.start() - prefix.len();
+    let prefix = take_last_chars(&text[..anchor.byte], PREVIEW_LEAD_CHARS);
+    let start = anchor.byte - prefix.len();
     let preview = summarize(&text[start..], max_chars.saturating_sub(1));
     if start > 0 {
         format!("…{preview}")
@@ -7834,6 +8592,9 @@ fn command_reports_updates(command: &Commands) -> bool {
             | Commands::Rpc { .. }
             | Commands::Mcp { .. }
             | Commands::Herdr { .. }
+            | Commands::Rex {
+                action: RexCommand::ResumeLast { .. } | RexCommand::Resume { .. }
+            }
             | Commands::IndexService {
                 action: IndexServiceCommand::Run { .. }
             }
@@ -8897,6 +9658,21 @@ mod tests {
     }
 
     #[test]
+    fn previews_show_an_identifier_past_an_early_common_word() {
+        let text = format!(
+            "error: the build failed {} then parse_retry_budget_v2 rejected the request",
+            "while compiling the workspace ".repeat(40)
+        );
+        let matchers = build_matchers("error parse_retry_budget_v2").unwrap();
+        let preview = match_preview(&text, &matchers, 400);
+        assert!(preview.contains("parse_retry_budget_v2"), "{preview}");
+        assert!(preview.chars().count() <= 400);
+        // A single term still previews its earliest hit.
+        let preview = match_preview(&text, &build_matchers("error").unwrap(), 400);
+        assert!(preview.starts_with("error: the build failed"), "{preview}");
+    }
+
+    #[test]
     fn empty_search_projection_keeps_the_compact_default() {
         for fields in [None, Some("".to_string()), Some(" , ".to_string())] {
             let fields = search_fields(fields, false).unwrap().unwrap();
@@ -8923,22 +9699,22 @@ mod tests {
             "1",
         ])
         .unwrap();
-        let Commands::Sessions {
+        let Commands::Sessions(SessionsArgs {
             session_id,
             source_path,
             source,
             origin,
             limit,
             ..
-        } = cli.command.unwrap()
+        }) = cli.command.unwrap()
         else {
             panic!("expected sessions command");
         };
-        assert_eq!(session_id.as_deref(), Some("shared"));
+        assert_eq!(session_id, ["shared"]);
         assert_eq!(source_path.as_deref(), Some("/old session.jsonl"));
         assert_eq!(source, Some(SourceFilter::Codex));
         assert_eq!(origin, SessionOrigin::All);
-        assert_eq!(limit, 1);
+        assert_eq!(limit, Some(1));
         let defaults: SessionsRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(defaults.session_id.is_none());
         assert!(defaults.source_path.is_none());
@@ -8961,7 +9737,7 @@ mod tests {
                 let cli = Cli::try_parse_from(args).unwrap();
                 let origin = match cli.command.unwrap() {
                     Commands::Search { origin, .. }
-                    | Commands::Sessions { origin, .. }
+                    | Commands::Sessions(SessionsArgs { origin, .. })
                     | Commands::Usage { origin, .. } => origin,
                     _ => unreachable!(),
                 };
@@ -9001,7 +9777,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: Vec::new(),
@@ -9034,6 +9810,10 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9063,6 +9843,7 @@ mod tests {
         assert!(args.contains(&"--no-grok".to_string()));
         assert!(args.contains(&"--no-jcode".to_string()));
         assert!(args.contains(&"--no-muse".to_string()));
+        assert!(args.contains(&"--no-antigravity".to_string()));
         assert!(args.contains(&"--no-bob".to_string()));
     }
 
@@ -9071,7 +9852,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: vec!["~/work/**".to_string(), "/tmp/secret/*.jsonl".to_string()],
@@ -9104,6 +9885,10 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9134,7 +9919,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: Vec::new(),
@@ -9167,6 +9952,10 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9199,7 +9988,7 @@ mod tests {
         let index = IndexArgs {
             only_source: Vec::new(),
             exclude_source: Vec::new(),
-            source: None,
+            source: Vec::new(),
             include_agents: false,
             include_reasoning: false,
             exclude: Vec::new(),
@@ -9232,6 +10021,10 @@ mod tests {
             no_zcode: false,
             kilocode: false,
             no_kilocode: false,
+            kimi: false,
+            no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9923,6 +10716,7 @@ arguments = {
             "--no-jcode",
             "--no-muse",
             "--no-kiro",
+            "--no-kimi",
         ])
         .unwrap();
 
@@ -9936,6 +10730,8 @@ arguments = {
         assert!(index.no_grok);
         assert!(index.no_jcode);
         assert!(index.no_muse);
+        assert!(index.no_kiro);
+        assert!(index.no_kimi);
     }
 
     #[test]
@@ -10330,6 +11126,25 @@ arguments = {
             "Environment=\"PI_CODING_AGENT_SESSION_DIR=/tmp/pi \\\"sessions\\\" 100%%\"\n"
         ));
         assert!(service.contains("ExecStart=/usr/bin/memex index --no-pi\n"));
+    }
+
+    #[test]
+    fn systemd_exec_start_keeps_each_argument_one_word() {
+        let service = build_systemd_service(
+            "/opt/my tools/memex",
+            &[
+                "--exclude".to_string(),
+                "~/My Work/**".to_string(),
+                "%h\nExecStartPre=/bin/evil $HOME".to_string(),
+            ],
+            true,
+            &[],
+        );
+        assert!(service.contains(
+            "ExecStart=\"/opt/my tools/memex\" --exclude \"~/My Work/**\" \
+             \"%%h\\nExecStartPre=/bin/evil $$HOME\"\n"
+        ));
+        assert!(!service.contains("\nExecStartPre="));
     }
 
     #[test]

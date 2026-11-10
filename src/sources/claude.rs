@@ -17,11 +17,358 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    // Preserve pre-reader fallback IDs independently of attachment-only messages,
-    // and classify background transcripts consistently across every record.
-    index: 8,
-    usage: 4,
+    // Index harness-injected user text as system context, keep queued prompts, recaps,
+    // compaction summaries and API errors, and skip history a `/branch` fork copied.
+    index: 9,
+    // Reconcile content blocks and divergent workflow copies as one logical agent.
+    usage: 6,
 };
+
+/// Elements Claude Code writes into user-role text that nobody typed: output it captured from a
+/// command the user ran, and context it or an IDE extension attaches to a prompt. Claude Code
+/// strips them before showing a prompt back; they are indexed as system context instead.
+const HARNESS_TAGS: [&str; 8] = [
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-stdout",
+    "bash-stderr",
+    "bash-exit-code",
+    "system-reminder",
+    "ide_opened_file",
+    "ide_selection",
+];
+
+/// Prefixes of user-role text that Claude Code wrote itself: command output, background task
+/// notifications, teammate messages, the local-command caveat, the interrupt marker and the
+/// directive a forked worker starts with.
+const INJECTED_PREFIXES: [&str; 10] = [
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "<teammate-message",
+    "<tick>",
+    "[Request interrupted by user",
+    "<fork-boilerplate>",
+];
+
+/// The sentences Claude Code puts before the model's summary on a compaction summary line,
+/// current wording first.
+const COMPACT_PREAMBLES: [&str; 2] = [
+    "The summary below covers the earlier portion of the conversation.",
+    "The conversation is summarized below:",
+];
+
+/// What Claude Code appends after the model's summary on a compaction summary line.
+const COMPACT_TRAILERS: [&str; 6] = [
+    "\n\nIf you need specific details from before compaction",
+    "\n\nRecent messages are preserved verbatim.",
+    "\n\nNote: the earliest part of the conversation was too large to include",
+    "\n\nYour REPL VM state was kept across this compaction",
+    "\nContinue the conversation from where it left off",
+    "\nPlease continue the conversation from where we left it off",
+];
+
+/// The body between the first `<name>` and its `</name>`.
+fn tag_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = text.find(&open)? + open.len();
+    let len = text[start..].find(&close)?;
+    Some(&text[start..start + len])
+}
+
+/// Where the first `<name>` or `<name attr...>` opening tag starts.
+fn open_tag(text: &str, name: &str) -> Option<usize> {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(at) = text[from..].find(&open) {
+        let start = from + at;
+        let after = start + open.len();
+        if text[after..].starts_with(|c: char| c == '>' || c.is_whitespace()) {
+            return Some(start);
+        }
+        from = after;
+    }
+    None
+}
+
+/// User-role text split into what the user typed and the harness context around it.
+#[derive(Debug, Default, PartialEq)]
+struct TypedText {
+    typed: Option<String>,
+    context: Vec<String>,
+}
+
+/// Separate [`HARNESS_TAGS`] elements (an unclosed one runs to the end) from a user prompt, and
+/// render a slash command, bash-mode input or `#` memory note as the line the user typed.
+fn typed_text(text: &str) -> TypedText {
+    let mut remaining = text.to_string();
+    let mut context = Vec::new();
+    for name in HARNESS_TAGS {
+        let close = format!("</{name}>");
+        while let Some(start) = open_tag(&remaining, name) {
+            let end = remaining[start..]
+                .find(&close)
+                .map_or(remaining.len(), |at| start + at + close.len());
+            let element = remaining[start..end].trim();
+            if !element.is_empty() {
+                context.push(element.to_string());
+            }
+            remaining.replace_range(start..end, "");
+        }
+    }
+    let trimmed = remaining.trim();
+    let typed = if trimmed.starts_with("<command-")
+        && let Some(name) = tag_body(trimmed, "command-name")
+    {
+        let args = tag_body(trimmed, "command-args").unwrap_or_default().trim();
+        Some(if args.is_empty() {
+            name.trim().to_string()
+        } else {
+            format!("{} {args}", name.trim())
+        })
+    } else if trimmed.starts_with("<bash-input>")
+        && let Some(command) = tag_body(trimmed, "bash-input")
+    {
+        Some(format!("! {}", command.trim()))
+    } else if trimmed.starts_with("<user-memory-input>")
+        && let Some(note) = tag_body(trimmed, "user-memory-input")
+    {
+        Some(format!("# {}", note.trim()))
+    } else {
+        Some(trimmed.to_string())
+    };
+    TypedText {
+        typed: typed.filter(|typed| !typed.is_empty()),
+        context,
+    }
+}
+
+/// The model-written part of a compaction summary line, without Claude Code's preamble, its
+/// pointer to the transcript and its instruction to carry on. Text in neither known shape is
+/// kept whole.
+fn compact_summary(text: &str) -> &str {
+    let Some(body) = COMPACT_PREAMBLES
+        .iter()
+        .find_map(|preamble| text.find(preamble).map(|at| &text[at + preamble.len()..]))
+    else {
+        return text.trim();
+    };
+    let end = COMPACT_TRAILERS
+        .iter()
+        .filter_map(|trailer| body.find(trailer))
+        .min();
+    let body = body[..end.unwrap_or(body.len())].trim();
+    body.strip_prefix("Summary:").map_or(body, str::trim_start)
+}
+
+/// Whether an `origin` names the user: absent, null or `{"kind": "human"}`. Any other kind
+/// (`task-notification`, `peer`, `auto-continuation`, ...) is the harness speaking.
+fn human_origin(origin: Option<&simd_json::BorrowedValue<'_>>) -> bool {
+    origin.is_none_or(|origin| {
+        origin.is_null()
+            || origin
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .is_none_or(|kind| kind == "human")
+    })
+}
+
+/// The text of every text block of `content` (or a plain string), joined.
+fn joined_text(content: Option<&simd_json::BorrowedValue<'_>>) -> Option<String> {
+    let content = content?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let texts = content
+        .as_array()?
+        .iter()
+        .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+        .collect::<Vec<_>>();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+/// A user line Claude Code wrote itself: `isMeta` (skill prompts, caveats), a non-human
+/// `origin`, or text opening with an [`INJECTED_PREFIXES`] marker. A subagent's first line is
+/// its task even when it is `isMeta` (a forked skill's prompt).
+fn injected_user_line(object: &simd_json::borrowed::Object<'_>) -> bool {
+    let flag = |key: &str| object.get(key).and_then(|value| value.as_bool()) == Some(true);
+    let task = flag("isSidechain")
+        && object
+            .get("parentUuid")
+            .is_none_or(|parent| parent.is_null());
+    let content = object
+        .get("message")
+        .and_then(|message| message.get("content"));
+    let first_text = content.and_then(|content| {
+        content.as_str().or_else(|| {
+            content
+                .as_array()
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(|text| text.as_str())
+        })
+    });
+    (flag("isMeta") && !task)
+        || !human_origin(object.get("origin"))
+        || first_text.is_some_and(|text| {
+            let text = text.trim_start();
+            INJECTED_PREFIXES
+                .iter()
+                .any(|prefix| text.starts_with(prefix))
+        })
+}
+
+/// The role and text of a conversation line that is neither a user nor an assistant message,
+/// or `None` for bookkeeping. A prompt typed while the agent was busy is only written as a
+/// `queued_command` attachment; recaps, retried API errors, safeguard notices and typed slash
+/// commands are system lines.
+fn side_entry(
+    object: &simd_json::borrowed::Object<'_>,
+    entry_type: &str,
+) -> Option<(&'static str, String)> {
+    let (role, text) = match entry_type {
+        "attachment" => {
+            let queued = object.get("attachment").filter(|attachment| {
+                attachment.get("type").and_then(|kind| kind.as_str()) == Some("queued_command")
+            })?;
+            let by_user = queued.get("isMeta").and_then(|meta| meta.as_bool()) != Some(true)
+                && queued
+                    .get("commandMode")
+                    .and_then(|mode| mode.as_str())
+                    .is_none_or(|mode| mode == "prompt")
+                && human_origin(queued.get("origin"));
+            // A message from the agent that spawned this one, or a peer, prompts it as a task.
+            let by_agent = matches!(
+                queued
+                    .get("origin")
+                    .and_then(|origin| origin.get("kind"))
+                    .and_then(|kind| kind.as_str()),
+                Some("coordinator" | "peer")
+            );
+            let prompt = joined_text(queued.get("prompt"))?;
+            if by_user || by_agent {
+                ("user", typed_text(&prompt).typed?)
+            } else {
+                ("system", prompt)
+            }
+        }
+        "system" => {
+            let subtype = object.get("subtype").and_then(|value| value.as_str());
+            let content = || joined_text(object.get("content"));
+            match subtype? {
+                "away_summary" => ("assistant", format!("recap: {}", content()?.trim())),
+                "api_error" => {
+                    let error = object.get("error")?;
+                    let text = error
+                        .get("formatted")
+                        .or_else(|| error.get("message"))
+                        .and_then(|text| text.as_str())
+                        .or_else(|| error.as_str())?;
+                    ("system", format!("API error: {text}"))
+                }
+                // Other informational notices (idle compaction, auto mode) are not part of the
+                // conversation.
+                "informational" => (
+                    "system",
+                    content().filter(|text| text.contains("safeguards"))?,
+                ),
+                "local_command" => {
+                    let text = content()?;
+                    if text.trim_start().starts_with("<command-") {
+                        ("user", typed_text(&text).typed?)
+                    } else {
+                        ("system", text)
+                    }
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some((role, text))
+}
+
+/// The session a `/branch` fork was copied from. `/branch` writes the copied history first, each
+/// line keeping its uuid and naming it in `forkedFrom: {sessionId, messageUuid}`.
+fn copied_from<'a>(object: &'a simd_json::borrowed::Object<'_>) -> Option<&'a str> {
+    let forked_from = object.get("forkedFrom")?;
+    let uuid = object.get("uuid").and_then(|value| value.as_str())?;
+    (forked_from
+        .get("messageUuid")
+        .and_then(|value| value.as_str())
+        == Some(uuid))
+    .then(|| {
+        forked_from
+            .get("sessionId")
+            .and_then(|value| value.as_str())
+    })
+    .flatten()
+    .filter(|session| !session.is_empty())
+}
+
+/// The transcript of a fork's origin session, beside the fork in its project directory.
+fn origin_transcript(path: &Path, origin: &str) -> PathBuf {
+    path.with_file_name(format!("{origin}.jsonl"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForkFingerprint {
+    origin: PathBuf,
+    origin_exists: bool,
+}
+
+/// What a `/branch` fork's index projection depends on outside its own file. Its copied
+/// history is skipped only while the origin transcript holds it, so the origin appearing or
+/// disappearing (Claude Code deletes old transcripts) must reparse the fork. A transcript's
+/// origin is fixed by its first lines, so `previous` is reused while the file only grows.
+/// `None` for transcripts that are not forks.
+pub(crate) fn fork_fingerprint(
+    path: &Path,
+    previous: Option<&str>,
+    reuse_previous: bool,
+) -> Option<String> {
+    let origin = if reuse_previous {
+        // Without a previous fork fingerprint, a file that only grew is not a fork.
+        serde_json::from_str::<ForkFingerprint>(previous?)
+            .ok()?
+            .origin
+    } else {
+        let file = File::open(path).ok()?;
+        let bytes = super::common::map_sequential(&file).ok()?;
+        origin_transcript(path, &fork_origin(&bytes)?)
+    };
+    let origin_exists = origin.is_file();
+    serde_json::to_string(&ForkFingerprint {
+        origin,
+        origin_exists,
+    })
+    .ok()
+}
+
+/// The fork origin of a transcript: the session its first message line was copied from.
+fn fork_origin(bytes: &[u8]) -> Option<String> {
+    for line in bytes.split(|byte| *byte == b'\n').take(64) {
+        let mut buffer = line.to_vec();
+        let Ok(value) = simd_json::to_borrowed_value(&mut buffer) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if matches!(
+            object.get("type").and_then(|value| value.as_str()),
+            Some("user" | "assistant")
+        ) {
+            return copied_from(object).map(str::to_string);
+        }
+    }
+    None
+}
 
 /// Return the human-facing title Claude stores alongside a conversation.
 ///
@@ -138,8 +485,17 @@ pub fn discover(
     Ok(files)
 }
 
-pub fn usage_files() -> Vec<PathBuf> {
-    super::common::jsonl_files(crate::config::default_claude_sources())
+pub fn usage_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    // Copies can contain unique history. Read them all and reconcile shared responses.
+    super::common::jsonl_files(roots.iter().cloned())
+}
+
+/// A discovered agent copy and the byte boundary captured for this refresh.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentCopy {
+    pub path: PathBuf,
+    pub size: u64,
+    pub metadata_sha256: String,
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -215,6 +571,158 @@ fn decode_project_name(folder_name: &str) -> String {
     } else {
         meaningful.join("-")
     }
+}
+
+/// Index of the `projects` component that roots a Claude transcript path. Encoded cwd
+/// directories start with `-`, so the last component named `projects` is the root's.
+fn projects_component(path: &Path) -> Option<usize> {
+    path.components()
+        .enumerate()
+        .filter(|(_, component)| component.as_os_str() == "projects")
+        .last()
+        .map(|(index, _)| index)
+}
+
+/// The transcript's path below its `projects` directory: `<encoded cwd>/<session>.jsonl`,
+/// or deeper for agent transcripts. It names the same conversation under any config root.
+pub(crate) fn project_relative_path(path: &Path) -> Option<PathBuf> {
+    let projects = projects_component(path)?;
+    let relative: PathBuf = path.components().skip(projects + 1).collect();
+    (relative.components().count() >= 2).then_some(relative)
+}
+
+/// Name of the Claude config directory a transcript was read from, such as `work` for
+/// `~/.claude-profiles/work/projects/...` or `.claude` for `~/.claude/projects/...`.
+pub fn profile_from_path(path: &Path) -> Option<String> {
+    let projects = projects_component(path)?;
+    let config_dir = path.components().nth(projects.checked_sub(1)?)?;
+    match config_dir {
+        std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// The `subagents` directory and file name shared by every copy of an agent transcript.
+/// Workflow runs store each agent twice, as `subagents/agent-<id>.jsonl` and as
+/// `subagents/workflows/<run>/agent-<id>.jsonl`.
+pub(crate) fn agent_copy_key(path: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
+    let name = path.file_name()?;
+    if !name.to_str()?.starts_with("agent-") {
+        return None;
+    }
+    let parent = path.parent()?;
+    let subagents = if parent.file_name()? == "subagents" {
+        parent
+    } else {
+        let workflows = parent.parent()?;
+        let subagents = workflows.parent()?;
+        (workflows.file_name()? == "workflows" && subagents.file_name()? == "subagents")
+            .then_some(subagents)?
+    };
+    Some((subagents.to_path_buf(), name.to_os_string()))
+}
+
+/// The workflow run directories under a `subagents` directory.
+pub(crate) fn workflow_runs(subagents: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(subagents.join("workflows"))
+        .map(|runs| runs.flatten().map(|run| run.path()).collect())
+        .unwrap_or_default()
+}
+
+/// Every copy of one agent transcript that exists on disk.
+pub(crate) fn agent_copies(
+    subagents: &Path,
+    runs: &[PathBuf],
+    name: &std::ffi::OsStr,
+) -> Vec<PathBuf> {
+    let mut copies = vec![subagents.join(name)];
+    copies.extend(runs.iter().map(|run| run.join(name)));
+    copies.retain(|path| path.is_file());
+    copies
+}
+
+/// Map each duplicate to the path that owns its merged index projection. Usage retains the
+/// physical copies so its file cache observes changes to every part of the logical agent.
+pub(crate) fn agent_copy_owners(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> std::collections::HashMap<PathBuf, PathBuf> {
+    let mut groups = std::collections::HashMap::<_, Vec<PathBuf>>::new();
+    for path in paths {
+        if let Some(key) = agent_copy_key(&path) {
+            groups.entry(key).or_default().push(path);
+        }
+    }
+    let mut owners = std::collections::HashMap::new();
+    for mut copies in groups.into_values() {
+        copies.sort();
+        copies.dedup();
+        if copies.len() < 2 {
+            continue;
+        }
+        let owner = preferred_agent_copy(&copies)
+            .expect("a duplicated agent has copies")
+            .clone();
+        owners.extend(copies.into_iter().map(|copy| (copy, owner.clone())));
+    }
+    owners
+}
+
+/// The path that owns an agent's merged index projection. The workflow copy is written as
+/// the agent runs; the direct copy appears later, may hold only the tail, and gains resumed
+/// records. Prefer the newest last record, then file size, then the direct `subagents/` copy.
+/// Timestamps count only when every copy's last record is readable. This selects a source
+/// path, never a reason to discard unique events from another copy.
+pub(crate) fn preferred_agent_copy(copies: &[PathBuf]) -> Option<&PathBuf> {
+    let timestamps = copies
+        .iter()
+        .map(|path| last_record_timestamp(path))
+        .collect::<Option<Vec<_>>>();
+    copies
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, path)| {
+            let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+            (
+                timestamps
+                    .as_ref()
+                    .map(|timestamps| timestamps[*index].clone()),
+                size,
+                std::cmp::Reverse(path.components().count()),
+            )
+        })
+        .map(|(_, path)| path)
+}
+
+/// The `timestamp` of the last record in a transcript's final 256 KiB. Most last lines are a
+/// few KiB, so a short tail is tried first.
+fn last_record_timestamp(path: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Stamped {
+        timestamp: Option<String>,
+    }
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    for tail_bytes in [16 * 1024, 256 * 1024] {
+        let start = len.saturating_sub(tail_bytes);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        // Unless the tail is the whole file, its first line began before it.
+        let complete = match tail.iter().position(|byte| *byte == b'\n') {
+            Some(newline) if start > 0 => &tail[newline + 1..],
+            None if start > 0 => &[],
+            _ => &tail[..],
+        };
+        let timestamp = complete.rsplit(|byte| *byte == b'\n').find_map(|line| {
+            serde_json::from_slice::<Stamped>(line)
+                .ok()
+                .and_then(|record| record.timestamp)
+        });
+        if timestamp.is_some() || start == 0 {
+            return timestamp;
+        }
+    }
+    None
 }
 
 pub fn is_subagent_path(path: &Path) -> bool {
@@ -310,6 +818,15 @@ pub fn probe(path: &Path) -> Result<SourceMetadata> {
             break;
         }
     }
+    if !is_subagent_path(path)
+        && !is_background
+        && let Some(origin) = super::common::map_sequential(&File::open(path)?)
+            .ok()
+            .and_then(|bytes| fork_origin(&bytes))
+    {
+        conversation_kind = ConversationKind::Fork;
+        parent_session_id = Some(origin);
+    }
 
     Ok(SourceMetadata {
         session: SessionIdentity {
@@ -352,6 +869,137 @@ pub(crate) fn parse_index_records_with_background(
     known_background: Option<bool>,
     byte_boundary: u64,
     next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
+    let file = File::open(path)?;
+    let mmap = super::common::map_sequential(&file)?;
+    parse_index_bytes(
+        path,
+        bounded_transcript_bytes(&mmap, byte_boundary),
+        state,
+        include_reasoning,
+        known_background,
+        next_doc_id,
+        emit,
+    )
+}
+
+/// A growing file's captured boundary may end inside a line. Leave that line for the next
+/// refresh, even if its prefix happens to be valid JSON before the writer finishes it.
+fn bounded_transcript_bytes(bytes: &[u8], byte_boundary: u64) -> &[u8] {
+    let end = byte_boundary.min(bytes.len() as u64) as usize;
+    let captured = &bytes[..end];
+    if end < bytes.len() && !captured.ends_with(b"\n") {
+        &captured[..captured
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1)]
+    } else {
+        captured
+    }
+}
+
+/// Read every copy at its discovered boundary, deduplicate shared events, and parse the
+/// chronological union under one source path. The source transcripts are never rewritten.
+pub(crate) fn parse_agent_records(
+    owner: &Path,
+    copies: &[AgentCopy],
+    include_reasoning: bool,
+    next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut lines = Vec::new();
+    let mut seen = HashSet::new();
+    // Keep the owner's representation when copies differ in metadata for the same event.
+    let mut copies = copies.iter().collect::<Vec<_>>();
+    copies.sort_by_key(|copy| (copy.path != owner, &copy.path));
+    for copy in copies {
+        let file = File::open(&copy.path)?;
+        let mmap = super::common::map_sequential(&file)?;
+        let bytes = bounded_transcript_bytes(&mmap, copy.size);
+        let mut occurrences = HashMap::new();
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let value = match serde_json::from_slice::<Value>(line) {
+                Ok(value) => Some(value),
+                Err(error) if !line.ends_with(b"\n") && error.is_eof() => continue,
+                Err(_) => None,
+            };
+            let key = value.as_ref().map(|value| {
+                if let Some(uuid) = value
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .filter(|uuid| !uuid.is_empty())
+                {
+                    // Content blocks can share an event UUID. Match the block as well so a
+                    // tail-only copy cannot hide a different block from the same response.
+                    serde_json::json!([
+                        value.get("type"),
+                        uuid,
+                        value
+                            .get("message")
+                            .and_then(|message| message.get("content"))
+                    ])
+                    .to_string()
+                } else if let Some(message) = value.get("message") {
+                    serde_json::json!([
+                        value.get("type"),
+                        value.get("timestamp"),
+                        message.get("id"),
+                        message.get("role"),
+                        message.get("content")
+                    ])
+                    .to_string()
+                } else {
+                    value.to_string()
+                }
+            });
+            if let Some(key) = key {
+                // Repeated identical events within one file remain distinct. Only matching
+                // occurrences in another physical copy are suppressed.
+                let occurrence = occurrences.entry(key.clone()).or_insert(0usize);
+                let unique = seen.insert((key, *occurrence));
+                *occurrence += 1;
+                if !unique {
+                    continue;
+                }
+            }
+            let timestamp = value
+                .as_ref()
+                .and_then(|value| value.get("timestamp"))
+                .and_then(Value::as_str)
+                .and_then(super::common::parse_iso_millis)
+                .unwrap_or(0);
+            lines.push((timestamp, line.to_vec()));
+        }
+    }
+    lines.sort_by_key(|(timestamp, _)| *timestamp);
+    let mut merged = Vec::new();
+    for (_, line) in lines {
+        merged.extend_from_slice(&line);
+        if !line.ends_with(b"\n") {
+            merged.push(b'\n');
+        }
+    }
+    parse_index_bytes(
+        owner,
+        &merged,
+        IndexParseState::default(),
+        include_reasoning,
+        None,
+        next_doc_id,
+        emit,
+    )
+}
+
+fn parse_index_bytes(
+    path: &Path,
+    mmap: &[u8],
+    state: IndexParseState,
+    include_reasoning: bool,
+    known_background: Option<bool>,
+    next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<(IndexParseOutput, bool)> {
     let mut legacy_turn_id = state.legacy_ordinal()?;
@@ -365,13 +1013,6 @@ pub(crate) fn parse_index_records_with_background(
     use memchr::memchr;
     use simd_json::prelude::*;
 
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
-    // Discovery captured this boundary before parsing began. Never consume
-    // bytes appended after it: they need a fresh metadata probe so a late
-    // `sessionKind: "bg"` marker can reclassify the whole transcript.
-    let defer_unterminated_tail = byte_boundary < mmap.len() as u64;
-    let mmap = &mmap[..byte_boundary.min(mmap.len() as u64) as usize];
     // `sessionKind` is not repeated on every event. Establish this file-level
     // origin before emitting any records so a later `bg` marker cannot leave
     // the transcript split between interactive and background classifications.
@@ -385,10 +1026,63 @@ pub(crate) fn parse_index_records_with_background(
     let project = project_from_path(path);
     let session_id = session_id_from_path(path);
     let is_agent_file = is_subagent_path(path);
+    let fork_parent = (!is_agent_file && !is_background)
+        .then(|| fork_origin(mmap))
+        .flatten();
+    // The history a `/branch` fork copied is indexed in the session it was copied from, while
+    // that transcript exists (see `fork_fingerprint`).
+    let skip_copies = fork_parent
+        .as_deref()
+        .is_some_and(|origin| origin_transcript(path, origin).is_file());
     let source_path = path.to_string_lossy().to_string();
     let mut buffer = Vec::new();
     let mut diagnostics = ParseDiagnostics::default();
     let mut session_cwd: Option<String> = None;
+    let links_for = |object: &simd_json::borrowed::Object<'_>| {
+        let sidechain = object
+            .get("isSidechain")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let mut kind = classify_with_session_kind(path, sidechain, is_background);
+        if fork_parent.is_some() && kind == ConversationKind::Main {
+            kind = ConversationKind::Fork;
+        }
+        let thread_source = match kind {
+            ConversationKind::Subagent => Some("subagent".to_string()),
+            ConversationKind::Sidechain => Some("sidechain".to_string()),
+            ConversationKind::Fork => Some("fork".to_string()),
+            _ => None,
+        };
+        // Agent transcripts, nested ones included, name the root session: project and tag
+        // inheritance follows one parent level.
+        let parent_session_id = if is_agent_file {
+            super::common::borrowed_string(object, "sessionId")
+        } else {
+            fork_parent.clone()
+        };
+        RecordLinks {
+            event_id: super::common::borrowed_string(object, "uuid"),
+            parent_event_id: super::common::borrowed_string(object, "parentUuid"),
+            logical_parent_event_id: super::common::borrowed_string(object, "logicalParentUuid"),
+            parent_session_id,
+            thread_source,
+            conversation_kind: Some(kind.as_str().to_string()),
+            parent_tool_use_id: super::common::borrowed_string(object, "parentToolUseID"),
+            source_tool_use_id: super::common::borrowed_string(object, "sourceToolUseID"),
+            source_tool_assistant_uuid: super::common::borrowed_string(
+                object,
+                "sourceToolAssistantUUID",
+            ),
+            ..RecordLinks::default()
+        }
+    };
+    let timestamp_of = |object: &simd_json::borrowed::Object<'_>| {
+        object
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .and_then(super::common::parse_iso_millis)
+            .unwrap_or(0)
+    };
 
     while start < mmap.len() {
         let source_record_offset = start as u64;
@@ -400,9 +1094,6 @@ pub(crate) fn parse_index_records_with_background(
         // start offset so the next ingest reads the complete record. A final
         // non-newline record is still valid when this mmap is exactly the task
         // boundary.
-        if !has_newline && defer_unterminated_tail {
-            break;
-        }
         let line = &slice[..relative];
         start += relative + usize::from(has_newline);
         if line.is_empty() {
@@ -437,11 +1128,39 @@ pub(crate) fn parse_index_records_with_background(
         {
             session_cwd = Some(cwd.to_string());
         }
+        if skip_copies && copied_from(object).is_some() {
+            continue;
+        }
         let entry_type = object
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("");
         if entry_type != "user" && entry_type != "assistant" {
+            if let Some((role, text)) = side_entry(object, entry_type) {
+                // Newly retained lines never held a legacy ordinal; keeping them off the
+                // ordinals keeps the identities of later legacy records stable.
+                let mut links = links_for(object);
+                links.source_record_offset = Some(source_record_offset);
+                emit(Record {
+                    source: SourceKind::Claude,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp_of(object),
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: role.to_string(),
+                    text,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                })?;
+                turn_id += 1;
+                continue;
+            }
+            // An `api-request-blob` logs a message of an API request, repeating the
+            // conversation and the context sent with it.
             if !matches!(
                 entry_type,
                 "progress"
@@ -457,45 +1176,15 @@ pub(crate) fn parse_index_records_with_background(
                     | "permission-mode"
                     | "attachment"
                     | "mode"
+                    | "api-request-blob"
             ) {
                 diagnostics.increment_unknown_top_level(entry_type);
             }
             continue;
         }
         let entry_uuid = super::common::borrowed_string(object, "uuid");
-        let entry_parent_uuid = super::common::borrowed_string(object, "parentUuid");
-        let sidechain = object
-            .get("isSidechain")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let kind = classify_with_session_kind(path, sidechain, is_background);
-        let thread_source = match kind {
-            ConversationKind::Subagent => Some("subagent".to_string()),
-            ConversationKind::Sidechain => Some("sidechain".to_string()),
-            _ => None,
-        };
-        let entry_links = RecordLinks {
-            event_id: entry_uuid.clone(),
-            parent_event_id: entry_parent_uuid,
-            logical_parent_event_id: super::common::borrowed_string(object, "logicalParentUuid"),
-            parent_session_id: is_agent_file
-                .then(|| super::common::borrowed_string(object, "sessionId"))
-                .flatten(),
-            thread_source,
-            conversation_kind: Some(kind.as_str().to_string()),
-            parent_tool_use_id: super::common::borrowed_string(object, "parentToolUseID"),
-            source_tool_use_id: super::common::borrowed_string(object, "sourceToolUseID"),
-            source_tool_assistant_uuid: super::common::borrowed_string(
-                object,
-                "sourceToolAssistantUUID",
-            ),
-            ..RecordLinks::default()
-        };
-        let timestamp = object
-            .get("timestamp")
-            .and_then(|value| value.as_str())
-            .and_then(super::common::parse_iso_millis)
-            .unwrap_or(0);
+        let entry_links = links_for(object);
+        let timestamp = timestamp_of(object);
         let Some(message) = object.get("message").and_then(|value| value.as_object()) else {
             continue;
         };
@@ -680,7 +1369,62 @@ pub(crate) fn parse_index_records_with_background(
             }
         }
 
-        let text = text_parts.join(" ").trim().to_string();
+        // The line's text records, the first carrying the line's own id. Harness-written user
+        // text stays searchable as system context but is never the user's prompt.
+        let mut text_records: Vec<(&str, String)> = Vec::new();
+        let mut feedback_only = false;
+        let flag = |key: &str| object.get(key).and_then(|value| value.as_bool()) == Some(true);
+        let joined = text_parts.join(" ").trim().to_string();
+        if flag("isCompactSummary") {
+            let summary = compact_summary(&text_parts.join("\n")).to_string();
+            if !summary.is_empty() {
+                text_records.push(("assistant", format!("compaction: {summary}")));
+            }
+        } else if entry_type == "assistant" {
+            // Claude Code writes failed API calls as synthetic assistant lines.
+            let role = if flag("isApiErrorMessage") {
+                "system"
+            } else {
+                "assistant"
+            };
+            if !joined.is_empty() {
+                text_records.push((role, joined));
+            }
+        } else if injected_user_line(object) {
+            if !joined.is_empty() {
+                text_records.push(("system", joined));
+            }
+        } else {
+            let mut typed = Vec::new();
+            let mut context = Vec::new();
+            for part in &text_parts {
+                let split = typed_text(part);
+                typed.extend(split.typed);
+                context.extend(split.context);
+            }
+            // What the user typed when rejecting a tool call is their own turn. A line with
+            // nothing else to index produced no record before, so it takes no legacy ordinal.
+            feedback_only = typed.is_empty();
+            if let Some(feedback) = object
+                .get("userFeedback")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+            {
+                typed.push(feedback.to_string());
+            } else {
+                feedback_only = false;
+            }
+            if !typed.is_empty() {
+                text_records.push(("user", typed.join(" ")));
+            }
+            if !context.is_empty() {
+                text_records.push(("system", context.join("\n")));
+            }
+        }
+        let mut text_records = text_records.into_iter();
+        let (role, text) = text_records.next().unwrap_or((entry_type, String::new()));
+        let context_links = entry_links.clone();
         let mut entry_links = entry_links;
         if let Some(array) = content.and_then(|v| v.as_array())
             && array.iter().any(|block| {
@@ -704,7 +1448,7 @@ pub(crate) fn parse_index_records_with_background(
             entry_links.source_content = Some(serde_json::to_string(&display_blocks)?);
         }
         if !text.is_empty() || entry_links.source_content.is_some() {
-            if text.is_empty() {
+            if text.is_empty() || feedback_only {
                 entry_links.source_record_offset = Some(source_record_offset);
             }
             emit(Record {
@@ -714,12 +1458,33 @@ pub(crate) fn parse_index_records_with_background(
                 project: project.clone(),
                 session_id: session_id.clone(),
                 turn_id,
-                role: entry_type.to_string(),
+                role: role.to_string(),
                 text,
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
                 links: entry_links,
+                source_path: source_path.clone(),
+            })?;
+            turn_id += 1;
+        }
+        for (context_role, context) in text_records {
+            let mut links = context_links.clone();
+            links.event_id = entry_uuid.as_ref().map(|uuid| format!("{uuid}:context"));
+            links.source_record_offset = Some(source_record_offset);
+            emit(Record {
+                source: SourceKind::Claude,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: context_role.to_string(),
+                text: context,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links,
                 source_path: source_path.clone(),
             })?;
             turn_id += 1;
@@ -870,18 +1635,41 @@ fn usage_timestamp_millis(timestamp: &simd_json::BorrowedValue<'_>) -> u64 {
 pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
     use std::collections::HashMap;
 
-    let mut best_exact: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut best_exact: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut best_agent = HashMap::new();
     let mut keep = vec![true; events.len()];
     for (index, event) in events.iter().enumerate() {
         if event.source != "claude" {
             continue;
         }
-        let (Some(message), Some(request)) =
-            (event.message_id.as_deref(), event.request_id.as_deref())
-        else {
+        if let Some(message) = event.message_id.as_deref()
+            && let Some(agent) = agent_copy_key(Path::new(&*event.source_path))
+        {
+            // The direct copy can omit requestId or hold only the resumed tail. Message IDs
+            // still name responses within the same logical agent across all its copies.
+            if let Some(previous) = best_agent.get(&(agent.clone(), message)).copied() {
+                if choose_usage(&events[previous], event) {
+                    keep[index] = false;
+                } else {
+                    keep[previous] = false;
+                    best_agent.insert((agent, message), index);
+                }
+            } else {
+                best_agent.insert((agent, message), index);
+            }
+        }
+    }
+    for (index, event) in events.iter().enumerate() {
+        if !keep[index] || event.source != "claude" {
             continue;
+        }
+        // Claude Code writes one line per content block, each repeating the response's usage.
+        // Without a `requestId`, the message ID still names the response within its file.
+        let key = match (event.message_id.as_deref(), event.request_id.as_deref()) {
+            (Some(message), Some(request)) => (message, request, ""),
+            (Some(message), None) => (message, "", &*event.source_path),
+            (None, _) => continue,
         };
-        let key = (message, request);
         if let Some(previous) = best_exact.get(&key).copied() {
             if choose_usage(&events[previous], event) {
                 keep[index] = false;
@@ -903,11 +1691,14 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
         }
     }
     for indices in by_message.into_values() {
-        if indices.len() < 2 || !indices.iter().any(|index| !events[*index].sidechain) {
+        let is_agent = |event: &UsageEvent| {
+            event.sidechain || is_subagent_path(Path::new(&*event.source_path))
+        };
+        if indices.len() < 2 || !indices.iter().any(|index| !is_agent(&events[*index])) {
             continue;
         }
         for index in indices {
-            if events[index].sidechain {
+            if is_agent(&events[index]) {
                 keep[index] = false;
             }
         }
@@ -1142,6 +1933,268 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session_title(&path, "s").as_deref(), Some("Escaped type"));
+    }
+
+    #[test]
+    fn transcript_paths_name_their_profile_and_conversation() {
+        let main = Path::new("/home/u/.claude-profiles/work/projects/-home-u-repo/s.jsonl");
+        let agent = Path::new(
+            "/home/u/.claude/projects/-home-u-projects/s/subagents/workflows/wf_1/agent-a.jsonl",
+        );
+        assert_eq!(profile_from_path(main).as_deref(), Some("work"));
+        assert_eq!(profile_from_path(agent).as_deref(), Some(".claude"));
+        assert_eq!(profile_from_path(Path::new("/data/claude/s.jsonl")), None);
+        assert_eq!(
+            project_relative_path(main),
+            Some(PathBuf::from("-home-u-repo/s.jsonl"))
+        );
+        assert_eq!(
+            project_relative_path(agent),
+            Some(PathBuf::from(
+                "-home-u-projects/s/subagents/workflows/wf_1/agent-a.jsonl"
+            ))
+        );
+        assert_eq!(
+            project_relative_path(Path::new("/x/projects/s.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_copies_share_a_key_and_equal_sizes_keep_the_direct_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        fs::write(&direct, "{}\n").unwrap();
+        fs::write(&workflow, "{}\n").unwrap();
+        fs::write(subagents.join("workflows/wf_1/journal.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(agent_copy_key(&direct), agent_copy_key(&workflow));
+        assert_eq!(
+            agent_copy_key(&subagents.join("workflows/wf_1/journal.jsonl")),
+            None
+        );
+        assert_eq!(
+            agent_copy_key(&temp.path().join("projects/-p/agent-a.jsonl")),
+            None
+        );
+        let (directory, name) = agent_copy_key(&workflow).unwrap();
+        let mut copies = agent_copies(&directory, &workflow_runs(&directory), &name);
+        copies.sort();
+        assert_eq!(copies, [direct.clone(), workflow.clone()]);
+        assert_eq!(preferred_agent_copy(&copies), Some(&direct));
+        fs::write(&workflow, "{}\n{}\n").unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+    }
+
+    #[test]
+    fn the_agent_copy_with_the_newest_record_wins_over_a_larger_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let record = |uuid: &str, minute: u32, extra: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"{uuid}\",{extra}\"timestamp\":\"2026-10-11T10:{minute:02}:00.000Z\",\"message\":{{\"content\":\"x\"}}}}\n"
+            )
+        };
+        // The workflow copy repeats extra fields on every line.
+        let extra = format!("\"version\":\"{}\",", "2".repeat(200));
+        fs::write(
+            &workflow,
+            record("u1", 1, &extra) + &record("u2", 2, &extra),
+        )
+        .unwrap();
+        // A resumed agent adds one short record to the direct copy only.
+        fs::write(
+            &direct,
+            record("u1", 1, "") + &record("u2", 2, "") + &record("u3", 3, ""),
+        )
+        .unwrap();
+        assert!(fs::metadata(&direct).unwrap().len() < fs::metadata(&workflow).unwrap().len());
+        let copies = [direct.clone(), workflow.clone()];
+        assert_eq!(preferred_agent_copy(&copies), Some(&direct));
+
+        // A direct copy rewritten with only the tail ends on the same record and loses to the
+        // complete workflow copy.
+        fs::write(&direct, record("u2", 2, "")).unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+
+        // A last line longer than the tail hides the workflow copy's newest record; an older
+        // direct copy must not win by default, so sizes decide.
+        let huge = format!("\"content\":\"{}\",", "x".repeat(300 * 1024));
+        fs::write(
+            &workflow,
+            record("u1", 1, &extra) + &record("u2", 2, &extra) + &record("u3", 3, &huge),
+        )
+        .unwrap();
+        fs::write(&direct, record("u1", 1, "") + &record("u2", 2, "")).unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+    }
+
+    #[test]
+    fn usage_reads_all_copies_and_counts_a_workflow_response_once() {
+        let _guard = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvVarGuard::set_os(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(temp.path().as_os_str()),
+        )]);
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        // Claude Code omits `requestId` from the direct copy only, so reconciliation alone
+        // cannot tell that both copies record the same response.
+        let line = r#"{"type":"assistant","isSidechain":true,"message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        fs::write(&direct, format!("{line}\n")).unwrap();
+        fs::write(
+            &workflow,
+            format!(
+                "{}\n",
+                line.replacen('{', r#"{"requestId":"req_1","version":"2.1","#, 1)
+            ),
+        )
+        .unwrap();
+        let mut both = parse_usage_file(&direct).unwrap();
+        both.extend(parse_usage_file(&workflow).unwrap());
+        reconcile_usage(&mut both);
+        assert_eq!(both.len(), 1);
+
+        assert_eq!(
+            usage_files(&crate::config::default_claude_sources()),
+            [direct, workflow]
+        );
+    }
+
+    #[test]
+    fn usage_still_prefers_a_parent_response_when_agent_copies_omit_sidechain_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-p");
+        let parent = project.join("s.jsonl");
+        let direct = project.join("s/subagents/agent-a.jsonl");
+        let workflow = project.join("s/subagents/workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let requested = line.replacen('{', r#"{"requestId":"req_1","#, 1);
+        fs::write(&parent, format!("{requested}\n")).unwrap();
+        fs::write(&direct, format!("{line}\n")).unwrap();
+        fs::write(&workflow, format!("{requested}\n")).unwrap();
+        let mut events = parse_usage_file(&direct).unwrap();
+        events.extend(parse_usage_file(&workflow).unwrap());
+        events.extend(parse_usage_file(&parent).unwrap());
+
+        reconcile_usage(&mut events);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(&*events[0].source_path, parent.to_str().unwrap());
+        assert_eq!(events[0].tokens.total(), 15);
+    }
+
+    #[test]
+    fn merged_agent_blocks_keep_unique_content_and_reconstruct_tool_pairs_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let line = |uuid: &str, minute: u32, kind: &str, content: Value| {
+            serde_json::json!({
+                "type": kind, "uuid": uuid,
+                "timestamp": format!("2026-10-11T10:{minute:02}:00.000Z"),
+                "message": {"content": content}
+            })
+            .to_string()
+                + "\n"
+        };
+        let first = line(
+            "shared",
+            1,
+            "assistant",
+            serde_json::json!([{"type":"text","text":"first block"}]),
+        );
+        let second = line(
+            "shared",
+            2,
+            "assistant",
+            serde_json::json!([{"type":"text","text":"second block"}]),
+        );
+        let tool = line(
+            "call",
+            3,
+            "assistant",
+            serde_json::json!([{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"x"}}]),
+        );
+        let result = line(
+            "result",
+            4,
+            "user",
+            serde_json::json!([{"type":"tool_result","tool_use_id":"tool-1","content":"contents"}]),
+        );
+        fs::write(&workflow, format!("{first}{second}{tool}")).unwrap();
+        fs::write(&direct, format!("{second}{result}")).unwrap();
+        let copies = [&direct, &workflow]
+            .into_iter()
+            .map(|path| AgentCopy {
+                path: path.clone(),
+                size: fs::metadata(path).unwrap().len(),
+                metadata_sha256: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+
+        let (parsed, _) =
+            parse_agent_records(&direct, &copies, false, &AtomicU64::new(1), |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].text, "first block");
+        assert_eq!(records[1].text, "second block");
+        assert_eq!(records[2].role, "tool_use");
+        assert_eq!(records[3].role, "tool_result");
+        assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == direct.to_string_lossy())
+        );
+        assert_eq!(parsed.diagnostics.orphan_tool_results, 0);
+    }
+
+    #[test]
+    fn usage_counts_each_content_block_response_once_without_request_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-a.jsonl");
+        let line = |output: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{{\"id\":\"msg_1\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":{output}}}}}}}\n"
+            )
+        };
+        // Two content blocks of one response, then a separate response.
+        let other = line(7).replace("msg_1", "msg_2");
+        fs::write(&path, format!("{}{}{other}", line(4), line(5))).unwrap();
+        let mut events = parse_usage_file(&path).unwrap();
+        // The same response in another file is not merged without a request ID.
+        let elsewhere = temp.path().join("other.jsonl");
+        fs::write(&elsewhere, line(5)).unwrap();
+        events.extend(parse_usage_file(&elsewhere).unwrap());
+
+        reconcile_usage(&mut events);
+
+        let mut outputs = events
+            .iter()
+            .map(|event| (event.source_path.to_string(), event.tokens.output))
+            .collect::<Vec<_>>();
+        outputs.sort();
+        let path = path.to_string_lossy().into_owned();
+        let elsewhere = elsewhere.to_string_lossy().into_owned();
+        assert_eq!(outputs, [(path.clone(), 5), (path, 7), (elsewhere, 5)]);
     }
 
     #[test]
@@ -1507,5 +2560,331 @@ mod tests {
             record.text.contains("ciphertext-must-never-be-indexed")
                 || record.text.contains("signature-must-never-be-indexed")
         }));
+    }
+
+    fn parse_all(path: &Path) -> (Vec<Record>, IndexParseOutput) {
+        let mut records = Vec::new();
+        let parsed = parse_index_records(
+            path,
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        (records, parsed)
+    }
+
+    fn roles_and_texts(records: &[Record]) -> Vec<(&str, &str)> {
+        records
+            .iter()
+            .map(|record| (record.role.as_str(), record.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn harness_written_user_text_is_system_context_and_side_lines_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("s1.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../fixtures/parse_fidelity/claude.jsonl"),
+        )
+        .unwrap();
+        let (records, parsed) = parse_all(&path);
+
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                (
+                    "system",
+                    "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>"
+                ),
+                ("user", "/model opus"),
+                (
+                    "system",
+                    "<local-command-stdout>Set model to opus</local-command-stdout>"
+                ),
+                ("user", "fix the parser"),
+                (
+                    "system",
+                    "<system-reminder>\nThe date is Monday.\n</system-reminder>"
+                ),
+                (
+                    "system",
+                    "Base directory for this skill: /work/.claude/skills/review\n\n# Review checklist"
+                ),
+                ("assistant", "Reading the parser now."),
+                ("user", "also check forks please"),
+                (
+                    "system",
+                    "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>"
+                ),
+                (
+                    "assistant",
+                    "recap: You asked to fix the parser. Next, run the fixture tests."
+                ),
+                ("system", "API error: Connection dropped (ECONNRESET)"),
+                (
+                    "system",
+                    "Opus 5.5's safeguards stopped the response above · continuing once with that noted"
+                ),
+                ("user", "/cost"),
+                (
+                    "assistant",
+                    "compaction: We fixed the parser and added fixtures."
+                ),
+                ("system", "API Error: 529 Overloaded"),
+                ("system", "[Request interrupted by user]"),
+                (
+                    "system",
+                    "<task-notification>\n<task-id>b2</task-id>\n<summary>Background build finished</summary>\n</task-notification>"
+                ),
+                (
+                    "tool_use",
+                    r#"{"file_path":"/work/memex/src/a.rs","old_string":"a","new_string":"b"}"#
+                ),
+                (
+                    "tool_result",
+                    "The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:\nuse rstest instead"
+                ),
+                ("user", "use rstest instead"),
+                ("user", "! cargo test"),
+                (
+                    "system",
+                    "<bash-stdout>test result: ok</bash-stdout><bash-stderr></bash-stderr>"
+                ),
+            ]
+        );
+        // The prompt and the reminder attached to it keep distinct ids.
+        assert_eq!(records[3].links.event_id.as_deref(), Some("u04"));
+        assert_eq!(records[4].links.event_id.as_deref(), Some("u04:context"));
+        assert_eq!(records[7].links.event_id.as_deref(), Some("q07"));
+        // Records the parser did not emit before take no legacy ordinal, so the identities
+        // of later legacy records do not shift.
+        let newly_retained = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.links.source_record_offset.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(newly_retained, [4, 7, 8, 9, 10, 11, 12, 19]);
+        // Request blobs are known bookkeeping, not drift.
+        assert!(parsed.diagnostics.unknown_top_level_types.is_empty());
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.text.contains("request blob"))
+        );
+    }
+
+    #[test]
+    fn a_forked_skill_subagent_task_stays_the_users_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("project/s1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-a1.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"parentUuid":null,"isSidechain":true,"agentId":"a1","sessionId":"s1","type":"user","message":{"role":"user","content":"You are reviewing for recall."},"isMeta":true,"uuid":"d1"}"#,
+                "\n",
+                r#"{"parentUuid":"d1","isSidechain":true,"agentId":"a1","sessionId":"s1","type":"user","message":{"role":"user","content":"Base directory for this skill"},"isMeta":true,"uuid":"d2"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let (records, _) = parse_all(&path);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "You are reviewing for recall."),
+                ("system", "Base directory for this skill"),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_text_separates_harness_context_and_renders_commands() {
+        let typed = |text: &str| typed_text(text);
+        assert_eq!(
+            typed("<ide_selection lines=\"1-2\">fn main()</ide_selection>explain"),
+            TypedText {
+                typed: Some("explain".into()),
+                context: vec!["<ide_selection lines=\"1-2\">fn main()</ide_selection>".into()],
+            }
+        );
+        assert_eq!(
+            typed("hi <bash-stdout>unclosed output").typed.as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            typed("<command-message>login</command-message>\n<command-name>/login</command-name>\n<command-args></command-args>")
+                .typed
+                .as_deref(),
+            Some("/login")
+        );
+        assert_eq!(
+            typed("<user-memory-input>prefer rstest</user-memory-input>")
+                .typed
+                .as_deref(),
+            Some("# prefer rstest")
+        );
+        assert_eq!(
+            typed("<ide_other>kept</ide_other>").typed.as_deref(),
+            Some("<ide_other>kept</ide_other>")
+        );
+        let reminder_only = typed("<system-reminder>context</system-reminder>");
+        assert_eq!(reminder_only.typed, None);
+        assert_eq!(
+            reminder_only.context,
+            ["<system-reminder>context</system-reminder>"]
+        );
+    }
+
+    #[test]
+    fn a_branch_fork_skips_copied_history_and_names_its_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("-work-memex");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("fork.jsonl");
+        let copied = concat!(
+            r#"{"parentUuid":null,"isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"user","message":{"role":"user","content":"original prompt"},"uuid":"p1","forkedFrom":{"sessionId":"origin","messageUuid":"p1"}}"#,
+            "\n",
+            r#"{"parentUuid":"p1","isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"original answer"}]},"uuid":"p2","forkedFrom":{"sessionId":"origin","messageUuid":"p2"}}"#,
+            "\n",
+        );
+        let appended = concat!(
+            r#"{"parentUuid":"p2","isSidechain":false,"cwd":"/work/memex","sessionId":"fork","type":"user","message":{"role":"user","content":"branch prompt"},"uuid":"n1"}"#,
+            "\n",
+        );
+        let origin = project.join("origin.jsonl");
+        fs::write(&origin, "{}\n").unwrap();
+        fs::write(&path, copied).unwrap();
+        let (records, first) = parse_all(&path);
+        assert!(records.is_empty());
+
+        let metadata = probe(&path).unwrap();
+        assert_eq!(metadata.session.conversation_kind, ConversationKind::Fork);
+        assert_eq!(
+            metadata.session.parent_session_id.as_deref(),
+            Some("origin")
+        );
+
+        // An incremental parse still knows the transcript is a fork.
+        fs::write(&path, format!("{copied}{appended}")).unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState {
+                offset: first.offset,
+                turn_id: first.turn_id,
+                legacy_turn_id: first.legacy_turn_id,
+                pending_tool_calls: first.pending_tool_calls,
+            },
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(roles_and_texts(&records), [("user", "branch prompt")]);
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("fork"));
+        assert_eq!(records[0].links.thread_source.as_deref(), Some("fork"));
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("origin")
+        );
+
+        // Once the origin transcript is gone (Claude Code deletes old ones), the fork's
+        // fingerprint changes, forcing a reparse that keeps the copied history.
+        let present = fork_fingerprint(&path, None, false).unwrap();
+        assert_eq!(
+            fork_fingerprint(&path, Some(&present), true),
+            Some(present.clone())
+        );
+        fs::remove_file(&origin).unwrap();
+        let missing = fork_fingerprint(&path, Some(&present), true).unwrap();
+        assert_ne!(missing, present);
+        let (records, _) = parse_all(&path);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "original prompt"),
+                ("assistant", "original answer"),
+                ("user", "branch prompt"),
+            ]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| { record.links.parent_session_id.as_deref() == Some("origin") })
+        );
+        // A file that only grew without a fork fingerprint is not read again.
+        assert_eq!(fork_fingerprint(&path, None, true), None);
+    }
+
+    #[test]
+    fn a_resumed_copy_without_branch_markers_is_indexed_whole() {
+        // `--fork-session` copies lines without `forkedFrom`; and a marker naming another
+        // line is not a copy of this one.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("resumed.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"sessionId":"resumed","type":"user","message":{"role":"user","content":"kept prompt"},"uuid":"r1","forkedFrom":{"sessionId":"origin","messageUuid":"other"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let (records, _) = parse_all(&path);
+        assert_eq!(roles_and_texts(&records), [("user", "kept prompt")]);
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+        assert_eq!(records[0].links.parent_session_id, None);
+    }
+
+    #[test]
+    fn a_nested_subagent_names_the_root_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("-work-memex/root/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let line = |agent: &str| {
+            format!(
+                r#"{{"parentUuid":null,"isSidechain":true,"agentId":"{agent}","sessionId":"root","type":"user","message":{{"role":"user","content":"task for {agent}"}},"uuid":"{agent}-1"}}"#
+            ) + "\n"
+        };
+        let outer = subagents.join("agent-outer.jsonl");
+        let inner = subagents.join("agent-inner.jsonl");
+        fs::write(&outer, line("outer")).unwrap();
+        fs::write(&inner, line("inner")).unwrap();
+        fs::write(
+            subagents.join("agent-outer.meta.json"),
+            r#"{"agentType":"general-purpose"}"#,
+        )
+        .unwrap();
+        fs::write(
+            subagents.join("agent-inner.meta.json"),
+            r#"{"agentType":"Explore","parentAgentId":"outer"}"#,
+        )
+        .unwrap();
+
+        let parent = |path: &Path| {
+            let (records, _) = parse_all(path);
+            assert_eq!(
+                probe(path).unwrap().session.parent_session_id,
+                records[0].links.parent_session_id
+            );
+            records[0].links.parent_session_id.clone()
+        };
+        // Project and tag inheritance follows one parent level, so a nested agent keeps the
+        // root session as its parent rather than the agent that spawned it.
+        assert_eq!(parent(&outer).as_deref(), Some("root"));
+        assert_eq!(parent(&inner).as_deref(), Some("root"));
     }
 }

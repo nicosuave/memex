@@ -593,7 +593,13 @@ mod tests {
         assert!(socket.exists());
     }
 
+    /// Publishes a hand-built index, which an ingest cannot refresh, so reads skip the refresh.
     fn publish(paths: &Paths, records: &[Record]) {
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "auto_index_on_search = false\n",
+        )
+        .unwrap();
         let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
         let mut writer = index.writer().unwrap();
         let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();

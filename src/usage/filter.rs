@@ -534,4 +534,106 @@ mod tests {
         assert_eq!(fallback.details[0].session_id.as_deref(), Some(fallback_id));
         assert_eq!(full_stem.events, 0);
     }
+
+    #[test]
+    fn goose_scanner_splits_reported_cache_tokens_out_of_the_input() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("goose");
+        let database = root.join("data/sessions/sessions.db");
+        std::fs::create_dir_all(database.parent().unwrap()).expect("session dir");
+        crate::sources::goose::tests::fixture_db(&database);
+        let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+        let report = scan_usage(&UsageQuery {
+            source: Some(SourceFilter::Goose),
+            project: Some("repo".into()),
+            project_grouping: ProjectGrouping::Flat,
+            include_events: true,
+            ..UsageQuery::default()
+        })
+        .expect("scan goose");
+
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.events, 2);
+        // 1000 + 50 for the main session, 200 + 20 for the sub-agent. goose
+        // reports the 600 cached prompt tokens inside the 1000, so a naive
+        // read would total 1650.
+        let main = report
+            .details
+            .iter()
+            .find(|event| event.session_id.as_deref() == Some("sess_main"))
+            .expect("main event");
+        assert_eq!(main.tokens.raw_input, 1000);
+        assert_eq!(main.tokens.uncached_input, 400);
+        assert_eq!(main.tokens.cache_read, 600);
+        assert_eq!(main.tokens.total(), 1050);
+        assert_eq!(main.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(main.source_cost_usd, Some(0.25));
+        assert!(report.details.iter().any(|event| {
+            event.session_id.as_deref() == Some("sess_child")
+                && event.tokens.uncached_input == 200
+                && event.model.as_deref() == Some("gpt-4o-mini")
+        }));
+    }
+
+    #[test]
+    fn kimi_scanner_reads_every_agent_journal_under_the_home_override() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let kimi_home = tmp.path().join("kimi-home");
+        let session = kimi_home.join("sessions/wd_memex_0123456789ab/session_a");
+        for agent in ["main", "agent-0"] {
+            std::fs::create_dir_all(session.join("agents").join(agent)).expect("agent dir");
+        }
+        std::fs::write(
+            session.join("state.json"),
+            r#"{"id":"session_a","cwd":"/Users/alice/Code/memex"}"#,
+        )
+        .expect("write state");
+        std::fs::write(
+            session.join("agents/main/wire.jsonl"),
+            concat!(
+                r#"{"type":"usage.record","agentId":"main","model":"kimi-code/k3","usage":{"inputOther":10,"output":4,"inputCacheRead":2,"inputCacheCreation":3},"usageScope":"turn","time":1782864000000}"#,
+                "\n"
+            ),
+        )
+        .expect("write main wire");
+        std::fs::write(
+            session.join("agents/agent-0/wire.jsonl"),
+            concat!(
+                r#"{"type":"usage.record","agentId":"agent-0","model":"kimi-code/k3","usage":{"inputOther":5,"output":1,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1782864000001}"#,
+                "\n"
+            ),
+        )
+        .expect("write subagent wire");
+        let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(kimi_home.as_os_str()))]);
+        let report = scan_usage(&UsageQuery {
+            source: Some(SourceFilter::Kimi),
+            project: Some("memex".into()),
+            project_grouping: ProjectGrouping::Flat,
+            include_events: true,
+            ..UsageQuery::default()
+        })
+        .expect("scan kimi");
+
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.events, 2);
+        assert_eq!(report.total_tokens, 25);
+        let main = report
+            .details
+            .iter()
+            .find(|event| event.session_id.as_deref() == Some("session_a"))
+            .expect("main agent event");
+        assert_eq!(main.tokens.total(), 19);
+        assert_eq!(main.model.as_deref(), Some("kimi-code/k3"));
+        assert!(main.source_path.ends_with("agents/main/wire.jsonl"));
+        assert!(report.details.iter().any(|event| {
+            event.session_id.as_deref() == Some("session_a:agent-0")
+                && event.source_path.ends_with("agents/agent-0/wire.jsonl")
+        }));
+    }
 }

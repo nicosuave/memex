@@ -10,6 +10,10 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Matches the web client: a cached transcript is shown as-is for this long,
+/// then shown while it is revalidated against the latest page.
+const READER_CACHE_LIFETIME_MS: i64 = 30_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kind {
     Restore,
@@ -148,6 +152,7 @@ impl Store {
             "refresh" => {
                 self.activity_revision += 1;
                 self.refresh();
+                self.revalidate_reader();
             }
             "configure" => {
                 self.configured = true;
@@ -599,7 +604,17 @@ impl Store {
                     Err(error) => self.state["readerError"] = json!(error),
                     Ok(value) => {
                         let (rows, total) = decode_page(value);
+                        if mode == "revalidate" {
+                            if self.reader_matches(at, &rows, total) {
+                                self.state["readerLoadedAt"] = json!(now_ms());
+                                self.save_reader();
+                            } else {
+                                self.load_reader(total);
+                            }
+                            return;
+                        }
                         self.state["recordTotal"] = json!(total);
+                        self.state["readerLoadedAt"] = json!(now_ms());
                         if mode == "initial" && at != total.saturating_sub(60) {
                             self.load_page(total.saturating_sub(60), "initial", "", 0);
                             return;
@@ -683,15 +698,28 @@ impl Store {
     }
     fn merge_sessions(&mut self) {
         let ids = self.ids();
-        let mut rows: Vec<Value> = ids
+        // Search hits arrive in relevance order; interleave machines by rank and
+        // fall back to recency only between equally ranked hits.
+        let ranked = !string(&self.state, "query").trim().is_empty();
+        let mut rows: Vec<(usize, Value)> = ids
             .iter()
-            .flat_map(|id| self.batches.get(id).into_iter().flatten().cloned())
+            .flat_map(|id| {
+                self.batches
+                    .get(id)
+                    .into_iter()
+                    .flat_map(|rows| rows.iter().cloned().enumerate())
+            })
             .collect();
-        rows.sort_by(|a, b| {
-            string(b, "last_at")
-                .cmp(string(a, "last_at"))
-                .then_with(|| identity(a).cmp(&identity(b)))
+        rows.sort_by(|(a_rank, a), (b_rank, b)| {
+            (if ranked {
+                a_rank.cmp(b_rank)
+            } else {
+                std::cmp::Ordering::Equal
+            })
+            .then_with(|| string(b, "last_at").cmp(string(a, "last_at")))
+            .then_with(|| identity(a).cmp(&identity(b)))
         });
+        let rows: Vec<Value> = rows.into_iter().map(|(_, row)| row).collect();
         self.state["sessions"] = json!(rows);
         self.state["canLoadMore"] = json!(ids.iter().any(|id| {
             self.batches
@@ -874,6 +902,7 @@ impl Store {
             ("anchor", json!("")),
             ("anchorOffset", json!(0)),
             ("expansion", json!({})),
+            ("readerLoadedAt", json!(0)),
         ] {
             self.state[key] = value;
         }
@@ -888,6 +917,7 @@ impl Store {
                 ("anchor", "anchor"),
                 ("anchorOffset", "anchorOffset"),
                 ("expansion", "expansion"),
+                ("readerLoadedAt", "loadedAt"),
             ] {
                 self.state[key] = cached[source].clone();
             }
@@ -901,21 +931,52 @@ impl Store {
             };
             self.navigate(target, 0);
             self.state["navigationKind"] = json!("restore");
+            if now_ms() - self.state["readerLoadedAt"].as_i64().unwrap_or_default()
+                >= READER_CACHE_LIFETIME_MS
+            {
+                self.revalidate_reader();
+            }
             self.load_metadata();
             return;
         }
-        let target = string(&session, "search_record_id");
-        if target.is_empty() {
-            self.load_page(
-                number(&session, "message_count").saturating_sub(60),
-                "initial",
-                "",
-                0,
-            );
-        } else {
-            self.locate_page(0, target);
-        }
+        self.load_reader(number(&session, "message_count"));
         self.load_metadata();
+    }
+    /// Load the selected session from scratch: its search hit when it has one,
+    /// otherwise the latest page of `total_hint` records.
+    fn load_reader(&mut self, total_hint: usize) {
+        let target = string(&self.state["selected"], "search_record_id").to_owned();
+        if target.is_empty() {
+            self.load_page(total_hint.saturating_sub(60), "initial", "", 0);
+        } else {
+            self.locate_page(0, &target);
+        }
+    }
+    /// Keep showing the current window while the latest page is refetched;
+    /// the window is replaced only if the session changed underneath it.
+    fn revalidate_reader(&mut self) {
+        if self.state["selected"].is_null() || self.state["readerBusy"] == true {
+            return;
+        }
+        if array(&self.state["records"]).is_empty() {
+            self.load_reader(number(&self.state["selected"], "message_count"));
+        } else {
+            let total = number(&self.state, "recordTotal");
+            self.load_page(total.saturating_sub(60), "revalidate", "", 0);
+        }
+    }
+    /// The native transports carry no snapshot version, so an unchanged total
+    /// and identical overlapping records stand in for the web client's check.
+    fn reader_matches(&self, at: usize, rows: &[Value], total: usize) -> bool {
+        let records = array(&self.state["records"]);
+        let offset = number(&self.state, "offset");
+        total == number(&self.state, "recordTotal")
+            && rows.iter().enumerate().all(|(index, row)| {
+                (at + index)
+                    .checked_sub(offset)
+                    .and_then(|position| records.get(position))
+                    .is_none_or(|cached| cached == row)
+            })
     }
     fn load_metadata(&mut self) {
         let selected = &self.state["selected"];
@@ -1063,7 +1124,7 @@ impl Store {
             return;
         }
         let key = identity(&self.state["selected"]);
-        self.cache.insert(key.clone(),json!({"records":self.state["records"],"offset":self.state["offset"],"total":self.state["recordTotal"],"anchor":self.state["anchor"],"anchorOffset":self.state["anchorOffset"],"expansion":self.state["expansion"]}));
+        self.cache.insert(key.clone(),json!({"records":self.state["records"],"offset":self.state["offset"],"total":self.state["recordTotal"],"anchor":self.state["anchor"],"anchorOffset":self.state["anchorOffset"],"expansion":self.state["expansion"],"loadedAt":self.state["readerLoadedAt"]}));
         self.cache_keys.retain(|k| k != &key);
         self.cache_keys.push(key);
         while self.cache_keys.len() > 20 {
@@ -1179,7 +1240,7 @@ fn initial_state() -> Value {
         "readerBusy":false, "readerError":"", "metadataBusy":false,"metadataError":"", "findText":"", "matches":[],
         "matchIndex":-1, "finding":false, "findError":"", "scannedRecords":0,
         "navigationSerial":0, "readerOpenedSerial":0, "targetRecord":"", "targetOccurrence":0,
-        "navigationKind":"record", "anchor":"", "anchorOffset":0, "expansion":{}
+        "navigationKind":"record", "anchor":"", "anchorOffset":0, "expansion":{}, "readerLoadedAt":0
     });
     state
         .as_object_mut()
@@ -1542,6 +1603,94 @@ mod tests {
             Ok(json!({"points":[{"timestamp_ms":0,"value":999,"source":"codex"}]})),
         );
         assert!(s.charts.is_empty());
+    }
+    #[test]
+    fn search_results_keep_rank_order_across_machines() {
+        let mut s = store();
+        s.state["machines"] = json!([{"id":"local"},{"id":"peer"}]);
+        s.action(json!({"op":"configure","changes":{"query":"needle"}}));
+        let hit = |id: &str, last_at: &str| {
+            let mut row = session(id);
+            row["last_at"] = json!(last_at);
+            row
+        };
+        respond(
+            &mut s,
+            |k| matches!(k, Kind::Sessions(id) if id == "local"),
+            Ok(json!([
+                hit("best", "2026-01-01"),
+                hit("third", "2026-03-01")
+            ])),
+        );
+        respond(
+            &mut s,
+            |k| matches!(k, Kind::Sessions(id) if id == "peer"),
+            Ok(json!([hit("second", "2026-02-01")])),
+        );
+        let order: Vec<&str> = array(&s.state["sessions"])
+            .iter()
+            .map(|row| string(row, "session_id"))
+            .collect();
+        assert_eq!(order, ["second", "best", "third"]);
+        s.action(json!({"op":"configure","changes":{"query":""}}));
+        respond(
+            &mut s,
+            |k| matches!(k, Kind::Sessions(id) if id == "local"),
+            Ok(json!([hit("old", "2026-01-01"), hit("new", "2026-03-01")])),
+        );
+        assert_eq!(s.state["sessions"][0]["session_id"], "new");
+    }
+    #[test]
+    fn stale_reader_cache_is_revalidated_on_reopen_and_refresh() {
+        let mut s = store();
+        s.open(session("a"));
+        respond(
+            &mut s,
+            |k| matches!(k, Kind::Page { .. }),
+            Ok(page(&[("r0", "zero"), ("r1", "one")], 2)),
+        );
+        s.open(session("b"));
+        s.requests.clear();
+        s.open(session("a"));
+        assert!(
+            !s.requests
+                .iter()
+                .any(|(r, _)| matches!(r.kind, Kind::Page { .. })),
+            "a fresh cache is shown without refetching"
+        );
+
+        s.open(session("b"));
+        s.cache.get_mut(&identity(&session("a"))).unwrap()["loadedAt"] = json!(0);
+        s.requests.clear();
+        s.open(session("a"));
+        assert_eq!(s.state["records"][1]["record_id"], "r1");
+        respond(
+            &mut s,
+            |k| matches!(k, Kind::Page { mode, .. } if mode == "revalidate"),
+            Ok(page(&[("r0", "zero"), ("r1", "one")], 2)),
+        );
+        assert_eq!(s.state["readerBusy"], false);
+        assert!(
+            s.requests
+                .iter()
+                .all(|(r, _)| !matches!(r.kind, Kind::Page { .. }))
+        );
+
+        s.action(json!({"op":"refresh"}));
+        respond(
+            &mut s,
+            |k| matches!(k, Kind::Page { mode, .. } if mode == "revalidate"),
+            Ok(page(&[("r1", "one"), ("r2", "two")], 3)),
+        );
+        let payload = respond(
+            &mut s,
+            |k| matches!(k, Kind::Page { mode, .. } if mode == "initial"),
+            Ok(page(&[("r0", "zero"), ("r1", "one"), ("r2", "two")], 3)),
+        );
+        assert_eq!(payload["offset"], 0);
+        assert_eq!(array(&s.state["records"]).len(), 3);
+        assert_eq!(s.state["recordTotal"], 3);
+        assert_eq!(s.state["targetRecord"], "r2");
     }
     #[test]
     fn reader_cache_is_bounded_to_twenty_sessions() {

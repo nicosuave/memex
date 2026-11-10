@@ -15,7 +15,8 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    // v3 stops indexing reasoning (unless opted in), synthetic, and ignored legacy parts.
+    index: 3,
     usage: 5,
 };
 
@@ -31,7 +32,8 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// `(max_seq, max_time_updated)` cursors for v2 databases, so persisted v1
 /// cursors must be re-derived once.
 /// v4 removes legacy resurrection, splits tool records, and strengthens change detection.
-pub const DATABASE_STATE_VERSION: u32 = 5;
+/// v6 drops synthetic and ignored v1 text parts, so every v1 session must rehydrate once.
+pub const DATABASE_STATE_VERSION: u32 = 6;
 
 pub fn matches_path(path: &str) -> bool {
     (path.contains("opencode/storage/message") || path.contains("opencode\\storage\\message"))
@@ -947,9 +949,35 @@ fn session_links_from_value(value: &BorrowedValue<'_>) -> SessionLinks {
     }
 }
 
+/// What one v1 part (legacy JSON file or SQLite `part` row) contributes to the transcript.
+enum PartText<'a> {
+    Text(&'a str),
+    Reasoning(&'a str),
+    Skip,
+}
+
+/// Mirrors OpenCode's own projection: only `text` parts are conversation text, and of those,
+/// `synthetic` ones are injected by OpenCode itself while `ignored` ones are withheld from the
+/// model, so neither is indexed. Reasoning is returned separately so callers can make it opt-in.
+fn classify_part<'a>(part: &'a BorrowedValue<'_>) -> PartText<'a> {
+    let flag = |key: &str| part.get(key).and_then(|value| value.as_bool()) == Some(true);
+    let text = part.get("text").and_then(|value| value.as_str());
+    match part.get("type").and_then(|kind| kind.as_str()) {
+        Some("text") if !flag("synthetic") && !flag("ignored") => text
+            .filter(|text| !text.is_empty())
+            .map_or(PartText::Skip, PartText::Text),
+        Some("reasoning") => text
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map_or(PartText::Skip, PartText::Reasoning),
+        _ => PartText::Skip,
+    }
+}
+
 pub(crate) fn parse_index_records(
     session_dir: &Path,
     state: IndexParseState,
+    include_reasoning: bool,
     session_links: &HashMap<String, SessionLinks>,
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
@@ -1014,6 +1042,7 @@ pub(crate) fn parse_index_records(
             .collect::<Vec<_>>();
         part_files.sort();
         let mut text_parts = Vec::new();
+        let mut reasoning_parts = Vec::new();
         for path in part_files {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
@@ -1024,9 +1053,33 @@ pub(crate) fn parse_index_records(
             let Ok(part) = simd_json::to_borrowed_value(&mut bytes) else {
                 continue;
             };
-            if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
-                text_parts.push(text.to_string());
+            match classify_part(&part) {
+                PartText::Text(text) => text_parts.push(text.to_string()),
+                PartText::Reasoning(text) if include_reasoning => {
+                    reasoning_parts.push(text.to_string());
+                }
+                PartText::Reasoning(_) | PartText::Skip => {}
             }
+        }
+        for (index, text) in reasoning_parts.into_iter().enumerate() {
+            let mut record_links = links.record_links();
+            record_links.event_id = Some(format!("{message_id}:reasoning:{index}"));
+            emit(Record {
+                source: SourceKind::Opencode,
+                doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                ts: timestamp,
+                project: project.clone(),
+                session_id: session_id.clone(),
+                turn_id,
+                role: "reasoning".to_string(),
+                text,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+                links: record_links,
+                source_path: source_path.clone(),
+            })?;
+            turn_id += 1;
         }
         if text_parts.is_empty() {
             continue;
@@ -1233,14 +1286,10 @@ fn collect_modern_messages(
             });
         }
         let text = match parse_modern_value(part_data, |value| {
-            if value.get("type").and_then(|kind| kind.as_str()) != Some("text") {
-                return Ok(None);
-            }
-            Ok(value
-                .get("text")
-                .and_then(|text| text.as_str())
-                .filter(|text| !text.is_empty())
-                .map(str::to_string))
+            Ok(match classify_part(value) {
+                PartText::Text(text) => Some(text.to_string()),
+                PartText::Reasoning(_) | PartText::Skip => None,
+            })
         })? {
             ModernJson::Valid(text) => text,
             ModernJson::Malformed => {
@@ -2347,12 +2396,24 @@ mod tests {
                 params!["m_empty", "s_child", 101_i64, r#"{"role":"assistant"}"#],
             )
             .unwrap();
-        // Part ordering is by id, not insertion order. Non-text parts are ignored.
+        // Part ordering is by id, not insertion order. Non-text, synthetic, and ignored parts
+        // are skipped.
         for (id, message, data) in [
             ("p_z", "m_a", r#"{"type":"text","text":"second"}"#),
             ("p_a", "m_a", r#"{"type":"image","text":"not emitted"}"#),
             ("p_b", "m_a", r#"{"type":"text","text":"first"}"#),
+            ("p_ba", "m_a", r#"{"type":"reasoning","text":"thinking"}"#),
             ("p_c", "m_b", r#"{"type":"text","text":"user fallback"}"#),
+            (
+                "p_ca",
+                "m_b",
+                r#"{"type":"text","text":"injected","synthetic":true}"#,
+            ),
+            (
+                "p_cb",
+                "m_b",
+                r#"{"type":"text","text":"withheld","ignored":true}"#,
+            ),
             ("p_d", "m_empty", r#"{"type":"tool","text":"ignored"}"#),
         ] {
             connection
@@ -2380,6 +2441,7 @@ mod tests {
         assert_eq!(records[0].text, "first\nsecond");
         assert_eq!(records[0].turn_id, 7);
         assert_eq!(records[1].links.event_id.as_deref(), Some("m_b"));
+        assert_eq!(records[1].text, "user fallback");
         assert_eq!(records[1].role, "user");
         assert_eq!(records[1].turn_id, 8);
         assert_eq!(
@@ -2664,7 +2726,7 @@ mod tests {
             .unwrap();
             fs::write(
                 part_dir.join("part.json"),
-                format!(r#"{{"text":"{text}"}}"#),
+                format!(r#"{{"type":"text","text":"{text}"}}"#),
             )
             .unwrap();
             let session_meta = root.join("storage/session");
@@ -2692,6 +2754,7 @@ mod tests {
             parse_index_records(
                 &session.path,
                 IndexParseState::default(),
+                false,
                 &HashMap::new(),
                 &AtomicU64::new(1),
                 |record| {
@@ -2708,6 +2771,87 @@ mod tests {
                 .map(|record| record.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["from a", "from b"]
+        );
+    }
+
+    #[test]
+    fn legacy_reasoning_is_opt_in_and_synthetic_parts_are_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = temp.path().join("storage/message/ses_1");
+        let part_dir = temp.path().join("storage/part/msg_1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&part_dir).unwrap();
+        fs::write(
+            session_dir.join("msg_1.json"),
+            r#"{"id":"msg_1","role":"assistant","time":{"created":5}}"#,
+        )
+        .unwrap();
+        for (name, part) in [
+            ("prt_1.json", r#"{"type":"step-start"}"#),
+            (
+                "prt_2.json",
+                r#"{"type":"reasoning","text":" private chain of thought "}"#,
+            ),
+            ("prt_3.json", r#"{"type":"text","text":"visible answer"}"#),
+            (
+                "prt_4.json",
+                r#"{"type":"text","text":"injected note","synthetic":true}"#,
+            ),
+            (
+                "prt_5.json",
+                r#"{"type":"text","text":"withheld note","ignored":true}"#,
+            ),
+            (
+                "prt_6.json",
+                r#"{"type":"tool","tool":"bash","text":"tool text"}"#,
+            ),
+        ] {
+            fs::write(part_dir.join(name), part).unwrap();
+        }
+
+        let parse = |include_reasoning| {
+            let mut records = Vec::new();
+            parse_index_records(
+                &session_dir,
+                IndexParseState::default(),
+                include_reasoning,
+                &HashMap::new(),
+                &AtomicU64::new(1),
+                |record| {
+                    records.push(record);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            records
+        };
+
+        let default = parse(false);
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].role, "assistant");
+        assert_eq!(default[0].text, "visible answer");
+        assert_eq!(default[0].links.event_id.as_deref(), Some("msg_1"));
+
+        let with_reasoning = parse(true);
+        assert_eq!(
+            with_reasoning
+                .iter()
+                .map(|record| (
+                    record.role.as_str(),
+                    record.text.as_str(),
+                    record.links.event_id.as_deref(),
+                    record.turn_id
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "reasoning",
+                    "private chain of thought",
+                    Some("msg_1:reasoning:0"),
+                    0
+                ),
+                ("assistant", "visible answer", Some("msg_1"), 1),
+            ]
         );
     }
 

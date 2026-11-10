@@ -838,9 +838,9 @@ fn insert_fact_events<'a>(
 }
 
 /// Record a partition's freshness fingerprint atomically with its facts.
-/// Warnings accumulate deduplicated across upserts: a warning stays until a full
-/// (legacy) rebuild recomputes them, so a fixed file's warning can linger — the
-/// same direction as blob-save staleness, and self-healing on the next rebuild.
+/// Warnings are replaced, not merged: each build or facts refresh records the
+/// warnings of its own pass, so a file that now parses cleanly loses its
+/// warning on the next refresh.
 pub(crate) fn write_fact_sync(
     connection: &Connection,
     filter: SourceFilter,

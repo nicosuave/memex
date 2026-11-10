@@ -1040,7 +1040,7 @@ impl LexicalMemoryIndex {
             );
             parser.set_field_boost(self.fields.heading, 1.5);
             parser.set_field_boost(self.fields.title, 1.25);
-            parser.parse_query(query)?
+            crate::index::parse_text_query(&parser, query)?
         };
         let rows = searcher.search(&parsed, &TopDocs::with_limit(limit))?;
         rows.into_iter()

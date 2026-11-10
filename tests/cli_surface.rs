@@ -83,7 +83,7 @@ fn assert_directory_empty(path: &Path) {
 fn top_level_help_shows_only_the_canonical_command_surface() {
     let rows = command_rows(&successful_stdout(&["--help"]));
     for command in [
-        "index", "daemon", "web", "session", "projects", "machines", "debug",
+        "index", "daemon", "web", "session", "projects", "machines", "debug", "dream",
     ] {
         assert!(
             rows.contains(command),
@@ -131,6 +131,11 @@ fn nested_help_exposes_the_approved_command_groups_without_side_effects() {
         &["session", "batch", "--root", root_arg, "--help"],
         &["debug", "--help"],
         &["debug", "eval-retrieval", "--root", root_arg, "--help"],
+        &["dream", "--root", root_arg, "--help"],
+        &["dream", "run", "--root", root_arg, "--help"],
+        &["dream", "show", "--root", root_arg, "--help"],
+        &["dream", "lint", "--root", root_arg, "--help"],
+        &["dream", "status", "--root", root_arg, "--help"],
     ];
     for args in cases {
         let help = successful_stdout(args);
@@ -304,6 +309,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             assert_eq!(report["vector_backfill"]["running"], false);
             let sources = report["sources"].as_array().unwrap();
             assert!(sources.iter().any(|source| source == "kiro"));
+            assert!(sources.iter().any(|source| source == "kimi"));
             assert!(sources.iter().any(|source| source == "zcode"));
             assert!(sources.iter().any(|source| source == "hermes"));
         }
@@ -323,6 +329,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             "  model: minilm",
             "  execution-provider: cpu",
             "  - kiro",
+            "  - kimi",
             "  - hermes",
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");

@@ -257,6 +257,10 @@ fn handle_request(
             Ok(payload) => respond_json(request, StatusCode(200), &payload),
             Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
         },
+        "/api/tags" => match tags_payload(paths) {
+            Ok(payload) => respond_json(request, StatusCode(200), &payload),
+            Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
+        },
         "/api/search" => match SearchRequest::from_url(&parsed) {
             Ok(params) => match search_payload(paths, &params) {
                 Ok(payload) => respond_json(request, StatusCode(200), &payload),
@@ -751,6 +755,7 @@ pub(crate) fn raw_activity_payload(
                     include_reviews: params.origin == SessionKindFilter::All,
                     cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                     memo_ttl_ms: 60_000,
+                    claude_sources: Some(config.claude_sources()),
                 };
                 let report = scan_usage(&query)?;
                 let partial = !report.warnings.is_empty();
@@ -819,6 +824,7 @@ pub(crate) fn raw_activity_payload(
                 include_reviews: params.origin == SessionKindFilter::All,
                 cache_path: Some(paths.state.join("usage-cache.sqlite3")),
                 memo_ttl_ms: 60_000,
+                claude_sources: Some(config.claude_sources()),
             };
             let scan_warnings = visit_usage_activity(&query, |point| {
                 add_activity_value(
@@ -1361,6 +1367,7 @@ struct SearchRequest {
     query: String,
     source: Option<SourceFilter>,
     project: Option<String>,
+    tags: Vec<String>,
     offset: usize,
     limit: usize,
     origin: SessionKindFilter,
@@ -1380,6 +1387,7 @@ impl SearchRequest {
         let mut query = String::new();
         let mut source = None;
         let mut project = None;
+        let mut tags = Vec::new();
         let mut offset = 0;
         let mut limit = 50;
         let mut origin = SessionKindFilter::Primary;
@@ -1394,6 +1402,12 @@ impl SearchRequest {
                 }
                 "project" if !value.trim().is_empty() => {
                     project = Some(value.trim().to_string());
+                }
+                "tag" if !value.trim().is_empty() => {
+                    let tag = crate::session_meta::normalize_tag(value)?;
+                    if !tags.contains(&tag) {
+                        tags.push(tag);
+                    }
                 }
                 "origin" => origin = parse_origin(value)?,
                 "range" => range = TimeRange::parse(value)?,
@@ -1438,6 +1452,7 @@ impl SearchRequest {
             query,
             source,
             project,
+            tags,
             offset,
             limit,
             origin,
@@ -1479,6 +1494,8 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "bob" => Ok(SourceFilter::Bob),
         "zcode" => Ok(SourceFilter::Zcode),
         "kilocode" => Ok(SourceFilter::Kilocode),
+        "kimi" => Ok(SourceFilter::Kimi),
+        "goose" => Ok(SourceFilter::Goose),
         "kiro" => Ok(SourceFilter::Kiro),
         _ => Err(anyhow!("unknown source: {value}")),
     }
@@ -1497,6 +1514,30 @@ fn stats_payload(paths: &Paths) -> Result<StatsPayload> {
 }
 
 #[derive(Serialize)]
+struct TagsPayload {
+    tags: Vec<TagSummary>,
+}
+
+#[derive(Serialize)]
+struct TagSummary {
+    tag: String,
+    session_count: u64,
+}
+
+fn tags_payload(paths: &Paths) -> Result<TagsPayload> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Ok(TagsPayload { tags: Vec::new() });
+    }
+    let tags = AnalyticsStore::open_read_only(db)?
+        .query_tags()?
+        .into_iter()
+        .map(|(tag, session_count)| TagSummary { tag, session_count })
+        .collect();
+    Ok(TagsPayload { tags })
+}
+
+#[derive(Serialize)]
 struct SearchPayload {
     query: String,
     offset: usize,
@@ -1510,12 +1551,35 @@ struct SessionSummary {
     record_id: String,
     source_path: String,
     project: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
     source: String,
     role: String,
     ts: u64,
     score: Option<f32>,
     snippet: String,
     snippet_matches: Vec<SnippetMatch>,
+    /// Child session the hit came from when search shows it on this session;
+    /// `record_id` then names a record of that child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_in: Option<MatchedChild>,
+}
+
+#[derive(Serialize)]
+struct MatchedChild {
+    session_id: String,
+    source_path: String,
+    kind: String,
+}
+
+impl MatchedChild {
+    fn of(record: &crate::types::Record, rollup: &crate::search::SessionRollup) -> Self {
+        Self {
+            session_id: record.session_id.clone(),
+            source_path: record.source_path.clone(),
+            kind: rollup.matched_kind.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1539,6 +1603,7 @@ pub(crate) fn evaluate_search(
             query: query.to_string(),
             source,
             project: project.map(str::to_string),
+            tags: Vec::new(),
             offset: 0,
             limit,
             origin,
@@ -1552,13 +1617,17 @@ pub(crate) fn evaluate_search(
     for summary in payload.results {
         let source = crate::types::SourceKind::from_label(&summary.source)
             .ok_or_else(|| anyhow!("unknown result source: {}", summary.source))?;
+        let record_session = summary
+            .matched_in
+            .map_or(summary.session_id, |child| child.session_id);
         let selector = crate::retrieval::ContextSelector::record_id(summary.record_id)
-            .with_scope(Some(summary.session_id), Some(source));
+            .with_scope(Some(record_session), Some(source));
         let record = crate::retrieval::resolve_record(&index, &selector)?;
         hits.push(crate::machine::LocatedRecord {
             machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
             score: summary.score.unwrap_or_default(),
             record,
+            rollup: None,
         });
         snippets.push(summary.snippet);
     }
@@ -1592,40 +1661,37 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 recency_weight: crate::search::DEFAULT_RECENCY_WEIGHT,
                 recency_half_life_days: 30.0,
                 min_score: None,
-                project_grouping: None,
+                project_grouping: Some(ProjectGrouping::Flat),
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+                tags: params.tags.clone(),
             },
             &crate::search::Selection::conversations(target, params.origin),
             false,
         )?;
         let has_more = found.items.len() > params.offset.saturating_add(params.limit);
         let matchers = crate::cli::build_matchers(&params.query)?;
-        let results = found
+        let mut results: Vec<SessionSummary> = found
             .items
             .into_iter()
             .skip(params.offset)
             .take(params.limit)
             .map(|located| {
-                let record = located.record;
                 let snippet = if params.query.is_empty() {
-                    summarize(&record.text, 360)
+                    summarize(&located.record.text, 360)
                 } else {
-                    crate::cli::match_preview(&record.text, &matchers, 160)
+                    crate::cli::match_preview(&located.record.text, &matchers, 160)
                 };
-                SessionSummary {
-                    record_id: crate::retrieval::canonical_record_id(&record),
-                    session_id: record.session_id,
-                    source_path: record.source_path,
-                    project: record.project,
-                    source: record.source.label().to_string(),
-                    role: record.role,
-                    ts: record.ts,
-                    score: Some(located.score),
-                    snippet_matches: snippet_match_spans(&snippet, &matchers),
+                let snippet_matches = snippet_match_spans(&snippet, &matchers);
+                session_summary(
+                    located.record,
+                    located.rollup,
+                    Some(located.score),
                     snippet,
-                }
+                    snippet_matches,
+                )
             })
             .collect();
+        attach_assignments(paths, &mut results, false);
         return Ok(SearchPayload {
             query: params.query.clone(),
             offset: params.offset,
@@ -1634,6 +1700,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         });
     }
     let index = open_index(paths)?;
+    let catalog_scope = catalog_session_scope(paths, params)?;
     let matchers = crate::cli::build_matchers(&params.query)?;
     let since = params
         .range
@@ -1643,21 +1710,22 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let mut candidate_limit = target.saturating_mul(4).max(100).min(document_count);
     let query_options = |limit| QueryOptions {
         query: params.query.clone(),
-        project: params.project.clone(),
+        project: params.project.clone().filter(|_| catalog_scope.is_none()),
         role: None,
         tool: None,
         session_id: None,
-        session_scope: None,
+        session_scope: catalog_scope.clone(),
         source: params.source,
         since,
         until: None,
         limit,
     };
     let mut main_scope_cache = HashMap::new();
+    let rollup_store = AnalyticsStore::open_read_only(analytics_path(&paths.state)).ok();
     let summaries = loop {
         let records: Vec<(Option<f32>, crate::types::Record)> = match params.sort {
             SearchSort::Relevance => unreachable!("relevance returns through shared search"),
-            SearchSort::Newest if params.query.is_empty() => index
+            SearchSort::Newest if params.query.is_empty() && catalog_scope.is_none() => index
                 .recent_records_filtered_since(
                     candidate_limit,
                     params.source,
@@ -1745,22 +1813,46 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 }
             }
         }
+        // Query matches in child sessions show on their root session, like the
+        // relevance path; the recent listing keeps listing sessions as-is.
+        let roll_up = !params.query.is_empty() && params.origin != SessionKindFilter::All;
+        let mut rollups = crate::search::Rollups::new(
+            records
+                .iter()
+                .filter(|_| roll_up)
+                .map(|(_, record)| (crate::machine::LOCAL_MACHINE_ID, record)),
+            params.origin,
+            rollup_store.as_ref(),
+        );
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
         for (score, record) in records {
-            let session_key = (
+            let mut session_key = (
                 record.source.storage_label().to_string(),
                 record.session_id.clone(),
                 record.source_path.clone(),
             );
-            if !seen.insert(session_key.clone()) {
+            let kind = group_kind
+                .get(&session_key)
+                .and_then(|kind| kind.as_deref());
+            let rollup = if kind == Some("main") {
+                None
+            } else if roll_up {
+                let Some(rollup) = rollups.attribute(crate::machine::LOCAL_MACHINE_ID, &record)
+                else {
+                    continue;
+                };
+                if let Some(rollup) = &rollup {
+                    session_key.1.clone_from(&rollup.session_id);
+                    session_key.2.clone_from(&rollup.source_path);
+                }
+                rollup
+            } else if params.origin.matches_kind(kind) {
+                None
+            } else {
                 continue;
-            }
-            if !params.origin.matches_kind(
-                group_kind
-                    .get(&session_key)
-                    .and_then(|kind| kind.as_deref()),
-            ) {
+            };
+            if !seen.insert(session_key) {
                 continue;
             }
             let snippet = if params.query.is_empty() {
@@ -1769,18 +1861,13 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 crate::cli::match_preview(&record.text, &matchers, 160)
             };
             let snippet_matches = snippet_match_spans(&snippet, &matchers);
-            summaries.push(SessionSummary {
-                record_id: crate::retrieval::canonical_record_id(&record),
-                session_id: record.session_id,
-                source_path: record.source_path,
-                project: record.project,
-                source: record.source.label().to_string(),
-                role: record.role,
-                ts: record.ts,
+            summaries.push(session_summary(
+                record,
+                rollup,
                 score,
                 snippet,
                 snippet_matches,
-            });
+            ));
             if summaries.len() == target {
                 break;
             }
@@ -1794,11 +1881,12 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     };
 
     let has_more = summaries.len() > params.offset.saturating_add(params.limit);
-    let results = summaries
+    let mut results: Vec<SessionSummary> = summaries
         .into_iter()
         .skip(params.offset)
         .take(params.limit)
         .collect();
+    attach_assignments(paths, &mut results, catalog_scope.is_some());
 
     Ok(SearchPayload {
         query: params.query.clone(),
@@ -1806,6 +1894,101 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         has_more,
         results,
     })
+}
+
+/// One result row. A rolled-up child hit is listed on its root session, which
+/// is what opening the row reaches; the child stays named in `matched_in`.
+fn session_summary(
+    record: crate::types::Record,
+    rollup: Option<crate::search::SessionRollup>,
+    score: Option<f32>,
+    snippet: String,
+    snippet_matches: Vec<SnippetMatch>,
+) -> SessionSummary {
+    let matched_in = rollup
+        .as_ref()
+        .map(|rollup| MatchedChild::of(&record, rollup));
+    let (session_id, source_path) = match rollup {
+        Some(rollup) => (rollup.session_id, rollup.source_path),
+        None => (record.session_id.clone(), record.source_path.clone()),
+    };
+    SessionSummary {
+        record_id: crate::retrieval::canonical_record_id(&record),
+        session_id,
+        source_path,
+        project: record.project,
+        tags: Vec::new(),
+        source: record.source.label().to_string(),
+        role: record.role,
+        ts: record.ts,
+        score,
+        snippet,
+        snippet_matches,
+        matched_in,
+    }
+}
+
+/// Sessions a project or tag filter selects when the index alone cannot answer it:
+/// tags live only in the assignment store, and an assigned project overrides the
+/// indexed one. `None` leaves filtering to the index.
+fn catalog_session_scope(
+    paths: &Paths,
+    params: &SearchRequest,
+) -> Result<Option<Vec<SessionScopeKey>>> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Ok((!params.tags.is_empty()).then(Vec::new));
+    }
+    let store = AnalyticsStore::open_read_only(&db)?.with_tags(params.tags.clone());
+    let project = params
+        .project
+        .as_deref()
+        .filter(|_| store.has_project_assignments().unwrap_or(false));
+    if params.tags.is_empty() && project.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(store.query_search_scopes(
+        project,
+        ProjectGrouping::Flat,
+        None,
+    )?))
+}
+
+/// Show assigned projects and tags on result rows. Relevance results already carry
+/// assigned projects from the shared search path.
+fn attach_assignments(paths: &Paths, results: &mut [SessionSummary], projects: bool) {
+    let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
+        return;
+    };
+    let keys = results
+        .iter()
+        .filter_map(|summary| {
+            crate::types::SourceKind::from_label(&summary.source).map(|source| {
+                (
+                    source,
+                    summary.session_id.clone(),
+                    summary.source_path.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let tags = store.query_session_tags(&keys).unwrap_or_default();
+    let assigned = (projects || store.has_project_assignments().unwrap_or(false))
+        .then(|| {
+            store
+                .query_session_projects(&keys, ProjectGrouping::Flat)
+                .ok()
+        })
+        .flatten()
+        .unwrap_or_default();
+    for (summary, key) in results.iter_mut().zip(keys) {
+        if let Some(tags) = tags.get(&key) {
+            summary.tags.clone_from(tags);
+        }
+        if let Some(project) = assigned.get(&key) {
+            summary.project.clone_from(project);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3278,6 +3461,7 @@ mod tests {
                 query: "needle".to_string(),
                 source: Some(SourceFilter::Claude),
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 0,
                 limit: 20,
                 origin: SessionKindFilter::All,
@@ -3356,6 +3540,7 @@ mod tests {
                 query: "alpha".to_string(),
                 source: None,
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3374,6 +3559,7 @@ mod tests {
                 query: "alpha".to_string(),
                 source: None,
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 0,
                 limit: 1,
                 origin: SessionKindFilter::Primary,
@@ -3391,6 +3577,7 @@ mod tests {
                 query: "alpha".to_string(),
                 source: None,
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 1,
                 limit: 1,
                 origin: SessionKindFilter::Primary,
@@ -3432,6 +3619,7 @@ mod tests {
                 query: String::new(),
                 source: Some(SourceFilter::Codex),
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3570,6 +3758,7 @@ mod tests {
                 query: "text:needle".to_string(),
                 source: None,
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3600,6 +3789,7 @@ mod tests {
                 query: String::new(),
                 source: None,
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3734,6 +3924,7 @@ mod tests {
                 query: "collision".to_string(),
                 source: None,
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 10,
                 origin: SessionKindFilter::Primary,
@@ -3966,6 +4157,7 @@ mod tests {
                     query: "flaky".to_string(),
                     source: None,
                     project: None,
+                    tags: Vec::new(),
                     offset: 0,
                     limit: 30,
                     origin,
@@ -3998,6 +4190,90 @@ mod tests {
         let mut regular = ids(payload_for(SessionKindFilter::Regular));
         regular.sort();
         assert_eq!(regular, vec!["session-main", "session-sub"]);
+    }
+
+    #[test]
+    fn search_payload_shows_child_only_matches_on_the_parent() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        for (doc_id, session_id, kind, parent, text) in [
+            (1, "parent", "main", None, "plan the release"),
+            (
+                2,
+                "agent-a",
+                "subagent",
+                Some("parent"),
+                "fix the flaky widget",
+            ),
+        ] {
+            index
+                .add_record(
+                    &mut writer,
+                    &Record {
+                        source: SourceKind::Claude,
+                        doc_id,
+                        ts: doc_id * 1_000,
+                        project: "memex".to_string(),
+                        session_id: session_id.to_string(),
+                        turn_id: doc_id as u32,
+                        role: "assistant".to_string(),
+                        text: text.to_string(),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: RecordLinks {
+                            conversation_kind: Some(kind.to_string()),
+                            parent_session_id: parent.map(str::to_string),
+                            ..RecordLinks::default()
+                        },
+                        source_path: format!("/tmp/{session_id}.jsonl"),
+                    },
+                )
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+
+        for origin in [SessionKindFilter::Primary, SessionKindFilter::Regular] {
+            for sort in [SearchSort::Relevance, SearchSort::Newest] {
+                let payload = search_payload(
+                    &paths,
+                    &SearchRequest {
+                        query: "flaky".to_string(),
+                        source: None,
+                        project: None,
+                        tags: Vec::new(),
+                        offset: 0,
+                        limit: 30,
+                        origin,
+                        range: TimeRange::All,
+                        sort,
+                    },
+                )
+                .unwrap();
+                let rows = payload
+                    .results
+                    .iter()
+                    .map(|result| {
+                        let child = result.matched_in.as_ref().expect("child attribution");
+                        (
+                            result.session_id.as_str(),
+                            child.session_id.as_str(),
+                            child.kind.as_str(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    rows,
+                    vec![("parent", "agent-a", "subagent")],
+                    "{origin:?} {sort:?}"
+                );
+            }
+        }
     }
 
     #[test]

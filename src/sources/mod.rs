@@ -12,11 +12,13 @@ pub mod codex;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
+pub mod goose;
 pub mod grok;
 pub mod hermes;
 pub mod jcode;
 mod jsonl;
 pub mod kilocode;
+pub mod kimi;
 pub mod kiro;
 pub mod muse;
 pub mod omp;
@@ -138,6 +140,15 @@ pub struct ParseDiagnostics {
     pub encrypted_reasoning_dropped: u64,
     pub truncated_tool_inputs: u64,
     pub truncated_tool_outputs: u64,
+    /// Credentials replaced by index-time redaction.
+    pub redacted_secrets: u64,
+    /// Fields replaced whole because redacting them exceeded the time budget.
+    pub redaction_timeouts: u64,
+    /// Tool inputs withheld (a command carrying a credential, content written to a
+    /// sensitive file).
+    pub withheld_tool_inputs: u64,
+    /// Tool outputs withheld (credential commands, sensitive-file reads and writes).
+    pub withheld_tool_outputs: u64,
     /// Source stores discovery could not read this refresh (locked, corrupt, or on an
     /// unsupported schema). Their previously indexed records are kept until they read again.
     pub unreadable_sources: Vec<String>,
@@ -170,6 +181,10 @@ impl ParseDiagnostics {
         self.encrypted_reasoning_dropped += other.encrypted_reasoning_dropped;
         self.truncated_tool_inputs += other.truncated_tool_inputs;
         self.truncated_tool_outputs += other.truncated_tool_outputs;
+        self.redacted_secrets += other.redacted_secrets;
+        self.redaction_timeouts += other.redaction_timeouts;
+        self.withheld_tool_inputs += other.withheld_tool_inputs;
+        self.withheld_tool_outputs += other.withheld_tool_outputs;
         for (key, count) in other.unknown_top_level_types {
             *self.unknown_top_level_types.entry(key).or_default() += count;
         }
@@ -297,6 +312,8 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Zcode => zcode::VERSIONS,
         SourceKind::Kiro => kiro::VERSIONS,
         SourceKind::Kilocode => kilocode::VERSIONS,
+        SourceKind::Kimi => kimi::VERSIONS,
+        SourceKind::Goose => goose::VERSIONS,
     }
 }
 
@@ -316,7 +333,11 @@ pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<
         SourceKind::Kilocode => {
             kilocode::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
         }
+        SourceKind::Kimi => kimi::session_cwd(path),
         SourceKind::Hermes => hermes::session_cwd(path, session_id),
+        SourceKind::Goose => {
+            goose::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
+        }
         _ => jsonl::scan_session_cwd(path, session_id),
     }
 }
@@ -324,10 +345,11 @@ pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<
 /// True when a directory lies inside a transcript store owned by a supported
 /// source rather than in a user workspace. Resume commands must never treat
 /// such a directory as a session cwd: CLIs such as antigravity would ask the
-/// user to trust an agent's own state store as a project.
-pub fn is_state_store_dir(dir: &Path) -> bool {
+/// user to trust an agent's own state store as a project. `claude_sources` adds the
+/// configured Claude roots to the environment's.
+pub fn is_state_store_dir(dir: &Path, claude_sources: &[PathBuf]) -> bool {
     let home = common::home();
-    state_store_roots()
+    state_store_roots(claude_sources)
         .into_iter()
         // A source configured to keep transcripts directly in `$HOME` (pi's
         // `sessionDir = "~"`) must not make the whole home directory internal.
@@ -335,9 +357,10 @@ pub fn is_state_store_dir(dir: &Path) -> bool {
         .any(|root| dir.starts_with(root))
 }
 
-fn state_store_roots() -> Vec<PathBuf> {
+fn state_store_roots(claude_sources: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.extend(crate::config::default_claude_sources());
+    roots.extend(claude_sources.iter().cloned());
     // CODEX_HOME also owns real workspaces under worktrees/. Only its
     // transcript directories are unsafe resume destinations.
     roots.extend(
@@ -358,6 +381,8 @@ fn state_store_roots() -> Vec<PathBuf> {
     roots.extend(antigravity::profile_roots());
     roots.extend(bob::roots());
     roots.extend(kilocode::roots());
+    roots.push(kimi::home());
+    roots.extend(goose::roots());
     roots
 }
 
@@ -384,6 +409,8 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Zcode
                 | SourceKind::Kiro
                 | SourceKind::Kilocode
+                | SourceKind::Kimi
+                | SourceKind::Goose
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -411,6 +438,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Kiro
     } else if kilocode::matches_path(path) {
         SourceKind::Kilocode
+    } else if kimi::matches_path(path) {
+        SourceKind::Kimi
     } else if grok::matches_path(path) {
         SourceKind::Grok
     } else if cursor::matches_path(path) {
@@ -425,6 +454,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Copilot
     } else if hermes::matches_path(path) {
         SourceKind::Hermes
+    } else if goose::matches_path(path) {
+        SourceKind::Goose
     } else {
         SourceKind::Claude
     }
@@ -468,28 +499,35 @@ mod tests {
         let _env = pin_source_roots(temp.path());
         // Transcript stores of any source are internal, wherever the roots
         // are configured to live...
-        assert!(is_state_store_dir(&temp.path().join(
-            "ANTIGRAVITY_HOME/antigravity-cli/brain/id/.system_generated/logs"
-        )));
         assert!(is_state_store_dir(
-            &temp.path().join("CODEX_HOME/sessions/2026/09")
+            &temp
+                .path()
+                .join("ANTIGRAVITY_HOME/antigravity-cli/brain/id/.system_generated/logs"),
+            &[]
         ));
         assert!(is_state_store_dir(
-            &temp.path().join("CODEX_HOME/archived_sessions/2026/09")
+            &temp.path().join("CODEX_HOME/sessions/2026/09"),
+            &[]
+        ));
+        assert!(is_state_store_dir(
+            &temp.path().join("CODEX_HOME/archived_sessions/2026/09"),
+            &[]
         ));
         assert!(!is_state_store_dir(
-            &temp.path().join("CODEX_HOME/worktrees/24d4/memex")
+            &temp.path().join("CODEX_HOME/worktrees/24d4/memex"),
+            &[]
         ));
         assert!(is_state_store_dir(
-            &temp.path().join("CLAUDE_CONFIG_DIR/projects/encoded-slug")
+            &temp.path().join("CLAUDE_CONFIG_DIR/projects/encoded-slug"),
+            &[]
         ));
         // ...while user workspaces stay resumable, even inside the same parent.
-        assert!(!is_state_store_dir(&temp.path().join("my-repo")));
+        assert!(!is_state_store_dir(&temp.path().join("my-repo"), &[]));
         // A source configured to keep transcripts directly in $HOME must not
         // make the whole home directory internal.
         let home = common::home();
         let _env_home = EnvVarGuard::set(&[("PI_CODING_AGENT_SESSION_DIR", home.to_str())]);
-        assert!(!is_state_store_dir(&home));
+        assert!(!is_state_store_dir(&home, &[]));
     }
 
     #[test]
@@ -505,6 +543,7 @@ mod tests {
             SourceKind::Muse,
             SourceKind::Kiro,
             SourceKind::Kilocode,
+            SourceKind::Kimi,
             SourceKind::Grok,
         ] {
             assert_ne!(

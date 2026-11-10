@@ -355,7 +355,10 @@ fn capture_is_opt_in_and_existing_files_are_never_overwritten() {
 fn failed_commands_still_finish_the_trace() {
     let temp = fixture();
     let trace = temp.path().join("trace.json");
-    let output = run(temp.path(), &temp.path().join("index"), Some(&trace), "(");
+    // Any query text now searches, so fail the command with an index root that is a file.
+    let root = temp.path().join("not-an-index");
+    fs::write(&root, "not an index").unwrap();
+    let output = run(temp.path(), &root, Some(&trace), "privateneedle");
     assert!(!output.status.success());
     let document: serde_json::Value = serde_json::from_slice(&fs::read(trace).unwrap()).unwrap();
     assert_eq!(document["incomplete_spans"], 0);

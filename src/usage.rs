@@ -92,6 +92,17 @@ pub struct UsageQuery {
     /// `project`, `session_keys`, ...) apply after assembly, so repeated queries over
     /// the same corpus share one scan. Zero bypasses retention entirely (one-shot).
     pub memo_ttl_ms: u64,
+    /// Claude `projects` directories to scan, such as `UserConfig::claude_sources`; `None`
+    /// reads the environment's (`default_claude_sources`).
+    pub claude_sources: Option<Vec<PathBuf>>,
+}
+
+impl UsageQuery {
+    pub(crate) fn claude_roots(&self) -> Vec<PathBuf> {
+        self.claude_sources
+            .clone()
+            .unwrap_or_else(crate::config::default_claude_sources)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, ValueEnum)]

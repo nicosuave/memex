@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 3,
-    index: 3,
+    // Keep omp Python runs, file mentions and narration and assistant errors, and link
+    // forks and omp subagents to the session they came from.
+    index: 4,
     usage: 4,
 };
 
@@ -166,6 +168,13 @@ fn content_text(content: Option<&BorrowedValue<'_>>) -> String {
                         parts.push(text.to_string());
                     }
                 }
+                // omp's narration is prose the model addressed to the user, which the
+                // provider returned as a thinking block.
+                "thinking" if is_narration(object) => {
+                    if let Some(text) = object.get("thinking").and_then(|value| value.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                }
                 "thinking" | "redacted_thinking" | "encrypted_reasoning" => {
                     // Plaintext reasoning is projected separately as role=reasoning so it
                     // remains BM25-only and is never embedded as assistant prose.
@@ -187,6 +196,10 @@ fn content_text(content: Option<&BorrowedValue<'_>>) -> String {
     content.to_string()
 }
 
+fn is_narration(block: &simd_json::borrowed::Object<'_>) -> bool {
+    block.get("narration").and_then(|value| value.as_bool()) == Some(true)
+}
+
 fn summary_message_text(message: &simd_json::borrowed::Object<'_>, role: &str) -> String {
     let summary = if role == "branchSummary" || role == "compactionSummary" {
         message.get("summary").and_then(|value| value.as_str())
@@ -198,6 +211,135 @@ fn summary_message_text(message: &simd_json::borrowed::Object<'_>, role: &str) -
         .unwrap_or_else(|| content_text(message.get("content")))
         .trim()
         .to_string()
+}
+
+/// The session a transcript descends from, and how.
+struct SessionLineage {
+    /// `subagent` or `fork`.
+    kind: &'static str,
+    id: String,
+    file: PathBuf,
+}
+
+/// The parent of the session whose header is `header`: the session whose artifacts directory
+/// holds the transcript (omp keeps a session's subagent and advisor transcripts in
+/// `<session>/<name>.jsonl` beside `<session>.jsonl`), else the session file the header's
+/// `parentSession` (v1: `branchedFrom`) names, which `/fork` and `/tree` write. The parent is
+/// named by its own header's id, else by its file name.
+fn session_lineage(
+    path: &Path,
+    header: &simd_json::borrowed::Object<'_>,
+) -> Option<SessionLineage> {
+    let dir = path.parent()?;
+    let mut owner = dir.as_os_str().to_owned();
+    owner.push(".jsonl");
+    let owner = PathBuf::from(owner);
+    if owner.is_file() {
+        return Some(SessionLineage {
+            kind: "subagent",
+            id: header_id(&owner).unwrap_or_else(|| session_id_from_path(&owner)),
+            file: owner,
+        });
+    }
+    let parent = header
+        .get("parentSession")
+        .or_else(|| header.get("branchedFrom"))
+        .and_then(|value| value.as_str())
+        .filter(|parent| !parent.trim().is_empty())?;
+    let file = dir.join(parent);
+    Some(SessionLineage {
+        kind: "fork",
+        id: header_id(&file).unwrap_or_else(|| session_id_from_path(&file)),
+        file,
+    })
+}
+
+/// The lineage the `session` header of the transcript at `path` names.
+fn header_lineage(path: &Path) -> Option<SessionLineage> {
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(File::open(path).ok()?);
+    reader.split(b'\n').take(4).find_map(|line| {
+        let mut line = line.ok()?;
+        let value = simd_json::to_borrowed_value(&mut line).ok()?;
+        let header = value.as_object()?;
+        (header.get("type")?.as_str()? == "session")
+            .then(|| session_lineage(path, header))
+            .flatten()
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LineageFingerprint {
+    file: PathBuf,
+    exists: bool,
+}
+
+/// What a transcript's index projection depends on outside its own file: whether the parent
+/// session's file exists. A fork's copied history is skipped only while the parent holds it,
+/// and the parent's header names it, so the parent appearing or disappearing must reparse the
+/// transcript. The header is fixed, so `previous` is reused while the file keeps its prefix.
+/// `None` for transcripts with no parent.
+pub(crate) fn lineage_fingerprint(
+    path: &Path,
+    previous: Option<&str>,
+    reuse_previous: bool,
+) -> Option<String> {
+    let file = if reuse_previous {
+        // Without a previous lineage fingerprint, a file that kept its header has no parent.
+        serde_json::from_str::<LineageFingerprint>(previous?)
+            .ok()?
+            .file
+    } else {
+        header_lineage(path)?.file
+    };
+    let exists = file.is_file();
+    serde_json::to_string(&LineageFingerprint { file, exists }).ok()
+}
+
+/// The id in the `session` header of the transcript at `path`.
+fn header_id(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(File::open(path).ok()?);
+    reader.lines().take(4).find_map(|line| {
+        let header = serde_json::from_str::<serde_json::Value>(&line.ok()?).ok()?;
+        (header.get("type")?.as_str()? == "session")
+            .then(|| header.get("id")?.as_str().map(str::to_string))
+            .flatten()
+            .filter(|id| !id.is_empty())
+    })
+}
+
+/// Byte offset just past the entries a fork copied from `parent`: forks keep the copied
+/// entries' ids, so the leading entries whose ids the parent holds were indexed there.
+fn inherited_prefix_end(bytes: &[u8], parent: &Path) -> usize {
+    let Ok(parent) = std::fs::read(parent) else {
+        return 0;
+    };
+    let entry_id = |line: &[u8]| {
+        let value = serde_json::from_slice::<serde_json::Value>(line).ok()?;
+        (value.get("type")?.as_str()? != "session")
+            .then(|| value.get("id")?.as_str().map(str::to_string))
+            .flatten()
+    };
+    let parent_ids = parent
+        .split(|byte| *byte == b'\n')
+        .filter_map(entry_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut end = 0;
+    let mut offset = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        offset += line.len();
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        match entry_id(line) {
+            Some(id) if parent_ids.contains(&id) => end = offset,
+            Some(_) => break,
+            // The header and title lines carry no entry id.
+            None => {}
+        }
+    }
+    end
 }
 
 fn bash_text(command: &str, output: &str, exit_code: Option<i64>) -> String {
@@ -254,15 +396,17 @@ pub(crate) fn parse_index_records_for(
     let mut diagnostics = ParseDiagnostics::default();
 
     let mut buf = Vec::new();
-    if start > 0 && !mmap.is_empty() {
-        let rel = memchr(b'\n', &mmap).unwrap_or(mmap.len());
-        let line = &mmap[..rel];
-        if !line.is_empty() {
-            buf.extend_from_slice(line);
-            if let Ok(value) = simd_json::to_borrowed_value(&mut buf)
-                && let Some(obj) = value.as_object()
-                && obj.get("type").and_then(|v| v.as_str()) == Some("session")
-            {
+    // The header names the session this one descends from; omp writes a title line first.
+    let mut lineage = None;
+    for line in mmap.split(|byte| *byte == b'\n').take(4) {
+        buf.clear();
+        buf.extend_from_slice(line);
+        if let Ok(value) = simd_json::to_borrowed_value(&mut buf)
+            && let Some(obj) = value.as_object()
+            && obj.get("type").and_then(|v| v.as_str()) == Some("session")
+        {
+            lineage = session_lineage(path, obj);
+            if start > 0 {
                 if let Some(timestamp) = obj
                     .get("timestamp")
                     .map(timestamp_millis)
@@ -272,9 +416,26 @@ pub(crate) fn parse_index_records_for(
                 }
                 apply_session_header(obj, &mut session_id, &mut project);
             }
-            buf.clear();
+            break;
         }
     }
+    buf.clear();
+    // History a fork copied from its parent was indexed in the parent.
+    let inherited_end = lineage
+        .as_ref()
+        .filter(|lineage| lineage.kind == "fork")
+        .map_or(0, |lineage| inherited_prefix_end(&mmap, &lineage.file));
+    let links_for = |obj: &simd_json::borrowed::Object<'_>, conversation_kind: &str| {
+        let mut links = base_links(
+            obj,
+            match &lineage {
+                Some(lineage) if conversation_kind == "main" => lineage.kind,
+                _ => conversation_kind,
+            },
+        );
+        links.parent_session_id = lineage.as_ref().map(|lineage| lineage.id.clone());
+        links
+    };
     while start < mmap.len() {
         let line_start = start;
         let slice = &mmap[start..];
@@ -312,13 +473,16 @@ pub(crate) fn parse_index_records_for(
             "compaction" => "compaction",
             _ => "main",
         };
-        let mut base_links = base_links(obj, conversation_kind);
+        let mut base_links = links_for(obj, conversation_kind);
 
         if entry_type == "session" {
             if entry_timestamp > 0 {
                 session_timestamp = entry_timestamp;
             }
             apply_session_header(obj, &mut session_id, &mut project);
+            continue;
+        }
+        if line_start < inherited_end {
             continue;
         }
         let timestamp = if entry_timestamp > 0 {
@@ -438,6 +602,9 @@ pub(crate) fn parse_index_records_for(
                             .get("type")
                             .and_then(|value| value.as_str())
                             .unwrap_or("");
+                        if block_type == "thinking" && is_narration(block_obj) {
+                            continue;
+                        }
                         if block_type == "thinking" {
                             let thinking = block_obj
                                 .get("thinking")
@@ -539,26 +706,52 @@ pub(crate) fn parse_index_records_for(
                 }
 
                 let text = content_text(content).trim().to_string();
-                if text.is_empty() {
-                    continue;
+                if !text.is_empty() {
+                    emit(Record {
+                        source,
+                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        ts: timestamp,
+                        project: project.clone(),
+                        session_id: session_id.clone(),
+                        turn_id,
+                        role: role.to_string(),
+                        text,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links: base_links.clone(),
+                        source_path: source_path.clone(),
+                    })?;
+                    turn_id += 1;
                 }
-                let record = Record {
-                    source,
-                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-                    ts: timestamp,
-                    project: project.clone(),
-                    session_id: session_id.clone(),
-                    turn_id,
-                    role: role.to_string(),
-                    text,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: None,
-                    links: base_links,
-                    source_path: source_path.clone(),
-                };
-                emit(record)?;
-                turn_id += 1;
+                // A failed or aborted call usually has no content; `errorMessage` is what pi
+                // shows for it.
+                if role == "assistant"
+                    && let Some(error) = message
+                        .get("errorMessage")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|error| !error.is_empty())
+                {
+                    let mut links = base_links;
+                    links.event_id = links.event_id.map(|id| format!("{id}:error"));
+                    emit(Record {
+                        source,
+                        doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                        ts: timestamp,
+                        project: project.clone(),
+                        session_id: session_id.clone(),
+                        turn_id,
+                        role: "system".to_string(),
+                        text: format!("Error: {error}"),
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                        links,
+                        source_path: source_path.clone(),
+                    })?;
+                    turn_id += 1;
+                }
             }
             "toolResult" | "tool" => {
                 let tool_call_id = message
@@ -614,7 +807,8 @@ pub(crate) fn parse_index_records_for(
                 emit(record)?;
                 turn_id += 1;
             }
-            "bashExecution" => {
+            // A `!command` the user ran in pi's shell, or a `$code` run in omp's Python kernel.
+            "bashExecution" | "pythonExecution" => {
                 if message
                     .get("excludeFromContext")
                     .and_then(|v| v.as_bool())
@@ -622,8 +816,13 @@ pub(crate) fn parse_index_records_for(
                 {
                     continue;
                 }
+                let (input_key, tool_name) = if role == "bashExecution" {
+                    ("command", "Bash")
+                } else {
+                    ("code", "Python")
+                };
                 let command = message
-                    .get("command")
+                    .get(input_key)
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -646,7 +845,7 @@ pub(crate) fn parse_index_records_for(
                     turn_id,
                     role: "tool_result".to_string(),
                     text,
-                    tool_name: Some("Bash".to_string()),
+                    tool_name: Some(tool_name.to_string()),
                     tool_input: if command.is_empty() {
                         None
                     } else {
@@ -661,6 +860,37 @@ pub(crate) fn parse_index_records_for(
                     source_path: source_path.clone(),
                 };
                 emit(record)?;
+                turn_id += 1;
+            }
+            // The files an omp `@path` mention put in the model's context. Their contents are
+            // not the user's words, so only the paths are indexed, as context.
+            "fileMention" => {
+                let paths = message
+                    .get("files")
+                    .and_then(|files| files.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|file| file.get("path").and_then(|path| path.as_str()))
+                    .filter(|path| !path.is_empty())
+                    .collect::<Vec<_>>();
+                if paths.is_empty() {
+                    continue;
+                }
+                emit(Record {
+                    source,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "system".to_string(),
+                    text: format!("Mentioned files: {}", paths.join(", ")),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: base_links,
+                    source_path: source_path.clone(),
+                })?;
                 turn_id += 1;
             }
             "custom" | "branchSummary" | "compactionSummary" => {
@@ -954,6 +1184,181 @@ mod tests {
             !with_reasoning
                 .iter()
                 .any(|record| record.text.contains("ciphertext-must-never-be-indexed"))
+        );
+    }
+
+    fn parse_from(path: &Path, state: IndexParseState, include_reasoning: bool) -> Vec<Record> {
+        let mut records = Vec::new();
+        parse_index_records_for(
+            path,
+            state,
+            SourceKind::Omp,
+            include_reasoning,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        records
+    }
+
+    fn roles_and_texts(records: &[Record]) -> Vec<(&str, &str)> {
+        records
+            .iter()
+            .map(|record| (record.role.as_str(), record.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn omp_python_runs_file_mentions_narration_and_errors_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("omp.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../fixtures/parse_fidelity/omp.jsonl"),
+        )
+        .unwrap();
+        let records = parse_from(&path, IndexParseState::default(), true);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("system", "Mentioned files: src/lib.rs, README.md"),
+                ("user", "Explain @src/lib.rs"),
+                (
+                    "tool_result",
+                    "$ print(len(open('README.md').read()))\n8\n\nexit code: 0"
+                ),
+                ("reasoning", "private chain of thought"),
+                (
+                    "assistant",
+                    "Reading the file now so I can explain it.\nIt exports one function."
+                ),
+                ("system", "Error: 429 rate limit exceeded"),
+            ]
+        );
+        assert_eq!(records[2].tool_name.as_deref(), Some("Python"));
+        assert_eq!(
+            records[5].links.event_id.as_deref(),
+            Some("assistant-2:error")
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.text.contains("file_body_must_not_be_indexed"))
+        );
+    }
+
+    #[test]
+    fn a_fork_skips_copied_entries_and_names_its_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("--work-project--");
+        fs::create_dir_all(&dir).unwrap();
+        let entry = |id: &str, parent: &str, role: &str, text: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":"{parent}","timestamp":"2026-10-13T00:00:01.000Z","message":{{"role":"{role}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            ) + "\n"
+        };
+        let copied = entry("u1", "", "user", "original prompt")
+            + &entry("a1", "u1", "assistant", "original answer");
+        fs::write(
+            dir.join("2026-10-13T00-00-00-000Z_parent.jsonl"),
+            r#"{"type":"session","version":3,"id":"parent-session","timestamp":"2026-10-13T00:00:00.000Z","cwd":"/work/project"}"#
+                .to_string()
+                + "\n"
+                + &copied,
+        )
+        .unwrap();
+        let header = r#"{"type":"session","version":3,"id":"fork-session","timestamp":"2026-10-13T00:01:00.000Z","cwd":"/work/project","parentSession":"2026-10-13T00-00-00-000Z_parent.jsonl"}"#
+            .to_string()
+            + "\n";
+        let fork = dir.join("2026-10-13T00-01-00-000Z_fork.jsonl");
+        let own = entry("u2", "a1", "user", "branch prompt");
+        fs::write(&fork, format!("{header}{copied}{own}")).unwrap();
+
+        let records = parse_from(&fork, IndexParseState::default(), false);
+        assert_eq!(roles_and_texts(&records), [("user", "branch prompt")]);
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("fork"));
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+
+        // Resumed mid-file, the records still name the parent.
+        let more = entry("a2", "u2", "assistant", "branch answer");
+        fs::write(&fork, format!("{header}{copied}{own}{more}")).unwrap();
+        let offset = (header.len() + copied.len() + own.len()) as u64;
+        let records = parse_from(
+            &fork,
+            IndexParseState {
+                offset,
+                ..IndexParseState::default()
+            },
+            false,
+        );
+        assert_eq!(roles_and_texts(&records), [("assistant", "branch answer")]);
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+
+        // Without the parent file the copied history is indexed, and the fingerprint change
+        // forces that reparse.
+        let present = lineage_fingerprint(&fork, None, false).unwrap();
+        assert_eq!(
+            lineage_fingerprint(&fork, Some(&present), true),
+            Some(present.clone())
+        );
+        fs::remove_file(dir.join("2026-10-13T00-00-00-000Z_parent.jsonl")).unwrap();
+        assert_ne!(
+            lineage_fingerprint(&fork, Some(&present), true),
+            Some(present)
+        );
+        let records = parse_from(&fork, IndexParseState::default(), false);
+        assert_eq!(
+            roles_and_texts(&records),
+            [
+                ("user", "original prompt"),
+                ("assistant", "original answer"),
+                ("user", "branch prompt"),
+                ("assistant", "branch answer"),
+            ]
+        );
+        assert_eq!(lineage_fingerprint(&fork, None, true), None);
+    }
+
+    #[test]
+    fn an_omp_artifacts_transcript_is_a_subagent_of_its_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("2026-10-13T00-00-00-000Z_owner.jsonl");
+        fs::write(
+            &owner,
+            r#"{"type":"session","version":3,"id":"owner-session","timestamp":"2026-10-13T00:00:00.000Z","cwd":"/work/project"}"#,
+        )
+        .unwrap();
+        let artifacts = temp.path().join("2026-10-13T00-00-00-000Z_owner");
+        fs::create_dir_all(&artifacts).unwrap();
+        let agent = artifacts.join("explore-1.jsonl");
+        fs::write(
+            &agent,
+            concat!(
+                r#"{"type":"session","version":3,"id":"agent-session","timestamp":"2026-10-13T00:00:05.000Z","cwd":"/work/project"}"#,
+                "\n",
+                r#"{"type":"message","id":"t1","parentId":null,"timestamp":"2026-10-13T00:00:06.000Z","message":{"role":"user","content":[{"type":"text","text":"explore the parser"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let records = parse_from(&agent, IndexParseState::default(), false);
+        assert_eq!(roles_and_texts(&records), [("user", "explore the parser")]);
+        assert_eq!(
+            records[0].links.conversation_kind.as_deref(),
+            Some("subagent")
+        );
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("owner-session")
         );
     }
 }

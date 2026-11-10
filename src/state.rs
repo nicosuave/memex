@@ -21,6 +21,9 @@ pub struct FileIdentity {
     /// Owning store of a virtual KiloCode session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kilocode_database: Option<String>,
+    /// Owning store of a virtual goose session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goose_database: Option<String>,
     /// SQLite commits can change only the WAL while the main file stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlite_wal: Option<SqliteWalIdentity>,
@@ -97,6 +100,10 @@ pub struct PendingToolCall {
     pub source_tool_use_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tool_assistant_uuid: Option<String>,
+    /// Set when redaction withholds this call's output, so a result parsed in a later
+    /// incremental pass is withheld too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld_output: Option<crate::redact::WithheldOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -370,7 +377,7 @@ impl PendingIngest {
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let parent = parent_directory(path)?;
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;

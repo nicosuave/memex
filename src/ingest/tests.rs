@@ -3,11 +3,11 @@ use super::discovery::{
     modified_ns, prepare_refresh, unchanged_file_metadata,
 };
 use super::execution::{
-    RecordSender, build_parser_thread_pool, execute_refresh, finish_file_task, parse_claude_file,
-    parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
+    RecordSender, build_parser_thread_pool, catch_parser_panic, execute_refresh, finish_file_task,
+    parse_claude_file, parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
 };
 use super::publication::{
-    open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
+    EmbedBudget, open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
 };
 use crate::analytics::backfill_from_index;
 
@@ -55,6 +55,8 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_bob: false,
         include_zcode: false,
         include_kilocode: false,
+        include_kimi: false,
+        include_goose: false,
         include_kiro: false,
         embeddings,
         backfill_embeddings: false,
@@ -62,6 +64,8 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        embedding_budget: None,
+        redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     }
 }
 
@@ -239,9 +243,16 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     fs::write(&memory, "# Decisions\n\nRevised middle paragraph.\n").unwrap();
     assert!(can_skip_fresh_scan(&paths, &published, &options, 3600).unwrap());
     assert!(
-        ingest_if_stale(&paths, &published, &options, 3600, &lease, None)
-            .unwrap()
-            .is_none()
+        ingest_if_stale(
+            &paths,
+            &published,
+            &options,
+            Freshness::Bounded { ttl_seconds: 3600 },
+            &lease,
+            None
+        )
+        .unwrap()
+        .is_none()
     );
     let updated = store.load().unwrap();
     assert_eq!(updated.documents[0].stable_id, original_id);
@@ -251,7 +262,15 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     assert_eq!(published.doc_count().unwrap(), 1);
 
     fs::remove_file(memory).unwrap();
-    ingest_if_stale(&paths, &published, &options, 3600, &lease, None).unwrap();
+    ingest_if_stale(
+        &paths,
+        &published,
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        None,
+    )
+    .unwrap();
     assert!(store.load().unwrap().documents.is_empty());
 }
 
@@ -795,6 +814,7 @@ fn incremental_task(
         turn_id,
         legacy_turn_id: Some(turn_id),
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: metadata.len(),
         mtime: metadata
             .modified()
@@ -944,6 +964,7 @@ fn cancelled_writer_does_not_publish_staged_records() {
         index_root: PathBuf::new(),
         input_bytes: None,
         defer_merges: false,
+        embedding_budget: None,
         embeddings: false,
         do_backfill_embeddings: false,
         reset_vector_store: false,
@@ -1020,6 +1041,7 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
         WriterContext {
             index_root: paths.index.clone(),
             defer_merges: false,
+            embedding_budget: None,
             input_bytes: Some(0),
             embeddings: true,
             do_backfill_embeddings: false,
@@ -1159,6 +1181,7 @@ fn parser_cancellation_preserves_active_vectors() {
         index_root: PathBuf::new(),
         input_bytes: None,
         defer_merges: false,
+        embedding_budget: None,
         embeddings: true,
         do_backfill_embeddings: false,
         reset_vector_store: true,
@@ -2591,6 +2614,7 @@ fn device_renumbering_preserves_append_continuity() {
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2615,6 +2639,7 @@ fn device_renumbering_does_not_hide_file_replacement() {
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2907,12 +2932,16 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_bob: false,
         include_zcode: false,
         include_kilocode: false,
+        include_kimi: false,
+        include_goose: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        embedding_budget: None,
+        redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     };
 
     let lease = ingest_lease(&paths);
@@ -3413,6 +3442,7 @@ fn unroutable_remote_runtime(dimensions: Option<usize>) -> EmbedRuntimeConfig {
                 max_retries: 0,
             },
             dimensions,
+            redaction: Default::default(),
         }),
         ..EmbedRuntimeConfig::default()
     }
@@ -3685,12 +3715,16 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_bob: false,
         include_zcode: false,
         include_kilocode: false,
+        include_kimi: false,
+        include_goose: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        embedding_budget: None,
+        redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     };
 
     let lease = ingest_lease(&paths);
@@ -4302,6 +4336,7 @@ fn ingest_pi_incremental_records_keep_header_project() {
         turn_id: 1,
         legacy_turn_id: None,
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: (existing.len() + appended.len()) as u64,
         mtime: 0,
         change: FileChange::Append,
@@ -4383,6 +4418,7 @@ fn parse_copilot_session_extracts_messages_tools_and_workspace() {
         turn_id: 0,
         legacy_turn_id: None,
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: meta.len(),
         mtime: 0,
         change: FileChange::Append,
@@ -4476,6 +4512,7 @@ fn writer_loop_accepts_copilot_source_progress() {
         index_root: PathBuf::new(),
         input_bytes: None,
         defer_merges: false,
+        embedding_budget: None,
         embeddings: false,
         do_backfill_embeddings: false,
         reset_vector_store: false,
@@ -4888,6 +4925,191 @@ fn targeted_ingest_codex_history_uses_known_rollouts_without_discovery() {
     assert!(!result.full_scan);
     assert_eq!(result.report.files_scanned, 1);
     assert_eq!(indexed_texts(&paths), ["history only", "rollout original"]);
+}
+
+fn codex_rollout(id: &str, text: &str) -> String {
+    format!(
+        "{}\n{}\n",
+        serde_json::json!({"type": "session_meta", "payload": {"id": id, "cwd": "/tmp"}}),
+        serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}}),
+    )
+}
+
+fn compress_rollout(path: &Path, contents: &str) -> PathBuf {
+    let compressed = PathBuf::from(format!("{}.zst", path.display()));
+    fs::write(
+        &compressed,
+        zstd::encode_all(contents.as_bytes(), 3).expect("compress rollout"),
+    )
+    .unwrap();
+    compressed
+}
+
+fn session_source_paths(paths: &Paths, session_id: &str) -> Vec<String> {
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut source_paths = index
+        .records_by_session_id(session_id)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.source_path)
+        .collect::<Vec<_>>();
+    source_paths.sort();
+    source_paths
+}
+
+#[test]
+fn codex_compressed_rollouts_are_indexed_under_their_real_path() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("codex");
+    let sessions = home.join("sessions/2026/09/30");
+    let archived = home.join("archived_sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&archived).unwrap();
+    let active_id = "019a0000-0000-7000-8000-000000000001";
+    let archived_id = "019a0000-0000-7000-8000-000000000002";
+    let active = compress_rollout(
+        &sessions.join(format!("rollout-2026-09-30T10-00-00-{active_id}.jsonl")),
+        &codex_rollout(active_id, "compressed active"),
+    );
+    let archived = compress_rollout(
+        &archived.join(format!("rollout-2026-09-01T10-00-00-{archived_id}.jsonl")),
+        &codex_rollout(archived_id, "compressed archived"),
+    );
+    let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.include_codex = true;
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.files_skipped, 0);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["compressed active", "compressed archived"]
+    );
+    for (id, path) in [(active_id, &active), (archived_id, &archived)] {
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(session_source_paths(&paths, id), [path]);
+    }
+    let reader = SearchIndex::open_or_create(&paths.index).unwrap();
+    let source_path = active.to_string_lossy().into_owned();
+    let (page, _) = reader
+        .records_by_session_path_page(active_id, Some(&source_path), 0, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].text, "compressed active");
+    assert_eq!(
+        crate::sources::codex::probe(&active)
+            .unwrap()
+            .session
+            .session_id,
+        active_id
+    );
+    drop(reader);
+
+    // The checkpoint keeps the compressed size, so an unchanged archive is not reparsed.
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(report.records_added, 0);
+    assert_eq!(report.files_skipped, report.files_scanned);
+}
+
+#[test]
+fn codex_rollout_compressed_in_place_keeps_one_session() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("codex");
+    let sessions = home.join("sessions/2026/09/30");
+    fs::create_dir_all(&sessions).unwrap();
+    let id = "019a0000-0000-7000-8000-000000000003";
+    let plain = sessions.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+    let contents = codex_rollout(id, "rollout before compression");
+    fs::write(&plain, &contents).unwrap();
+    let _env = EnvVarGuard::set_os(&[("CODEX_HOME", Some(home.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.include_codex = true;
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let plain_path = plain.to_string_lossy().into_owned();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+
+    // Codex writes the archive beside the original before removing it. Neither a watcher
+    // hint for the archive nor a full scan may index the session a second time.
+    let compressed = compress_rollout(&plain, &contents);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([compressed.clone()]),
+    )
+    .unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+
+    // Once the original is gone, the archive takes over without losing the session.
+    fs::remove_file(&plain).unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let result = ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([plain])).unwrap();
+    assert!(result.full_scan);
+    let compressed_path = compressed.to_string_lossy().into_owned();
+    assert_eq!(session_source_paths(&paths, id), [compressed_path.clone()]);
+    assert_eq!(indexed_texts(&paths), ["rollout before compression"]);
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(!state.files.contains_key(&plain_path));
+    assert!(state.files.contains_key(&compressed_path));
+
+    // A plain copy that reappears beside the indexed archive takes the session back.
+    let restored = PathBuf::from(&plain_path);
+    fs::write(&restored, &contents).unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([restored])).unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path.clone()]);
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(state.files.contains_key(&plain_path));
+    assert!(!state.files.contains_key(&compressed_path));
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert_eq!(session_source_paths(&paths, id), [plain_path]);
+}
+
+#[test]
+fn growth_of_a_compressed_codex_rollout_reparses_it_whole() {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let id = "019a0000-0000-7000-8000-000000000004";
+    let path = compress_rollout(
+        &tmp.path().join(format!("rollout-{id}.jsonl")),
+        &codex_rollout(id, "first"),
+    );
+    let metadata = path.metadata().unwrap();
+    let (task, _) =
+        discovery::prepare_file_task(path.clone(), SourceKind::Codex, false, &metadata, None);
+    let state = execution::completed_file_state(&task, metadata.len(), 2, Some(2), HashMap::new());
+
+    // A second zstd frame grows the file in place without touching its prefix, which is
+    // what a plain transcript's append looks like to change detection.
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&zstd::encode_all(codex_rollout(id, "second").as_bytes(), 3).unwrap())
+        .unwrap();
+    drop(file);
+    let grown = path.metadata().unwrap();
+    assert!(grown.len() > metadata.len());
+    let (task, skip) =
+        discovery::prepare_file_task(path, SourceKind::Codex, false, &grown, Some(&state));
+    assert!(!skip);
+    assert!(task.change.replaces_records(), "{:?}", task.change);
+    assert_eq!(task.offset, 0);
+    assert_eq!(task.legacy_turn_id, Some(0));
 }
 
 #[test]
@@ -6442,7 +6664,18 @@ fn journal_refreshes_narrow_to_changed_paths_and_walk_after_a_directory_rename()
         let journal = discovery::start_journal_replay(&paths, &options);
         journal.wait_until_streaming(journal::REPLAY_BUDGET);
         let index = open_search_index(&paths);
-        ingest_selected(&paths, &index, &options, &lease, None, None, Some(journal)).unwrap()
+        ingest_selected(
+            &paths,
+            &index,
+            &options,
+            &lease,
+            Narrowing::Journal {
+                replay: journal,
+                walk: true,
+            },
+            None,
+        )
+        .unwrap()
     };
     let indexed = || {
         let index = open_search_index(&paths);
@@ -7105,4 +7338,1312 @@ fn kilocode_migrates_database_checkpoint_and_honors_session_exclusions() {
     options.exclude_patterns = vec![database.to_string_lossy().into_owned()];
     run(&options);
     assert!(indexed_texts(&paths).is_empty());
+}
+
+fn write_claude_messages(path: &Path, texts: &[&str]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for text in texts {
+        append_claude_message(path, text);
+    }
+}
+
+fn indexed_source_paths(paths: &Paths) -> Vec<PathBuf> {
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut source_paths = Vec::new();
+    index
+        .for_each_record(|record| {
+            source_paths.push(PathBuf::from(record.source_path));
+            Ok(())
+        })
+        .unwrap();
+    source_paths.sort();
+    source_paths.dedup();
+    source_paths
+}
+
+#[test]
+fn workflow_agent_copies_index_once_and_follow_the_more_complete_copy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("claude-projects");
+    let subagents = root.join("-tmp-project/session/subagents");
+    let direct = subagents.join("agent-a1.jsonl");
+    let workflow = subagents.join("workflows/wf_run/agent-a1.jsonl");
+    write_claude_messages(&direct, &["first", "second"]);
+    write_claude_messages(&workflow, &["first", "second", "third"]);
+    let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![root];
+    let lease = ingest_lease(&paths);
+    let open = || SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_texts(&paths), ["first", "second", "third"]);
+    assert_eq!(
+        indexed_source_paths(&paths),
+        std::slice::from_ref(&workflow)
+    );
+
+    // The direct copy is rewritten as a tail and then resumed. A watcher hint for it alone
+    // must preserve the workflow copy's earlier messages under the new projection owner.
+    fs::write(&direct, "").unwrap();
+    append_claude_message(&direct, "second");
+    append_claude_message(&direct, "third");
+    append_claude_message(&direct, "fourth");
+    let dirty = HashSet::from([direct.clone()]);
+    let result = ingest_dirty(&paths, &open(), &options, &lease, &dirty).unwrap();
+    assert!(!result.full_scan);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["first", "fourth", "second", "third"]
+    );
+    assert_eq!(indexed_source_paths(&paths), std::slice::from_ref(&direct));
+
+    // A full scan keeps the same choice.
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_source_paths(&paths), std::slice::from_ref(&direct));
+
+    // Without a watcher hint, a full scan still notices that the retired copy grew: listings of
+    // unchanged directories hold only indexed files, so the copies are looked up on disk.
+    append_claude_message(&workflow, "fourth");
+    append_claude_message(&workflow, "fifth");
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_source_paths(&paths), [workflow]);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["fifth", "first", "fourth", "second", "third"]
+    );
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).unwrap();
+    assert_eq!(analytics.session_count().unwrap(), 1);
+}
+
+#[test]
+fn several_claude_roots_index_together() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path();
+    let legacy = home.join(".claude/projects");
+    let work = home.join(".claude-profiles/work/projects");
+    write_claude_messages(
+        &legacy.join("-tmp-project/legacy.jsonl"),
+        &["legacy question"],
+    );
+    write_claude_messages(&work.join("-tmp-project/work.jsonl"), &["work question"]);
+    let paths = Paths::new(Some(home.join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![
+        legacy,
+        work,
+        home.join(".claude-profiles/not-yet-used/projects"),
+    ];
+
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    assert_eq!(indexed_texts(&paths), ["legacy question", "work question"]);
+}
+
+#[test]
+fn moved_claude_config_directory_retires_old_rows_but_keeps_lost_ones() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path();
+    let legacy = home.join(".claude/projects");
+    let profile = home.join(".claude-profiles/personal/projects");
+    write_claude_messages(
+        &legacy.join("-tmp-moved/session.jsonl"),
+        &["moved conversation"],
+    );
+    write_claude_messages(
+        &legacy.join("-tmp-lost/session.jsonl"),
+        &["lost conversation"],
+    );
+    let paths = Paths::new(Some(home.join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![legacy.clone(), profile.clone()];
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    // The whole config directory moves into a profile; one conversation does not survive.
+    fs::create_dir_all(home.join(".claude-profiles")).unwrap();
+    fs::rename(home.join(".claude"), home.join(".claude-profiles/personal")).unwrap();
+    fs::remove_dir_all(profile.join("-tmp-lost")).unwrap();
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    assert_eq!(
+        indexed_source_paths(&paths),
+        [
+            legacy.join("-tmp-lost/session.jsonl"),
+            profile.join("-tmp-moved/session.jsonl"),
+        ]
+    );
+    assert_eq!(
+        indexed_texts(&paths),
+        ["lost conversation", "moved conversation"]
+    );
+}
+
+#[test]
+fn kilocode_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert_eq!(report.files_skipped, 0);
+}
+
+#[test]
+fn kilocode_store_removed_with_its_directory_keeps_indexed_sessions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("kilo");
+    let database = root.join("kilo.db");
+    fs::create_dir_all(&root).unwrap();
+    let _env = EnvVarGuard::set_os(&[("KILO_DATA_DIR", Some(root.as_os_str()))]);
+    crate::sources::kilocode::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kilocode = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    full();
+    let indexed = indexed_texts(&paths);
+    assert!(!indexed.is_empty());
+
+    // The volume holding the store is gone: keep its sessions and say so.
+    fs::remove_dir_all(&root).unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), indexed);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+
+    // The store is deleted while its directory remains: the sessions go with it.
+    fs::create_dir_all(&root).unwrap();
+    let report = full();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn goose_sessions_index_conversations_but_not_turn_context() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data").join("sessions").join("sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    run(&options);
+    let indexed = indexed_texts(&paths);
+    assert!(indexed.contains(&"List the files".to_string()));
+    assert!(indexed.contains(&"One file".to_string()));
+    assert!(indexed.contains(&"Count the entries".to_string()));
+    // Turn scaffolding and internal CLI sessions never reach the index.
+    assert!(!indexed.iter().any(|text| text.contains("<turn-context>")));
+    assert!(
+        !indexed
+            .iter()
+            .any(|text| text.contains("internal plumbing"))
+    );
+    // Reasoning blocks are opt-in, like every other source.
+    assert!(!indexed.iter().any(|text| text == "thinking about it"));
+    let reader =
+        crate::state::checkpoint::CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(
+        reader.goose_database_paths().unwrap(),
+        HashSet::from([database.to_string_lossy().into_owned()])
+    );
+
+    // An excluded session keeps its records out of a fresh index while its
+    // sibling still indexes.
+    let fresh = Paths::new(Some(temp.path().join("memex-excluded"))).unwrap();
+    fresh.ensure_dirs().unwrap();
+    let fresh_lease = ingest_lease(&fresh);
+    options.exclude_patterns = vec![
+        crate::sources::goose::virtual_path(&database, "sess_main")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&fresh.index).unwrap();
+    ingest_all(&fresh, &index, &options, &fresh_lease).unwrap();
+    assert_eq!(
+        indexed_texts(&fresh),
+        [
+            "Count the entries",
+            "[image: image/png]",
+            "invalid arguments"
+        ]
+    );
+}
+
+#[test]
+fn goose_refresh_preserves_unchanged_sessions_and_reconciles_deletions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data/sessions/sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let session_ids = |session| {
+        let mut ids = SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id(session)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    full();
+    let original = indexed_texts(&paths);
+    let main_ids = session_ids("sess_main");
+    let child_ids = session_ids("sess_child");
+    assert!(!main_ids.is_empty());
+    assert!(!child_ids.is_empty());
+    assert_eq!(full().records_added, 0);
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(session_ids("sess_main"), main_ids);
+    assert_eq!(session_ids("sess_child"), child_ids);
+
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("ALTER TABLE sessions RENAME TO unavailable_sessions")
+        .unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+    writer
+        .execute_batch("ALTER TABLE unavailable_sessions RENAME TO sessions")
+        .unwrap();
+
+    // A narrowed refresh must publish the session deletion, not just drop its checkpoint.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_child';
+             DELETE FROM sessions WHERE id = 'sess_child';",
+        )
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let dirty = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.clone()]),
+    )
+    .unwrap();
+    assert!(!dirty.full_scan);
+    drop(index);
+    assert!(session_ids("sess_child").is_empty());
+    assert_eq!(session_ids("sess_main"), main_ids);
+
+    // Full discovery must publish deletions too, without resurrecting the child.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_main';
+             DELETE FROM sessions WHERE id = 'sess_main';",
+        )
+        .unwrap();
+    full();
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn goose_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert_eq!(report.files_skipped, 0);
+}
+
+#[test]
+fn ingest_kimi_journals_from_kimi_code_home_override() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kimi_home = tmp.path().join("kimi-home");
+    let session_dir = kimi_home
+        .join("sessions")
+        .join("wd_kimi-project_0123456789ab")
+        .join("session_11111111-2222-3333-4444-555555555555");
+    for agent in ["main", "agent-0"] {
+        fs::create_dir_all(session_dir.join("agents").join(agent)).expect("create agent dir");
+    }
+    fs::write(
+        session_dir.join("state.json"),
+        r#"{"id":"session_11111111-2222-3333-4444-555555555555","version":2,"cwd":"/workspace/kimi-project","title":"Inspect the project","agents":{"main":{"type":"main"},"agent-0":{"type":"sub","parentAgentId":"main"}}}"#,
+    )
+    .expect("write state");
+    let main_wire = session_dir.join("agents/main/wire.jsonl");
+    fs::write(
+        &main_wire,
+        include_str!("../../fixtures/trajectory_parity/kimi.jsonl"),
+    )
+    .expect("write kimi fixture");
+    let subagent_wire = session_dir.join("agents/agent-0/wire.jsonl");
+    fs::write(
+        &subagent_wire,
+        concat!(
+            r#"{"type":"metadata","protocol_version":"1.5","created_at":1782864000020}"#,
+            "\n",
+            r#"{"type":"context.append_message","agentId":"agent-0","message":{"role":"user","content":[{"type":"text","text":"Summarize the README"}],"toolCalls":[],"origin":{"kind":"system_trigger","name":"subagent"}},"time":1782864000021}"#,
+            "\n",
+            r#"{"type":"context.append_loop_event","agentId":"agent-0","event":{"type":"content.part","uuid":"sub-text-1","stepUuid":"sub-step-1","part":{"type":"text","text":"Summary: project contents"}},"time":1782864000022}"#,
+            "\n",
+        ),
+    )
+    .expect("write subagent wire");
+    // The sessions tree also holds Kimi's own search cache, which is not a journal.
+    fs::create_dir_all(kimi_home.join("sessions/.index-cache")).expect("create cache dir");
+    fs::write(kimi_home.join("sessions/.index-cache/scan.json"), "{}").expect("write cache");
+    let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(kimi_home.as_os_str()))]);
+
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = SearchIndex::open_or_create(&paths.index).expect("index");
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kimi = true;
+    let lease = ingest_lease(&paths);
+    let report = ingest_all(&paths, &index, &options, &lease).expect("ingest");
+    assert_eq!(report.files_scanned, 2);
+    // Reasoning is off; the injected reminder, lifecycle records, the duplicate
+    // message projection, and the malformed tail are skipped.
+    assert_eq!(report.records_added, 7);
+    assert_eq!(report.diagnostics.malformed_json_lines, 1);
+    assert!(report.diagnostics.unknown_top_level_types.is_empty());
+
+    let session_id = "session_11111111-2222-3333-4444-555555555555";
+    let records = index
+        .records_by_session_id(session_id)
+        .expect("records by session");
+    assert_eq!(records.len(), 5);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.source == SourceKind::Kimi)
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.project == "kimi-project")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.source_path == main_wire.to_string_lossy())
+    );
+    assert!(!records.iter().any(|record| record.role == "reasoning"));
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text.contains("todo list reminder"))
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.role == "user" && record.text == "Inspect the project")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.role == "assistant" && record.text == "I will read the file.")
+    );
+    assert!(records.iter().any(|record| {
+        record.role == "tool_use"
+            && record.tool_name.as_deref() == Some("Read")
+            && record.links.source_tool_use_id.as_deref() == Some("tool_1")
+    }));
+    assert!(records.iter().any(|record| {
+        record.role == "tool_result"
+            && record.text == "project contents"
+            && record.tool_name.as_deref() == Some("Read")
+            && record.links.parent_tool_use_id.as_deref() == Some("tool_1")
+    }));
+    assert!(records.iter().any(|record| {
+        record.links.conversation_kind.as_deref() == Some("compaction")
+            && record.text == "Read the README and reported the project contents."
+    }));
+
+    let subagent = index
+        .records_by_session_id(&format!("{session_id}:agent-0"))
+        .expect("subagent records");
+    assert_eq!(subagent.len(), 2);
+    assert_eq!(subagent[0].role, "user");
+    assert_eq!(subagent[0].text, "Summarize the README");
+    assert!(subagent.iter().all(|record| {
+        record.links.parent_session_id.as_deref() == Some(session_id)
+            && record.links.conversation_kind.as_deref() == Some("subagent")
+            && record.source_path == subagent_wire.to_string_lossy()
+    }));
+
+    // Journals append in place; a refresh only parses the new lines.
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("noop ingest")
+            .records_added,
+        0
+    );
+    let mut writer = fs::OpenOptions::new()
+        .append(true)
+        .open(&main_wire)
+        .expect("reopen main wire");
+    writer
+        .write_all(
+            concat!(
+                r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Now run the tests"}],"toolCalls":[],"origin":{"kind":"user"}},"time":1782864000030}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .expect("append prompt");
+    let appended = ingest_all(&paths, &index, &options, &lease).expect("append ingest");
+    assert_eq!(appended.records_added, 1);
+    let records = index
+        .records_by_session_id(session_id)
+        .expect("records after append");
+    assert_eq!(records.len(), 6);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.role == "user" && record.text == "Now run the tests")
+    );
+}
+
+#[test]
+fn kimi_undo_appended_after_indexing_retracts_the_undone_turn() {
+    use std::io::Write;
+
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let kimi_home = tmp.path().join("kimi-home");
+    let session_dir = kimi_home.join("sessions/wd_repo_0123456789ab/session_undo");
+    fs::create_dir_all(session_dir.join("agents/main")).expect("create agent dir");
+    let wire = session_dir.join("agents/main/wire.jsonl");
+    let prompt = |text: &str, time: u64| {
+        format!(
+            "{{\"type\":\"context.append_message\",\"agentId\":\"main\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"toolCalls\":[],\"origin\":{{\"kind\":\"user\"}}}},\"time\":{time}}}\n"
+        )
+    };
+    // Line 1 is the header; the first turn is line 2 and the undone one is line 3.
+    fs::write(
+        &wire,
+        r#"{"type":"metadata","protocol_version":"1.5","created_at":1782864000000}"#.to_string()
+            + "\n"
+            + &prompt("keep this", 1782864000001)
+            + &prompt("undo this", 1782864000002),
+    )
+    .expect("write wire");
+    let _env = EnvVarGuard::set_os(&[("KIMI_CODE_HOME", Some(kimi_home.as_os_str()))]);
+
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = SearchIndex::open_or_create(&paths.index).expect("index");
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_kimi = true;
+    let lease = ingest_lease(&paths);
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("ingest")
+            .records_added,
+        2
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&wire)
+        .expect("reopen wire")
+        .write_all(
+            (concat!(
+                r#"{"type":"agent.switched","agentId":"main","branch":"b1","reason":"undo","base":{"branch":"main","line":2},"turns":1,"legacyUndoLine":5,"time":1782864000003}"#,
+                "\n",
+                r#"{"type":"context.undo","agentId":"main","count":1,"time":1782864000003}"#,
+                "\n",
+                r#"{"type":"context.undone","agentId":"main","turns":1,"fromTurnId":1,"time":1782864000003}"#,
+                "\n",
+            )
+            .to_string()
+                + &prompt("retyped", 1782864000004))
+                .as_bytes(),
+        )
+        .expect("append undo");
+    ingest_all(&paths, &index, &options, &lease).expect("refresh");
+
+    let mut texts = index
+        .records_by_session_id("session_undo")
+        .expect("records")
+        .into_iter()
+        .map(|record| record.text)
+        .collect::<Vec<_>>();
+    texts.sort();
+    assert_eq!(texts, ["keep this", "retyped"]);
+}
+
+fn unanswerable_journal() -> journal::ReplayHandle {
+    journal::ReplayHandle::spawn(Vec::new(), "no roots".to_string(), |_| None)
+}
+
+#[test]
+fn bounded_reads_keep_the_index_when_the_journal_cannot_answer_and_strict_reads_walk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    append_claude_message(&transcript, "appended");
+
+    let bounded = Freshness::Bounded { ttl_seconds: 3600 };
+    let index = open_search_index(&paths);
+    let report = ingest_if_stale(
+        &paths,
+        &index,
+        &options,
+        bounded,
+        &lease,
+        Some(unanswerable_journal()),
+    )
+    .unwrap()
+    .expect("a journal refresh runs within the TTL");
+    assert_eq!(report.records_added, 0);
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+
+    assert!(
+        ingest_if_stale(&paths, &index, &options, Freshness::None, &lease, None)
+            .unwrap()
+            .is_none()
+    );
+
+    let report = ingest_if_stale(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Strict,
+        &lease,
+        Some(unanswerable_journal()),
+    )
+    .unwrap()
+    .expect("a strict read refreshes");
+    assert_eq!(report.records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["appended", "indexed"]);
+}
+
+#[test]
+fn session_refresh_targets_name_appended_rewritten_and_unrecorded_transcripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let appended = source.join("appended.jsonl");
+    let rewritten = source.join("rewritten.jsonl");
+    let quiet = source.join("quiet.jsonl");
+    append_claude_message(&appended, "appended original");
+    append_claude_message(&rewritten, "rewritten original, long enough to shrink");
+    append_claude_message(&quiet, "quiet original");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    let key = |path: &Path| path.to_string_lossy().into_owned();
+    let all = [key(&appended), key(&rewritten), key(&quiet)];
+    assert_eq!(
+        session_refresh_targets(&paths, all.iter().map(String::as_str)).unwrap(),
+        Some(HashSet::new())
+    );
+
+    append_claude_message(&appended, "appended later");
+    fs::write(&rewritten, "").unwrap();
+    append_claude_message(&rewritten, "rewritten");
+    let unrecorded = source.join("unrecorded.jsonl");
+    append_claude_message(&unrecorded, "unrecorded");
+    let sources = [
+        key(&appended),
+        key(&rewritten),
+        key(&quiet),
+        key(&unrecorded),
+    ];
+    let targets = session_refresh_targets(&paths, sources.iter().map(String::as_str))
+        .unwrap()
+        .expect("every source is a transcript on disk");
+    assert_eq!(
+        targets,
+        HashSet::from([appended.clone(), rewritten.clone(), unrecorded.clone()])
+    );
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        &targets,
+    )
+    .unwrap();
+    assert_eq!(
+        indexed_texts(&paths),
+        [
+            "appended later",
+            "appended original",
+            "quiet original",
+            "rewritten",
+            "unrecorded"
+        ]
+    );
+}
+
+#[test]
+fn session_refresh_targets_route_database_sessions_to_their_store_and_refuse_other_shapes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let database = tmp.path().join("zcode").join("db.sqlite");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    fs::write(&database, "").unwrap();
+    let session = crate::sources::zcode::virtual_path(&database, "session")
+        .to_string_lossy()
+        .into_owned();
+    // The store is always handed on: a WAL-only commit leaves its own metadata unchanged.
+    assert_eq!(
+        session_refresh_targets(&paths, [session.as_str()]).unwrap(),
+        Some(HashSet::from([database.clone()]))
+    );
+
+    // A legacy OpenCode session is a directory, and a transcript that is gone cannot be
+    // stat'ed; neither can be refreshed on its own.
+    let directory = tmp.path().join("storage").join("session");
+    fs::create_dir_all(&directory).unwrap();
+    let missing = tmp.path().join("missing.jsonl");
+    for untargetable in [directory, missing] {
+        let untargetable = untargetable.to_string_lossy().into_owned();
+        assert_eq!(
+            session_refresh_targets(&paths, [session.as_str(), untargetable.as_str()]).unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn session_reads_that_cannot_be_narrowed_walk_only_when_freshness_allows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &open_search_index(&paths), &options, &lease).unwrap();
+    append_claude_message(&source.join("other.jsonl"), "elsewhere");
+    // A transcript removed after the read stat'ed it sends the dirty selection to a resync.
+    let vanished = HashSet::from([source.join("vanished.jsonl")]);
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        &vanished,
+    )
+    .unwrap();
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+
+    ingest_session_sources(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Strict,
+        &lease,
+        &vanished,
+    )
+    .unwrap();
+    assert_eq!(indexed_texts(&paths), ["elsewhere", "indexed"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn bounded_reads_keep_the_stored_cursor_and_scan_cache_when_the_journal_cannot_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    append_claude_message(&source.join("session.jsonl"), "indexed");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source.clone()];
+    let lease = ingest_lease(&paths);
+    let state_path = paths.state.join("ingest.json");
+    // The replay never finds a previous cursor, so it cannot name changes, but on macOS it
+    // still captures where the volume's journal stands.
+    let journal = || journal::ReplayHandle::spawn(vec![source.clone()], "claude".into(), |_| None);
+    // A walking refresh stores the cursor its replay captured.
+    ingest_selected(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        &lease,
+        Narrowing::Journal {
+            replay: journal(),
+            walk: true,
+        },
+        None,
+    )
+    .unwrap();
+    let stored = || {
+        let reader = CheckpointReader::open(&state_path).unwrap();
+        (
+            reader.load_journal_cursor("claude").unwrap(),
+            reader.header().unwrap().scan_cache.last_scan_ts,
+        )
+    };
+    let before = stored();
+    assert!(before.0.is_some(), "the walk stored a cursor");
+    append_claude_message(&source.join("session.jsonl"), "appended");
+
+    ingest_if_stale(
+        &paths,
+        &open_search_index(&paths),
+        &options,
+        Freshness::Bounded { ttl_seconds: 3600 },
+        &lease,
+        Some(journal()),
+    )
+    .unwrap();
+    assert_eq!(stored(), before);
+    assert_eq!(indexed_texts(&paths), ["indexed"]);
+}
+
+/// Answers OpenAI-style embedding requests with 3-dimensional vectors until dropped.
+fn serve_test_embeddings() -> (String, std::thread::JoinHandle<usize>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("bind embedding server");
+    let addr = server.server_addr().to_ip().expect("server address");
+    let handle = std::thread::spawn(move || {
+        let mut requests = 0;
+        while let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(500)) {
+            let mut raw = String::new();
+            let _ = request.as_reader().read_to_string(&mut raw);
+            let body: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            let count = body["input"].as_array().map_or(1, Vec::len);
+            let data: Vec<_> = (0..count)
+                .map(|index| serde_json::json!({"index": index, "embedding": [1.0, 0.5, 0.25]}))
+                .collect();
+            let response = tiny_http::Response::from_string(
+                serde_json::json!({"object": "list", "data": data}).to_string(),
+            )
+            .with_header(
+                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+            );
+            let _ = request.respond(response);
+            requests += 1;
+        }
+        requests
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+fn budgeted_embedding_writer(
+    paths: &Paths,
+    index: &SearchIndex,
+    base_url: &str,
+    records: Vec<Record>,
+    embedding_budget: Option<Duration>,
+) -> WriterOutcome {
+    let (tx_record, rx_record) = unbounded();
+    for record in records {
+        tx_record.send(record).expect("send record");
+    }
+    drop(tx_record);
+    let (decision_tx, decision_rx) = bounded(1);
+    decision_tx
+        .send(WriterDecision::Commit {
+            session_cwds: Vec::new(),
+        })
+        .expect("commit");
+    let ctx = WriterContext {
+        index_root: paths.index.clone(),
+        input_bytes: None,
+        defer_merges: false,
+        embedding_budget,
+        embeddings: true,
+        do_backfill_embeddings: false,
+        reset_vector_store: false,
+        vector_dir: paths.vectors.clone(),
+        analytics_path: analytics_path(&paths.state),
+        progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
+        model: ModelChoice::Remote("test-model".to_string()),
+        embed_runtime: EmbedRuntimeConfig {
+            remote: Some(crate::embed::RemoteEmbedConfig {
+                endpoint: crate::remote_embed::RemoteEndpoint {
+                    base_url: base_url.to_string(),
+                    api_key: None,
+                    timeout: Duration::from_secs(5),
+                    max_retries: 0,
+                },
+                dimensions: None,
+                redaction: Default::default(),
+            }),
+            ..EmbedRuntimeConfig::default()
+        },
+        tool_content_limits: IndexedToolContentLimits::default(),
+        reconcile_vector_ids: false,
+        scope_targets: Vec::new(),
+        opencode_session_cwds: HashMap::new(),
+        repositories: Arc::new(crate::repository::RepositoryResolver::default()),
+        codex_metadata_checkpoints: HashMap::new(),
+        vector_delete_paths: HashSet::new(),
+    };
+    let writer = index.writer().expect("writer");
+    run_writer_fixture(
+        index.clone(),
+        writer,
+        rx_record,
+        decision_rx,
+        Vec::new(),
+        ctx,
+    )
+    .expect("run writer")
+}
+
+#[test]
+fn spent_embedding_budget_publishes_records_and_a_later_refresh_backfills_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = save_search_records(&paths, &[record(1, "user", "existing")]);
+    backfill_from_index(analytics_path(&paths.state), &index).expect("seed analytics");
+    let (base_url, server) = serve_test_embeddings();
+
+    let outcome = budgeted_embedding_writer(
+        &paths,
+        &index,
+        &base_url,
+        vec![record(2, "user", "second"), record(3, "user", "third")],
+        Some(Duration::ZERO),
+    );
+    assert_eq!(
+        outcome,
+        WriterOutcome::Published {
+            records_added: 2,
+            records_embedded: 0,
+        }
+    );
+    let index = open_search_index(&paths);
+    assert_eq!(index.doc_count().expect("document count"), 3);
+    let vectors = VectorIndex::open(&paths.vectors).expect("vector index");
+    assert_eq!(vectors.len(), 0);
+
+    let outcome = budgeted_embedding_writer(&paths, &index, &base_url, Vec::new(), None);
+    assert_eq!(
+        outcome,
+        WriterOutcome::Published {
+            records_added: 0,
+            records_embedded: 3,
+        }
+    );
+    let vectors = VectorIndex::open(&paths.vectors).expect("vector index");
+    assert!((1..=3).all(|doc_id| vectors.contains(doc_id)));
+    drop(index);
+    server.join().expect("embedding server");
+}
+
+#[test]
+fn embed_budget_drops_buffered_work_once_spent() {
+    let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true));
+    assert!(!EmbedBudget::new(None).spent());
+    assert!(!EmbedBudget::new(Some(Duration::from_secs(3600))).spent());
+
+    let mut budget = EmbedBudget::new(Some(Duration::ZERO));
+    assert!(budget.spent());
+    let mut buffer = vec![
+        (1, "one".to_string(), SourceKind::Claude),
+        (2, "two".to_string(), SourceKind::Claude),
+    ];
+    budget.skip(&mut buffer, &progress);
+    assert!(buffer.is_empty());
+    assert_eq!(budget.skipped, 2);
+}
+
+/// Revoke read access so the parser fails on `path`. Returns false where that cannot work
+/// (running as root), so the caller can skip.
+#[cfg(unix)]
+fn make_unreadable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::File::open(path).is_err()
+}
+
+#[cfg(unix)]
+fn make_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+fn recorded_failures(paths: &Paths) -> Vec<String> {
+    failures::FailureLog::load(&paths.state)
+        .unwrap()
+        .files()
+        .map(|failure| failure.path.clone())
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn unparseable_transcript_is_isolated_reported_and_retried_after_it_is_fixed() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let good = source.join("good.jsonl");
+    let bad = source.join("bad.jsonl");
+    append_claude_message(&good, "good original");
+    append_claude_message(&bad, "bad original");
+    if !make_unreadable(&bad) {
+        return;
+    }
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let refresh = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let bad_key = bad.to_string_lossy().into_owned();
+
+    let report = refresh();
+    assert_eq!(report.records_added, 1);
+    assert_eq!(indexed_texts(&paths), ["good original"]);
+    assert_eq!(report.failed_files.len(), 1);
+    assert_eq!(report.failed_files[0].path, bad_key);
+    assert_eq!(report.failed_files[0].attempts, 1);
+    assert_eq!(recorded_failures(&paths), std::slice::from_ref(&bad_key));
+    let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+    assert!(
+        !state.files.contains_key(&bad_key),
+        "no checkpoint for a failed file"
+    );
+    assert!(
+        failures::status_lines(&paths.state)
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(&bad_key))
+    );
+
+    // Unchanged and inside its backoff, the file is left alone instead of failing again.
+    append_claude_message(&good, "good appended");
+    let report = refresh();
+    assert_eq!(report.files_deferred, 1);
+    assert!(report.failed_files.is_empty());
+    assert_eq!(indexed_texts(&paths), ["good appended", "good original"]);
+
+    // Fixing the file changes its identity, which retries it at once.
+    make_readable(&bad);
+    let report = refresh();
+    assert_eq!(report.files_deferred, 0);
+    assert!(report.failed_files.is_empty());
+    assert_eq!(
+        indexed_texts(&paths),
+        ["bad original", "good appended", "good original"]
+    );
+    assert!(recorded_failures(&paths).is_empty());
+    assert!(!paths.state.join("ingest-failures.json").exists());
+    assert!(failures::status_lines(&paths.state).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn failing_transcript_keeps_its_indexed_records_and_checkpoint() {
+    for replace in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("claude");
+        fs::create_dir_all(&source).unwrap();
+        let good = source.join("good.jsonl");
+        let bad = source.join("bad.jsonl");
+        append_claude_message(&good, "good original");
+        append_claude_message(&bad, "bad original");
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let mut options = ingest_options(false, ModelChoice::gemma());
+        options.claude_sources = vec![source];
+        let refresh = || {
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            ingest_all(&paths, &index, &options, &lease).unwrap()
+        };
+        refresh();
+        let bad_key = bad.to_string_lossy().into_owned();
+        let state_path = paths.state.join("ingest.json");
+        let checkpoint = IngestState::load(&state_path).unwrap().files[&bad_key].clone();
+
+        // An append parses from the checkpoint offset; a rewrite deletes the old records
+        // before replaying. Neither may publish when the file cannot be read.
+        if replace {
+            fs::remove_file(&bad).unwrap();
+            append_claude_message(&bad, "bad rewritten");
+        } else {
+            append_claude_message(&bad, "bad appended");
+        }
+        append_claude_message(&good, "good appended");
+        if !make_unreadable(&bad) {
+            return;
+        }
+        let report = refresh();
+        assert_eq!(report.failed_files.len(), 1, "replace={replace}");
+        assert_eq!(
+            indexed_texts(&paths),
+            ["bad original", "good appended", "good original"],
+            "replace={replace}"
+        );
+        assert_eq!(
+            IngestState::load(&state_path).unwrap().files[&bad_key],
+            checkpoint,
+            "replace={replace}"
+        );
+
+        make_readable(&bad);
+        refresh();
+        let expected = if replace {
+            vec!["bad rewritten", "good appended", "good original"]
+        } else {
+            vec![
+                "bad appended",
+                "bad original",
+                "good appended",
+                "good original",
+            ]
+        };
+        assert_eq!(indexed_texts(&paths), expected, "replace={replace}");
+        assert!(recorded_failures(&paths).is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_transcript_is_retried_once_its_backoff_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let bad = source.join("bad.jsonl");
+    append_claude_message(&bad, "bad original");
+    if !make_unreadable(&bad) {
+        return;
+    }
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let refresh = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    assert_eq!(refresh().failed_files.len(), 1);
+    assert_eq!(refresh().files_deferred, 1);
+
+    // Expire the backoff without touching the file: the next refresh tries again and
+    // doubles the delay.
+    let log_path = paths.state.join("ingest-failures.json");
+    let mut log: serde_json::Value = serde_json::from_slice(&fs::read(&log_path).unwrap()).unwrap();
+    let entry = log["files"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    entry["retry_at"] = serde_json::json!(0);
+    fs::write(&log_path, serde_json::to_vec(&log).unwrap()).unwrap();
+    let report = refresh();
+    assert_eq!(report.files_deferred, 0);
+    assert_eq!(report.failed_files.len(), 1);
+    let failure = &report.failed_files[0];
+    assert_eq!(failure.attempts, 2);
+    assert_eq!(failure.retry_at - failure.last_seen, 60);
+    make_readable(&bad);
+}
+
+#[cfg(unix)]
+#[test]
+fn dirty_hint_for_a_deferred_transcript_needs_no_ingest() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("claude");
+    fs::create_dir_all(&source).unwrap();
+    let bad = source.join("bad.jsonl");
+    append_claude_message(&bad, "bad original");
+    if !make_unreadable(&bad) {
+        return;
+    }
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![source];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .unwrap()
+            .failed_files
+            .len(),
+        1
+    );
+    let dirty = HashSet::from([bad.clone()]);
+    assert!(!crate::watch::dirty_needs_ingest(&paths, &dirty).unwrap());
+    make_readable(&bad);
+    append_claude_message(&bad, "bad appended");
+    assert!(crate::watch::dirty_needs_ingest(&paths, &dirty).unwrap());
+}
+
+#[test]
+fn parser_panic_becomes_an_error() {
+    let error = catch_parser_panic(|| panic!("malformed line")).unwrap_err();
+    assert_eq!(error.to_string(), "parser panicked: malformed line");
+    let error = catch_parser_panic(|| panic!("{} lines", 2)).unwrap_err();
+    assert_eq!(error.to_string(), "parser panicked: 2 lines");
+    catch_parser_panic(|| Ok(())).unwrap();
+}
+
+#[test]
+fn redaction_applies_before_indexing_across_incremental_passes_and_settings() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("claude-projects");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join("session.jsonl");
+    // Assembled at runtime so no contiguous fake token sits in the source.
+    let token = format!("gh{}{}", "p_", "Zz9".repeat(12));
+    let call = serde_json::json!({
+        "type": "assistant",
+        "uuid": "a1",
+        "message": {"content": [
+            {"type": "text", "text": format!("I will push with {token}")},
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "cat .env"}},
+        ]},
+    });
+    let result = serde_json::json!({
+        "type": "user",
+        "uuid": "u2",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "PLAIN_VALUE=abc123xyz"},
+        ]},
+    });
+    let mut writer = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(writer, "{call}").unwrap();
+
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![root];
+    options.redaction = Arc::new(crate::redact::Redactor::new(&[], &[]).unwrap());
+    let ingest = |options: &IngestOptions| {
+        ingest_all(&paths, &open_search_index(&paths), options, &lease).unwrap()
+    };
+    let texts = || {
+        let mut texts = Vec::new();
+        open_search_index(&paths)
+            .for_each_record(|record| {
+                texts.push(record.text.clone());
+                Ok(())
+            })
+            .unwrap();
+        texts.sort();
+        texts
+    };
+    let saved_state = || {
+        IngestState::load(&paths.state.join("ingest.json"))
+            .unwrap()
+            .files[&path.to_string_lossy().into_owned()]
+            .clone()
+    };
+
+    let report = ingest(&options);
+    assert_eq!(report.diagnostics.redacted_secrets, 1);
+    assert_eq!(
+        saved_state().pending_tool_calls["toolu_1"].withheld_output,
+        Some(crate::redact::WithheldOutput::SensitiveFile)
+    );
+    // The result arrives in a later pass than its call.
+    writeln!(writer, "{result}").unwrap();
+    let report = ingest(&options);
+    assert_eq!(report.diagnostics.withheld_tool_outputs, 1);
+    let redacted = texts();
+    assert!(redacted.contains(&"I will push with [redacted:github-token]".to_string()));
+    assert!(redacted.contains(&"[output withheld: sensitive file]".to_string()));
+    assert!(redacted.iter().any(|text| text.contains("cat .env")));
+    assert!(
+        redacted
+            .iter()
+            .all(|text| !text.contains(&token) && !text.contains("abc123xyz"))
+    );
+    assert_eq!(ingest(&options).records_added, 0);
+
+    // Turning redaction off changes the checkpoint version, so history is re-derived raw.
+    options.redaction = Arc::new(crate::redact::Redactor::disabled());
+    ingest(&options);
+    let raw = texts();
+    assert!(raw.iter().any(|text| text.contains(&token)));
+    assert!(raw.contains(&"PLAIN_VALUE=abc123xyz".to_string()));
+    assert_eq!(
+        saved_state().parser_version,
+        crate::sources::index_state_version(SourceKind::Claude)
+    );
 }

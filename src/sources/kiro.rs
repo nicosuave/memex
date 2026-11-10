@@ -127,7 +127,11 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<super::UsageParseOutput> {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line)?;
+        // Like the index parser, a malformed line (or a summary this parser
+        // cannot price in credits) is skipped instead of dropping the file.
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let payload = &value["payload"];
         if payload["type"] != "usage_summary" {
             continue;
@@ -138,26 +142,26 @@ pub(crate) fn parse_usage_file(path: &Path) -> Result<super::UsageParseOutput> {
         else {
             continue;
         };
-        let mut credits = 0.0;
-        for summary in summaries {
-            anyhow::ensure!(
-                matches!(summary["unit"].as_str(), Some("credit" | "credits")),
-                "unsupported Kiro usage unit"
-            );
-            let amount = summary["usage"]
-                .as_f64()
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .ok_or_else(|| anyhow::anyhow!("invalid Kiro credit usage"))?;
-            credits += amount;
-            anyhow::ensure!(credits.is_finite(), "Kiro credit total overflow");
-        }
-        let timestamp_ms = value["timestamp"]
+        let Some(credits) = summaries.iter().try_fold(0.0, |total: f64, summary| {
+            matches!(summary["unit"].as_str(), Some("credit" | "credits"))
+                .then(|| summary["usage"].as_f64())
+                .flatten()
+                .filter(|amount| amount.is_finite() && *amount >= 0.0)
+                .map(|amount| total + amount)
+                .filter(|total| total.is_finite())
+        }) else {
+            continue;
+        };
+        let Some(timestamp_ms) = value["timestamp"]
             .as_str()
             .and_then(super::common::parse_iso_millis)
-            .ok_or_else(|| anyhow::anyhow!("Kiro usage summary has no valid timestamp"))?;
-        let execution_id = string(payload, "executionId")
-            .or_else(|| string(&value, "id"))
-            .ok_or_else(|| anyhow::anyhow!("Kiro usage summary has no stable identity"))?;
+        else {
+            continue;
+        };
+        let Some(execution_id) = string(payload, "executionId").or_else(|| string(&value, "id"))
+        else {
+            continue;
+        };
         output.events.push(crate::usage::UsageEvent {
             source: "kiro",
             source_path: path.to_string_lossy().as_ref().into(),
@@ -698,6 +702,45 @@ mod tests {
         assert_eq!(reasoning.len(), full.len() + 1);
         assert_eq!(reasoning[1].role, "reasoning");
         assert_eq!(reasoning[1].text, "thought");
+    }
+
+    #[test]
+    fn usage_skips_malformed_lines_and_unsupported_summaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("messages.jsonl");
+        let summary = |execution: &str, summaries: Value| {
+            event(
+                execution,
+                json!({"type":"usage_summary", "executionId":execution,
+                    "promptTurnSummaries":summaries}),
+            )
+        };
+        let contents = "invalid\n".to_owned()
+            + &summary(
+                "good",
+                json!([{"unit":"credit","usage":1.5},{"unit":"credits","usage":0.5}]),
+            )
+            + &summary(
+                "tokens",
+                json!([{"unit":"credit","usage":1.0},{"unit":"token","usage":9.0}]),
+            )
+            + &summary("negative", json!([{"unit":"credit","usage":-1.0}]))
+            + &json!({"id":"untimed","payload":{"type":"usage_summary",
+                "promptTurnSummaries":[{"unit":"credit","usage":4.0}]}})
+            .to_string()
+            + "\n"
+            + &summary("later", json!([{"unit":"credit","usage":3.0}]));
+        fs::write(&path, contents).unwrap();
+        let parsed = parse_usage_file(&path).unwrap();
+        assert!(parsed.cacheable);
+        assert_eq!(
+            parsed
+                .events
+                .iter()
+                .map(|e| (e.source_record_id.as_deref().unwrap(), e.credits.unwrap()))
+                .collect::<Vec<_>>(),
+            vec![("good", 2.0), ("later", 3.0)]
+        );
     }
 
     #[test]

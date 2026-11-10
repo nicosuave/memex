@@ -1,11 +1,16 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+/// Serialize tests that change the process environment.
+///
+/// The lock guards no data, so a test that panicked while holding it leaves nothing
+/// inconsistent; recovering from the poison keeps one failure from failing every later
+/// test that takes the lock.
 pub fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock test env")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub struct EnvVarGuard {
@@ -56,7 +61,7 @@ impl Drop for EnvVarGuard {
 /// stores never depend on the machine they run on. Hold `env_lock()` for the
 /// duration of the test alongside the returned guard.
 pub fn pin_source_roots(base: &std::path::Path) -> EnvVarGuard {
-    const ROOT_VARS: [&str; 15] = [
+    const ROOT_VARS: [&str; 17] = [
         "HOME",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
@@ -72,6 +77,8 @@ pub fn pin_source_roots(base: &std::path::Path) -> EnvVarGuard {
         "MUSE_SESSIONS_DIR",
         "ANTIGRAVITY_HOME",
         "MEMEX_BOB_DB",
+        "KIMI_CODE_HOME",
+        "GOOSE_PATH_ROOT",
     ];
     let values: Vec<Option<OsString>> = ROOT_VARS
         .iter()

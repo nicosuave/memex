@@ -21,7 +21,10 @@ pub struct SourceAudit {
     pub producer_versions: BTreeMap<String, u64>,
 }
 
-pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<SourceAudit>> {
+pub fn audit_installed_sources(
+    source: Option<SourceFilter>,
+    claude_sources: &[PathBuf],
+) -> Result<Vec<SourceAudit>> {
     let mut groups = Vec::new();
     let mut push = |kind: SourceKind, files: Vec<PathBuf>| {
         if source.is_none_or(|filter| filter.matches(kind)) {
@@ -29,7 +32,10 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
         }
     };
 
-    push(SourceKind::Claude, super::claude::usage_files());
+    push(
+        SourceKind::Claude,
+        super::claude::usage_files(claude_sources),
+    );
     push(
         SourceKind::Codex,
         super::codex::discover_rollouts(None)
@@ -101,6 +107,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
             .map(|file| file.path)
             .collect(),
     );
+    push(SourceKind::Kimi, super::kimi::usage_files());
     push(
         SourceKind::Muse,
         super::muse::discover(None)
@@ -118,6 +125,7 @@ pub fn audit_installed_sources(source: Option<SourceFilter>) -> Result<Vec<Sourc
     push(SourceKind::Bob, super::bob::usage_files());
     push(SourceKind::Zcode, super::zcode::usage_files());
     push(SourceKind::Kilocode, super::kilocode::usage_files());
+    push(SourceKind::Goose, super::goose::usage_files());
 
     push(
         SourceKind::Omp,
@@ -146,25 +154,29 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
         files: files.len() as u64,
         ..SourceAudit::default()
     };
-    for file in files {
+    for path in files {
         if matches!(
             source,
-            SourceKind::Hermes | SourceKind::Bob | SourceKind::Zcode | SourceKind::Kilocode
+            SourceKind::Hermes
+                | SourceKind::Bob
+                | SourceKind::Zcode
+                | SourceKind::Kilocode
+                | SourceKind::Goose
         ) {
-            // Hermes usage truth, Bob tasks, Zcode, and KiloCode sessions are
-            // SQLite data.
+            // Hermes usage truth, Bob tasks, Zcode, KiloCode, and goose sessions
+            // are SQLite data.
             // Audit must not reinterpret the database as JSON, and in particular
             // must not read transcript/message columns: count the file, skip
             // content.
             continue;
         }
-        if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(file) {
+        if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(path) {
             // Conversation stores are SQLite; audit must not reinterpret the
             // database as JSON. The overview.txt / transcript.jsonl projections
             // are JSONL and audit normally below.
             continue;
         }
-        let Ok(file) = std::fs::File::open(file) else {
+        let Ok(file) = std::fs::File::open(path) else {
             audit.unreadable_files += 1;
             continue;
         };
@@ -178,7 +190,17 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
             audit_jcode_file(file, &mut audit);
             continue;
         }
-        let reader = std::io::BufReader::new(file);
+        let reader: Box<dyn BufRead> = if super::common::is_zstd(path) {
+            match zstd::stream::read::Decoder::new(file) {
+                Ok(decoder) => Box::new(std::io::BufReader::new(decoder)),
+                Err(_) => {
+                    audit.unreadable_files += 1;
+                    continue;
+                }
+            }
+        } else {
+            Box::new(std::io::BufReader::new(file))
+        };
         for line in reader.lines() {
             let Ok(line) = line else {
                 audit.malformed_json_lines += 1;
@@ -336,6 +358,12 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
                 increment(&mut audit.semantic_types, kind);
             }
         }
+        SourceKind::Kimi => {
+            // Loop events nest the conversation shape one level down.
+            if let Some(kind) = value.pointer("/event/type").and_then(Value::as_str) {
+                increment(&mut audit.semantic_types, &format!("{top_level}/{kind}"));
+            }
+        }
         SourceKind::Muse => {
             if let Some(payload) = value.get("payload").and_then(Value::as_object) {
                 let kind = payload
@@ -379,6 +407,8 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         SourceKind::Zcode => {}
         // KiloCode sessions are SQLite rows, not per-line JSON documents.
         SourceKind::Kilocode => {}
+        // goose sessions are SQLite rows, not per-line JSON documents.
+        SourceKind::Goose => {}
     }
 }
 

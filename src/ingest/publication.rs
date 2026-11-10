@@ -54,6 +54,7 @@ pub(super) fn writer_loop(
         index_root: _,
         input_bytes: _,
         defer_merges: _,
+        embedding_budget,
         embeddings,
         do_backfill_embeddings,
         reset_vector_store,
@@ -104,6 +105,7 @@ pub(super) fn writer_loop(
     let mut embedder: Option<EmbedderHandle> = None;
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     let mut index_pending = [0u64; SOURCE_COUNT];
+    let mut budget = EmbedBudget::new(embedding_budget);
     if embeddings {
         let handle = EmbedderHandle::with_model_and_runtime(&model, &embed_runtime)?;
         let dims = handle.dims;
@@ -153,22 +155,27 @@ pub(super) fn writer_loop(
             index_pending[source_idx] = 0;
         }
         if let Some(text) = embed_text {
-            if let Some(vindex) = vector_index.as_ref()
-                && !vindex.contains(doc_id)
-            {
-                progress.add_embed_total(source, 1);
-                progress.add_embed_pending(source, 1);
-                embed_buffer.push((doc_id, text, source));
-            }
-            if let Some(emb) = embedder.as_mut()
-                && embed_buffer.len() >= emb.batch_size()
-            {
-                embedded_count += flush_embeddings(
-                    &mut embed_buffer,
-                    emb,
-                    vector_index.as_mut().unwrap(),
-                    &progress,
-                )?;
+            if budget.spent() {
+                budget.skip(&mut embed_buffer, &progress);
+                budget.skipped += 1;
+            } else {
+                if let Some(vindex) = vector_index.as_ref()
+                    && !vindex.contains(doc_id)
+                {
+                    progress.add_embed_total(source, 1);
+                    progress.add_embed_pending(source, 1);
+                    embed_buffer.push((doc_id, text, source));
+                }
+                if let Some(emb) = embedder.as_mut()
+                    && embed_buffer.len() >= emb.batch_size()
+                {
+                    embedded_count += flush_embeddings(
+                        &mut embed_buffer,
+                        emb,
+                        vector_index.as_mut().unwrap(),
+                        &progress,
+                    )?;
+                }
             }
         }
         count += 1;
@@ -220,7 +227,9 @@ pub(super) fn writer_loop(
         }
     }
     if embeddings {
-        if !embed_buffer.is_empty() {
+        if budget.spent() {
+            budget.skip(&mut embed_buffer, &progress);
+        } else if !embed_buffer.is_empty() {
             embedded_count += flush_embeddings(
                 &mut embed_buffer,
                 embedder.as_mut().unwrap(),
@@ -241,8 +250,10 @@ pub(super) fn writer_loop(
                 embedder.as_mut().unwrap(),
                 vector_index.as_mut().unwrap(),
                 &progress,
+                &mut budget,
             )?;
         }
+        budget.warn_if_skipped();
     }
     if let Some(vindex) = vector_index.as_ref() {
         staged_vectors = Some(vindex.stage()?);
@@ -307,6 +318,7 @@ pub(super) fn backfill_embeddings(
     embedder: &mut EmbedderHandle,
     vector_index: &mut crate::vector::VectorIndex,
     progress: &Arc<Progress>,
+    budget: &mut EmbedBudget,
 ) -> Result<usize> {
     crate::profiling::span!("vectors.backfill");
     use std::cell::Cell;
@@ -314,6 +326,11 @@ pub(super) fn backfill_embeddings(
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     index.for_each_record(|record| {
         if !record_needs_embedding(&record) || vector_index.contains(record.doc_id) {
+            return Ok(());
+        }
+        if budget.spent() {
+            budget.skip(&mut embed_buffer, progress);
+            budget.skipped += 1;
             return Ok(());
         }
         progress.add_embed_total(record.source, 1);
@@ -329,11 +346,63 @@ pub(super) fn backfill_embeddings(
         }
         Ok(())
     })?;
-    if !embed_buffer.is_empty() {
+    if budget.spent() {
+        budget.skip(&mut embed_buffer, progress);
+    } else if !embed_buffer.is_empty() {
         let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
         embedded_count.set(embedded_count.get() + n);
     }
     Ok(embedded_count.get())
+}
+
+/// Wall-clock limit on the embedding work of one refresh. Embedding is checked between
+/// batches, so one batch can run past the deadline; records past it publish without vectors
+/// and a later refresh backfills them.
+pub(super) struct EmbedBudget {
+    limit: Option<std::time::Duration>,
+    deadline: Option<std::time::Instant>,
+    /// Records left without vectors because the budget was spent.
+    pub(super) skipped: usize,
+}
+
+impl EmbedBudget {
+    pub(super) fn new(limit: Option<std::time::Duration>) -> Self {
+        Self {
+            limit,
+            deadline: limit.map(|limit| std::time::Instant::now() + limit),
+            skipped: 0,
+        }
+    }
+
+    pub(super) fn spent(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    /// Drop buffered work that the spent budget will not embed.
+    pub(super) fn skip(
+        &mut self,
+        buffer: &mut Vec<(u64, String, SourceKind)>,
+        progress: &Arc<Progress>,
+    ) {
+        for (_, _, source) in buffer.drain(..) {
+            progress.sub_embed_pending(source, 1);
+            self.skipped += 1;
+        }
+    }
+
+    pub(super) fn warn_if_skipped(&self) {
+        if self.skipped > 0
+            && let Some(limit) = self.limit
+        {
+            eprintln!(
+                "warning: embedding budget of {}s spent; {} records were indexed without \
+                 vectors and will be embedded by a later refresh or `memex index embed`",
+                limit.as_secs(),
+                self.skipped
+            );
+        }
+    }
 }
 
 pub(super) fn pending_ingest_path(paths: &Paths) -> PathBuf {
@@ -410,6 +479,9 @@ pub(super) struct RecoveredCheckpoint {
     pub state: CheckpointSession,
     pub pending_recovery: Option<PendingIngest>,
     pub empty_index_rebuild: bool,
+    /// Sessions an earlier discovery pass already dropped from `state` before it had
+    /// to restart; the restart cannot rediscover them, so their deletions carry over.
+    pub carried_missing_paths: Vec<String>,
 }
 
 pub(super) fn recover_checkpoint(
@@ -476,5 +548,6 @@ pub(super) fn recover_checkpoint(
         state,
         pending_recovery,
         empty_index_rebuild,
+        carried_missing_paths: Vec::new(),
     })
 }

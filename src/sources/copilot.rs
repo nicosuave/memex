@@ -14,7 +14,8 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    // Index Copilot-written user messages as system context, and compaction summaries.
+    index: 3,
     usage: 3,
 };
 
@@ -203,6 +204,12 @@ pub(crate) fn parse_index_records(
                 if text.trim().is_empty() {
                     continue;
                 }
+                // A user message with a `source` is Copilot's own: the `memory` it injects
+                // before a prompt, or a subagent's task (`agent-<id>`) its parent wrote.
+                let injected = data
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|source| !source.is_empty());
                 let links = copilot_record_links(obj, data, &session_id, turn_id);
                 let record = Record {
                     source: SourceKind::Copilot,
@@ -211,7 +218,7 @@ pub(crate) fn parse_index_records(
                     project: project.clone(),
                     session_id: session_id.clone(),
                     turn_id,
-                    role: "user".to_string(),
+                    role: if injected { "system" } else { "user" }.to_string(),
                     text,
                     tool_name: None,
                     tool_input: None,
@@ -375,6 +382,39 @@ pub(crate) fn parse_index_records(
                 emit(record)?;
                 turn_id += 1;
             }
+            // The summary that stands in for the conversation before an applied compaction.
+            // A failed or skipped compaction changed nothing.
+            "session.compaction_complete"
+                if data.get("success").and_then(|v| v.as_bool()) == Some(true)
+                    && data.get("outcome").and_then(|v| v.as_str()) == Some("applied") =>
+            {
+                let summary = data
+                    .get("summaryContent")
+                    .and_then(text_from_json)
+                    .unwrap_or_default();
+                let summary = summary.trim();
+                if summary.is_empty() {
+                    continue;
+                }
+                let links = copilot_record_links(obj, data, &session_id, turn_id);
+                let record = Record {
+                    source: SourceKind::Copilot,
+                    doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
+                    ts: timestamp,
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    role: "assistant".to_string(),
+                    text: format!("compaction: {summary}"),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: source_path.clone(),
+                };
+                emit(record)?;
+                turn_id += 1;
+            }
             _ => {}
         }
     }
@@ -479,8 +519,17 @@ fn copilot_record_links(
     turn_id: u32,
 ) -> RecordLinks {
     let parent_session_id = copilot_string_field(data, obj, COPILOT_PARENT_SESSION_KEYS);
+    // A bare `source` names who wrote an event (`memory`, `agent-<id>`, `startup`), so only a
+    // conversation kind is read from it.
     let explicit_thread_source =
-        copilot_string_field(data, obj, &["threadSource", "thread_source", "source"]);
+        copilot_string_field(data, obj, &["threadSource", "thread_source"]).or_else(|| {
+            copilot_string_field(data, obj, &["source"]).filter(|source| {
+                matches!(
+                    source.as_str(),
+                    "subagent" | "sidechain" | "branch" | "fork"
+                )
+            })
+        });
     let thread_source = explicit_thread_source.or_else(|| {
         parent_session_id
             .as_ref()
@@ -797,6 +846,52 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_written_messages_are_context_and_compactions_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = temp
+            .path()
+            .join("session-state/11111111-1111-4111-8111-111111111111");
+        std::fs::create_dir_all(&session).unwrap();
+        let path = session.join("events.jsonl");
+        std::fs::write(
+            &path,
+            include_str!("../../fixtures/parse_fidelity/copilot.jsonl"),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.role.as_str(), record.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("user", "Count the lines in hello.py"),
+                ("system", "Run wc -l hello.py and report the number."),
+                ("assistant", "hello.py has 3 lines."),
+                (
+                    "assistant",
+                    "compaction: <overview>\nThe user asked how many lines hello.py has.\n</overview>"
+                ),
+            ]
+        );
+        // `source` names who wrote a message, not the kind of conversation it belongs to.
+        assert!(records.iter().all(|record| {
+            record.links.thread_source.is_none()
+                && record.links.conversation_kind.as_deref() == Some("main")
+        }));
+    }
 
     #[test]
     fn usage_decoder_reads_wrapped_otel_attributes() {

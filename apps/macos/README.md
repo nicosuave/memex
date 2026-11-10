@@ -24,7 +24,7 @@ runtime. If you have not set up an index yet, install the terminal CLI and index
 your sources:
 
 ```sh
-brew install nicosuave/tap/memex
+brew install memex
 memex index
 ```
 

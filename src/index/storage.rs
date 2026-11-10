@@ -651,7 +651,9 @@ fn collect_unreachable_with_sync(
     let mut removal_attempted = false;
     for owner in fs::read_dir(&store)? {
         let owner = owner?;
-        if owner.file_name() == ".lock" {
+        // `.lock` and dotfiles other tools drop into the store (Finder's `.DS_Store`) are never
+        // owners; skipping them keeps one stray file from wedging collection forever.
+        if owner.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
         if !owner.file_type()?.is_dir() || !safe_owner(&owner.file_name().to_string_lossy()) {
@@ -802,6 +804,23 @@ mod tests {
             0
         );
         assert_eq!(bytes(&directory, "live.store"), b"reachable");
+    }
+
+    #[test]
+    fn cleanup_shared_ignores_dotfiles_in_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let _guard = lock_store(root).unwrap();
+        fs::create_dir(root.join(GENERATIONS_DIR)).unwrap();
+        let owner = root.join(STORE).join(new_generation_name());
+        fs::create_dir(&owner).unwrap();
+        fs::write(owner.join("orphan.store"), b"unreachable").unwrap();
+        let finder = root.join(STORE).join(".DS_Store");
+        fs::write(&finder, b"finder metadata").unwrap();
+        assert_eq!(collect_unreachable(root, true).unwrap(), 1);
+        assert_eq!(collect_unreachable(root, false).unwrap(), 1);
+        assert!(!owner.exists());
+        assert!(finder.exists());
     }
 
     #[test]

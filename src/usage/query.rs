@@ -21,7 +21,7 @@ use crate::types::SourceFilter;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,7 +98,12 @@ fn try_cold_serve_points(
     if query.memo_ttl_ms != 0 {
         // Retaining callers answer from the assembly we load here. Reading
         // points first would scan the same facts twice on the first query.
-        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+        populate_snapshots_from_facts(
+            query.source,
+            cache_path,
+            &ready.per_source,
+            &query.claude_roots(),
+        );
         return Ok(None);
     }
     let Ok(points) = read_fact_points(query, cache_path) else {
@@ -143,13 +148,17 @@ impl ColdFacts {
 /// any doubt returns `None` and the normal path rebuilds instead.
 fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
     let cache_path = query.cache_path.as_deref()?;
+    let claude_sources = query.claude_roots();
     let ttl = Duration::from_millis(query.memo_ttl_ms);
     if !ttl.is_zero() {
         // Usable snapshots beat facts reads (borrowed views, no mapping), so
         // cold-serve only when the normal path would have to build.
         match query.source {
             Some(filter) => {
-                if lock_partitions().contains_key(&(filter, query.cache_path.clone())) {
+                if lock_partitions()
+                    .get(&(filter, query.cache_path.clone()))
+                    .is_some_and(|entry| entry.matches_roots(filter, &claude_sources))
+                {
                     return None;
                 }
             }
@@ -158,10 +167,11 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
                     return None;
                 }
                 let store = lock_partitions();
-                if SCANNERS
-                    .iter()
-                    .all(|(filter, _)| store.contains_key(&(*filter, query.cache_path.clone())))
-                {
+                if SCANNERS.iter().all(|(filter, _)| {
+                    store
+                        .get(&(*filter, query.cache_path.clone()))
+                        .is_some_and(|entry| entry.matches_roots(*filter, &claude_sources))
+                }) {
                     // All partitions resident: the normal path only re-checks and
                     // merges, which is cheaper than a facts read.
                     return None;
@@ -178,10 +188,15 @@ fn cold_facts_ready(query: &UsageQuery) -> Option<ColdFacts> {
             continue;
         }
         let generation = cache.fact_generation(filter.as_str()).ok()??;
-        let observed = validate_partition(filter, Some(cache_path), None)?;
+        let observed = validate_partition(filter, Some(cache_path), None, &claude_sources)?;
         if !observed.valid {
             if !ttl.is_zero() && query.source == Some(filter) {
-                populate_after_failed_validation(filter, cache_path, observed.fingerprint);
+                populate_after_failed_validation(
+                    filter,
+                    cache_path,
+                    observed.fingerprint,
+                    &claude_sources,
+                );
             }
             return None;
         }
@@ -212,6 +227,7 @@ fn populate_snapshots_from_facts(
     source: Option<SourceFilter>,
     cache_path: &Path,
     per_source: &[ColdSource],
+    claude_sources: &[PathBuf],
 ) {
     let Ok(_refresh) = USAGE_SCAN_LOCK.try_lock() else {
         return;
@@ -221,7 +237,10 @@ fn populate_snapshots_from_facts(
     };
     for source in per_source {
         let filter = &source.filter;
-        if lock_partitions().contains_key(&(*filter, Some(cache_path.to_path_buf()))) {
+        if lock_partitions()
+            .get(&(*filter, Some(cache_path.to_path_buf())))
+            .is_some_and(|entry| entry.matches_roots(*filter, claude_sources))
+        {
             continue;
         }
         let Ok(assembly) = read_fact_assembly(&cache.connection, *filter) else {
@@ -250,12 +269,13 @@ fn populate_snapshots_from_facts(
                 fact_generation: Some(source.generation.clone()),
                 assembly,
                 warnings: Arc::new(source.warnings.clone()),
+                claude_sources: claude_sources.to_vec(),
             },
         );
     }
     if source.is_none() {
         // Index over the fresh assemblies; partition checks inside reuse them.
-        refresh_merged(&Some(cache_path.to_path_buf()));
+        refresh_merged(&Some(cache_path.to_path_buf()), claude_sources);
     }
 }
 
@@ -323,7 +343,12 @@ fn try_cold_serve_report(query: &UsageQuery) -> Result<Option<UsageReport>> {
         .as_deref()
         .expect("cold serve needs a cache");
     if query.memo_ttl_ms != 0 {
-        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+        populate_snapshots_from_facts(
+            query.source,
+            cache_path,
+            &ready.per_source,
+            &query.claude_roots(),
+        );
         return Ok(None);
     }
     let Ok(report) = scan_usage_from_facts(query, cache_path, &ready.warnings) else {
@@ -496,6 +521,50 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
+    fn configured_claude_roots_replace_the_environment() {
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        for (config_dir, id) in [
+            ("environment", "ignored"),
+            ("work", "work"),
+            ("personal", "personal"),
+        ] {
+            let project = temp.path().join(config_dir).join("projects/-p");
+            std::fs::create_dir_all(&project).unwrap();
+            let line = serde_json::json!({
+                "type": "assistant", "sessionId": id, "timestamp": 1000,
+                "message": { "id": id, "model": "claude-sonnet-4-6",
+                    "usage": { "inputTokens": 10 } }
+            });
+            std::fs::write(project.join(format!("{id}.jsonl")), format!("{line}\n")).unwrap();
+        }
+        let _env = EnvVarGuard::set_os(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(temp.path().join("environment").as_os_str()),
+        )]);
+        let query = UsageQuery {
+            source: Some(SourceFilter::Claude),
+            include_events: true,
+            claude_sources: Some(vec![
+                temp.path().join("work/projects"),
+                temp.path().join("personal/projects"),
+            ]),
+            ..UsageQuery::default()
+        };
+
+        let mut sessions = scan_usage(&query)
+            .unwrap()
+            .details
+            .into_iter()
+            .filter_map(|event| event.session_id)
+            .collect::<Vec<_>>();
+        sessions.sort();
+        assert_eq!(sessions, ["personal", "work"]);
+    }
+
+    #[test]
     fn cold_retaining_activity_keeps_events_outside_the_first_query_range() {
         use crate::test_support::{EnvVarGuard, env_lock};
 
@@ -579,7 +648,12 @@ mod tests {
         let cache_path = query.cache_path.as_deref().unwrap();
         {
             let _refresh = USAGE_SCAN_LOCK.lock().unwrap();
-            populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+            populate_snapshots_from_facts(
+                query.source,
+                cache_path,
+                &ready.per_source,
+                &query.claude_roots(),
+            );
             assert!(!lock_partitions().contains_key(&key));
         }
         std::fs::write(&transcript, line(800)).unwrap();
@@ -593,7 +667,12 @@ mod tests {
             800,
         );
         assert!(!ready.generations_current(cache_path));
-        populate_snapshots_from_facts(query.source, cache_path, &ready.per_source);
+        populate_snapshots_from_facts(
+            query.source,
+            cache_path,
+            &ready.per_source,
+            &query.claude_roots(),
+        );
         assert!(!lock_partitions().contains_key(&key));
         assert_eq!(scan_usage(&query).unwrap().total_tokens, 800);
     }
@@ -801,12 +880,22 @@ mod tests {
             .map(|entry| entry.fingerprint.clone())
             .expect("snapshot published");
         assert!(
-            check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
+            check_partition_valid(
+                key.0,
+                key.1.as_deref(),
+                Some(&fingerprint),
+                &crate::config::default_claude_sources()
+            ),
             "unchanged corpus revalidates"
         );
         std::fs::write(&transcript, format!("{}{}", line(10), line(70))).expect("grow transcript");
         assert!(
-            !check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
+            !check_partition_valid(
+                key.0,
+                key.1.as_deref(),
+                Some(&fingerprint),
+                &crate::config::default_claude_sources()
+            ),
             "appended transcript invalidates"
         );
         // Let the 1ms TTL lapse so the next query revalidates instead of reusing.
@@ -817,7 +906,12 @@ mod tests {
             .map(|entry| entry.fingerprint.clone())
             .expect("snapshot republished");
         assert!(
-            check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
+            check_partition_valid(
+                key.0,
+                key.1.as_deref(),
+                Some(&fingerprint),
+                &crate::config::default_claude_sources()
+            ),
             "refreshed corpus revalidates"
         );
     }
@@ -857,7 +951,8 @@ mod tests {
         assert!(check_partition_valid(
             key.0,
             key.1.as_deref(),
-            Some(&fingerprint)
+            Some(&fingerprint),
+            &crate::config::default_claude_sources()
         ));
         // Commits landing entirely in the WAL leave the main file's metadata
         // untouched: the listing fingerprint cannot see them, so only the
@@ -865,14 +960,20 @@ mod tests {
         let wal = db_path.with_extension("db-wal");
         std::fs::write(&wal, "wal-1").expect("write wal");
         assert!(
-            !check_partition_valid(key.0, key.1.as_deref(), Some(&fingerprint)),
+            !check_partition_valid(
+                key.0,
+                key.1.as_deref(),
+                Some(&fingerprint),
+                &crate::config::default_claude_sources()
+            ),
             "WAL-only change invalidates"
         );
         std::fs::remove_file(&wal).expect("remove wal");
         assert!(check_partition_valid(
             key.0,
             key.1.as_deref(),
-            Some(&fingerprint)
+            Some(&fingerprint),
+            &crate::config::default_claude_sources()
         ));
     }
 

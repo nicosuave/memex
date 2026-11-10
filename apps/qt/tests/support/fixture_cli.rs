@@ -41,6 +41,11 @@ fn main() {
             json!([{"id":"local","label":"This computer"},{"id":"fixture-peer","label":"Fixture peer"}])
         }
         "projects" => {
+            // Project summaries arrive independently of session lists. Keep the
+            // peer slow so UI tests exercise partially aggregated results.
+            if machine == "fixture-peer" {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
             json!([{"project":"/synthetic/project","session_count":4,"last_at":"2026-09-13T10:00:00Z"}])
         }
         "sessions" if args.iter().any(|s| s == "--count") => {

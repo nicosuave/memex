@@ -1,6 +1,6 @@
 use super::*;
 use crate::analytics::{AnalyticsWriter, SessionKindFilter};
-use crate::types::Record;
+use crate::types::{Record, SourceKind};
 
 fn request(
     paths: &Paths,
@@ -13,6 +13,7 @@ fn request(
         additional_queries: Vec::new(),
         cwd: None,
         project: Some("museum".into()),
+        tags: Vec::new(),
         role: None,
         tool: None,
         session: None,
@@ -240,4 +241,61 @@ fn explicit_recency_timestamp_and_score_options_remain_effective() {
     let threshold = collect_search_with_auto_index(threshold, false).unwrap();
     assert_eq!(threshold.results.len(), 1);
     assert_eq!(threshold.results[0].record.doc_id, 1);
+}
+
+#[test]
+fn search_scopes_by_user_tags_and_assigned_projects() {
+    let _lock = crate::test_support::env_lock();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(root.path().to_path_buf())).unwrap();
+    paths.ensure_dirs().unwrap();
+    std::fs::write(
+        paths.root.join("config.toml"),
+        "auto_index_on_search = false\n",
+    )
+    .unwrap();
+    let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+    let mut writer = index.writer().unwrap();
+    let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+    for (id, session, project) in [(1u64, "scratch", "tmp"), (2, "repo", "museum")] {
+        let record: Record = serde_json::from_value(serde_json::json!({
+            "source": "codex", "doc_id": id, "ts": 1700000000000u64 + id, "project": project,
+            "session_id": session, "turn_id": id, "role": "user", "text": "needle curator",
+            "source_path": format!("/fixture/{session}.jsonl"),
+        }))
+        .unwrap();
+        index.add_record(&mut writer, &record).unwrap();
+        analytics.record(&record).unwrap();
+    }
+    writer.commit().unwrap();
+    index.publish_generation().unwrap();
+    analytics.flush().unwrap();
+    drop(analytics);
+    let store = crate::session_meta::SessionMetaStore::open(&paths.state).unwrap();
+    store
+        .add_tags(SourceKind::Codex, "repo", &["tooling".to_string()])
+        .unwrap();
+
+    let sessions = |project: Option<&str>, tags: &[&str]| {
+        let mut request = request(&paths, "needle", SessionOrigin::All, 10);
+        request.project = project.map(str::to_string);
+        request.tags = tags.iter().map(|tag| tag.to_string()).collect();
+        let mut ids = collect_search(request)
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|hit| hit.record.session_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    assert_eq!(sessions(None, &["Tooling"]), ["repo"]);
+    assert!(sessions(None, &["missing"]).is_empty());
+    // Without assignments, flat project names filter the index directly.
+    assert_eq!(sessions(Some("museum"), &[]), ["repo"]);
+    store
+        .set_project(SourceKind::Codex, "scratch", "museum")
+        .unwrap();
+    assert_eq!(sessions(Some("museum"), &[]), ["repo", "scratch"]);
+    assert!(sessions(Some("tmp"), &[]).is_empty());
 }

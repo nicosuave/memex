@@ -36,8 +36,7 @@ TestCase {
         compare(app.home, true);
         compare(store.origin, "interactive");
         tryCompare(store, "total", 4);
-        compare(store.projects.length, 1);
-        compare(store.projects[0].session_count, 8);
+        tryVerify(() => store.projects.length === 1 && store.projects[0].session_count === 8, 10000);
         verify(store.sessions.some(s => s.machine === "fixture-peer"));
         verify(store.sessions.some(s => s.machine === "local"));
         compare(new Set(store.sessions.map(s => store.identity(s))).size, 4);

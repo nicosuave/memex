@@ -8,7 +8,7 @@
 # with exactly this version.
 id = "nicosuave.memex"
 name = "memex"
-version = "0.28.0"
+version = "0.33.1"
 min_herdr_version = "0.7.0"
 platforms = ["macos", "linux"]
 description = "Session desk for your agent history: search past Claude Code / Codex / Cursor / Pi / Oh My Pi sessions and resume one into a herdr tab."
@@ -65,8 +65,8 @@ title = "memex: toggle sidebar"
 contexts = ["pane", "workspace"]
 command = ["bash", "herdr/plugin.sh", "toggle"]
 
-# The session palette: recent sessions as an overlay, Enter resumes into a new tab, q returns
-# focus wherever it was. The natural keybinding target.
+# The session palette: recent sessions as an overlay, Enter resumes into a new tab (or focuses
+# the pane already running that session), q returns focus wherever it was. The natural keybinding target.
 [[actions]]
 id = "palette"
 title = "memex: session palette"
@@ -81,7 +81,8 @@ contexts = ["pane", "workspace"]
 command = ["bash", "herdr/plugin.sh", "recent-here"]
 
 # Resume the most recent session for the focused pane's directory without opening the TUI.
-# memex resolves the session and asks herdr for a new tab itself.
+# memex resolves the session and asks herdr for a new tab itself, or focuses the pane already
+# running it.
 [[actions]]
 id = "resume-last"
 title = "memex: resume last session"

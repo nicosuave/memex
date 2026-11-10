@@ -20,6 +20,34 @@ this helper; complete the staged migration before starting the new daemon.
 Stale-schema startup now requires operator action even when embeddings are disabled.
 If there are no vectors to preserve, explicitly rebuild instead of using this export.
 
+## Keep vectors when transcripts move
+
+Moving transcripts to another configured Claude root, such as `~/.claude` into a
+per-account profile listed in `claude_paths`, removes the records indexed under the old
+paths and indexes the moved transcripts as new records without vectors. To reuse the
+vectors instead, update a copy of the root in place with the same storage version.
+Unchanged records keep their vectors, and the import restores vectors for moved records
+by matching their embedding inputs:
+
+```sh
+cargo build --release --bin memex --example vector_transfer
+HELPER="$PWD/target/release/examples/vector_transfer"
+ROOT="$HOME/.memex"
+SOURCE="$HOME/.memex-move-source"
+STAGE="$HOME/.memex-move-stage"
+CACHE="$HOME/memex-move-vectors.sqlite3"
+# With the daemon stopped; reflink copies are instant on btrfs, XFS, and APFS (cp -c).
+cp -a --reflink=always "$ROOT" "$SOURCE"
+cp -a --reflink=always "$ROOT" "$STAGE"
+"$HELPER" export --root "$SOURCE" --cache "$CACHE"
+target/release/memex index --root "$STAGE" --no-embeddings --non-interactive
+"$HELPER" import --root "$STAGE" --cache "$CACHE" --model bge --dimensions 384
+```
+
+`missing` is the number of new inputs the daemon embeds after the switch. Swap `STAGE`
+in for `ROOT` while the daemon is stopped, and keep the old root until the restarted
+service has been checked.
+
 ## Build readers for both storage versions
 
 The following example upgrades an upstream v0.19.0 index. From a checkout that
@@ -65,8 +93,11 @@ cp -p "$OLD_ROOT/config.toml" "$STAGE/config.toml"
 
 Check `matched`, `missing`, and `unmatched_exported`. Investigate every unmatched
 exported input before switching; absent sources or parser exclusions can reduce
-coverage. On import, `existing` counts vectors already present in the destination,
-so a retry does not duplicate them. A new lexical record with no matching cache entry stays
+coverage. Import fills only records without a vector; `existing` counts the vectors
+already present in the destination, which it neither rewrites nor compares, so a retry
+does not duplicate them. `verify` compares every matched vector and suits a root built
+from the cache alone: identical inputs embedded in different batches can differ in the
+last bits. A new lexical record with no matching cache entry stays
 missing; the helper never invents a replacement or silently changes models.
 
 Preserve the original `memory` directory and `web-auth-token`, if present, in the

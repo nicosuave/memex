@@ -3071,8 +3071,9 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
 name = "memex"
-version = "0.28.0"
+version = "0.33.1"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "axum",
  "base64 0.22.1",
@@ -3089,6 +3090,7 @@ dependencies = [
  "gix",
  "globset",
  "hashbrown 0.17.1",
+ "hf-hub 0.5.0",
  "hmac",
  "indicatif 0.17.11",
  "libc",
@@ -3096,6 +3098,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "model2vec-rs",
+ "ndarray 0.17.2",
  "notify",
  "once_cell",
  "ort",
@@ -3109,12 +3112,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "signal-hook",
  "simd-json",
  "subtle",
  "tantivy",
  "tempfile",
  "tiny_http",
+ "tokenizers 0.22.2",
  "tokio",
  "toml",
  "toml_edit 0.22.27",
@@ -3125,6 +3130,7 @@ dependencies = [
  "url",
  "usearch",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]

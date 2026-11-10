@@ -160,17 +160,3 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
 
-  update-homebrew:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger homebrew-tap update
-        run: |
-          # Strip all leading v's to handle vv0.2.3 -> 0.2.3
-          VERSION="${RELEASE_TAG#v}"
-          VERSION="${VERSION#v}"
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.HOMEBREW_TAP_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/nicosuave/homebrew-tap/dispatches \
-            -d "{\"event_type\":\"update-formula\",\"client_payload\":{\"formula\":\"memex\",\"version\":\"${VERSION}\",\"repo\":\"nicosuave/memex\"}}"

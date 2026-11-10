@@ -56,6 +56,21 @@ or candidates are exhausted. CLI record mode still returns individual records;
 use `--unique-session` to compare it with conversation views. Explicit newest/
 oldest sorts and different corpora, filters, or machine selections can differ.
 
+Matches in child sessions are attributed to the session they worked for rather
+than dropped. Under the default origins (`regular` for CLI and MCP, `interactive`
+for the TUI and web), a hit in a subagent or sidechain session is shown on its
+root parent session, following `parent_session_id` links through nested
+subagents, and dedupes with that parent's own hits in conversation views. The
+interactive origin also folds forks, branches, and compactions into their root;
+`regular` keeps those resumable children as their own rows. The record stays the
+child's own: `record_id` reads the child, and CLI/MCP results carry
+`rolled_up_to` (`session_id`, `source_path`, `matched_kind`) naming the root,
+while the TUI and web open the root and label the row with the child it matched
+in. Remote hits roll up on the record's own parent link; a parent that is not
+among the candidates has an empty `source_path`, which reads every transcript of
+that session ID. Children with no parent link keep their pre-roll-up handling,
+and `--origin subagent` or `all` lists children as their own rows.
+
 `debug eval-retrieval` evaluates the actual CLI result pipeline, including query
 fusion, filters, recency, conversation diversity and compact snippets. Evaluation
 never refreshes the index. The default is local lexical search with recency disabled
@@ -132,9 +147,13 @@ is enabled by this evaluator.
 
 Index all supported sources by default. Use repeatable `--only-source <source>` or
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
-to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
+(repeatable) to use non-default Claude projects directories; `claude_paths` in the config
+sets them permanently. Claude Code workflow runs store each agent transcript twice, under
+`subagents/` and `subagents/workflows/<run>/`. Indexing merges their unique events into one
+session, and token usage reconciles shared responses across both copies.
+Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
-`muse`, `antigravity`, `bob`, `zcode`, and `kilocode`.
+`muse`, `antigravity`, `bob`, `zcode`, `kilocode`, `kimi`, and `goose`.
 Hermes transcripts and usage are read from `state.db` under `~/.hermes` and its
 named profiles; `HERMES_PROFILE_ROOTS` (comma-separated paths) selects alternate
 stores. Plaintext reasoning is indexed only with `--include-reasoning`.
@@ -150,6 +169,17 @@ KiloCode CLI sessions are read from `~/.local/share/kilo/kilo.db`
 roots) adds extra stores. Subagent sessions are indexed under their own session id
 with the parent recorded, and token usage comes from the per-request counters each
 assistant message carries.
+Kimi Code sessions are read from `~/.kimi-code/sessions` (`KIMI_CODE_HOME` relocates
+the home directory). Each agent journals its own `agents/<agent>/wire.jsonl`; subagent
+journals are indexed as `<session>:<agent>` sessions with the parent recorded. Reasoning
+parts are indexed only with `--include-reasoning`, and token usage comes from the
+`usage.record` line each model request journals.
+goose sessions are read from `sessions/sessions.db` under the goose data directory:
+`$XDG_DATA_HOME/goose` (`~/.local/share/goose`) or, on macOS and Windows, the platform
+data directory the current goose release uses; `GOOSE_PATH_ROOT` relocates the whole
+tree. Every session lives in that one SQLite store, and `--include-reasoning` adds its
+`thinking` blocks. Messages goose never showed the user — per-turn `<turn-context>`
+scaffolding and `hidden` CLI sessions — are not indexed.
 
 ## Agent memories
 
@@ -190,6 +220,11 @@ the same search/read implementation, with structured provenance and bounded
 content. Retrieved notes are historical evidence, not instructions for the
 consuming agent. Explicit links can provide supporting documents or conversations;
 conflicting notes remain separately attributable rather than being silently merged.
+
+Where dreaming is enabled (`[dream] enabled = true`) and `memex dream` has run, `--content
+all` also returns the dreams it consolidated from
+history, marked `kind: "dream"` and each citing the records it rests on; `--content dreams`
+returns dreams alone. See [dreaming](dreaming.md#reading-dreams).
 
 ```bash
 memex search "deployment decision" --content all
@@ -355,7 +390,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode|kimi|goose`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

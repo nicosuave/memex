@@ -2,6 +2,7 @@ mod checkpoint;
 pub mod directories;
 pub(crate) mod discovery;
 mod execution;
+pub(crate) mod failures;
 pub mod journal;
 mod plan;
 mod publication;
@@ -77,6 +78,8 @@ pub struct IngestOptions {
     pub include_zcode: bool,
     pub include_kilocode: bool,
     pub include_kiro: bool,
+    pub include_kimi: bool,
+    pub include_goose: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -86,15 +89,45 @@ pub struct IngestOptions {
     /// Search-triggered refreshes append without foreground merges; compaction is scheduled
     /// separately once segments accumulate.
     pub defer_merges: bool,
+    /// Wall-clock time this refresh may spend embedding; `None` is unbounded. Once it is
+    /// spent the remaining records publish without vectors, and a later refresh or
+    /// `memex index embed` backfills them. Read-triggered refreshes set it so a slow
+    /// embedder cannot hold the ingest lease for the whole backlog.
+    pub embedding_budget: Option<std::time::Duration>,
+    /// Index-time secret redaction (`[redaction]`); its settings are part of every
+    /// checkpoint version.
+    pub redaction: Arc<crate::redact::Redactor>,
 }
 
-#[derive(Debug)]
+impl IngestOptions {
+    /// The checkpoint version a `source` file is parsed under with these options.
+    pub fn index_state_version(&self, source: SourceKind) -> u32 {
+        self.redaction
+            .fold_version(crate::sources::index_state_version_for(
+                source,
+                self.include_reasoning,
+            ))
+    }
+}
+
+/// How long a read-triggered refresh (search, session read, TUI auto-index) may spend
+/// embedding before it publishes the rest without vectors. See
+/// [`IngestOptions::embedding_budget`].
+pub const READ_REFRESH_EMBEDDING_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, Default)]
 pub struct IngestReport {
     pub records_added: usize,
     pub records_embedded: usize,
     pub files_scanned: usize,
     pub files_skipped: usize,
     pub diagnostics: crate::sources::ParseDiagnostics,
+    /// Files this refresh left alone because they failed to parse earlier and have neither
+    /// changed nor reached their retry time.
+    pub files_deferred: usize,
+    /// Files that failed to parse during this refresh. They were skipped, their indexed
+    /// records and checkpoints kept, and everything else published.
+    pub failed_files: Vec<failures::FileFailure>,
 }
 
 pub(crate) struct DirtyIngestReport {
@@ -117,6 +150,7 @@ struct FileTask {
     parser_version: u32,
     codex_metadata_offsets: Option<Vec<u64>>,
     claude_background: Option<bool>,
+    claude_agent_copies: Vec<crate::sources::claude::AgentCopy>,
 }
 
 impl FileTask {
@@ -190,6 +224,7 @@ struct WriterContext {
     codex_metadata_checkpoints: HashMap<String, (u64, Vec<u64>)>,
     vector_delete_paths: HashSet<String>,
     defer_merges: bool,
+    embedding_budget: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,19 +249,38 @@ struct VectorMigration {
     model: ModelChoice,
 }
 
-/// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.
-/// Returns Ok(None) if skipped due to fresh cache, Ok(Some(report)) if indexing ran.
+/// How far a read may trail the transcripts on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Reads serve the index as it stands.
+    None,
+    /// Reads take in what the journal names as changed. When it cannot name the changes, the
+    /// index is walked only once the last walk is older than `ttl_seconds`.
+    Bounded { ttl_seconds: u64 },
+    /// Reads take in what the journal names as changed, and walk whenever it cannot.
+    Strict,
+}
+
+/// Bring the index up to date for a read, as far as `freshness` asks. Returns Ok(None) when
+/// nothing was refreshed, Ok(Some(report)) when a refresh ran.
 pub fn ingest_if_stale(
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
-    ttl_seconds: u64,
+    freshness: Freshness,
     lease: &IngestLease,
     journal: Option<journal::ReplayHandle>,
 ) -> Result<Option<IngestReport>> {
     crate::profiling::span!("ingest.freshness");
     let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
-    if can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)? {
+    let walk = match freshness {
+        Freshness::None => return Ok(None),
+        Freshness::Strict => true,
+        Freshness::Bounded { ttl_seconds } => {
+            !can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)?
+        }
+    };
+    if !walk && journal.is_none() {
         crate::profiling::count!("ingest.fresh_cache_hits", 1);
         // The transcript scan cache cannot detect edits in a Markdown memory
         // file. Refresh these small documents even when transcript discovery is
@@ -240,8 +294,96 @@ pub fn ingest_if_stale(
     }
 
     crate::profiling::count!("ingest.fresh_cache_misses", 1);
-    let report = ingest_selected(paths, index, options, lease, None, Some(header), journal)?.report;
+    let narrowing = match journal {
+        Some(replay) => discovery::Narrowing::Journal { replay, walk },
+        None => discovery::Narrowing::None,
+    };
+    let report = ingest_selected(paths, index, options, lease, narrowing, Some(header))?.report;
     Ok(Some(report))
+}
+
+/// Bring the sources a session read names up to date, as far as `freshness` asks. `targets`
+/// comes from [`session_refresh_targets`]. A target the dirty selection cannot resolve on its
+/// own walks only when `freshness` would walk for any other read; otherwise the read sees the
+/// index as it stands. Returns Ok(None) when nothing was refreshed.
+pub(crate) fn ingest_session_sources(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    freshness: Freshness,
+    lease: &IngestLease,
+    targets: &HashSet<PathBuf>,
+) -> Result<Option<IngestReport>> {
+    let walk = match freshness {
+        Freshness::None => return Ok(None),
+        Freshness::Strict => true,
+        Freshness::Bounded { ttl_seconds } => {
+            let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
+            !can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)?
+        }
+    };
+    let narrowing = discovery::Narrowing::Dirty {
+        paths: targets,
+        walk,
+    };
+    Ok(Some(
+        ingest_selected(paths, index, options, lease, narrowing, None)?.report,
+    ))
+}
+
+/// The paths a dirty refresh needs to bring `sources` up to date: transcripts whose size,
+/// identity or timestamps moved since the checkpoint last recorded them, or that it never
+/// recorded, and the SQLite store behind every database-backed session, whose writer can
+/// commit to the WAL while the main file's metadata stays put. Returns None when a source
+/// cannot be targeted this way, such as a legacy OpenCode session directory or a transcript
+/// that no longer exists, so the caller refreshes as other reads do.
+pub(crate) fn session_refresh_targets<'a>(
+    paths: &Paths,
+    sources: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<HashSet<PathBuf>>> {
+    let mut targets = HashSet::new();
+    let mut transcripts = Vec::new();
+    for source in sources {
+        let virtual_database = crate::sources::bob::split_virtual_path(Path::new(source))
+            .or_else(|| crate::sources::zcode::split_virtual_path(Path::new(source)))
+            .or_else(|| crate::sources::kilocode::split_virtual_path(Path::new(source)))
+            .or_else(|| crate::sources::goose::split_virtual_path(Path::new(source)))
+            .map(|(database, _)| database);
+        if let Some(database) = virtual_database {
+            if !database.is_file() {
+                return Ok(None);
+            }
+            targets.insert(database);
+        } else if std::fs::metadata(source).is_ok_and(|metadata| metadata.is_file()) {
+            transcripts.push(source.to_owned());
+        } else {
+            return Ok(None);
+        }
+    }
+    let state_path = paths.state.join("ingest.json");
+    if transcripts.is_empty() || !state_path.exists() {
+        targets.extend(transcripts.into_iter().map(PathBuf::from));
+        return Ok(Some(targets));
+    }
+    let recorded = CheckpointReader::open(&state_path)?.load_files(
+        &transcripts,
+        crate::state::checkpoint::FileLoadScope::Targeted,
+    )?;
+    for source in transcripts {
+        let unchanged = match (recorded.get(&source), std::fs::metadata(&source)) {
+            (Some(Some(previous)), Ok(metadata)) => {
+                discovery::unchanged_file_metadata(previous, &metadata, previous.parser_version)
+                    && previous.identity.sqlite_wal.as_ref().is_none_or(|wal| {
+                        *wal == crate::state::SqliteWalIdentity::read(Path::new(&source))
+                    })
+            }
+            _ => false,
+        };
+        if !unchanged {
+            targets.insert(PathBuf::from(source));
+        }
+    }
+    Ok(Some(targets))
 }
 
 pub fn ingest_all(
@@ -250,7 +392,15 @@ pub fn ingest_all(
     options: &IngestOptions,
     lease: &IngestLease,
 ) -> Result<IngestReport> {
-    ingest_selected(paths, index, options, lease, None, None, None).map(|result| result.report)
+    ingest_selected(
+        paths,
+        index,
+        options,
+        lease,
+        discovery::Narrowing::None,
+        None,
+    )
+    .map(|result| result.report)
 }
 
 pub(crate) fn ingest_dirty(
@@ -260,7 +410,17 @@ pub(crate) fn ingest_dirty(
     lease: &IngestLease,
     dirty: &HashSet<PathBuf>,
 ) -> Result<DirtyIngestReport> {
-    ingest_selected(paths, index, options, lease, Some(dirty), None, None)
+    ingest_selected(
+        paths,
+        index,
+        options,
+        lease,
+        discovery::Narrowing::Dirty {
+            paths: dirty,
+            walk: true,
+        },
+        None,
+    )
 }
 
 fn ingest_selected(
@@ -268,31 +428,92 @@ fn ingest_selected(
     index: &SearchIndex,
     options: &IngestOptions,
     lease: &IngestLease,
-    dirty: Option<&HashSet<PathBuf>>,
+    narrowing: discovery::Narrowing<'_>,
     checkpoint_header: Option<CheckpointHeader>,
-    journal: Option<journal::ReplayHandle>,
 ) -> Result<DirtyIngestReport> {
     crate::profiling::span!("ingest.all");
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
-    let narrowing = match (dirty, journal) {
-        (Some(dirty), _) => discovery::Narrowing::Dirty(dirty),
-        (None, Some(journal)) => discovery::Narrowing::Journal(journal),
-        (None, None) => discovery::Narrowing::None,
-    };
+    let dirty = matches!(narrowing, discovery::Narrowing::Dirty { .. });
     let pool = parser_thread_pool()?;
-    let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
-    if dirty.is_none() {
-        refresh_memories(paths, options, &repositories)?;
+    let mut failure_log = failures::FailureLog::load(&paths.state)?;
+    let mut failed_files: Vec<failures::FileFailure> = Vec::new();
+    let mut narrowing = narrowing;
+    let mut checkpoint_header = checkpoint_header;
+    let mut memories_refreshed = false;
+    for attempt in 1.. {
+        let recovered =
+            publication::recover_checkpoint(paths, index, lease, checkpoint_header.take())?;
+        if !dirty && !memories_refreshed {
+            refresh_memories(paths, options, &repositories)?;
+            memories_refreshed = true;
+        }
+        let prepared =
+            discovery::prepare_refresh(paths, index, options, &pool, recovered, narrowing, None)?;
+        let full_scan = prepared.full_scan;
+        if full_scan && dirty && !memories_refreshed {
+            refresh_memories(paths, options, &repositories)?;
+            memories_refreshed = true;
+        }
+        let selection = prepared.selection.clone();
+        let deferred = prepared.deferred_paths.clone();
+        let settled = prepared
+            .tasks
+            .iter()
+            .map(|task| task.path.to_string_lossy().into_owned())
+            .chain(prepared.delete_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        let error = match execution::execute_refresh(
+            prepared,
+            paths,
+            index,
+            options,
+            repositories.clone(),
+            &pool,
+        ) {
+            Ok(mut report) => {
+                failure_log.settle(
+                    settled.iter().map(String::as_str),
+                    full_scan.then_some(deferred.as_slice()),
+                );
+                failure_log.save(&paths.state)?;
+                // Files this refresh just failed on are reported as failures, not deferrals.
+                report.files_deferred = deferred
+                    .iter()
+                    .filter(|path| !failed_files.iter().any(|failed| failed.path == **path))
+                    .count();
+                report.failed_files = failed_files;
+                return Ok(DirtyIngestReport { report, full_scan });
+            }
+            Err(error) => error,
+        };
+        let isolated = match error.downcast::<failures::ParseFailures>() {
+            // Each attempt defers the files the previous one failed on, so retries converge
+            // unless files keep changing under the refresh.
+            Ok(isolated) if attempt < MAX_ISOLATION_ATTEMPTS => isolated,
+            Ok(isolated) => return Err(isolated.into()),
+            Err(error) => return Err(error),
+        };
+        // Nothing was published. Record the failures so discovery defers those files, then
+        // rerun the same selection without them.
+        let now = failures::now_secs();
+        for failure in isolated.0 {
+            let recorded = failure_log.record(failure, now);
+            eprintln!(
+                "warning: skipped {} transcript {}; its indexed records are kept and it is retried once it changes or after its backoff: {}",
+                recorded.source.label(),
+                recorded.path,
+                recorded.error
+            );
+            failed_files.push(recorded);
+        }
+        failure_log.save(&paths.state)?;
+        narrowing = discovery::Narrowing::Resolved(selection);
     }
-    let prepared =
-        discovery::prepare_refresh(paths, index, options, &pool, recovered, narrowing, None)?;
-    let full_scan = prepared.full_scan;
-    if full_scan && dirty.is_some() {
-        refresh_memories(paths, options, &repositories)?;
-    }
-    let report = execution::execute_refresh(prepared, paths, index, options, repositories, &pool)?;
-    Ok(DirtyIngestReport { report, full_scan })
+    unreachable!("the isolation loop returns")
 }
+
+/// Refresh attempts per ingest that may isolate failing files before the failure is returned.
+const MAX_ISOLATION_ATTEMPTS: usize = 4;
 
 #[cfg(test)]
 mod tests;

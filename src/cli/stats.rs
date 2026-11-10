@@ -1,6 +1,7 @@
 use super::surface::{IndexSource, OutputFormat, OutputOptions};
 use crate::config::{Paths, UserConfig};
 use crate::index::SearchIndex;
+use crate::ingest::failures::{DaemonIngestStatus, FailureLog, FileFailure};
 use crate::memory::{MemoryFreshness, MemoryStore};
 use crate::state::ScanCache;
 use crate::vector::VectorIndex;
@@ -30,6 +31,12 @@ struct StatsReport {
     execution_provider: String,
     compute_units: Option<String>,
     sources: Vec<String>,
+    /// Files skipped after parse failures; their indexed records are kept.
+    ingest_failures: Vec<FileFailure>,
+    /// Present while the daemon's refreshes keep failing as a whole.
+    daemon_ingest: Option<DaemonIngestStatus>,
+    #[serde(skip)]
+    ingest_status: Vec<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -117,6 +124,9 @@ fn build_report(paths: &Paths) -> Result<StatsReport> {
                     .to_string()
             })
             .collect(),
+        ingest_failures: FailureLog::load(&paths.state)?.files().cloned().collect(),
+        daemon_ingest: DaemonIngestStatus::load(&paths.state)?,
+        ingest_status: crate::ingest::failures::status_lines(&paths.state)?,
     })
 }
 
@@ -150,6 +160,9 @@ fn print_report(report: &StatsReport, out: &mut impl Write) -> Result<()> {
     writeln!(out, "  last-scan: {last_scan} ({freshness})")?;
     writeln!(out, "  scanned-files: {}", report.scan_cache.file_count)?;
     writeln!(out, "  scanned-bytes: {}", report.scan_cache.total_bytes)?;
+    for line in &report.ingest_status {
+        writeln!(out, "  {line}")?;
+    }
     writeln!(out, "\nembeddings:")?;
     writeln!(out, "  enabled: {}", enabled_label(report.embeddings))?;
     writeln!(out, "  mode: {}", report.embeddings_mode)?;

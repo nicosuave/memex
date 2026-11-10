@@ -10,7 +10,7 @@ Token tracking is disabled by default because it scans and caches local agent lo
 token_usage = true
 ```
 
-Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, Hermes, Jcode, Muse, and IBM Bob records:
+Then reconstruct historical token usage from local Claude Code, Codex, Cursor, OpenCode, Pi, Oh My Pi, OpenClaw, Copilot, Grok, Hermes, Jcode, Muse, IBM Bob, KiloCode, Kimi Code, and goose records:
 
 ```
 memex usage
@@ -25,7 +25,11 @@ local databases, separately from its searchable agent transcripts. Copilot usage
 is read from local OpenTelemetry JSONL exports under `~/.copilot/otel` (or
 `COPILOT_HOME/otel`) and `COPILOT_OTEL_FILE_EXPORTER_PATH`; its session transcripts
 alone are insufficient. Antigravity history is searchable, but its token buckets
-are not yet validated and Memex does not report usage for it.
+are not yet validated and Memex does not report usage for it. goose reports one
+ledger row per model request; it stores prompt tokens inclusive of the cache
+subsets, and Memex splits them so cached tokens are not billed twice. Rows goose
+carries forward without a model name (schema upgrades, edited conversations)
+count toward the totals and stay unpriced.
 
 `--cost auto` prefers a provider-stored request cost and otherwise applies the versioned built-in API price catalog. `--cost source` uses only stored costs; `--cost reprice` always applies the catalog. Calculated costs are API-equivalent estimates, not subscription charges. Events with unknown models or prices remain in token totals and are reported as unpriced.
 

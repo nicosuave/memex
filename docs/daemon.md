@@ -42,6 +42,12 @@ memex daemon disable
 The daemon reads config defaults for its mode, interval, listeners, and log paths.
 Flags override those defaults.
 
+A refresh that fails as a whole is retried with exponential backoff from 2 seconds up to
+1 minute; changes that arrive meanwhile wait for the retry. While refreshes keep failing,
+`memex daemon status` and `memex stats` report the streak, its last error, and the next
+retry. A single transcript that cannot be parsed does not fail the refresh; see
+[per-file failures](refresh.md#per-file-failures).
+
 If an index has an incompatible schema or term dictionary format, continuous indexing
 logs the recovery error once and stays paused without retrying or exiting into a service
 manager restart loop. The daemon remains running but is not ready. Repair or explicitly
@@ -69,6 +75,13 @@ daemon does not notice when `embedding_dimensions` is removed for a remote model
 provider changes its vector size; run `memex embed` once to rebuild. Changing remote
 embedding settings, such as the base URL, API key, timeout, or retries, restarts the embed
 worker. A failing embed worker is restarted with exponential backoff of up to 5 minutes.
+
+### Scheduled dreams
+
+With `[dream] enabled = true` and `auto = true`, the daemon starts `memex dream run` in a
+child process once enough new sessions have accumulated and none has been active for a
+while. Both are off by default; see [dreaming](dreaming.md#scheduling). `memex dream status` shows whether the gate
+is open.
 
 ### Reclaiming obsolete index generations
 

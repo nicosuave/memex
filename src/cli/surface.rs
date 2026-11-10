@@ -89,6 +89,76 @@ pub(super) enum SessionCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Assign a session to a project, overriding its derived repository grouping
+    #[command(
+        after_help = "Continuation and sub-agent sessions inherit their parent's project unless\nthey have their own. Derived repository facts are kept; `clear-project` restores them."
+    )]
+    SetProject {
+        session_id: String,
+        project: String,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// Remove a session's project assignment, restoring its derived grouping
+    ClearProject {
+        session_id: String,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// Add, remove, or list user tags
+    Tag {
+        #[command(subcommand)]
+        action: TagCommand,
+    },
+    /// Show a session's assigned and derived project and its tags
+    Inspect {
+        session_id: String,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+}
+
+#[derive(Subcommand)]
+pub(super) enum TagCommand {
+    /// Add tags to a session
+    Add {
+        session_id: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// Remove tags from a session
+    #[command(alias = "remove")]
+    Rm {
+        session_id: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// List tags with their session counts
+    #[command(alias = "list")]
+    Ls {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub(super) struct AssignmentTarget {
+    /// Provider, when several share the session ID
+    #[arg(long)]
+    pub(super) source: Option<crate::types::SourceFilter>,
+    /// Machine that indexes the session
+    #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
+    pub(super) machine: String,
+    #[arg(long)]
+    pub(super) root: Option<PathBuf>,
+    #[command(flatten)]
+    pub(super) output: OutputArgs,
 }
 
 #[derive(Subcommand)]
@@ -235,6 +305,8 @@ pub(super) enum IndexSource {
     Zcode,
     Kiro,
     Kilocode,
+    Kimi,
+    Goose,
 }
 
 impl IndexArgs {
@@ -257,6 +329,8 @@ impl IndexArgs {
             IndexSource::Zcode => self.zcode && !self.no_zcode,
             IndexSource::Kiro => self.kiro && !self.no_kiro,
             IndexSource::Kilocode => self.kilocode && !self.no_kilocode,
+            IndexSource::Kimi => self.kimi && !self.no_kimi,
+            IndexSource::Goose => self.goose && !self.no_goose,
         };
         legacy_enabled
             && (self.only_source.is_empty() || self.only_source.contains(&source))
@@ -459,6 +533,8 @@ mod tests {
             "--no-pi",
             "--claude-path",
             "/tmp/custom projects",
+            "--claude-path",
+            "/tmp/another profile/projects",
         ]);
         let args = super::super::build_index_command_args(
             &selected,
@@ -473,8 +549,11 @@ mod tests {
         command.extend(args.iter().map(String::as_str));
         let reparsed = index_args(&command);
         assert_eq!(
-            reparsed.source.as_deref(),
-            Some(std::path::Path::new("/tmp/custom projects"))
+            reparsed.source,
+            vec![
+                std::path::PathBuf::from("/tmp/custom projects"),
+                std::path::PathBuf::from("/tmp/another profile/projects"),
+            ]
         );
         for &source in IndexSource::value_variants() {
             assert_eq!(
@@ -508,10 +587,12 @@ mod tests {
             "--no-zcode",
             "--no-kiro",
             "--no-kilocode",
+            "--no-kimi",
+            "--no-goose",
         ]);
         assert_eq!(
-            selected.source.as_deref(),
-            Some(std::path::Path::new("/tmp/custom"))
+            selected.source,
+            vec![std::path::PathBuf::from("/tmp/custom")]
         );
         for &source in IndexSource::value_variants() {
             assert_eq!(

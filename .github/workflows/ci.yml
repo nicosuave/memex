@@ -77,6 +77,12 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    env:
+      # Default and profiling tests keep separate binaries on the same runner.
+      # Omit debug symbols and incremental state to keep both within its disk budget.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -87,7 +93,7 @@ jobs:
         uses: jdx/mr-boxington-action@a20e1ffcd962370fb2b6045c13b7b349f7b03386
         with:
           version: 1.11.0
-          cache-generation: build-v1
+          cache-generation: build-v2
 
       - name: Build
         run: mbx build --verbose
@@ -96,10 +102,64 @@ jobs:
         run: mbx test --verbose -- --test-threads=1
 
       - name: Test profiling feature
-        run: cargo test --features profiling --verbose -- --test-threads=1
+        run: mbx test --features profiling --verbose -- --test-threads=1
 
       - name: Smoke test Criterion benchmarks
-        run: cargo bench --bench index --profile dev -- --test
+        run: mbx bench --bench index --profile dev -- --test
+
+  # homebrew/core autobumps memex from release tags. Build this checkout with the
+  # live core formula so a change that breaks its recipe (system ONNX Runtime and
+  # SQLite, no network during the build) fails here instead of in the bump PR.
+  homebrew-core:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ENV_HINTS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Homebrew
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+            echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+          fi
+          # Runner images lag Homebrew; core formulae use the current DSL.
+          brew update
+          brew --version
+
+      - name: Stage the core formula against this checkout
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          source_archive="$RUNNER_TEMP/memex-$version.tar.gz"
+          git archive --format=tar.gz --prefix="memex-$version/" -o "$source_archive" HEAD
+          sha=$(shasum -a 256 "$source_archive" | cut -d' ' -f1)
+
+          brew tap-new --no-git local/memex
+          formula="$(brew --repo local/memex)/Formula/memex.rb"
+          curl -fsSL https://raw.githubusercontent.com/Homebrew/homebrew-core/HEAD/Formula/m/memex.rb -o "$formula"
+          # Swap the release tarball for this checkout and drop the bottles so
+          # everything else in the recipe runs exactly as core defines it.
+          SOURCE_ARCHIVE="$source_archive" VERSION="$version" SHA="$sha" perl -0pi -e '
+            s{^  url "[^"]*"$}{  url "file://$ENV{SOURCE_ARCHIVE}"\n  version "$ENV{VERSION}"}m or die "url not found\n";
+            s{^  sha256 "[^"]*"$}{  sha256 "$ENV{SHA}"}m or die "sha256 not found\n";
+            s{^  bottle do\n.*?^  end\n\n}{}ms or die "bottle block not found\n";
+          ' "$formula"
+          brew trust --formula local/memex/memex
+          cat "$formula"
+
+      - name: Build from source
+        run: brew install --build-from-source --verbose local/memex/memex
+
+      - name: Run the formula test
+        run: brew test --verbose local/memex/memex
 
   clippy:
     runs-on: ubuntu-latest

@@ -62,12 +62,16 @@ type SearchResult = {
   record_id?: string
   source_path?: string
   project: string
+  tags?: string[]
   source: string
   role: string
   ts: number
   score?: number | null
   snippet: string
   snippet_matches?: Array<{ start: number; end: number }>
+  // Set when the hit came from a child session (such as a subagent) and the
+  // row shows the session it worked for; record_id then names a child record.
+  matched_in?: { session_id: string; source_path: string; kind: string }
 }
 
 type SearchPayload = {
@@ -107,6 +111,29 @@ function SortControl({ value, hasQuery, onChange }: {
 
 const timeRanges: TimeRange[] = ["24h", "7d", "30d", "all"]
 const defaultTimeRange: TimeRange = "30d"
+
+// Mirrors SourceFilter::as_str in src/types.rs; keep in step with new sources.
+const sourceOptions = [
+  { value: "claude", label: "Claude" },
+  { value: "codex", label: "Codex" },
+  { value: "opencode", label: "OpenCode" },
+  { value: "cursor", label: "Cursor" },
+  { value: "pi", label: "Pi" },
+  { value: "openclaw", label: "OpenClaw" },
+  { value: "copilot", label: "Copilot" },
+  { value: "omp", label: "Oh My Pi" },
+  { value: "grok", label: "Grok" },
+  { value: "hermes", label: "Hermes" },
+  { value: "jcode", label: "Jcode" },
+  { value: "muse", label: "Muse" },
+  { value: "antigravity", label: "Antigravity" },
+  { value: "bob", label: "IBM Bob" },
+  { value: "zcode", label: "ZCode" },
+  { value: "kiro", label: "Kiro" },
+  { value: "kilocode", label: "KiloCode" },
+  { value: "kimi", label: "Kimi Code" },
+  { value: "goose", label: "goose" },
+]
 
 function ResultSnippet({ result }: { result: SearchResult }) {
   if (!result.snippet) return <>No text preview</>
@@ -566,10 +593,20 @@ function ResultContinuation({
   )
 }
 
+function formatMatchedIn(matchedIn?: SearchResult["matched_in"]) {
+  return matchedIn ? ` · via ${matchedIn.kind} ${matchedIn.session_id.slice(0, 12)}` : ""
+}
+
+function formatTags(tags?: string[]) {
+  return tags?.length ? ` · ${tags.map((tag) => `#${tag}`).join(" ")}` : ""
+}
+
 function App() {
   const [query, setQuery] = useState(paramsAtLoad.get("q") || "")
   const [source, setSource] = useState(paramsAtLoad.get("source") || "all")
   const [project, setProject] = useState(paramsAtLoad.get("project") || "")
+  const [tag, setTag] = useState(paramsAtLoad.get("tag") || "")
+  const [knownTags, setKnownTags] = useState<string[]>([])
   const [origin, setOrigin] = useState(
     paramsAtLoad.get("origin") || "interactive",
   )
@@ -619,7 +656,7 @@ function App() {
   const resultOffset = useRef(0)
   const resultIntent = useRef("")
   const loadingMore = useRef(false)
-  const intent = JSON.stringify([query, source, project, origin, timeRange, sort])
+  const intent = JSON.stringify([query, source, project, tag, origin, timeRange, sort])
   const currentIntent = useRef(intent)
   currentIntent.current = intent
 
@@ -642,6 +679,7 @@ function App() {
       if (query.trim()) next.set("q", query.trim())
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
+      if (tag.trim()) next.set("tag", tag.trim())
       if (origin !== "interactive") next.set("origin", origin)
       if (nextTimeRange !== defaultTimeRange) next.set("range", nextTimeRange)
       if (nextSort) next.set("sort", nextSort)
@@ -656,7 +694,7 @@ function App() {
       const url = next.size ? `?${next}` : location.pathname
       return url
     },
-    [mode, origin, project, query, source, timeRange, selectedSort],
+    [mode, origin, project, query, source, tag, timeRange, selectedSort],
   )
 
   const updateLocation = useCallback(
@@ -667,12 +705,15 @@ function App() {
     },
     [locationForTarget],
   )
+  // A rolled-up hit's record lives in the child, not the session the row opens.
+  const resultRecordId = (result: SearchResult) =>
+    query.trim() && !result.matched_in ? result.record_id : undefined
   const resultHref = (result: SearchResult) =>
     locationForTarget({
       id: result.session_id,
       sourcePath: result.source_path,
       sessionSource: result.source,
-      recordId: query.trim() ? result.record_id : undefined,
+      recordId: resultRecordId(result),
     })
 
   const changeTimeRange = useCallback(
@@ -698,6 +739,7 @@ function App() {
       setQuery(params.get("q") || "")
       setSource(params.get("source") || "all")
       setProject(params.get("project") || "")
+      setTag(params.get("tag") || "")
       setOrigin(params.get("origin") || "interactive")
       setTimeRange(parseTimeRange(params.get("range")))
       setSelectedSort(parseSearchSort(params.get("sort")))
@@ -727,13 +769,25 @@ function App() {
       if (query.trim()) searchParams.set("q", query.trim())
       if (source !== "all") searchParams.set("source", source)
       if (project.trim()) searchParams.set("project", project.trim())
+      if (tag.trim()) searchParams.set("tag", tag.trim())
       if (origin !== "interactive") searchParams.set("origin", origin)
       searchParams.set("range", timeRange)
       searchParams.set("sort", sort)
       return searchParams
     },
-    [origin, project, query, source, timeRange, sort],
+    [origin, project, query, source, tag, timeRange, sort],
   )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    api<{ tags: Array<{ tag: string; session_count: number }> }>(
+      "/api/tags",
+      controller.signal,
+    )
+      .then((data) => setKnownTags(data.tags.map((entry) => entry.tag)))
+      .catch(() => {})
+    return () => controller.abort()
+  }, [searchRevision])
 
   const searchStatus = useCallback(
     (count: number) =>
@@ -865,7 +919,7 @@ function App() {
 
   useEffect(() => {
     setHomeSelectedIndex(0)
-  }, [origin, project, query, source, timeRange, sort])
+  }, [origin, project, query, source, tag, timeRange, sort])
 
   useEffect(() => {
     const discovered = results
@@ -889,7 +943,7 @@ function App() {
         id: result.session_id,
         sourcePath: result.source_path,
         sessionSource: result.source,
-        recordId: query.trim() ? result.record_id : undefined,
+        recordId: resultRecordId(result),
       }
       updateLocation(next, true)
       setTarget(next)
@@ -1005,6 +1059,7 @@ function App() {
   const filterCount =
     Number(source !== "all") +
     Number(Boolean(project.trim())) +
+    Number(Boolean(tag.trim())) +
     Number(origin !== "interactive")
   const homeSurface = (
     <main className="home-surface">
@@ -1067,15 +1122,11 @@ function App() {
               <SelectContent>
                 <SelectGroup>
                   <SelectItem value="all">all sources</SelectItem>
-                  <SelectItem value="claude">Claude</SelectItem>
-                  <SelectItem value="codex">Codex</SelectItem>
-                  <SelectItem value="opencode">OpenCode</SelectItem>
-                  <SelectItem value="cursor">Cursor</SelectItem>
-                  <SelectItem value="pi">Pi</SelectItem>
-                  <SelectItem value="openclaw">OpenClaw</SelectItem>
-                  <SelectItem value="copilot">Copilot</SelectItem>
-                  <SelectItem value="kiro">Kiro</SelectItem>
-                  <SelectItem value="kilocode">KiloCode</SelectItem>
+                  {sourceOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1122,6 +1173,33 @@ function App() {
                 </SelectGroup>
               </SelectContent>
             </Select>
+            {(knownTags.length > 0 || tag) && (
+              <Select
+                onValueChange={(value) => setTag(value === "all" ? "" : value)}
+                value={tag || "all"}
+              >
+                <SelectTrigger
+                  aria-label="Tag"
+                  className="home-filter-select home-project-select"
+                  size="sm"
+                  variant="ghost"
+                >
+                  <SelectValue placeholder="All tags" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="all">All tags</SelectItem>
+                    {Array.from(new Set([...knownTags, ...(tag ? [tag] : [])])).map(
+                      (option) => (
+                        <SelectItem key={option} value={option}>
+                          #{option}
+                        </SelectItem>
+                      ),
+                    )}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            )}
           </div>
         </div>
 
@@ -1181,6 +1259,8 @@ function App() {
                 </span>
                 <span className="home-result-meta">
                   {result.source} · {result.role}
+                  {formatMatchedIn(result.matched_in)}
+                  {formatTags(result.tags)}
                 </span>
                 <time>{formatDate(result.ts)}</time>
                 <span
@@ -1297,6 +1377,8 @@ function App() {
                           </div>
                           <div className="session-meta">
                             {result.source} · {result.role}
+                            {formatMatchedIn(result.matched_in)}
+                            {formatTags(result.tags)}
                             {result.score == null
                               ? ""
                               : ` · ${result.score.toFixed(2)}`}
@@ -1400,15 +1482,11 @@ function App() {
                       <SelectContent>
                         <SelectGroup>
                           <SelectItem value="all">All sources</SelectItem>
-                          <SelectItem value="claude">Claude</SelectItem>
-                          <SelectItem value="codex">Codex</SelectItem>
-                          <SelectItem value="opencode">OpenCode</SelectItem>
-                          <SelectItem value="cursor">Cursor</SelectItem>
-                          <SelectItem value="pi">Pi</SelectItem>
-                          <SelectItem value="openclaw">OpenClaw</SelectItem>
-                          <SelectItem value="copilot">Copilot</SelectItem>
-                          <SelectItem value="kiro">Kiro</SelectItem>
-                          <SelectItem value="kilocode">KiloCode</SelectItem>
+                          {sourceOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
                         </SelectGroup>
                       </SelectContent>
                     </Select>
@@ -1443,6 +1521,22 @@ function App() {
                       placeholder="Any project"
                       value={project}
                     />
+                  </div>
+                  <div className="filter-field">
+                    <label htmlFor="tag-filter">Tag</label>
+                    <Input
+                      className="shadow-none"
+                      id="tag-filter"
+                      list="tag-filter-options"
+                      onChange={(event) => setTag(event.target.value)}
+                      placeholder="Any tag"
+                      value={tag}
+                    />
+                    <datalist id="tag-filter-options">
+                      {knownTags.map((option) => (
+                        <option key={option} value={option} />
+                      ))}
+                    </datalist>
                   </div>
                 </PopoverContent>
               </Popover>

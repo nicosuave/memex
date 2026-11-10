@@ -35,7 +35,7 @@ printf '%s\n' \
   "Fix it with one of:" \
   "  herdr plugin install nicosuave/memex   # downloads a release build into the plugin" \
   "  cargo build --release                  # from a linked checkout of nicosuave/memex" \
-  "  brew install nicosuave/tap/memex       # puts memex on PATH"
+  "  brew install memex                     # puts memex on PATH"
 
 # `read -t` is the builtin fallback for a PATH so broken that even sleep is missing.
 command -v sleep >/dev/null 2>&1 && exec sleep 5

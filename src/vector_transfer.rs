@@ -181,11 +181,22 @@ fn cache_for_import(cache: &Path, model: &str, dimensions: usize) -> Result<Conn
     Ok(db)
 }
 
+/// Which matched vectors a pass writes and checks bitwise against the cache.
+enum Pass<'a> {
+    /// Fill records that lack a vector. A record that already has one keeps it unchecked:
+    /// identical inputs embedded in different batches can differ in the last bits.
+    TopUp(&'a mut HashSet<u64>),
+    /// Check the records a top-up filled.
+    Imported(&'a HashSet<u64>),
+    /// Check every matched record, for a root whose vectors all came from the cache.
+    All,
+}
+
 fn transfer(
     index: &SearchIndex,
     db: &Connection,
     vectors: &mut VectorIndex,
-    import: bool,
+    mut pass: Pass<'_>,
 ) -> Result<Report> {
     let mut report = Report::default();
     let mut hashes: HashSet<Vec<u8>> = db
@@ -208,8 +219,14 @@ fn transfer(
         };
         let embedding = decode(&bytes, vectors.dimensions())?;
         hashes.remove(&hash);
-        if import && !existing {
-            vectors.add(record.doc_id, &embedding)?;
+        match &mut pass {
+            Pass::TopUp(imported) if !existing => {
+                vectors.add(record.doc_id, &embedding)?;
+                imported.insert(record.doc_id);
+            }
+            Pass::TopUp(_) => return Ok(()),
+            Pass::Imported(imported) if !imported.contains(&record.doc_id) => return Ok(()),
+            Pass::Imported(_) | Pass::All => {}
         }
         let actual = vectors
             .embedding(record.doc_id)?
@@ -226,8 +243,9 @@ fn transfer(
     Ok(report)
 }
 
-/// Import into a separately staged root. Existing compatible vectors are preserved and checked;
-/// no generation is published until every matched vector passes exact bitwise verification.
+/// Fill the records of a separately staged root that lack a vector. The root's own vectors are
+/// preserved, so a root updated in place keeps them; every imported vector passes exact
+/// bitwise verification before the generation is published and again after reload.
 pub fn import(root: &Path, cache: &Path, model: &str, dimensions: usize) -> Result<Report> {
     let db = cache_for_import(cache, model, dimensions)?;
     let (_, _, source, _, _) = metadata(&db)?;
@@ -246,14 +264,16 @@ pub fn import(root: &Path, cache: &Path, model: &str, dimensions: usize) -> Resu
     } else {
         VectorIndex::open_or_create(&root.join("vectors"), dimensions, Some(model))?
     };
-    let report = transfer(&index, &db, &mut vectors, true)?;
+    let mut imported = HashSet::new();
+    let report = transfer(&index, &db, &mut vectors, Pass::TopUp(&mut imported))?;
     vectors.save()?;
     let mut reopened = VectorIndex::open(&root.join("vectors"))?;
-    transfer(&index, &db, &mut reopened, false)?;
+    transfer(&index, &db, &mut reopened, Pass::Imported(&imported))?;
     Ok(report)
 }
 
-/// Verify every content-matched vector, including exact f32 bits after disk reload.
+/// Verify every content-matched vector, including exact f32 bits after disk reload. Only a root
+/// whose vectors all came from the cache passes; see `Pass::TopUp`.
 pub fn verify(root: &Path, cache: &Path, model: &str, dimensions: usize) -> Result<Report> {
     let db = cache_for_import(cache, model, dimensions)?;
     let mut vectors = VectorIndex::open(&root.join("vectors"))?;
@@ -261,7 +281,7 @@ pub fn verify(root: &Path, cache: &Path, model: &str, dimensions: usize) -> Resu
         vectors.model() == Some(model) && vectors.dimensions() == dimensions,
         "destination vector model or dimensions mismatch"
     );
-    transfer(&open_index(root)?, &db, &mut vectors, false)
+    transfer(&open_index(root)?, &db, &mut vectors, Pass::All)
 }
 
 #[cfg(test)]
@@ -368,6 +388,39 @@ mod tests {
         db.execute("UPDATE vectors SET embedding=zeroblob(4)", [])?;
         assert!(import(new.path(), &cache, "test", 3).is_err());
         assert_eq!(fs::read(new.path().join("vectors/current.json"))?, pointer);
+        Ok(())
+    }
+
+    #[test]
+    fn import_into_a_root_updated_in_place_fills_only_missing_vectors() -> Result<()> {
+        let old = tempfile::tempdir()?;
+        let new = tempfile::tempdir()?;
+        let cache_dir = tempfile::tempdir()?;
+        let cache = cache_dir.path().join("vectors.sqlite3");
+        indexed(old.path(), &[(1, "same"), (2, "moved")])?;
+        let mut original =
+            VectorIndex::open_or_create(&old.path().join("vectors"), 3, Some("test"))?;
+        original.add(1, &[0.25, -0.5, 0.75])?;
+        original.add(2, &[0.5, 0.125, -0.25])?;
+        original.save()?;
+        export(old.path(), &cache)?;
+        // The staged root keeps record 1 with its own vector, which differs in the last bits
+        // from the cached one for the same input, and re-read record 2 as record 3.
+        indexed(new.path(), &[(1, "same"), (3, "moved")])?;
+        let own = [0.250_000_03, -0.5, 0.75];
+        let mut staged = VectorIndex::open_or_create(&new.path().join("vectors"), 3, Some("test"))?;
+        staged.add(1, &own)?;
+        staged.save()?;
+
+        let imported = import(new.path(), &cache, "test", 3)?;
+
+        assert_eq!(
+            (imported.matched, imported.existing, imported.missing),
+            (1, 1, 0)
+        );
+        let vectors = VectorIndex::open(&new.path().join("vectors"))?;
+        assert_eq!(vectors.embedding(1)?, Some(own.to_vec()));
+        assert_eq!(vectors.embedding(3)?, original.embedding(2)?);
         Ok(())
     }
 }

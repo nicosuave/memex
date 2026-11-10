@@ -41,8 +41,10 @@ private struct ReaderFixture {
           else [ "$budget" = 262144 ] || exit 3; limit=300
           fi
         fi
-        awk -v offset="$offset" -v limit="$limit" -v full="$full" -v page_info="$page_info" -v session="$session" 'BEGIN {
-          total=620; end=offset+limit; if(end>total)end=total;
+        total=620
+        [ -f "$(dirname "$0")/total" ] && total=$(cat "$(dirname "$0")/total")
+        awk -v offset="$offset" -v limit="$limit" -v full="$full" -v page_info="$page_info" -v session="$session" -v total="$total" 'BEGIN {
+          end=offset+limit; if(end>total)end=total;
           printf "[";
           for(i=offset;i<end;i++) {
             if(i>offset)printf ",";
@@ -50,7 +52,7 @@ private struct ReaderFixture {
           }
           if(!full || page_info) {
             if(end>offset)printf ",";
-            printf "{\"type\":\"page\",\"total\":620,\"next_offset\":%s}",(end<total ? end : "null");
+            printf "{\"type\":\"page\",\"total\":%d,\"next_offset\":%s}",total,(end<total ? end : "null");
           }
           printf "]";
         }'
@@ -83,6 +85,44 @@ private struct ReaderFixture {
     #expect(requests.count == 1)
     #expect(requests[0].contains("--page-info"))
     #expect(!requests[0].contains("--max-chars"))
+}
+
+@MainActor @Test func readerRevalidatesStaleWindowsAndPicksUpGrowth() async throws {
+    let fixture = try ReaderFixture()
+    defer { fixture.cleanUp() }
+    let store = Store(client: fixture.client)
+    let first = fixture.session("one"), second = fixture.session("two")
+    let requests = { (try? String(contentsOf: fixture.directory.appendingPathComponent("requests"), encoding: .utf8))?
+        .split(separator: "\n").count ?? 0 }
+    store.sessions = [first, second]
+    store.selectedID = first.id
+    await store.loadRecords()
+    await store.loadEarlierRecords()
+    let loaded = store.records
+    store.selectedID = second.id
+    await store.loadRecords()
+    store.selectedID = first.id
+    var before = requests()
+    await store.loadRecords()
+    #expect(requests() == before, "a fresh window is restored without refetching")
+    #expect(store.records == loaded)
+
+    store.readerCacheLifetime = 0
+    store.selectedID = second.id
+    await store.loadRecords()
+    store.selectedID = first.id
+    before = requests()
+    await store.loadRecords()
+    #expect(requests() > before, "a stale window is refetched")
+    #expect(store.records == loaded, "an unchanged session keeps the pages already loaded")
+    #expect(store.recordsOffset == 500)
+
+    try "625".write(to: fixture.directory.appendingPathComponent("total"), atomically: true, encoding: .utf8)
+    await store.revalidateRecords()
+    #expect(store.readerError == nil)
+    #expect(store.recordsOffset == 565)
+    #expect(store.records.last?.id == "one-r624")
+    #expect(!store.hasMoreRecords)
 }
 
 @Test(arguments: [0, 100, 1000]) func initialPageCorrectsStaleListCount(count: Int) async throws {

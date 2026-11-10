@@ -40,6 +40,12 @@ struct ContentLocation: Equatable {
     @MainActor @discardableResult func open(in context: RichContentContext) -> Bool {
         guard canOpen(in: context) else { return false }
         if url.isFileURL, let line { return SourceFilePreview.show(url: url, line: line) }
+        // Transcript links are untrusted: opening a bare file URL would launch an app or
+        // run a `.command` script an agent wrote, so local files are revealed instead.
+        if url.isFileURL {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            return true
+        }
         return NSWorkspace.shared.open(url)
     }
 }

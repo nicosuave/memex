@@ -60,16 +60,19 @@ pub(super) fn classify_file(
         return FileChange::Unchanged;
     }
     // A jcode session is one JSON object, an antigravity store is rewritten wholesale
-    // as the conversation grows, and Bob/ZCode virtual paths are database queries,
+    // as the conversation grows, a legacy OpenCode session is a directory whose size
+    // grows with each message file, and Bob/ZCode virtual paths are database queries,
     // so none can resume from a byte offset.
     if matches!(
         source,
-        SourceKind::Jcode
+        SourceKind::Opencode
+            | SourceKind::Jcode
             | SourceKind::Antigravity
             | SourceKind::Hermes
             | SourceKind::Bob
             | SourceKind::Zcode
             | SourceKind::Kilocode
+            | SourceKind::Goose
     ) {
         FileChange::Replaced
     } else {
