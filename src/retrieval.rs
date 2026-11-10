@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-const CANONICAL_RECORD_ID_VERSION: &str = "rid1";
+pub const CANONICAL_RECORD_ID_VERSION: &str = "rid1";
 
 /// Maximum number of records that may be requested on either side of a context anchor.
 ///

@@ -49,9 +49,15 @@ use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
 mod daemon_upgrade;
+mod dream;
 mod evaluation;
 mod stats;
 mod surface;
+use crate::dream::search::{DreamSearchHit, DreamSearchOptions, search_dreams};
+use dream::{
+    DreamCommand, DreamRunArgs, DreamSearchArgs, collect_dream_search, project_dream_hit,
+    run_dream_command,
+};
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, EvaluationArgs, IndexCommand, IndexSource,
     OutputArgs, OutputFormat, OutputOptions, SessionCommand, TagCommand, WebCommand,
@@ -63,7 +69,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  rex          Install the Rex module\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n  dream        Consolidate history into cited dreams\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  rex          Install the Rex module\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -375,6 +381,7 @@ EXAMPLES:
     memex search \"error handling\"
     memex search \"release checklist\" --content memories
     memex search \"authentication decision\" --content all
+    memex search \"package manager\" --content dreams
     memex search \"API design\" --source claude --limit 50
     memex search \"auth\" --since 2024-01-01T00:00:00Z --mode semantic
     memex search \"bug\" --fields score,session_id,snippet --format json
@@ -387,12 +394,13 @@ TIMESTAMP FORMAT:
 OUTPUT FIELDS (--fields):
     kind, machine, score, ts, doc_id, record_id, project, role, session_id, source, source_path, text, snippet, matches, rolled_up_to
     memory_id, content_version, section_ref, title, heading, cwd, mtime_ms, event_dates, start_line, end_line, document_kind, refs, freshness, changed_since_search
+    dream_id, dream_kind, status, evidence, generation, reinforced, supersedes, superseded_by, citation_count, citations (--content dreams)
     event_id, parent_event_id, logical_parent_event_id, parent_session_id, thread_source, conversation_kind
     parent_tool_use_id, source_tool_use_id, source_tool_assistant_uuid")]
     Search {
         /// Search query (keywords or natural language for semantic search)
         query: String,
-        /// Content corpus to search (conversation history by default)
+        /// Content corpus to search (conversation history by default); `all` adds memories and dreams from `memex dream`, `dreams` is dreams alone
         #[arg(long, value_enum, default_value_t = SearchContent::Conversations, help_heading = "Search")]
         content: SearchContent,
         /// Additional independent query view to fuse with reciprocal-rank fusion (repeatable)
@@ -661,6 +669,26 @@ The input contains at most 32 requests; each page is limited to 500 records."
         root: Option<PathBuf>,
         #[command(flatten)]
         output: OutputArgs,
+    },
+    /// Consolidate agent history into cited dreams
+    #[command(
+        args_conflicts_with_subcommands = true,
+        after_help = "\
+EXAMPLES:
+    memex dream --dry-run            # Judge new sessions, show proposed dreams, write nothing
+    memex dream                      # Publish a new generation of dreams
+    memex dream show                 # Read the current dreams with their citations
+    memex dream lint                 # Re-resolve citations; mark lost evidence
+    memex search \"package manager\" --content dreams
+
+Opt-in: set `[dream] enabled = true` in config.toml first. A dream run sends redacted excerpts of recent sessions and saved memories to the executor
+(the claude or codex CLI, or [dream] command). See docs/dreaming.md."
+    )]
+    Dream {
+        #[command(subcommand)]
+        action: Option<DreamCommand>,
+        #[command(flatten)]
+        run: DreamRunArgs,
     },
     /// Developer diagnostics and retrieval evaluation
     Debug {
@@ -1117,6 +1145,7 @@ pub(crate) enum SearchContent {
     Conversations,
     Memories,
     All,
+    Dreams,
 }
 
 impl From<McpSearchMode> for SearchMode {
@@ -1170,7 +1199,7 @@ fn default_recency_half_life_days() -> f32 {
 pub(crate) struct SearchRequest {
     /// Keywords or natural-language query.
     pub(crate) query: String,
-    /// Search conversations, memories, or both. Defaults to conversations.
+    /// Search conversations, memories, or all: conversations, memories, and the dreams `memex dream` consolidated from them (kind dream, each citing source records). dreams returns dreams alone. Defaults to conversations.
     #[serde(default)]
     pub(crate) content: SearchContent,
     /// Additional query views fused with reciprocal-rank fusion.
@@ -1857,6 +1886,7 @@ pub fn run() -> Result<()> {
         | Commands::EvalRetrieval { evaluation } => {
             evaluation::run(evaluation)?;
         }
+        Commands::Dream { action, run } => run_dream_command(action, run)?,
         Commands::Machines { root, output } => {
             let paths = Paths::new(root)?;
             let config = UserConfig::load(&paths)?;
@@ -2555,6 +2585,7 @@ fn run_poll_loop(
     let mut worker = EmbeddingWorker::default();
     let mut worker_spec = None;
     let mut vector_work = VectorWorkState::default();
+    let mut dreams = crate::dream::schedule::DreamScheduler::new(index.root.clone());
 
     let mcp_server = mcp
         .map(|options| crate::mcp::spawn_http(index.root.clone(), options))
@@ -2580,7 +2611,11 @@ fn run_poll_loop(
 
         let deadline = Instant::now() + Duration::from_secs(interval_secs);
         while Instant::now() < deadline && !shutdown.load(AtomicOrdering::Relaxed) {
-            upgrade.check(|| worker.stop());
+            dreams.service(&paths);
+            upgrade.check(|| {
+                dreams.stop();
+                worker.stop()
+            });
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(1));
@@ -2639,6 +2674,7 @@ fn run_event_loop(
     let mut worker = EmbeddingWorker::default();
     let mut worker_spec = None;
     let mut vector_work = VectorWorkState::default();
+    let mut dreams = crate::dream::schedule::DreamScheduler::new(index.root.clone());
 
     use crate::watch::{
         FireCause, HOT_SWEEP_INTERVAL, HOT_WINDOW, WatchConfig, WatchService, dirty_needs_ingest,
@@ -2688,7 +2724,11 @@ fn run_event_loop(
             &mut vector_work,
         )?;
 
-        upgrade.check(|| worker.stop());
+        dreams.service(&paths);
+        upgrade.check(|| {
+            dreams.stop();
+            worker.stop()
+        });
         match service.poll() {
             Some(FireCause::Resync) => {
                 if let Err(error) = refresh_watch_roots(&mut service, index) {
@@ -3242,6 +3282,33 @@ fn run_search(
     } else {
         SearchMode::Lexical
     };
+    if content == SearchContent::Dreams {
+        if trace {
+            return Err(anyhow!(
+                "retrieval traces currently record conversation searches only"
+            ));
+        }
+        let values = collect_dream_search(DreamSearchArgs {
+            query: joined_queries(query, additional_queries),
+            project,
+            source,
+            since,
+            until,
+            limit,
+            sort_by_timestamp: sort == SortBy::Ts,
+            mode,
+            conversation_filters: cwd.is_some()
+                || role.is_some()
+                || tool.is_some()
+                || session.is_some()
+                || !tags.is_empty()
+                || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All),
+            machines,
+            fields: if full { None } else { parse_fields(fields)? },
+            root,
+        })?;
+        return render_unified_search(values, format, pretty);
+    }
     if content != SearchContent::Conversations {
         return run_search_with_memories(MemorySurfaceSearchArgs {
             query,
@@ -3337,6 +3404,14 @@ fn run_search(
     render_located_results(collected.results, &collected.render)
 }
 
+/// Dream search has one query view; further views widen it instead of being fused by rank.
+fn joined_queries(query: String, additional: Vec<String>) -> String {
+    std::iter::once(query)
+        .chain(additional)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 struct MemorySurfaceSearchArgs {
     query: String,
     additional_queries: Vec<String>,
@@ -3370,6 +3445,7 @@ struct MemorySurfaceSearchArgs {
 enum UnifiedSearchResult {
     Conversation(Box<LocatedRecord>),
     Memory(Box<LocatedMemoryHit>),
+    Dream(Box<DreamSearchHit>),
 }
 
 impl UnifiedSearchResult {
@@ -3377,6 +3453,7 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => result.score,
             Self::Memory(result) => result.hit.score,
+            Self::Dream(result) => result.score,
         }
     }
 
@@ -3384,6 +3461,7 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => result.score = score,
             Self::Memory(result) => result.hit.score = score,
+            Self::Dream(result) => result.score = score,
         }
     }
 
@@ -3391,6 +3469,7 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => result.record.ts,
             Self::Memory(result) => result.hit.mtime_ms,
+            Self::Dream(result) => result.ts,
         }
     }
 
@@ -3398,9 +3477,14 @@ impl UnifiedSearchResult {
         match self {
             Self::Conversation(result) => (&result.machine, &result.record.session_id),
             Self::Memory(result) => (&result.machine, &result.hit.section_ref),
+            Self::Dream(result) => (&result.machine, &result.dream_id),
         }
     }
 }
+
+/// Dreams returned alongside conversations and memories. The dream store is small, so
+/// an uncapped keyword match over it would crowd source records out of a mixed page.
+const MIXED_DREAM_HITS: usize = 5;
 
 fn run_search_with_memories(args: MemorySurfaceSearchArgs) -> Result<()> {
     let format = args.format;
@@ -3469,6 +3553,37 @@ fn collect_search_with_memories(
     let mut failures = Vec::new();
     let include_conversations = content == SearchContent::All;
     let include_memories = !conversation_only_filters;
+    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
+    // Once dreaming is enabled, recall over everything includes what it concluded. Dreams live in
+    // this machine's store and are matched by keyword whatever the mode; `--cwd` scopes
+    // them by the repository it names.
+    let dream_options = if include_conversations
+        && include_memories
+        && config.dream.enabled()
+        && selected_machines
+            .iter()
+            .any(|machine| machine == crate::machine::LOCAL_MACHINE_ID)
+    {
+        Some(DreamSearchOptions {
+            query: joined_queries(query.clone(), additional_queries.clone()),
+            project: project.clone().or_else(|| {
+                let cwd = memory_cwd.as_ref()?.to_string_lossy();
+                crate::analytics::repository_project_for_cwd(&cwd).or_else(|| {
+                    Path::new(cwd.as_ref())
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                })
+            }),
+            source: source.and_then(|value| crate::types::SourceKind::from_label(value.as_str())),
+            since: parse_ts_millis(since.clone())?,
+            until: parse_ts_millis(until.clone())?,
+            limit: limit.min(MIXED_DREAM_HITS),
+            sort_by_timestamp: sort == SortBy::Ts,
+            include_inactive: false,
+        })
+    } else {
+        None
+    };
     let mut conversation_results = Vec::new();
     if include_conversations {
         let collected = collect_search(SearchCollectRequest {
@@ -3548,15 +3663,34 @@ fn collect_search_with_memories(
         }
     }
 
+    let mut dream_results = Vec::new();
+    if let Some(options) = &dream_options {
+        // A damaged dream store must not take conversation and memory recall down with it.
+        match search_dreams(&paths, options) {
+            Ok(hits) => dream_results = hits,
+            Err(error) => failures.push(format!(
+                "{}: dream search: {error:#}",
+                crate::machine::LOCAL_MACHINE_ID
+            )),
+        }
+    }
+
     let mut results = if content == SearchContent::Memories {
         memory_results
             .into_iter()
             .map(|result| UnifiedSearchResult::Memory(Box::new(result)))
             .collect::<Vec<_>>()
     } else {
-        // Scores from independent conversation and memory indexes are not comparable. Rank each
-        // corpus with reciprocal-rank fusion before merging them.
-        let mut merged = Vec::with_capacity(conversation_results.len() + memory_results.len());
+        // Scores from independent conversation, memory, and dream indexes are not comparable.
+        // Rank each corpus with reciprocal-rank fusion before merging them.
+        let mut merged = Vec::with_capacity(
+            conversation_results.len() + memory_results.len() + dream_results.len(),
+        );
+        for (rank, result) in dream_results.into_iter().enumerate() {
+            let mut result = UnifiedSearchResult::Dream(Box::new(result));
+            result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
+            merged.push(result);
+        }
         for (rank, result) in conversation_results.into_iter().enumerate() {
             let mut result = UnifiedSearchResult::Conversation(Box::new(result));
             result.set_score(1.0 / (60.0 + rank as f32 + 1.0));
@@ -3609,9 +3743,11 @@ fn collect_search_with_memories(
                 }
                 values.push(projected);
             }
+            UnifiedSearchResult::Dream(result) => {
+                values.push(project_dream_hit(*result, &fields)?);
+            }
         }
     }
-    let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
     Ok((values, failures, selected_machines))
 }
 
@@ -3663,6 +3799,7 @@ fn render_unified_search(values: Vec<Value>, format: SearchFormat, pretty: bool)
                     });
                 let identity = value
                     .get("memory_id")
+                    .or_else(|| value.get("dream_id"))
                     .or_else(|| value.get("record_id"))
                     .and_then(Value::as_str)
                     .unwrap_or("-");
@@ -4345,6 +4482,32 @@ fn project_located_results(
 pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Result<Value> {
     validate_mcp_search_request(&request)?;
     let source = parse_source_filter(request.source)?;
+    if request.content == SearchContent::Dreams {
+        let results = collect_dream_search(DreamSearchArgs {
+            query: joined_queries(request.query, request.additional_queries),
+            project: request.project,
+            source,
+            since: request.since,
+            until: request.until,
+            limit: request.limit,
+            sort_by_timestamp: request.sort == McpSearchSort::Ts,
+            mode: request.mode.into(),
+            conversation_filters: request.cwd.is_some()
+                || request.role.is_some()
+                || request.tool.is_some()
+                || request.session.is_some()
+                || !request.tags.is_empty()
+                || !matches!(request.origin, SessionOrigin::Regular | SessionOrigin::All),
+            machines: request.machines,
+            fields: None,
+            root,
+        })?;
+        return Ok(serde_json::json!({
+            "results": results,
+            "failures": [],
+            "selected_machines": [crate::machine::LOCAL_MACHINE_ID],
+        }));
+    }
     if request.content != SearchContent::Conversations {
         let (results, failures, selected_machines) =
             collect_search_with_memories(MemorySurfaceSearchArgs {
@@ -6607,7 +6770,7 @@ fn run_transfer(
     Ok(())
 }
 
-fn find_in_path(binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_path(binary: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(binary);
@@ -8238,7 +8401,7 @@ enum SortBy {
     Ts,
 }
 
-const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,rolled_up_to,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search";
+const DEFAULT_SEARCH_FIELDS: &str = "kind,machine,score,ts,doc_id,record_id,project,role,session_id,source,source_path,snippet,matches,rolled_up_to,memory_id,content_version,section_ref,title,heading,cwd,mtime_ms,event_dates,start_line,end_line,document_kind,refs,freshness,changed_since_search,dream_id,dream_kind,status,evidence,generation,reinforced,supersedes,superseded_by,citation_count,citations";
 
 fn search_fields(fields: Option<String>, full: bool) -> Result<Option<HashSet<String>>> {
     if full {

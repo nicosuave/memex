@@ -142,7 +142,8 @@ changed. Turning it off again re-derives the unredacted records the same way.
 
 `egress` is on by default and never reparses. It applies the same patterns (not the tool rules)
 to MCP responses served over HTTP, including results proxied from other machines and records
-indexed while index-time redaction is off, and to every remote embedding request. It is
+indexed while index-time redaction is off, and to every remote embedding request. It also
+covers what [`memex dream`](dreaming.md) sends to its executor and the excerpts it stores. It is
 independent of `enabled`, so the local index can stay exact while nothing unredacted leaves the
 machine; `patterns` apply to egress whether or not `enabled` is set. The stdio MCP server, the
 CLI, the TUI, and the loopback web UI read the index as it is.
@@ -222,6 +223,11 @@ listen = "127.0.0.1:5363"
 allowed_hosts = []
 allowed_origins = []
 # public_url = "https://memex.example.com"
+
+[dream]
+enabled = false  # opt in to dreaming; see dreaming.md for every key
+auto = false  # with enabled, let the daemon start dream runs
+# executor = "claude"  # "claude" or "codex"; unset picks whichever is on PATH
 ```
 
 Daemon logs and the plist live under `~/.memex` by default (macOS). On Linux, systemd units are created in `~/.config/systemd/user/`.

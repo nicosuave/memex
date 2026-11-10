@@ -104,6 +104,10 @@ tool. **Import into** creates a conversation in another tool using the
 - **Saved memories are separate from transcripts.** Only Claude project memories
   and Codex memory files are discovered. Search them with `--content memories`, or
   combine them with conversations using `--content all`.
+- **Dreaming is opt-in and model-driven.** `memex dream` sends redacted excerpts of recent
+  sessions and saved memories to the `claude` or `codex` CLI and stores what it concludes,
+  as cited dreams, under `~/.memex/dreams/`. Nothing runs and search returns no dreams
+  until you set `[dream] enabled = true`.
 
 See [source discovery and memory retrieval](docs/search.md) and
 [usage details](docs/usage.md) for formats, paths, and limitations.
@@ -186,6 +190,25 @@ For semantic or hybrid search, first generate local embeddings:
 memex index --embeddings
 memex search "how we handled retries" --mode hybrid --format text
 ```
+
+## Dream
+
+Consolidate recent history across agents into a small set of dreams: single statements,
+each citing the transcript records it rests on, such as corrections you keep giving,
+recurring mistakes, and saved memories that recent work contradicts. Opt in first with
+`[dream] enabled = true` in `config.toml`.
+
+```bash
+memex dream --dry-run
+memex dream
+memex dream show
+memex search "package manager" --content all
+```
+
+Dreams come back from `--content all` beside the conversations and memories they were drawn
+from, so an agent recalling prior decisions gets them without a separate query. Each run
+publishes a new generation with a diff, and Claude and Codex memory files are never
+written. See [dreaming](docs/dreaming.md).
 
 See [search and reading](docs/search.md) for filters, output formats, pagination,
 reasoning inclusion, and memory retrieval; see [embeddings and configuration](docs/configuration.md)
@@ -294,6 +317,7 @@ destination can reproduce the original session's behavior.
 | --- | --- |
 | [Installation and updates](docs/installation.md) | Package managers, source builds, Nix, skill updates, daemon upgrade migration |
 | [Indexing, search, and reading](docs/search.md) | Sources, memories, filters, formats, record budgets, pagination |
+| [Dreaming](docs/dreaming.md) | Cited dreams from history, executors, citations, lint, scheduling |
 | [Configuration and embeddings](docs/configuration.md) | Config file, models, execution providers, exclusions, resume templates |
 | [Projects and tags](docs/projects.md) | Project assignments, tags, inheritance, storage |
 | [Background indexing and Web UI](docs/daemon.md) | Services, browser authentication, index cleanup |
