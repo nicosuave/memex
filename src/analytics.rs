@@ -4207,6 +4207,29 @@ mod tests {
     }
 
     #[test]
+    fn claude_titles_edited_in_place_before_an_append_are_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("s.jsonl");
+        // The title sits far from both ends of the transcript.
+        let filler = format!(
+            "{}\n",
+            serde_json::json!({"type":"assistant", "message":{"content":"x".repeat(8192)}})
+        );
+        let original = title_line("custom-title", "s", "Saved one");
+        let edited = title_line("custom-title", "s", "Saved two");
+        assert_eq!(original.len(), edited.len());
+        fs::write(&transcript, format!("{filler}{original}{filler}")).unwrap();
+        index_claude_session(&db, &transcript, "s");
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved one"));
+
+        // Same inode, same bytes at both ends of the old content, and the file only grew:
+        // nothing but the content of the middle tells this from an append.
+        fs::write(&transcript, format!("{filler}{edited}{filler}{filler}")).unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved two"));
+    }
+
+    #[test]
     fn untitled_listings_return_the_titled_rows_without_labels() {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("analytics.sqlite");

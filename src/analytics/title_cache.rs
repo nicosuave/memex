@@ -2,27 +2,24 @@
 //!
 //! Claude writes a session's saved and generated names as metadata lines anywhere in its
 //! transcript, and later renames append more, so a title is only known after reading the
-//! whole file. Session listings resolve titles on every refresh. This cache keeps what a
-//! transcript's title lines folded to, together with the file identity they were read at:
-//! an unchanged transcript is not read again, and one that only grew is read from where
-//! the previous read stopped. Anything else is read whole, exactly as without the cache.
+//! whole file. Session listings resolve titles on every refresh. This cache keeps each
+//! transcript's title together with the file identity it was read at: an unchanged
+//! transcript is not read again, and a changed one is read whole, exactly as without the
+//! cache. Resuming a grown transcript from its old end would be cheaper but cannot tell an
+//! append from an in-place edit of the part already read without reading that part.
 //!
 //! The cache is derived only from the transcripts, so it may be lost or deleted at any
 //! time; every failure to use it falls back to reading the transcript.
 
 use crate::sources::claude::SessionTitles;
 use rusqlite::{Connection, OptionalExtension, params};
-use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 const CACHE_FILE: &str = "session-titles.sqlite3";
-/// Bump when the rules of [`SessionTitles`] change; titles cached under older rules are dropped.
-const RULES_VERSION: i64 = 1;
-/// Bytes hashed from each end of the scanned part of a transcript. A grown transcript is
-/// read from the previous end only while both ends still match, so a rewrite is read whole.
-const FINGERPRINT_WINDOW: usize = 4096;
+/// Bump when the rules of [`SessionTitles`] or the table change; older caches are dropped.
+const RULES_VERSION: i64 = 2;
 
 pub(crate) struct TitleCache {
     conn: Connection,
@@ -60,29 +57,10 @@ impl FileStamp {
     }
 }
 
-struct CachedTitles {
+struct CachedTitle {
     stamp: FileStamp,
-    /// End of the last newline-terminated line read; a grown file resumes here.
-    resume_offset: u64,
-    /// [`fingerprint`] of the bytes before `resume_offset`.
-    fingerprint: Vec<u8>,
-    /// Title lines folded up to `resume_offset`.
-    folded: SessionTitles,
-    /// The title of the whole file at `stamp`, including an unterminated final line.
+    /// The title of the whole file at `stamp`.
     title: Option<String>,
-}
-
-impl CachedTitles {
-    /// Whether `bytes` are this version of the file with only lines appended.
-    fn extends_to(&self, stamp: &FileStamp, bytes: &[u8]) -> bool {
-        let resume_offset = self.resume_offset as usize;
-        stamp.device == self.stamp.device
-            && stamp.inode == self.stamp.inode
-            && bytes.len() as u64 > self.stamp.size
-            && stamp.modified_ns >= self.stamp.modified_ns
-            && resume_offset <= bytes.len()
-            && fingerprint(&bytes[..resume_offset]) == self.fingerprint
-    }
 }
 
 impl TitleCache {
@@ -109,11 +87,6 @@ impl TitleCache {
                      modified_ns INTEGER,
                      device INTEGER,
                      inode INTEGER,
-                     resume_offset INTEGER NOT NULL,
-                     fingerprint BLOB NOT NULL,
-                     custom_title TEXT,
-                     ai_title TEXT,
-                     agent_name TEXT,
                      title TEXT,
                      PRIMARY KEY (source_path, session_id)
                  ) WITHOUT ROWID;
@@ -126,40 +99,27 @@ impl TitleCache {
     }
 
     /// The title [`crate::sources::claude::session_title`] returns for this transcript,
-    /// reading only what changed since the cached version. `None` when the transcript
-    /// cannot be found or read and no unchanged version is cached.
+    /// read from the transcript only when it changed since the cached version. `None`
+    /// when the transcript cannot be found or read.
     pub(crate) fn claude_title(&self, path: &Path, session_id: &str) -> Option<String> {
         let source_path = path.to_string_lossy();
         let stamp = FileStamp::of(&std::fs::metadata(path).ok()?);
-        let cached = self.load(&source_path, session_id);
-        if let Some(cached) = &cached
+        if let Some(cached) = self.load(&source_path, session_id)
             && cached.stamp == stamp
         {
-            return cached.title.clone();
+            return cached.title;
         }
         let file = File::open(path).ok()?;
         // SAFETY: as in `session_title`, the map is only read; transcripts are appended to.
         let bytes = unsafe { memmap2::Mmap::map(&file).ok()? };
-        let (mut folded, start) = match cached {
-            Some(cached) if cached.extends_to(&stamp, &bytes) => {
-                (cached.folded, cached.resume_offset as usize)
-            }
-            _ => (SessionTitles::default(), 0),
-        };
-        let resume_offset = start + folded.fold_lines(&bytes[start..], session_id);
-        let mut whole = folded.clone();
-        whole.fold_line(&bytes[resume_offset..], session_id);
-        let title = whole.title();
+        let title = SessionTitles::of_transcript(&bytes, session_id).title();
         // A file that changed between the stat and the map has no single identity to cache.
         if bytes.len() as u64 == stamp.size {
             self.store(
                 &source_path,
                 session_id,
-                &CachedTitles {
+                &CachedTitle {
                     stamp,
-                    resume_offset: resume_offset as u64,
-                    fingerprint: fingerprint(&bytes[..resume_offset]),
-                    folded,
                     title: title.clone(),
                 },
             );
@@ -167,32 +127,24 @@ impl TitleCache {
         title
     }
 
-    fn load(&self, source_path: &str, session_id: &str) -> Option<CachedTitles> {
+    fn load(&self, source_path: &str, session_id: &str) -> Option<CachedTitle> {
         let mut statement = self
             .conn
             .prepare_cached(
-                "SELECT size, modified_ns, device, inode, resume_offset, fingerprint,
-                        custom_title, ai_title, agent_name, title
+                "SELECT size, modified_ns, device, inode, title
                  FROM claude_titles WHERE source_path = ?1 AND session_id = ?2",
             )
             .ok()?;
         statement
             .query_row(params![source_path, session_id], |row| {
-                Ok(CachedTitles {
+                Ok(CachedTitle {
                     stamp: FileStamp {
                         size: row.get::<_, i64>(0)? as u64,
                         modified_ns: row.get(1)?,
                         device: row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
                         inode: row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
                     },
-                    resume_offset: row.get::<_, i64>(4)? as u64,
-                    fingerprint: row.get(5)?,
-                    folded: SessionTitles {
-                        custom_title: row.get(6)?,
-                        ai_title: row.get(7)?,
-                        agent_name: row.get(8)?,
-                    },
-                    title: row.get(9)?,
+                    title: row.get(4)?,
                 })
             })
             .optional()
@@ -201,12 +153,11 @@ impl TitleCache {
     }
 
     /// Best effort: a failed write leaves the next listing to read the transcript again.
-    fn store(&self, source_path: &str, session_id: &str, cached: &CachedTitles) {
+    fn store(&self, source_path: &str, session_id: &str, cached: &CachedTitle) {
         let Ok(mut statement) = self.conn.prepare_cached(
             "INSERT OR REPLACE INTO claude_titles(
-                 source_path, session_id, size, modified_ns, device, inode, resume_offset,
-                 fingerprint, custom_title, ai_title, agent_name, title
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 source_path, session_id, size, modified_ns, device, inode, title
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         ) else {
             return;
         };
@@ -217,22 +168,7 @@ impl TitleCache {
             cached.stamp.modified_ns,
             cached.stamp.device.map(|value| value as i64),
             cached.stamp.inode.map(|value| value as i64),
-            cached.resume_offset as i64,
-            cached.fingerprint,
-            cached.folded.custom_title,
-            cached.folded.ai_title,
-            cached.folded.agent_name,
             cached.title,
         ]);
     }
-}
-
-/// Hash of the length and both ends of `scanned`.
-fn fingerprint(scanned: &[u8]) -> Vec<u8> {
-    let window = FINGERPRINT_WINDOW.min(scanned.len());
-    let mut hash = Sha256::new();
-    hash.update((scanned.len() as u64).to_le_bytes());
-    hash.update(&scanned[..window]);
-    hash.update(&scanned[scanned.len() - window..]);
-    hash.finalize().to_vec()
 }

@@ -379,23 +379,29 @@ fn fork_origin(bytes: &[u8]) -> Option<String> {
 pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
     let file = File::open(path).ok()?;
     let bytes = unsafe { memmap2::Mmap::map(&file).ok()? };
-    let mut titles = SessionTitles::default();
-    let complete = titles.fold_lines(&bytes, session_id);
-    titles.fold_line(&bytes[complete..], session_id);
-    titles.title()
+    SessionTitles::of_transcript(&bytes, session_id).title()
 }
 
 /// The title lines of one session folded in file order: the last non-empty title of each
 /// kind wins, and a custom title outranks an AI title, which outranks an agent name.
-/// Folding is resumable, so the titles of an appended transcript extend from its old end.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub(crate) struct SessionTitles {
-    pub custom_title: Option<String>,
-    pub ai_title: Option<String>,
-    pub agent_name: Option<String>,
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    agent_name: Option<String>,
 }
 
 impl SessionTitles {
+    /// The titles of `session_id` in a whole transcript, including a final line that has
+    /// no newline yet.
+    pub(crate) fn of_transcript(bytes: &[u8], session_id: &str) -> Self {
+        let mut titles = Self::default();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            titles.fold_line(line, session_id);
+        }
+        titles
+    }
+
     pub(crate) fn title(&self) -> Option<String> {
         self.custom_title
             .clone()
@@ -403,19 +409,7 @@ impl SessionTitles {
             .or_else(|| self.agent_name.clone())
     }
 
-    /// Fold the newline-terminated lines of `bytes` and return their length. A trailing
-    /// line without a newline may still be being written, so it is left to [`Self::fold_line`]
-    /// and a later scan resumes at the returned offset.
-    pub(crate) fn fold_lines(&mut self, bytes: &[u8], session_id: &str) -> usize {
-        let mut offset = 0;
-        while let Some(length) = memchr::memchr(b'\n', &bytes[offset..]) {
-            self.fold_line(&bytes[offset..offset + length], session_id);
-            offset += length + 1;
-        }
-        offset
-    }
-
-    pub(crate) fn fold_line(&mut self, line: &[u8], session_id: &str) {
+    fn fold_line(&mut self, line: &[u8], session_id: &str) {
         // Most lines contain large transcript/tool bodies. Only metadata
         // candidates need JSON decoding; still inspect every line for renames.
         // Escaped JSON strings may encode the type using Unicode escapes.
