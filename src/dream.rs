@@ -1,4 +1,4 @@
-//! Dreaming: an offline pass in which a model reads recent agent history across tools and
+//! Dreaming: an offline pass in which a model reads recent conversations across agents and
 //! machines, together with the saved Claude and Codex memories, and proposes durable
 //! dreams. A dream is one stored statement with the records it rests on; a dream run is one
 //! execution of the pass. Memex owns the result:
