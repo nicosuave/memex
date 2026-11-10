@@ -8,29 +8,26 @@ struct PendingConversationStartView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                VStack(alignment: .trailing, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("You").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        Text(pending.prompt)
-                            .font(Font(AppPreferences.shared.bodyNSFont))
-                            .textSelection(.enabled)
-                        if !pending.attachmentNames.isEmpty {
-                            Text(pending.attachmentNames.joined(separator: ", "))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(12)
-                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 16))
-                    .frame(maxWidth: 640, alignment: .trailing)
-                    status.frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxWidth: 820)
-                .padding(24)
+            // The same transcript the created conversation uses, so the prompt keeps
+            // its bubble, width and typography when the real conversation replaces this page.
+            NativeTranscript(sessionID: "pending-start:" + pending.id.uuidString, records: [promptRecord],
+                             provider: pending.providerName, hasMore: false, isLoading: false, onLoadMore: {},
+                             startsAtEnd: true)
+            status
+                .frame(maxWidth: ConversationReadingLane.maximumWidth, alignment: .leading)
+                .padding(.horizontal, ConversationReadingLane.minimumMargin).padding(.vertical, 12)
                 .frame(maxWidth: .infinity)
-            }
         }
         .navigationTitle(pending.prompt.split(separator: "\n").first.map(String.init) ?? "New conversation")
+    }
+
+    private var promptRecord: TranscriptRecord {
+        var text = pending.prompt
+        if !pending.attachmentNames.isEmpty {
+            text += (text.isEmpty ? "" : "\n\n") + "Attached: " + pending.attachmentNames.joined(separator: ", ")
+        }
+        return TranscriptRecord(recordID: "pending-start:" + pending.id.uuidString,
+                                record: Message(role: "user", text: text, toolName: nil, toolInput: nil, toolOutput: nil))
     }
 
     @ViewBuilder private var status: some View {
@@ -45,10 +42,9 @@ struct PendingConversationStartView: View {
             }.font(.callout)
         } else {
             HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text(pending.status)
+                ShimmerText(pending.status, font: AppPreferences.shared.bodyNSFont)
                 if let project = pending.projectName { Text("· \(project)").foregroundStyle(.tertiary) }
-            }.font(.callout).foregroundStyle(.secondary)
+            }.font(.callout)
         }
     }
 }

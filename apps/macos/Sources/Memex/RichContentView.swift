@@ -52,36 +52,42 @@ enum RichContentBlock: Equatable {
     case attachment(label: String, source: String, image: Bool)
     case attachmentNotice(label: String, detail: String)
     case embeddedImage(label: String, data: Data, mimeType: String)
+
+    var isRich: Bool { if case .markdown = self { false } else { true } }
 }
 
 struct RichContentDocument {
     let blocks: [RichContentBlock]
-    var hasRichBlocks: Bool { blocks.contains { if case .markdown = $0 { false } else { true } } }
+    var hasRichBlocks: Bool { blocks.contains(where: \.isRich) }
 
     init(_ source: String) {
+        blocks = Document(parsing: source).children.flatMap { Self.blocks(for: $0) }
+    }
+
+    /// Blocks for one top-level node; a document is the concatenation, so a
+    /// streaming message can keep the blocks of nodes that settled.
+    static func blocks(for node: any Markup) -> [RichContentBlock] {
         var result: [RichContentBlock] = []
-        for node in Document(parsing: source).children {
-            if let code = node as? CodeBlock {
-                result.append(.code(code.code, language: code.language ?? "text"))
-            } else if let paragraph = node as? Paragraph,
-                      paragraph.children.contains(where: { $0 is Markdown.Image }) {
-                var prose = ""
-                for child in paragraph.children {
-                    if let image = child as? Markdown.Image, let source = image.source {
-                        if !prose.isEmpty { result.append(.markdown(prose)); prose = "" }
-                        result.append(.attachment(label: image.plainText, source: source, image: true))
-                    } else { prose += child.detachedFromParent.format() }
-                }
-                if !prose.isEmpty { result.append(.markdown(prose)) }
-            } else if let paragraph = node as? Paragraph, paragraph.childCount == 1,
-                      let link = paragraph.child(at: 0) as? Markdown.Link,
-                      let source = link.destination, ContentLocation.parse(source)?.url.isFileURL == true {
-                result.append(.attachment(label: link.plainText, source: source, image: false))
-            } else {
-                result.append(.markdown(node.detachedFromParent.format()))
+        if let code = node as? CodeBlock {
+            result.append(.code(code.code, language: code.language ?? "text"))
+        } else if let paragraph = node as? Paragraph,
+                  paragraph.children.contains(where: { $0 is Markdown.Image }) {
+            var prose = ""
+            for child in paragraph.children {
+                if let image = child as? Markdown.Image, let source = image.source {
+                    if !prose.isEmpty { result.append(.markdown(prose)); prose = "" }
+                    result.append(.attachment(label: image.plainText, source: source, image: true))
+                } else { prose += child.detachedFromParent.format() }
             }
+            if !prose.isEmpty { result.append(.markdown(prose)) }
+        } else if let paragraph = node as? Paragraph, paragraph.childCount == 1,
+                  let link = paragraph.child(at: 0) as? Markdown.Link,
+                  let source = link.destination, ContentLocation.parse(source)?.url.isFileURL == true {
+            result.append(.attachment(label: link.plainText, source: source, image: false))
+        } else {
+            result.append(.markdown(node.detachedFromParent.format()))
         }
-        blocks = result
+        return result
     }
 }
 
@@ -102,7 +108,10 @@ struct RichContentDocument {
     }
 
     func size(for width: CGFloat) -> NSSize {
-        container.containerSize = NSSize(width: max(1, width), height: .greatestFiniteMagnitude)
+        // Reassigning an unchanged size could discard layout that a streaming
+        // message keeps for its settled blocks.
+        let size = NSSize(width: max(1, width), height: .greatestFiniteMagnitude)
+        if container.containerSize != size { container.containerSize = size }
         manager.ensureLayout(for: container)
         let rect = manager.usedRect(for: container)
         return NSSize(width: ceil(rect.width), height: ceil(rect.height))
@@ -126,6 +135,15 @@ struct RichContentDocument {
             case .attachment(let attachment): attachment.height
             }
         }
+
+        /// The same retained layout object, whose view can be kept as is.
+        func isSameContent(as other: Item) -> Bool {
+            switch (self, other) {
+            case (.text(let lhs), .text(let rhs)): lhs === rhs
+            case (.code(let lhs), .code(let rhs)): lhs === rhs
+            default: false
+            }
+        }
     }
 
     let items: [Item]
@@ -134,35 +152,43 @@ struct RichContentDocument {
 
     init(blocks: [RichContentBlock], font: NSFont, context: RichContentContext) {
         self.context = context
-        items = blocks.map { block in
-            switch block {
-            case .mcpApp(let app):
-                guard app.allowsInteraction, context.mcpAppTransport != nil else {
-                    return .text(RichContentTextLayout(NSAttributedString(
-                        string: "Interactive app unavailable for this connection. The original tool result remains below.",
-                        attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor])))
-                }
-                return .mcpApp(app)
-            case .markdown, .attributed:
-                let rendered: NSAttributedString
-                if case .markdown(let source) = block { rendered = RichTextRenderer.renderMarkdown(source, font: font) }
-                else if case .attributed(let content) = block { rendered = content }
-                else { rendered = NSAttributedString(string: "") }
-                let content = NSMutableAttributedString(attributedString: rendered)
-                content.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: content.length)) { value, range, _ in
-                    guard let source = value as? String, let location = ContentLocation.parse(source), location.canOpen(in: context) else { return }
-                    content.addAttribute(.link, value: source, range: range)
-                    content.addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
-                }
-                return .text(RichContentTextLayout(content))
-            case .code(let source, let language): return .code(CodeContentLayout(code: source, language: language, font: font))
-            case .embeddedImage(let label, let data, let mimeType):
-                return .attachment(AttachmentContent(label: label, source: "Embedded image · \(mimeType)", isImage: true, context: context, embeddedData: data))
-            case .attachmentNotice(let label, let detail):
-                return .attachment(AttachmentContent(label: label, source: "", isImage: false, context: context, unavailableDetail: detail))
-            case .attachment(let label, let source, let image):
-                return .attachment(AttachmentContent(label: label, source: source, isImage: image, context: context))
+        items = blocks.map { Self.item(for: $0, font: font, context: context) }
+    }
+
+    /// Assembles retained items, such as the settled blocks of a streaming message.
+    init(items: [Item], context: RichContentContext) {
+        self.context = context
+        self.items = items
+    }
+
+    static func item(for block: RichContentBlock, font: NSFont, context: RichContentContext) -> Item {
+        switch block {
+        case .mcpApp(let app):
+            guard app.allowsInteraction, context.mcpAppTransport != nil else {
+                return .text(RichContentTextLayout(NSAttributedString(
+                    string: "Interactive app unavailable for this connection. The original tool result remains below.",
+                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor])))
             }
+            return .mcpApp(app)
+        case .markdown, .attributed:
+            let rendered: NSAttributedString
+            if case .markdown(let source) = block { rendered = RichTextRenderer.renderMarkdown(source, font: font) }
+            else if case .attributed(let content) = block { rendered = content }
+            else { rendered = NSAttributedString(string: "") }
+            let content = NSMutableAttributedString(attributedString: rendered)
+            content.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: content.length)) { value, range, _ in
+                guard let source = value as? String, let location = ContentLocation.parse(source), location.canOpen(in: context) else { return }
+                content.addAttribute(.link, value: source, range: range)
+                content.addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
+            }
+            return .text(RichContentTextLayout(content))
+        case .code(let source, let language): return .code(CodeContentLayout(code: source, language: language, font: font))
+        case .embeddedImage(let label, let data, let mimeType):
+            return .attachment(AttachmentContent(label: label, source: "Embedded image · \(mimeType)", isImage: true, context: context, embeddedData: data))
+        case .attachmentNotice(let label, let detail):
+            return .attachment(AttachmentContent(label: label, source: "", isImage: false, context: context, unavailableDetail: detail))
+        case .attachment(let label, let source, let image):
+            return .attachment(AttachmentContent(label: label, source: source, isImage: image, context: context))
         }
     }
 
@@ -176,6 +202,16 @@ struct RichContentDocument {
         view.configure(layout: self)
         materializedView = view
         return view
+    }
+
+    /// Takes over a displayed view of an earlier layout of the same message.
+    /// Item views whose layout objects are retained stay in place, with their
+    /// selection and horizontal scroll position; only changed items are rebuilt.
+    func adoptMaterializedView(from previous: RichContentLayout?) {
+        guard materializedView == nil, let previous, previous !== self, let view = previous.materializedView else { return }
+        previous.materializedView = nil
+        view.configure(layout: self)
+        materializedView = view
     }
 }
 
@@ -196,10 +232,16 @@ struct RichContentDocument {
     }
 
     fileprivate func configure(layout: RichContentLayout) {
+        // Keep the leading views whose layout objects did not change. A fresh
+        // view has none; a streaming message keeps its settled blocks' views.
+        let previous = contentLayout?.context == layout.context ? contentLayout?.items ?? [] : []
+        var kept = 0
+        while kept < min(previous.count, layout.items.count, items.count),
+              previous[kept].isSameContent(as: layout.items[kept]) { kept += 1 }
         contentLayout = layout
         context = layout.context
-        items.forEach { $0.removeFromSuperview() }
-        items = layout.items.map { item in
+        items[kept...].forEach { $0.removeFromSuperview() }
+        let created = layout.items[kept...].map { item -> NSView in
             switch item {
             case .mcpApp(let app): return NativeMcpAppHost.view(app: app, transport: context.mcpAppTransport)
             case .text(let text):
@@ -213,7 +255,8 @@ struct RichContentDocument {
                 return card
             }
         }
-        items.forEach { addSubview($0) }
+        items = Array(items[..<kept]) + created
+        created.forEach { addSubview($0) }
         needsLayout = true
     }
 

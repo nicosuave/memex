@@ -62,10 +62,8 @@ struct HomeConversationComposer: View {
             }
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(dropTargeted ? Color.accentColor : .clear, lineWidth: 2))
             if store.startingConversation {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text(draft.value.workspaceMode == .newWorktree ? "Preparing worktree and conversation…" : "Creating conversation…")
-                }.font(.caption).foregroundStyle(.secondary)
+                ShimmerText(draft.value.workspaceMode == .newWorktree ? "Preparing worktree and conversation…" : "Creating conversation…",
+                            font: .preferredFont(forTextStyle: .caption1))
             }
             if let workspace = draft.value.preparedWorkspace, workspace.state == .ready {
                 Text("Prepared folder: \(workspace.workingDirectory.path)")

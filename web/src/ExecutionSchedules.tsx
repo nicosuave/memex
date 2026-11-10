@@ -8,11 +8,11 @@ const weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Satur
 const selectStyle = "mt-1 w-full rounded border bg-background p-2"
 type Props = {
   client: ExecutionClient; info: HostInfo; schedules: HostSchedule[]; conversations: HostConversation[]; workspaces: HostWorkspace[];
-  selected: string; busy: boolean; operate: <T>(method: string, params?: Record<string, unknown>) => Promise<T | undefined>;
+  selected: string; isPending: (method: string, params?: Record<string, unknown>) => boolean; operate: <T>(method: string, params?: Record<string, unknown>) => Promise<T | undefined>;
   openConversation: (id: string) => void;
 }
 
-export function ExecutionSchedules({ client, info, schedules, conversations, workspaces, selected, busy, operate, openConversation }: Props) {
+export function ExecutionSchedules({ client, info, schedules, conversations, workspaces, selected, isPending, operate, openConversation }: Props) {
   const [id, setId] = useState(() => crypto.randomUUID() as string)
   const [text, setText] = useState("")
   const [conversation, setConversation] = useState("")
@@ -27,7 +27,7 @@ export function ExecutionSchedules({ client, info, schedules, conversations, wor
   const [timeZone, setTimeZone] = useState(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC")
   const [eventName, setEventName] = useState("")
   const [notificationPolicy, setNotificationPolicy] = useState("attention")
-  const [runs, setRuns] = useState<HostScheduleRun[]>([])
+  const [runs, setRuns] = useState<HostScheduleRun[] | null>(null)
   const [runError, setRunError] = useState("")
   const supportsRuns = info.capabilities.includes("schedules.runs")
   const supportsFresh = info.capabilities.includes("schedules.new_conversation")
@@ -76,10 +76,10 @@ export function ExecutionSchedules({ client, info, schedules, conversations, wor
           <p className="text-muted-foreground">{schedule.paused ? "Paused" : schedule.eventName ? `Event: ${schedule.eventName}` : `Next: ${new Date(schedule.nextRunAt).toLocaleString()}`} · {schedule.newConversation ? "New conversation each run" : "Existing conversation"}</p>
           {schedule.lastError && <p className="text-destructive">{schedule.lastError}</p>}
           <div className="flex flex-wrap gap-1">
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => edit(schedule)}>Edit</Button>
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void operate("schedule.pause", { scheduleId: schedule.id, paused: !schedule.paused })}>{schedule.paused ? "Resume" : "Pause"}</Button>
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void operate("schedule.run", { scheduleId: schedule.id })}>Run now</Button>
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void operate("schedule.delete", { scheduleId: schedule.id })}>Delete</Button>
+            <Button size="sm" variant="ghost" onClick={() => edit(schedule)}>Edit</Button>
+            <Button size="sm" variant="ghost" disabled={isPending("schedule.pause", { scheduleId: schedule.id })} onClick={() => void operate("schedule.pause", { scheduleId: schedule.id, paused: !schedule.paused })}>{schedule.paused ? "Resume" : "Pause"}</Button>
+            <Button size="sm" variant="ghost" disabled={isPending("schedule.run", { scheduleId: schedule.id })} onClick={() => void operate("schedule.run", { scheduleId: schedule.id })}>Run now</Button>
+            <Button size="sm" variant="ghost" disabled={isPending("schedule.delete", { scheduleId: schedule.id })} onClick={() => void operate("schedule.delete", { scheduleId: schedule.id })}>Delete</Button>
           </div>
         </div>)}
         {supportsFresh && <label className="block text-xs">Run in<select aria-label="Schedule target" className={selectStyle} value={fresh ? "new" : "existing"} onChange={event => setFresh(event.target.value === "new")}>
@@ -114,21 +114,21 @@ export function ExecutionSchedules({ client, info, schedules, conversations, wor
         {supportsRuns && <label className="block text-xs">Run notifications<select aria-label="Schedule notification policy" className={selectStyle} value={notificationPolicy} onChange={event => setNotificationPolicy(event.target.value)}>
           <option value="all">Completions and attention</option><option value="attention">Only when attention is needed</option><option value="never">Never</option>
         </select><span className="text-muted-foreground">Controls attention flags in the run inbox. System alerts depend on device notification settings.</span></label>}
-        <Button size="sm" disabled={busy || !text.trim() || !validTarget || !validTrigger} onClick={() => void save()}>Save schedule</Button>
-        <Button size="sm" variant="ghost" disabled={busy} onClick={() => { setId(crypto.randomUUID()); setText("") }}>New schedule</Button>
+        <Button size="sm" disabled={isPending("schedule.upsert", { scheduleId: id }) || !text.trim() || !validTarget || !validTrigger} onClick={() => void save()}>Save schedule</Button>
+        <Button size="sm" variant="ghost" onClick={() => { setId(crypto.randomUUID()); setText("") }}>New schedule</Button>
       </div>
     </details>
     {supportsRuns && <details className="rounded-md border p-3">
-      <summary className="text-sm font-medium">Schedule run inbox ({runs.filter(run => !run.read).length} unread)</summary>
+      <summary className="text-sm font-medium">Schedule run inbox ({runs?.filter(run => !run.read).length ?? 0} unread)</summary>
       <div className="mt-3 space-y-3">
         {runError && <p className="text-xs text-destructive">{runError}</p>}
-        {!runs.length && <p className="text-xs text-muted-foreground">No runs yet.</p>}
-        {runs.map(run => <article key={run.id} className="space-y-1 border-b pb-2 text-xs" aria-label={`Schedule run ${run.id}`}>
+        {runs?.length === 0 && <p className="text-xs text-muted-foreground">No runs yet.</p>}
+        {runs?.map(run => <article key={run.id} className="space-y-1 border-b pb-2 text-xs" aria-label={`Schedule run ${run.id}`}>
           <p className={run.read ? "" : "font-semibold"}>{run.status} · {new Date(run.createdAt).toLocaleString()}</p>
           {run.needsAttention && <p>Needs attention</p>}{run.error && <p className="text-destructive">{run.error}</p>}
           <div className="flex flex-wrap gap-1">
             {run.conversationID && <Button size="sm" variant="ghost" onClick={() => openConversation(run.conversationID!)}>Open run conversation</Button>}
-            <Button size="sm" variant="ghost" disabled={busy} onClick={() => void operate("schedule.run.read", { runId: run.id, read: !run.read })}>{run.read ? "Mark unread" : "Mark read"}</Button>
+            <Button size="sm" variant="ghost" disabled={isPending("schedule.run.read", { runId: run.id })} onClick={() => void operate("schedule.run.read", { runId: run.id, read: !run.read })}>{run.read ? "Mark unread" : "Mark read"}</Button>
           </div>
         </article>)}
       </div>

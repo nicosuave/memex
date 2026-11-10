@@ -25,7 +25,9 @@ struct ConversationHistoryStatus: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if store.historyActionInProgress { ProgressView().controlSize(.small) }
+            if store.historyActionInProgress {
+                ShimmerText("Running history action…", font: .preferredFont(forTextStyle: .caption1))
+            }
             ForEach(pending) { request in
                 HStack(alignment: .top) {
                     Text("A previous \(request.operation) request needs inspection. It will not be retried automatically.")

@@ -197,11 +197,12 @@ struct BrowserSidebar: View {
                                          managedSelection: managedSelection)
                     }
                     if store.loadingSessions {
-                        ProgressView().controlSize(.small).frame(maxWidth: .infinity)
+                        // A refresh keeps the rows already listed; only an empty list shows progress.
+                        if store.librarySessions.isEmpty { DelayedProgress().frame(maxWidth: .infinity) }
                     } else if store.hasMoreSessions, let last = store.sessions.last {
                         // Reaching the end of the list loads the next page. A new
                         // identity per page re-triggers while the end stays visible.
-                        ProgressView().controlSize(.small).frame(maxWidth: .infinity)
+                        DelayedProgress().frame(maxWidth: .infinity)
                             .id("page-\(store.sessions.count)")
                             .onAppear { store.loadMoreSessionsIfNeeded(visibleID: last.id) }
                     } else if store.librarySessions.isEmpty && store.listError == nil {
@@ -231,7 +232,7 @@ struct BrowserSidebar: View {
                 }
                 .labelsHidden().pickerStyle(.menu).buttonStyle(.borderless)
                 .frame(maxWidth: .infinity).accessibilityLabel("Machines")
-                if store.loadingMachines { ProgressView().controlSize(.mini) }
+                if store.loadingMachines { DelayedProgress(controlSize: .mini) }
                 if let error = store.machineError {
                     Button { Task { await store.loadMachines() } } label: { Image(systemName: "exclamationmark.triangle") }
                         .buttonStyle(.plain).help(error).accessibilityLabel("Retry loading machines")

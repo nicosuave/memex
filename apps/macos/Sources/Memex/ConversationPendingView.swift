@@ -1,14 +1,9 @@
 import SwiftUI
 
-#if canImport(SQACPUI)
-import SQACPUI
-#endif
-
 /// Local send state stays outside the source transcript and its search results.
 struct ConversationPendingView: View {
     let conversation: LiveConversation
-    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
-    @Environment(\.memexReduceMotion) private var appReduceMotion
+    @State private var slowSend = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -20,7 +15,9 @@ struct ConversationPendingView: View {
                         .buttonStyle(.plain).accessibilityLabel("Dismiss")
                 }
             }
-            if let pending = conversation.pendingPrompt {
+            // A new-turn prompt in flight is a transcript row. This bubble is for
+            // what is not in the transcript: steers, and prompts needing recovery.
+            if let pending = conversation.pendingPrompt, conversation.optimisticRecord == nil {
                 HStack {
                     Spacer(minLength: 30)
                     VStack(alignment: .trailing, spacing: 6) {
@@ -46,27 +43,26 @@ struct ConversationPendingView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                 }
             }
-            #if canImport(SQACPUI)
             if conversation.isWorking && conversation.snapshot.approvals.isEmpty && conversation.snapshot.questions.isEmpty {
-                Group {
-                    if systemReduceMotion || appReduceMotion {
-                        Text(activityLabel).foregroundStyle(.secondary)
-                    } else {
-                        AcpShimmerText(activityLabel)
-                    }
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(activityLabel)
-                .padding(.vertical, 8)
+                // Static under Reduce Motion; the label itself is the accessibility element.
+                ShimmerText(activityLabel, font: AppPreferences.shared.bodyNSFont).padding(.vertical, 8)
             }
-            #endif
         }
         .frame(maxWidth: ConversationReadingLane.maximumWidth, alignment: .leading)
         .padding(.horizontal, ConversationReadingLane.minimumMargin)
         .frame(maxWidth: .infinity)
+        .task(id: conversation.pendingPrompt?.commandID) {
+            slowSend = false
+            guard conversation.pendingPrompt != nil else { return }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            slowSend = true
+        }
     }
 
     private var activityLabel: String {
+        // An ordinary send is acknowledged within a moment; naming it only when
+        // it is slow avoids a label that flashes between Enter and the first output.
+        if conversation.status == "Sending…" && !slowSend { return "Thinking…" }
         guard conversation.status == "Working…" else { return conversation.status }
         return TranscriptPresentation.liveStatus(conversation.snapshot.records) ?? "Thinking…"
     }

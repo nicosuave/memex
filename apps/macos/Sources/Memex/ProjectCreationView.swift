@@ -36,8 +36,8 @@ struct ProjectCreationView: View {
             if let error { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             HStack {
                 if task != nil {
-                    ProgressView().controlSize(.small)
-                    Text(cancellationRequested ? "Cancelling…" : kind == .clone ? "Cloning repository…" : "Creating repository…").font(.caption)
+                    ShimmerText(cancellationRequested ? "Cancelling…" : kind == .clone ? "Cloning repository…" : "Creating repository…",
+                                font: .preferredFont(forTextStyle: .caption1))
                     Spacer()
                     Button("Cancel operation") { cancellationRequested = true; task?.cancel() }.disabled(cancellationRequested)
                 } else {

@@ -34,7 +34,7 @@ struct WorkspaceCheckpointControls: View {
                     }
                 }
             }.disabled(busy)
-            if busy { ProgressView().controlSize(.small) }
+            if busy { DelayedProgress() }
             if let error { Text(error).font(.caption).foregroundStyle(.orange).lineLimit(2).help(error) }
         }
         .task(id: conversationID) { await refresh() }

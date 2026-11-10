@@ -20,7 +20,7 @@ struct WorkspacePullRequestView: View {
                 Button("Load", action: load).disabled(busy)
                 Button("Done") { dismiss() }
             }
-            if busy { ProgressView("Reading pull request…") }
+            if busy { ShimmerText("Reading pull request…") }
             if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
             if let read {
                 let pr = read.pullRequest

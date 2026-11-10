@@ -159,7 +159,7 @@ struct ExecutionHostConnectionsView: View {
                     Button("Refresh host") { run { try await load(selected) } }.disabled(busy)
                 }
                 if let error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
-                if busy { ProgressView() }
+                if busy { DelayedProgress() }
             }.formStyle(.grouped)
         }.frame(minWidth: 560, idealWidth: 680, minHeight: 560)
         .task(id: initialHostID) {

@@ -190,9 +190,10 @@ struct ConversationDictationView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Dictate a prompt").font(.title2)
             Text("Record up to two minutes. Speech is transcribed on this Mac. Review the text before adding it to your draft.").font(.callout)
-            if dictation.phase == .authorizing { ProgressView("Requesting microphone and speech access…") }
+            // Granted access returns at once; the label shows only while a permission prompt is up.
+            if dictation.phase == .authorizing { DelayedProgress("Requesting microphone and speech access…") }
             if dictation.phase == .recording { Label("Recording", systemImage: "mic.fill").foregroundStyle(.red) }
-            if dictation.phase == .transcribing { ProgressView("Transcribing recording…") }
+            if dictation.phase == .transcribing { ShimmerText("Transcribing recording…") }
             TextEditor(text: $dictation.transcript).frame(minHeight: 140)
             if let error = dictation.error { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             if let url = dictation.recordingURL {

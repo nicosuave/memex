@@ -105,8 +105,78 @@ actor NativeConversationRuntime: ConversationRuntime {
     private var sentPromptIDs: Set<String> = []
     private var newPromptIDs: Set<String> = []
     private var changingHistory = false
+    private let latestPayload = LatestPayload()
+    private var control: ControlState?
+    private var lastPublish: ContinuousClock.Instant?
+    private var publishInterval = minimumPublishInterval
+    private var lastSourceRefresh: ContinuousClock.Instant?
+    private var running = false
+
+    /// Streaming publishes at most this often, and less often when one publish
+    /// is expensive, so reading a long conversation cannot occupy this actor.
+    private static let minimumPublishInterval = Duration.milliseconds(50)
+    private static let maximumPublishInterval = Duration.milliseconds(250)
+    /// The provider's transcript file changes constantly during a turn. Each
+    /// refresh re-reads and re-normalizes all of it, and live output already
+    /// arrives through the subscription, so mid-turn refreshes are spaced out.
+    private static let runningSourceRefreshInterval = Duration.seconds(5)
 
     init(creation: AgentConversationCreation? = nil) { self.creation = creation }
+
+    /// The newest subscription payload. Written on the serial subscription queue
+    /// so arrival order is preserved without depending on task scheduling.
+    private final class LatestPayload: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+        private var stored = 0
+        private var superseded = 0
+        func store(_ payload: String) { lock.withLock { value = payload; stored += 1 } }
+        /// A direct read is about to happen; payloads stored before it are older.
+        func supersede() { lock.withLock { superseded = stored } }
+        /// The newest payload, unless a direct read already covered it.
+        func take() -> String? {
+            lock.withLock {
+                defer { value = nil }
+                return stored > superseded ? value : nil
+            }
+        }
+        func reset() { lock.withLock { value = nil; superseded = stored } }
+    }
+
+    /// Everything a snapshot needs besides the conversation content. It changes
+    /// at command and turn boundaries, not with each streamed token.
+    private struct ControlState {
+        struct Fingerprint: Equatable {
+            let connected: Bool
+            let running: Bool
+            let pendingInteractions: [String]
+            init(_ conversation: RawTranscriptJSON) {
+                connected = conversation["connected"].bool ?? false
+                running = conversation["state"]["running"].bool ?? false
+                pendingInteractions = conversation["state"]["pending_interactions"].array.compactMap(\.string)
+            }
+        }
+        let fingerprint: Fingerprint
+        let actions: Set<AgentConversationAction>
+        let thread: RawTranscriptJSON
+        let operations: RawTranscriptJSON
+        let deliveries: [ConversationDelivery]
+        let controls: ConversationControls?
+        let canMutateHistory: Bool
+        let children: [ConversationChildHistory]
+        let mcpAppConnection: NativeMcpAppConnection?
+
+        /// A prompt, steer or settings change is still waiting for its outcome.
+        func awaitsOutcome(sentPromptIDs: Set<String>) -> Bool {
+            if controls?.pendingChanges == true { return true }
+            let settled = Set(deliveries.filter { ["completed", "failed"].contains($0.status) }.map(\.commandID))
+            if !sentPromptIDs.isSubset(of: settled) { return true }
+            return operations.array.contains {
+                ["thread.turn.start", "thread.turn.steer"].contains($0["command"]["type"].string ?? "")
+                    && !["completed", "failed"].contains($0["status"].string ?? "")
+            }
+        }
+    }
 
     private struct FileVersion: Equatable {
         let size: Int
@@ -153,10 +223,15 @@ actor NativeConversationRuntime: ConversationRuntime {
         let binding = AgentConversationBinding(sessionID: id, sourceID: source,
             nativeSessionID: target.session.sessionID, providerInstanceID: target.providerInstanceID,
             executionHostID: "local", workspaceID: target.workspaceID, cwd: target.workingDirectory.path)
+        let payloads = latestPayload
         subscription = service.subscribe(on: DispatchQueue(label: "memex.conversation.events")) { [weak self] result in
-            // Never carry Foundation Any across actors or project stale event payloads.
+            // Never carry Foundation Any across actors. Only the newest payload
+            // is kept, so a burst cannot project stale events.
             let error: ConversationRuntimeError?
-            if case .failure(let failure) = result { error = conversationProviderError(failure) } else { error = nil }
+            switch result {
+            case .success(let payload): payloads.store(payload); error = nil
+            case .failure(let failure): error = conversationProviderError(failure)
+            }
             Task { await self?.changed(error: error) }
         }
         do {
@@ -192,15 +267,25 @@ actor NativeConversationRuntime: ConversationRuntime {
             else { fail(error); return }
         }
         guard drain == nil, service != nil else { return }
+        // Leading edge: the first change after a quiet period publishes at once,
+        // and a burst then publishes at most once per interval.
+        let wait = lastPublish.map { $0 + publishInterval - .now } ?? .zero
         drain = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(80)) } catch { return }
+            if wait > .zero { do { try await Task.sleep(for: wait) } catch { return } }
             await self?.flush()
         }
     }
 
     private func flush() {
         drain = nil
-        do { try publish() } catch { fail(conversationProviderError(error)) }
+        // No payload means a direct read has already published this change.
+        guard let payload = latestPayload.take() else { return }
+        do { try publish(payload: payload, refreshControl: false) } catch { fail(conversationProviderError(error)) }
+    }
+
+    private func shouldRefreshSource() -> Bool {
+        guard running, let lastSourceRefresh else { return true }
+        return .now - lastSourceRefresh >= Self.runningSourceRefreshInterval
     }
 
     private func tick() {
@@ -208,7 +293,10 @@ actor NativeConversationRuntime: ConversationRuntime {
         if target.configuredProvider == nil {
             do {
                 let version = try FileVersion(target.sourceURL)
-                if version != fileVersion {
+                // A skipped refresh leaves `fileVersion` stale, so the first tick
+                // after the turn ends still picks the change up.
+                if version != fileVersion, shouldRefreshSource() {
+                    lastSourceRefresh = .now
                     if fileVersion == nil {
                         _ = try service.addSource(agent: target.session.source, format: "jsonl", url: target.sourceURL,
                             nativeNamespace: target.providerInstanceID, nativeSessionID: target.session.sessionID, sessionID: sessionID)
@@ -231,16 +319,61 @@ actor NativeConversationRuntime: ConversationRuntime {
         do { try publish() } catch { fail(conversationProviderError(error)) }
     }
 
-    private func publish() throws {
-        guard !changingHistory, let service, let sessionID,
-              let conversation = try ConversationProjection.conversation(in: service.read(sessionID: sessionID), sessionID: sessionID) else { return }
-        let actions = service.supportedActions(sessionID: sessionID)
-        let thread = try request("thread.snapshot", params: ["threadId": .string(sessionID)])
-        let operations = try request("provider_operation.list", params: ["threadId": .string(sessionID), "includeTerminal": .bool(false)])
+    /// A subscription payload is the same envelope `conversation.read` returns
+    /// for this session; anything else (the initial list, another session) is read.
+    private func conversation(from payload: String?, service: AgentConversationService, sessionID: String) throws -> RawTranscriptJSON? {
+        if let payload, let value = try? JSONDecoder().decode(RawTranscriptJSON.self, from: Data(payload.utf8)),
+           value["conversation"]["session_id"].string == sessionID {
+            return value["conversation"]
+        }
+        latestPayload.supersede()
+        return try ConversationProjection.conversation(in: service.read(sessionID: sessionID), sessionID: sessionID)
+    }
+
+    private func readControl(_ fingerprint: ControlState.Fingerprint, service: AgentConversationService, sessionID: String) throws -> ControlState {
         let deliveries = try service.commandStatuses(sessionID: sessionID).filter { $0.action == .prompt || $0.action == .steer }.map {
             ConversationDelivery(commandID: $0.commandID, status: $0.status, error: $0.error,
                                  nativeTurnID: $0.nativeTurnID, nativeMessageID: $0.nativeMessageID)
         }
+        return ControlState(fingerprint: fingerprint, actions: service.supportedActions(sessionID: sessionID),
+            thread: try request("thread.snapshot", params: ["threadId": .string(sessionID)]),
+            operations: try request("provider_operation.list", params: ["threadId": .string(sessionID), "includeTerminal": .bool(false)]),
+            deliveries: deliveries,
+            controls: try service.settings(sessionID: sessionID).map(ConversationControls.init),
+            canMutateHistory: service.supportsConversationMutation(sessionID: sessionID),
+            children: service.children(sessionID: sessionID).map(ConversationChildHistory.init),
+            mcpAppConnection: service.mcpAppTransportIdentity(sessionID: sessionID).map {
+                NativeMcpAppConnection(identity: $0, sessionID: sessionID, service: service)
+            })
+    }
+
+    /// `refreshControl` is false only for streamed content. Commands, the slow
+    /// tick and connection always re-read the control state.
+    private func publish(payload: String? = nil, refreshControl: Bool = true) throws {
+        guard !changingHistory, let service, let sessionID else { return }
+        let started = ContinuousClock.now
+        let interval = ChatSignpost.signposter.beginInterval("runtime.publish")
+        defer {
+            ChatSignpost.signposter.endInterval("runtime.publish", interval)
+            let finished = ContinuousClock.now
+            lastPublish = finished
+            // Spend at most a quarter of this actor's time publishing.
+            publishInterval = min(Self.maximumPublishInterval, max(Self.minimumPublishInterval, (finished - started) * 4))
+        }
+        guard let conversation = try conversation(from: payload, service: service, sessionID: sessionID) else { return }
+        let fingerprint = ControlState.Fingerprint(conversation)
+        let current: ControlState
+        if let cached = control, !refreshControl, wasReady, cached.fingerprint == fingerprint,
+           !cached.awaitsOutcome(sentPromptIDs: sentPromptIDs) {
+            current = cached
+        } else {
+            current = try readControl(fingerprint, service: service, sessionID: sessionID)
+            control = current
+        }
+        let actions = current.actions
+        let thread = current.thread
+        let operations = current.operations
+        let deliveries = current.deliveries
         // We observed the complete native stream for turns started and accepted
         // through this connection. Resumed or unconfirmed turns have no such guarantee.
         let ownedLiveUserTurns: Set<String> = target?.session.source == "codex"
@@ -250,16 +383,16 @@ actor NativeConversationRuntime: ConversationRuntime {
         var snapshot = ConversationProjection.snapshot(conversation, thread: thread, operations: operations,
             ready: actions.contains(.prompt), canCancel: actions.contains(.cancel), sentPromptIDs: sentPromptIDs,
             ownedLiveUserTurns: ownedLiveUserTurns)
-        snapshot.controls = try service.settings(sessionID: sessionID).map(ConversationControls.init)
+        snapshot.controls = current.controls
         snapshot.canSteer = actions.contains(.steer)
-        snapshot.canMutateHistory = service.supportsConversationMutation(sessionID: sessionID)
+        snapshot.canMutateHistory = current.canMutateHistory
         snapshot.deliveries = deliveries
-        snapshot.childHistories = service.children(sessionID: sessionID).map(ConversationChildHistory.init)
-        snapshot.mcpAppConnection = service.mcpAppTransportIdentity(sessionID: sessionID).map {
-            NativeMcpAppConnection(identity: $0, sessionID: sessionID, service: service)
-        }
+        snapshot.childHistories = current.children
+        snapshot.mcpAppConnection = current.mcpAppConnection
         snapshot.warning = snapshot.warning ?? warning
-        if snapshot.ready, let target, target.configuredProvider != nil {
+        running = snapshot.running
+        // Saved at boundaries and on the slow tick, not for every streamed token.
+        if snapshot.ready, let target, target.configuredProvider != nil, refreshControl || !snapshot.running {
             try ConfiguredConversationHistory.save(conversation: conversation, target: target)
         }
         if snapshot.ready { wasReady = true }
@@ -365,6 +498,12 @@ actor NativeConversationRuntime: ConversationRuntime {
         newPromptIDs.removeAll()
         poll?.cancel(); poll = nil
         drain?.cancel(); drain = nil
+        latestPayload.reset()
+        control = nil
+        lastPublish = nil
+        publishInterval = Self.minimumPublishInterval
+        lastSourceRefresh = nil
+        running = false
         if let subscription { service?.unsubscribe(subscription) }
         subscription = nil
         if let sessionID { try? service?.disconnect(sessionID: sessionID) }

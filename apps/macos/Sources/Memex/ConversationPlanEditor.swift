@@ -85,9 +85,9 @@ struct ConversationPlanEditor: View {
                     Text(text == loaded?.contents ? "Saved" : "Unsaved edits").font(.caption).foregroundStyle(.secondary)
                 }.disabled(busy)
             } else {
+                // The plan text stands in while the local copy opens; the editor replaces it.
                 ScrollView { Text(plan.text).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
-                if busy { ProgressView() }
-                else { Text("Read-only: the local plan document could not be opened.").font(.caption).foregroundStyle(.secondary) }
+                if !busy { Text("Read-only: the local plan document could not be opened.").font(.caption).foregroundStyle(.secondary) }
             }
         }.padding(20).frame(minWidth: 650, idealWidth: 800, minHeight: 450, idealHeight: 650)
             .task(id: plan.recordID) {

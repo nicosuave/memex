@@ -45,7 +45,7 @@ struct ConversationComposer: View {
                     Button { contextError = nil; conversation.clearSettingsError() } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
                 }
             }
-            if loadingContext { ProgressView("Capturing context…").controlSize(.small) }
+            if loadingContext { DelayedProgress("Capturing context…") }
             slashSuggestions
             if let error = conversation.draftSaveError {
                 Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
@@ -305,7 +305,7 @@ struct ConversationComposer: View {
                 Text("Skills and plugins must be browsed on this conversation’s execution host.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                if loadingProviderCatalog { ProgressView("Loading skills and plugins…").controlSize(.small) }
+                if loadingProviderCatalog { DelayedProgress("Loading skills and plugins…") }
                 ForEach(providerCatalog.issues, id: \.self) { issue in
                     Text(issue).font(.caption).foregroundStyle(.orange)
                 }

@@ -173,7 +173,7 @@ struct ProviderToolsSettingsView: View {
                         }.padding(8)
                     }
                 }
-                if busy { ProgressView().controlSize(.small) }
+                if busy { ShimmerText("Running the \(installation.provider == .codex ? "Codex" : "Claude Code") CLI…") }
                 if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
                 if let result { Text(result).foregroundStyle(.secondary) }
             }.padding(20).disabled(busy)

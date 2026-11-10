@@ -62,7 +62,7 @@ struct WorkspaceLifecycleView: View {
                     if entry.workspace.state == .failed { Text(entry.workspace.failure ?? "Preparation failed; resources retained.").font(.caption).foregroundStyle(.orange) }
                 }.padding(.vertical, 4)
             }.frame(minHeight: 280).disabled(busy)
-            if busy { ProgressView().controlSize(.small) }
+            if busy { DelayedProgress() }
             if let error { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
         }.padding(20).frame(width: 650)
         .task { await refresh() }

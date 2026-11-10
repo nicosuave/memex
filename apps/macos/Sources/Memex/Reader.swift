@@ -52,6 +52,19 @@ struct ReaderView: View {
                             }
                         footer(session)
                             .fixedSize(horizontal: false, vertical: true)
+                            .overlay(alignment: .top) {
+                                // Floats above the footer so appearing never changes its height.
+                                if store.readerUsesLiveSnapshot, !navigation.followsLatest,
+                                   let latest = store.selectedLiveConversation?.displayRecords.last {
+                                    Button {
+                                        requestedRecordID = latest.id
+                                        requestGeneration += 1
+                                    } label: { Label("Jump to latest", systemImage: "arrow.down") }
+                                        .buttonStyle(.bordered).controlSize(.small)
+                                        .background(.regularMaterial, in: Capsule())
+                                        .offset(y: -34)
+                                }
+                            }
                             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { footerHeight = $0 }
                     }
                 }
@@ -85,6 +98,12 @@ struct ReaderView: View {
             guard let live = store.selectedLiveConversation else { return }
             await live.monitorOwnership(isActive: { NSApp.isActive })
         }
+        .onChange(of: store.selectedLiveConversation?.optimisticPrompt?.commandID) { _, commandID in
+            // Sending always brings the sent message into view, even from earlier history.
+            guard let commandID else { return }
+            requestedRecordID = "optimistic:" + commandID
+            requestGeneration += 1
+        }
         .onChange(of: store.findConversationRequest) { _, _ in
             find?.isOpen = true
             findFocused = true
@@ -115,43 +134,44 @@ struct ReaderView: View {
     }
 
     private func transcript(_ session: Session) -> some View {
-        VStack(spacing: 0) {
-            if let live = store.selectedLiveConversation, store.readerUsesLiveSnapshot {
-                NativeTranscript(sessionID: session.id + ":live", records: live.visibleRecords,
-                                 provider: session.source, hasMore: false, isLoading: false, onLoadMore: {},
-                                 hasEarlier: live.hasEarlierRecords, startsAtEnd: true, navigation: navigation,
-                                 onLoadEarlier: { live.loadEarlierRecords() },
-                                 findQuery: activeFind?.query ?? "",
-                                 findHit: activeFind?.selectedHit, findGeneration: activeFind?.generation ?? 0,
-                                 rawTranscript: rawTranscript, isLocalHost: store.canAccessLocalFiles(for: session),
-                                 mcpAppTransport: live.snapshot.connected ? live.snapshot.mcpAppConnection?.transport : nil, sourcePath: session.sourcePath,
-                                 requestedRecordID: requestedRecordID, requestGeneration: requestGeneration,
-                                 followLatest: true, bottomInset: footerHeight,
-                                 onAddSelection: selectionHandler(for: session),
-                                 selectionReveal: selectionReveal, onSelectionRevealResult: selectionRevealResult)
-            } else {
-                NativeTranscript(sessionID: store.readerPositionKey,
-                                 records: store.loadedReaderKey == store.readerPositionKey ? store.records : [],
-                                 provider: session.source, hasMore: store.hasMoreRecords,
-                                 isLoading: store.loadingRecords,
-                                 onLoadMore: { Task { await store.loadMoreRecords() } },
-                                 hasEarlier: store.hasEarlierRecords, startsAtEnd: store.readerStartsAtEnd,
-                                 anchorID: store.readerAnchorID, navigation: navigation,
-                                 onLoadEarlier: { Task { await store.loadEarlierRecords() } },
-                                 findQuery: activeFind?.query ?? "",
-                                 findHit: activeFind?.selectedHit, findGeneration: activeFind?.generation ?? 0,
-                                 rawTranscript: rawTranscript, isLocalHost: store.canAccessLocalFiles(for: session),
-                                 sourcePath: session.sourcePath, requestedRecordID: requestedRecordID,
-                                 requestGeneration: requestGeneration, bottomInset: footerHeight,
-                                 onAddSelection: selectionHandler(for: session),
-                                 selectionReveal: selectionReveal, onSelectionRevealResult: selectionRevealResult)
+        // One transcript view serves both sources. Switching from indexed history
+        // to the live snapshot then reloads rows in place instead of replacing the
+        // AppKit controller, which would drop its layout and flash.
+        let live = store.selectedLiveConversation
+        let usesLive = live != nil && store.readerUsesLiveSnapshot
+        let history = store.loadedReaderKey == store.readerPositionKey ? store.records : []
+        // A prompt sent while browsing history shows at once, below the newest page.
+        let sentWhileBrowsing = usesLive || store.hasMoreRecords ? nil : live?.optimisticRecord
+        return VStack(spacing: 0) {
+            NativeTranscript(sessionID: usesLive ? session.id + ":live" : store.readerPositionKey,
+                             records: usesLive ? live?.displayRecords ?? [] : history + [sentWhileBrowsing].compactMap { $0 },
+                             provider: session.source, hasMore: usesLive ? false : store.hasMoreRecords,
+                             isLoading: usesLive ? false : store.loadingRecords,
+                             onLoadMore: { if !usesLive { Task { await store.loadMoreRecords() } } },
+                             hasEarlier: usesLive ? live?.hasEarlierRecords ?? false : store.hasEarlierRecords,
+                             startsAtEnd: usesLive || store.readerStartsAtEnd,
+                             anchorID: usesLive ? nil : store.readerAnchorID, navigation: navigation,
+                             onLoadEarlier: {
+                                 if usesLive { live?.loadEarlierRecords() } else { Task { await store.loadEarlierRecords() } }
+                             },
+                             findQuery: activeFind?.query ?? "",
+                             findHit: activeFind?.selectedHit, findGeneration: activeFind?.generation ?? 0,
+                             rawTranscript: rawTranscript, isLocalHost: store.canAccessLocalFiles(for: session),
+                             mcpAppTransport: usesLive && live?.snapshot.connected == true ? live?.snapshot.mcpAppConnection?.transport : nil,
+                             sourcePath: session.sourcePath,
+                             requestedRecordID: requestedRecordID, requestGeneration: requestGeneration,
+                             followLatest: usesLive || sentWhileBrowsing != nil,
+                             isStreaming: usesLive && live?.snapshot.running == true, bottomInset: footerHeight,
+                             onAddSelection: selectionHandler(for: session),
+                             selectionReveal: selectionReveal, onSelectionRevealResult: selectionRevealResult)
+            if !usesLive {
                 if let error = store.readerError {
                     ErrorBanner(message: error) {
                         Task { await store.retryRecords() }
                     }
                 }
                 if store.loadingRecords {
-                    ProgressView("Loading conversation…").controlSize(.small).padding(12)
+                    DelayedProgress("Loading conversation…").padding(12)
                 } else if store.records.isEmpty && store.readerError == nil {
                     Text("No messages in this transcript.").foregroundStyle(.secondary).padding(12)
                 }
@@ -304,7 +324,7 @@ struct ReaderView: View {
                 .onExitCommand { state.close() }
                 .accessibilityLabel("Find in conversation")
                 .frame(minWidth: 100).layoutPriority(1)
-            if state.isScanning { ProgressView().controlSize(.small) }
+            if state.isScanning { DelayedProgress() }
             Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 .frame(maxWidth: 90).help(state.statusDetail)
                 .accessibilityLabel(state.statusDetail)

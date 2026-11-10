@@ -60,6 +60,43 @@ struct ConversationSnapshot: Equatable, Sendable {
     var mcpAppConnection: NativeMcpAppConnection? = nil
 }
 
+/// Display state for a prompt the user just sent. It mirrors `pendingPrompt`
+/// but outlives it: provider acceptance can precede the echoed user record.
+struct OptimisticPrompt: Equatable, Sendable {
+    let commandID: String
+    let text: String
+    let attachmentTitles: [String]
+    /// The last record when the prompt crossed the provider boundary.
+    var anchorID: String?
+    var dispatched = false
+    var accepted = false
+    /// User records that already existed at dispatch and so cannot be the echo.
+    var knownUserIDs: Set<String> = []
+
+    var recordID: String { "optimistic:" + commandID }
+
+    var record: TranscriptRecord {
+        var body = text
+        if !attachmentTitles.isEmpty {
+            body += (body.isEmpty ? "" : "\n\n") + "Attached: " + attachmentTitles.joined(separator: ", ")
+        }
+        return TranscriptRecord(recordID: recordID, record: Message(role: "user", text: body, toolName: nil, toolInput: nil, toolOutput: nil))
+    }
+
+    /// The provider's own copy of this prompt. Exact native identity when the
+    /// delivery reports one; otherwise a user record that appeared after dispatch
+    /// and carries the same text.
+    func hasEcho(in records: [TranscriptRecord], delivery: ConversationDelivery?) -> Bool {
+        guard dispatched else { return false }
+        if delivery?.hasNativeEcho(in: records) == true { return true }
+        let wanted = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return records.contains { entry in
+            guard entry.record.role == "user", !entry.isRawOnly, !knownUserIDs.contains(entry.id) else { return false }
+            return wanted.isEmpty || entry.record.text.contains(wanted)
+        }
+    }
+}
+
 struct ConversationCommand: Sendable, Equatable {
     enum Action: Sendable, Equatable { case prompt, steer, cancel, approval, userInput, model, configuration }
     let id: String
@@ -108,6 +145,9 @@ final class LiveConversation {
     private(set) var attachmentError: String?
     private(set) var loadingAttachments = false
     private(set) var pendingPrompt: ConversationPendingPrompt?
+    /// The outgoing new-turn prompt as a transcript row, from Enter until its
+    /// native echo is in `snapshot.records`. Display only; it never affects delivery.
+    private(set) var optimisticPrompt: OptimisticPrompt?
     /// An empty queue has nothing to hold. Dropping the hold here keeps an
     /// interruption from silently pausing follow-ups queued later.
     private(set) var queue: [ConversationQueuedPrompt] = [] { didSet { if queue.isEmpty { queueHeld = false } } }
@@ -152,6 +192,9 @@ final class LiveConversation {
     @ObservationIgnored private var ownershipProbeID = 0
     /// Set while an outgoing prompt is being saved, before it reaches the runtime.
     @ObservationIgnored private var savingPromptID: String?
+    /// Enter time of the prompt in flight, for latency milestones only.
+    @ObservationIgnored private var promptStartedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var awaitingFirstOutput = false
     @ObservationIgnored var onNotificationState: ((Session, ConversationNotificationState) -> Void)?
     @ObservationIgnored var onTransferQueuedPrompt: ((Session, ConversationQueuedPrompt) async throws -> Void)?
     @ObservationIgnored var onResolveQueuedTransfer: ((Session, ConversationQueuedPrompt, QueuedTransferResolution) throws -> Void)?
@@ -303,7 +346,13 @@ final class LiveConversation {
             && (canSend || (!connectionAttempted && !connecting && !submitting && error == nil))
     }
     var hasPrompt: Bool { draft.nilIfBlank != nil || !attachments.isEmpty }
-    var canQueue: Bool { ownership == .available && !preparingPrompt && !loadingAttachments && !deliveryUncertain && error == nil && !changingHistory }
+    /// A follow-up can be queued while an earlier prompt is still being
+    /// dispatched. A prompt awaiting confirmation is already fenced by
+    /// `deliveryUncertain` only once it needs review, so check its phase here.
+    var canQueue: Bool {
+        ownership == .available && !loadingAttachments && error == nil && !changingHistory
+            && (!deliveryUncertain || pendingPrompt?.phase == .awaitingConfirmation)
+    }
     var canSteer: Bool {
         canQueue && snapshot.connected && snapshot.ready && snapshot.running && snapshot.canSteer
             && pendingPrompt == nil && !submitting && !submittingControl && !stopping && snapshot.controls?.pendingChanges != true
@@ -351,6 +400,43 @@ final class LiveConversation {
     }
     var visibleRecords: [TranscriptRecord] { Array(snapshot.records[visibleStart...]) }
     var hasEarlierRecords: Bool { visibleStart > 0 }
+
+    /// The sent prompt as a row while the transcript does not yet contain the
+    /// provider's copy. Steers stay in the pending view: they join a running turn
+    /// at a boundary the provider chooses, not at the end of the transcript.
+    var optimisticRecord: TranscriptRecord? {
+        guard let optimistic = optimisticPrompt else { return nil }
+        if let pending = pendingPrompt, pending.commandID == optimistic.commandID {
+            guard pending.phase == .preparing || pending.phase == .awaitingConfirmation else { return nil }
+        } else if !optimistic.accepted {
+            return nil
+        }
+        let delivery = snapshot.deliveries.first { $0.commandID == optimistic.commandID }
+        return optimistic.hasEcho(in: snapshot.records, delivery: delivery) ? nil : optimistic.record
+    }
+
+    /// `visibleRecords` with the optimistic prompt where its echo will appear.
+    var displayRecords: [TranscriptRecord] {
+        var records = visibleRecords
+        guard let row = optimisticRecord, let optimistic = optimisticPrompt else { return records }
+        guard optimistic.dispatched else { return records + [row] }
+        if let anchor = optimistic.anchorID, let index = records.lastIndex(where: { $0.id == anchor }) {
+            records.insert(row, at: index + 1)
+        } else if optimistic.anchorID == nil {
+            records.insert(row, at: 0)
+        } else {
+            records.append(row)
+        }
+        return records
+    }
+
+    private func beginOptimisticPrompt(_ command: ConversationCommand) {
+        guard command.action == .prompt else { return }
+        optimisticPrompt = OptimisticPrompt(commandID: command.id, text: command.text,
+                                            attachmentTitles: command.attachments.map(\.title))
+        promptStartedAt = .now
+        awaitingFirstOutput = true
+    }
     func loadEarlierRecords() { visibleLimit += MemexClient.pageSize }
     func revealRecord(_ id: String) {
         if let index = snapshot.records.firstIndex(where: { $0.id == id }) {
@@ -361,7 +447,9 @@ final class LiveConversation {
     var status: String {
         if changingHistory { return "Changing conversation history…" }
         if isOpenElsewhere { return "Open elsewhere" }
-        if connecting { return "Connecting…" }
+        if connecting || (preparingPrompt && pendingPrompt?.phase == .preparing && !snapshot.connected && error == nil) {
+            return "Connecting…"
+        }
         if error != nil { return "Connection needs attention" }
         if !snapshot.connected { return "Disconnected" }
         if !snapshot.approvals.isEmpty { return "Waiting for approval" }
@@ -503,6 +591,7 @@ final class LiveConversation {
                             self.settleStop()
                         }
                         self.reconcilePendingPrompt()
+                        self.noteProgress(finishedTurn: finishedTurn)
                         self.hasSnapshot = true
                         self.revision += 1
                         if snapshot.ready {
@@ -587,6 +676,21 @@ final class LiveConversation {
         await previous?.disconnect()
     }
 
+    /// Latency milestones, and retiring an optimistic prompt that the transcript
+    /// now represents (or that a finished turn never echoed).
+    private func noteProgress(finishedTurn: Bool) {
+        if awaitingFirstOutput, let promptStartedAt, let optimistic = optimisticPrompt, optimistic.dispatched,
+           let last = snapshot.records.last, last.record.role != "user", last.id != optimistic.anchorID {
+            awaitingFirstOutput = false
+            ChatSignpost.milestone("send.enterToFirstOutput", since: promptStartedAt)
+        }
+        guard let optimistic = optimisticPrompt, pendingPrompt?.commandID != optimistic.commandID else { return }
+        let delivery = snapshot.deliveries.first { $0.commandID == optimistic.commandID }
+        if finishedTurn || !optimistic.accepted || optimistic.hasEcho(in: snapshot.records, delivery: delivery) {
+            optimisticPrompt = nil
+        }
+    }
+
     private func finishConnecting(_ ready: Bool) {
         let waiter = connectionWaiter
         connectionWaiter = nil
@@ -594,25 +698,34 @@ final class LiveConversation {
     }
 
     func send() async {
-        await refreshOwnership()
         guard canSubmit, hasPrompt else { return }
         notice = nil
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = attachments
         let command = ConversationCommand(.prompt, text: text, attachments: attachments)
+        // Show the prompt and the working state before any awaited check. Nothing
+        // has crossed the provider boundary; every early return below restores it.
         pendingPrompt = ConversationPendingPrompt(command)
+        beginOptimisticPrompt(command)
         self.attachments = []
         draft = ""
         preparingPrompt = true
+        notifyState()
         defer {
             preparingPrompt = false
             restoreUnsentPrompt()
             notifyState()
             scheduleQueueDrain()
         }
+        await ChatSignpost.measure("send.ownershipProbe") { await refreshOwnership() }
+        guard ownership == .available, pendingPrompt?.commandID == command.id,
+              pendingPrompt?.phase == .preparing else { return }
         // Browsing history does not launch a provider. The first explicit send
         // loads its original session, then sends exactly once when it is ready.
-        if !connectionAttempted, !(await connect(ownershipChecked: true)) { return }
+        if !connectionAttempted {
+            let connected = await ChatSignpost.measure("send.connect") { await connect(ownershipChecked: true) }
+            if !connected { return }
+        }
         guard canSend else { return }
         completion = nil
         stopping = false
@@ -644,6 +757,8 @@ final class LiveConversation {
         if delivery.isAccepted || (pending.isSteer == true && delivery.status == "completed")
             || delivery.hasNativeEcho(in: snapshot.records) && pending.isSteer != true {
             pendingPrompt = nil
+            if optimisticPrompt?.commandID == pending.commandID { optimisticPrompt?.accepted = true }
+            if let promptStartedAt { ChatSignpost.milestone("send.enterToAccepted", since: promptStartedAt) }
             deliveryUncertain = false
             if pending.phase == .uncertain { error = nil }
             persistDraft()
@@ -904,6 +1019,7 @@ final class LiveConversation {
               steer ? canSteer : canSend else { return }
         let command = queue.removeFirst().command(steer: steer)
         pendingPrompt = ConversationPendingPrompt(command)
+        beginOptimisticPrompt(command)
         preparingPrompt = true
         completion = nil
         persistDraft()
@@ -1024,7 +1140,7 @@ final class LiveConversation {
             }
         }
         if command.action == .prompt, let beforePrompt {
-            await beforePrompt(session, command)
+            await ChatSignpost.measure("send.checkpoint") { await beforePrompt(session, command) }
             guard generation == token, pendingPrompt?.commandID == command.id,
                   pendingPrompt?.phase == .preparing else { return false }
         }
@@ -1037,7 +1153,7 @@ final class LiveConversation {
             pendingPrompt?.phase = .awaitingConfirmation
             savingPromptID = command.id
             persistDraft()
-            await drafts?.flush()
+            await ChatSignpost.measure("send.draftFlush") { await drafts?.flush() }
             if savingPromptID == command.id { savingPromptID = nil }
             guard generation == token else { return false }
             // Stop during the save cancels this prompt before the provider boundary.
@@ -1055,7 +1171,13 @@ final class LiveConversation {
             }
         }
         do {
-            try await runtime.perform(command)
+            if optimisticPrompt?.commandID == command.id {
+                optimisticPrompt?.anchorID = snapshot.records.last?.id
+                optimisticPrompt?.knownUserIDs = Set(snapshot.records.lazy.filter { $0.record.role == "user" }.map(\.id))
+                optimisticPrompt?.dispatched = true
+            }
+            if isPrompt, let promptStartedAt { ChatSignpost.milestone("send.enterToDispatch", since: promptStartedAt) }
+            try await ChatSignpost.measure("send.perform") { try await runtime.perform(command) }
             if command.action == .prompt || command.action == .steer, generation == token {
                 // Queuing a command is not confirmation that the provider accepted it.
                 reconcilePendingPrompt()

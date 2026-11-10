@@ -29,7 +29,7 @@ struct WorkspaceTerminalView: View {
                         Button("Try again") { retry += 1 }
                     }
                 } else {
-                    ProgressView("Opening workspace terminal…")
+                    DelayedProgress("Opening workspace terminal…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             } else {

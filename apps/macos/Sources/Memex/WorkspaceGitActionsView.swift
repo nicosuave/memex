@@ -28,7 +28,7 @@ struct WorkspaceGitActionsView: View {
                 Button("Create draft pull request…") { action = .pullRequest }.disabled(status?.branch.isEmpty != false)
                 Button("Refresh status") { Task { await refresh() } }
             }.disabled(busy || status == nil)
-            if busy { ProgressView().controlSize(.small) }
+            if busy { DelayedProgress() }
             if let result { Text(result).font(.caption).lineLimit(1).help(result) }
             if let error { Text(error).font(.caption).foregroundStyle(.orange).lineLimit(2).help(error) }
         }

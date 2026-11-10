@@ -16,6 +16,14 @@ enum RichTextRenderer {
         return output
     }
 
+    /// One top-level block. A document renders as the concatenation of its
+    /// blocks, which lets a streaming message keep the blocks that settled.
+    static func renderBlock(_ node: any Markup, font: NSFont) -> NSAttributedString {
+        let output = NSMutableAttributedString(string: "")
+        appendBlock(node, to: output, font: font, indent: 0)
+        return output
+    }
+
     private static func paragraph(indent: CGFloat, spacing: CGFloat = 8) -> NSMutableParagraphStyle {
         let style = NSMutableParagraphStyle()
         style.paragraphSpacing = spacing

@@ -968,3 +968,23 @@ body {
 .message-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .message[data-match="true"] { border-left: 3px solid var(--primary); padding-left: 12px; }
 @media (max-width: 720px) { .command-bar { flex-wrap: wrap; } .search-group { flex: 1 1 160px; } }
+
+/* The execution transcript runs its own bottom follow, so the browser must not anchor or animate scrolling. */
+.execution-scroll { overflow-anchor: none; scroll-behavior: auto; }
+
+/* A highlight band sweeps across the working label. The 250% background moves the band from just left to
+   just right of the text, so the sweep is sized to the text, not the container. */
+.execution-shimmer { display: inline-block; color: var(--muted-foreground); }
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .execution-shimmer {
+    background: linear-gradient(90deg, var(--muted-foreground) 40%, var(--foreground) 50%, var(--muted-foreground) 60%) 100% 0 / 250% 100% no-repeat;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: execution-shimmer 1.8s linear infinite;
+  }
+}
+@keyframes execution-shimmer { to { background-position: 0% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .execution-shimmer { animation: none; background: none; color: var(--muted-foreground); }
+}

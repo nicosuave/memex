@@ -20,7 +20,26 @@ export type CapturedAttachment = { id: string; name: string; block: Record<strin
 export type ExecutionDraft = { text: string; attachments: CapturedAttachment[] }
 
 export class ExecutionError extends Error {
-  constructor(readonly code: string, message: string) { super(message) }
+  /** `rejected` means the command definitively did not execute, so it can be discarded and resent. */
+  constructor(readonly code: string, message: string, readonly rejected = false) { super(message) }
+}
+
+// Host error codes for which the execution host records the command's receipt as
+// "rejected" (`rejectedCodes` in ExecutionHost.mutate), replays such a receipt
+// ("rejected"), or fails before any receipt exists (wrong_host, method_not_found).
+// Every other host error is recorded by the host as uncertain and stays unconfirmed here.
+const rejectedHostCodes = new Set(["invalid_params", "workspace_denied", "unsupported_provider", "not_found", "queue_state",
+  "rejected", "wrong_host", "method_not_found"])
+// The gateway answers these before relaying the envelope to the host (src/web.rs, /api/control).
+const unrelayedStatuses = new Set([400, 401, 403, 405])
+type Envelope<T> = { id?: unknown; result?: T; error?: string | { code: string; message: string } }
+export type ReadResult<T> = { raw: string; changed: false } | { raw: string; changed: true; result: T }
+
+/** One user action and its most specific target, so only that control waits for its request. */
+export function actionKey(method: string, params: Record<string, unknown> = {}): string {
+  const target = ["queuedCommandId", "requestId", "worktreeId", "scheduleId", "runId", "conversationId", "workspaceId"]
+    .map(name => params[name]).find(value => typeof value === "string")
+  return target === undefined ? method : `${method}:${target}`
 }
 
 const outboxPrefix = "memex-execution-outbox-v1:"
@@ -28,8 +47,14 @@ export class ExecutionClient {
   constructor(readonly token: string, readonly hostId?: string) {}
 
   async call<T>(method: string, params: Record<string, unknown> = {}, mutation = false, signal?: AbortSignal): Promise<T> {
+    return this.dispatch<T>(this.prepare(method, params, mutation), mutation, signal)
+  }
+
+  /** Builds the request and, for a mutation, saves it to the outbox before returning. Throws synchronously. */
+  prepare(method: string, params: Record<string, unknown> = {}, mutation = false, requestId?: string): ExecutionRequest {
     const commandId = typeof params.commandId === "string" ? params.commandId : crypto.randomUUID()
-    const request: ExecutionRequest = { id: commandId, method, params: { ...params, ...(this.hostId ? { hostId: this.hostId } : {}) } }
+    const request: ExecutionRequest = { id: mutation ? commandId : requestId ?? commandId, method,
+      params: { ...params, ...(this.hostId ? { hostId: this.hostId } : {}) } }
     if (mutation) {
       request.params.commandId = commandId
       request.params.issuedAt ??= new Date().toISOString()
@@ -44,21 +69,54 @@ export class ExecutionClient {
         }
       } else { localStorage.setItem(key, JSON.stringify(request)) }
     }
+    return request
+  }
+
+  async dispatch<T>(request: ExecutionRequest, mutation = false, signal?: AbortSignal): Promise<T> {
+    const response = await this.exchange<T>(request, mutation, signal)
+    // Without a previous answer to compare against, every answer is a changed one.
+    if (!response.changed) throw new ExecutionError("response", "The execution host returned no result")
+    return response.result
+  }
+
+  /** Reads with a fixed envelope ID, so an unchanged answer is byte-identical to `previous` and is not parsed again. */
+  read<T>(method: string, params: Record<string, unknown>, previous: string | undefined, signal?: AbortSignal): Promise<ReadResult<T>> {
+    return this.exchange<T>(this.prepare(method, params, false, method), false, signal, previous)
+  }
+
+  private async exchange<T>(request: ExecutionRequest, mutation: boolean, signal?: AbortSignal, previous?: string): Promise<ReadResult<T>> {
     let response: Response
+    let raw: string
     try {
       response = await fetch("/api/control", { method: "POST", redirect: "error", credentials: "omit",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" }, body: JSON.stringify(request),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(65000)]) : AbortSignal.timeout(65000) })
+      raw = await response.text()
     } catch (error) {
       throw new ExecutionError("delivery_unknown", mutation
-        ? `The exact command ${commandId} is saved. Check its receipt before resending: ${String(error)}` : String(error))
+        ? `The exact command ${request.id} is saved. Check its receipt before resending: ${String(error)}` : String(error))
     }
-    const envelope = await response.json() as { result?: T; error?: string | { code: string; message: string } }
-    if (!response.ok) throw new ExecutionError("http", typeof envelope.error === "string" ? envelope.error : `Execution host HTTP ${response.status}`)
-    if (envelope.error) throw typeof envelope.error === "string" ? new ExecutionError("host", envelope.error) : new ExecutionError(envelope.error.code, envelope.error.message)
+    if (response.ok && previous !== undefined && raw === previous) return { raw, changed: false }
+    let envelope: Envelope<T> | null = null
+    try { envelope = JSON.parse(raw) as Envelope<T> } catch { envelope = null }
+    if (!response.ok) {
+      const message = typeof envelope?.error === "string" ? envelope.error : !envelope && raw.trim() ? raw.trim() : `Execution host HTTP ${response.status}`
+      throw this.failed(request, mutation, new ExecutionError("http", message, unrelayedStatuses.has(response.status)))
+    }
+    if (!envelope || typeof envelope !== "object") throw new ExecutionError("response", "The execution host returned an unreadable response")
+    if (envelope.error) {
+      throw this.failed(request, mutation, typeof envelope.error === "string" ? new ExecutionError("host", envelope.error)
+        : new ExecutionError(envelope.error.code, envelope.error.message, envelope.id === request.id && rejectedHostCodes.has(envelope.error.code)))
+    }
     if (!("result" in envelope)) throw new ExecutionError("response", "The execution host returned no result")
-    if (mutation) localStorage.removeItem(this.outboxKey(commandId))
-    return envelope.result as T
+    if (mutation) localStorage.removeItem(this.outboxKey(request.id))
+    return { raw, changed: true, result: envelope.result as T }
+  }
+
+  private failed(request: ExecutionRequest, mutation: boolean, error: ExecutionError): ExecutionError {
+    // A definitive rejection never executed, so its saved outgoing intent cannot cause a duplicate.
+    if (mutation && error.rejected) localStorage.removeItem(this.outboxKey(request.id))
+    return error
   }
 
   pending(): ExecutionRequest[] {
@@ -77,7 +135,73 @@ export class ExecutionClient {
   saveDraft(conversationId: string, draft: ExecutionDraft): void {
     localStorage.setItem(`memex-execution-draft-v1:${this.hostId}:${conversationId}`, JSON.stringify(draft))
   }
+  /** Applies `change` to a saved draft and reports whether it changed anything. */
+  editDraft(conversationId: string, change: (draft: ExecutionDraft) => ExecutionDraft): boolean {
+    const saved = this.draft(conversationId)
+    const next = change(saved)
+    if (next === saved) return false
+    this.saveDraft(conversationId, next)
+    return true
+  }
   private outboxKey(id: string): string { return `${outboxPrefix}${this.hostId ?? "unpaired"}:${id}` }
+}
+
+export const emptyDraft: ExecutionDraft = { text: "", attachments: [] }
+export const isBlankDraft = (draft: ExecutionDraft) => !draft.text.trim() && !draft.attachments.length
+
+/** The prompt content a draft sends, or undefined for text alone. */
+export function draftPromptContent(draft: ExecutionDraft): Record<string, unknown>[] | undefined {
+  return draft.attachments.length ? [{ type: "text", text: draft.text }, ...draft.attachments.map(item => item.block)] : undefined
+}
+
+export const promptMethods = new Set(["conversation.send", "conversation.steer", "conversation.queue.add"])
+const transcriptKinds = new Set(["message", "tool_invocation", "tool_result", "context_boundary"])
+
+export function transcriptEntities(snapshot: HostSnapshot): HostEntity[] {
+  const conversation = snapshot.presentation?.conversation
+  const saved = conversation?.presentation || []
+  const live = [...(conversation?.ephemeral || [])].sort((a, b) => (a.source_order || 0) - (b.source_order || 0))
+  // An exact native message identity supersedes its saved projection. Similar text
+  // is never a reason to remove another message.
+  const liveNativeIDs = new Set(live.map(item => item.body.data.native_message_id).filter(Boolean))
+  return [...saved.filter(item => !item.body.data.native_message_id || !liveNativeIDs.has(item.body.data.native_message_id)), ...live]
+    .filter(item => transcriptKinds.has(item.body.kind))
+}
+
+export function entityKey(entity: HostEntity, index: number): string {
+  return entity.item_id || entity.entity_id || `unknown-${index}`
+}
+
+export function entityText(entity: HostEntity): string {
+  return (entity.body.data.parts || []).map(part => {
+    if (typeof part.data === "string") return part.data
+    return JSON.stringify(part.data, null, 2)
+  }).join("\n")
+}
+
+function userEntities(entities: HostEntity[]) {
+  return entities.map((entity, index) => ({ entity, key: entityKey(entity, index) }))
+    .filter(({ entity }) => entity.body.kind === "message" && entity.body.data.role === "user")
+}
+
+/** User messages that already exist when a prompt is dispatched cannot be its echo. */
+export function userEntityKeys(entities: HostEntity[]): Set<string> {
+  return new Set(userEntities(entities).map(({ key }) => key))
+}
+
+/**
+ * Whether the transcript holds the provider's own copy of a sent prompt: the exact native message or
+ * turn its delivery reports, otherwise (as the macOS client does) a user message that appeared after
+ * dispatch and contains the sent text. Without the dispatch-time user keys only exact identity counts.
+ */
+export function hasPromptEcho(commandId: string, text: string, knownUserKeys: ReadonlySet<string> | null, snapshot: HostSnapshot, entities: HostEntity[]): boolean {
+  const delivery = snapshot.deliveries.find(item => item.commandId === commandId)
+  const users = userEntities(entities)
+  if (delivery?.nativeMessageId && users.some(({ entity }) => entity.body.data.native_message_id === delivery.nativeMessageId)) return true
+  if (delivery?.nativeTurnId && users.some(({ entity }) => entity.native_turn_id === delivery.nativeTurnId)) return true
+  if (!knownUserKeys) return false
+  const wanted = text.trim()
+  return users.some(({ entity, key }) => !knownUserKeys.has(key) && (!wanted || entityText(entity).includes(wanted)))
 }
 
 export async function captureExecutionAttachment(file: File, capabilities: NonNullable<HostSnapshot["controls"]>["promptCapabilities"]): Promise<CapturedAttachment> {

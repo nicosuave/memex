@@ -50,7 +50,7 @@ struct WorkspaceChangesView: View {
                     .font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     .help(displayedRoot)
                 Spacer()
-                if state.loading { ProgressView().controlSize(.small).help("Refreshing workspace changes") }
+                if state.loading { DelayedProgress().help("Refreshing workspace changes") }
                 if let close {
                     Button(action: close) { Image(systemName: "xmark") }
                         .help("Close workspace changes").accessibilityLabel("Close workspace changes")
@@ -87,7 +87,7 @@ struct WorkspaceChangesView: View {
             }
             Divider()
             if state.directory != directory {
-                ProgressView("Reading workspace changes…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                DelayedProgress("Reading workspace changes…").frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 if let error = state.error {
                     errorBanner(error, retained: state.snapshot != nil) { refreshID = UUID() }
@@ -123,23 +123,19 @@ struct WorkspaceChangesView: View {
                                 }
                                     .overlay {
                                         if state.patch == nil {
-                                            if state.loadingPatch { ProgressView("Reading diff…") }
-                                            else {
+                                            if state.loadingPatch { DelayedProgress("Reading diff…") }
+                                            // A new selection renders once before its read starts; keep that frame blank.
+                                            else if state.patchError != nil || state.selectedPath == nil {
                                                 Text(state.patchError != nil ? "Could not read this diff." : "Select a file to see its changes.")
                                                     .foregroundStyle(.secondary)
                                             }
-                                        }
-                                    }
-                                    .overlay(alignment: .topTrailing) {
-                                        if state.loadingPatch && state.patch != nil {
-                                            ProgressView().controlSize(.small).padding(8).help("Refreshing diff")
                                         }
                                     }
                             }.frame(minWidth: 250, maxWidth: .infinity, maxHeight: .infinity)
                         }
                     }
                 } else if state.loading {
-                    ProgressView("Reading workspace changes…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                    DelayedProgress("Reading workspace changes…").frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if state.error != nil {
                     ContentUnavailableView("Could not read changes", systemImage: "exclamationmark.triangle",
                         description: Text("Try refreshing the workspace changes."))

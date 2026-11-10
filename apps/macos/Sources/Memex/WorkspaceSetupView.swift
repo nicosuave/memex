@@ -28,8 +28,7 @@ struct WorkspaceSetupView: View {
             }
             HStack {
                 if operation != nil {
-                    ProgressView().controlSize(.small)
-                    Text(cancelled ? "Cancelling…" : "Running setup…").font(.caption)
+                    ShimmerText(cancelled ? "Cancelling…" : "Running setup…", font: .preferredFont(forTextStyle: .caption1))
                     Spacer()
                     Button("Cancel operation") { cancelled = true; operation?.cancel() }.disabled(cancelled)
                 } else {

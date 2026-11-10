@@ -3,6 +3,14 @@ import Testing
 @testable import Memex
 
 @Suite @MainActor struct SidebarConversationTests {
+    @Test func onlyBusyConversationsPulseAndNeverUnderReduceMotion() {
+        let busy: [ConversationActivity] = [.starting, .working, .stopping]
+        let settled: [ConversationActivity] = [.approval, .question, .failed, .completed, .stopped, .openElsewhere]
+        #expect(busy.allSatisfy { $0.pulsesSymbol(reduceMotion: false) })
+        #expect(!busy.contains { $0.pulsesSymbol(reduceMotion: true) })
+        #expect(!settled.contains { $0.pulsesSymbol(reduceMotion: false) })
+    }
+
     @Test func layoutModesPreserveSelectionFiltersAndSearchIdentity() throws {
         let name = "Memex-sidebar-test-\(UUID())"
         let preferences = try #require(UserDefaults(suiteName: name))

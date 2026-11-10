@@ -64,7 +64,7 @@ struct ConversationChildView: View {
                 Toggle("Raw transcript", isOn: $raw)
             }
             if let error = history?.error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
-            if history?.loading == true { ProgressView("Reading child history…") }
+            if history?.loading == true { ShimmerText("Reading child history…") }
             if records.isEmpty && history?.loading != true {
                 ContentUnavailableView("Child history unavailable", systemImage: "bubble.left",
                     description: Text(conversation?.snapshot.connected != true ? "Connect the parent conversation to read provider history before indexing completes." : "Refresh to read this child through its parent connection."))
