@@ -404,7 +404,8 @@ fn inspect(
 ) -> Result<AssignmentReport> {
     let analytics = crate::analytics::AnalyticsStore::open_read_only(
         crate::analytics::analytics_path(&paths.state),
-    )?;
+    )?
+    .without_titles();
     let rows = analytics.query_sessions_detailed_selected(
         None,
         None,

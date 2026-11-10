@@ -33,6 +33,19 @@ The `ssh = "mini"` field is a shorthand for the `machines.control` table. Set
 `command = "/path/to/memex"` when `memex` is not on the non-interactive SSH `PATH`.
 SSH keys, users, ports, jump hosts, and host-key policy remain in `~/.ssh/config`.
 
+Memex reuses one SSH connection per host: the first request opens a shared connection
+through a control socket in a private directory under the state directory
+(`~/.memex/state/ssh`), and that connection stays open for 5 minutes after the last
+request, so later queries skip the SSH handshake. The shared connection checks the peer
+every 5 seconds while it is silent and closes after two unanswered checks, so a peer that
+sleeps or drops off the network stops costing requests within about 15 seconds. A new
+connection must connect and finish the handshake within `timeout_seconds` or 5 seconds,
+whichever is shorter. These settings override `ControlMaster`, `ControlPath`,
+`ControlPersist`, `ServerAliveInterval`, `ServerAliveCountMax`, and `ConnectTimeout` from
+`~/.ssh/config` for memex's own connections. When the state directory's path is too
+long for a Unix socket or contains characters other than letters, digits, `/`, `.`, `_`,
+and `-`, memex connects without sharing.
+
 ```sh
 memex search "tantivy corruption"             # configured defaults
 memex search "tantivy corruption" --machine mini
@@ -60,6 +73,11 @@ project, and query filters are shared by the session results and token chart; th
 dropdown bounds the chart. Repository project mode groups linked checkouts and worktrees
 under their repository name. Sessions without repository metadata appear under `Unfiled`
 instead of turning arbitrary working-directory or standalone-task names into projects.
+Without a query, each machine lists the sessions matching these filters from its own
+session catalog, as `memex sessions` does; until this machine has a catalog, its sessions
+come from its newest index records. A machine too old for federated session lists
+sends its newest records instead, grouped into sessions locally; one too old to filter by
+flat project matches the repository project and has its rows filtered locally.
 
 ### Opening federated results
 

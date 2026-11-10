@@ -39,6 +39,8 @@ pub struct VectorIndex {
     index: Index,
     doc_id_set: HashSet<u64>,
     needs_backfill: bool,
+    /// Whether staging would write anything the active generation does not already hold.
+    changed: bool,
 }
 
 pub(crate) struct StagedVectorGeneration {
@@ -177,6 +179,8 @@ impl VectorIndex {
             index,
             doc_id_set,
             needs_backfill: false,
+            // Publishing legacy flat storage moves it into a generation.
+            changed: storage.generation.is_none(),
         })
     }
 
@@ -199,6 +203,7 @@ impl VectorIndex {
             index,
             doc_id_set: HashSet::new(),
             needs_backfill: true,
+            changed: true,
         })
     }
 
@@ -213,6 +218,7 @@ impl VectorIndex {
         if !self.doc_id_set.insert(doc_id) {
             return Ok(());
         }
+        self.changed = true;
 
         // Expand capacity if needed
         if self.index.size() >= self.index.capacity() {
@@ -338,6 +344,7 @@ impl VectorIndex {
     pub(crate) fn retain_doc_ids(&mut self, retained: &HashSet<u64>) -> Result<()> {
         let removed: Vec<_> = self.doc_id_set.difference(retained).copied().collect();
         for doc_id in removed {
+            self.changed = true;
             self.index.remove(doc_id)?;
             self.doc_id_set.remove(&doc_id);
         }
@@ -347,10 +354,18 @@ impl VectorIndex {
     pub(crate) fn remove_doc_ids(&mut self, doc_ids: &HashSet<u64>) -> Result<()> {
         for doc_id in doc_ids {
             if self.doc_id_set.remove(doc_id) {
+                self.changed = true;
                 self.index.remove(*doc_id)?;
             }
         }
         Ok(())
+    }
+
+    /// Whether [`Self::stage`] would publish anything the active generation does not hold:
+    /// a new or replacement store, legacy flat storage, or an added or removed vector. An
+    /// unchanged store opened from a generation would stage a copy of that generation.
+    pub(crate) fn has_unpublished_changes(&self) -> bool {
+        self.changed
     }
 
     pub fn exists(dir: &Path) -> bool {

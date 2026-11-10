@@ -63,7 +63,6 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         model,
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
-        defer_merges: false,
         embedding_budget: None,
         redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     }
@@ -142,6 +141,74 @@ fn torn_jsonl_checkpoint_survives_completion_truncation_and_append() {
     assert_eq!(texts(), ["completed", "replacement"]);
     assert_eq!(saved_state().turn_id, 2);
     assert_eq!(ingest().records_added, 0);
+}
+
+/// A refresh of a few megabytes and a few hundred records is indexed by one worker, so it
+/// publishes one segment instead of one per indexing thread.
+#[test]
+fn multi_megabyte_append_publishes_one_segment() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("claude-projects");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join("session.jsonl");
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::gemma());
+    options.claude_sources = vec![root];
+    let append = |records: std::ops::Range<usize>| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for record in records {
+            let line = serde_json::json!({
+                "type": "user",
+                "uuid": format!("record-{record}"),
+                "timestamp": "2026-11-01T00:00:00Z",
+                "message": {
+                    "role": "user",
+                    "content": format!("record {record} ").repeat(1500),
+                },
+            });
+            writeln!(file, "{line}").unwrap();
+        }
+    };
+    let segments = || {
+        open_search_index(&paths)
+            .index
+            .searchable_segment_ids()
+            .unwrap()
+    };
+
+    append(0..1);
+    assert_eq!(
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease)
+            .unwrap()
+            .records_added,
+        1
+    );
+    let before = segments();
+    let appended_bytes = {
+        let start = path.metadata().unwrap().len();
+        append(1..301);
+        path.metadata().unwrap().len() - start
+    };
+    assert!(appended_bytes > 4 * 1024 * 1024, "{appended_bytes} bytes");
+
+    assert_eq!(
+        ingest_all(&paths, &open_search_index(&paths), &options, &lease)
+            .unwrap()
+            .records_added,
+        300
+    );
+    let after = segments();
+    assert!(before.iter().all(|id| after.contains(id)));
+    assert_eq!(after.len(), before.len() + 1);
 }
 
 #[test]
@@ -272,6 +339,51 @@ fn memory_edits_refresh_inside_transcript_scan_ttl_without_creating_sessions() {
     )
     .unwrap();
     assert!(store.load().unwrap().documents.is_empty());
+}
+
+#[test]
+fn memory_refresh_skips_embedding_while_another_writer_holds_the_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let claude = tmp.path().join("claude/projects");
+    let memory = claude.join("-work-project/memory/MEMORY.md");
+    fs::create_dir_all(memory.parent().unwrap()).unwrap();
+    fs::write(&memory, "# Decisions\n\nEmbed this section later.\n").unwrap();
+    let paths = Paths::new(Some(tmp.path().join("data"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let model = ModelChoice::Remote("test-model".to_string());
+    let mut options = ingest_options(true, model.clone());
+    options.claude_sources = vec![claude];
+    // Any embedding request against this endpoint fails, so a refresh that succeeds
+    // with it did not try to embed.
+    options.embed_runtime = unroutable_remote_runtime(None);
+    let repositories = crate::repository::RepositoryResolver::default();
+    let memory_vectors_current = || {
+        crate::memory_search::embed_memory(&paths, &model, &unroutable_remote_runtime(None), None)
+            .is_ok_and(|embedded| embedded == 0)
+    };
+
+    let backfill = match IngestLease::try_acquire_embedding(&paths, "test backfill").unwrap() {
+        crate::lease::LeaseAttempt::Acquired(lease) => lease,
+        crate::lease::LeaseAttempt::Busy(_) => panic!("embedding lease should be free"),
+    };
+    let started = std::time::Instant::now();
+    refresh_memories(&paths, &options, &repositories).unwrap();
+    assert!(
+        started.elapsed() < crate::lease::INGEST_LEASE_TIMEOUT / 4,
+        "refresh waited {:?} for the embedding lease",
+        started.elapsed()
+    );
+    let store = crate::memory::MemoryStore::new(paths.root.join("memory/documents.json"));
+    assert_eq!(store.load().unwrap().documents.len(), 1);
+    assert!(!memory_vectors_current());
+
+    drop(backfill);
+    let (base_url, server) = serve_test_embeddings();
+    let remote = options.embed_runtime.remote.as_mut().unwrap();
+    remote.endpoint.base_url = base_url;
+    refresh_memories(&paths, &options, &repositories).unwrap();
+    assert!(memory_vectors_current());
+    assert!(server.join().unwrap() > 0);
 }
 
 #[test]
@@ -963,7 +1075,6 @@ fn cancelled_writer_does_not_publish_staged_records() {
     let ctx = WriterContext {
         index_root: PathBuf::new(),
         input_bytes: None,
-        defer_merges: false,
         embedding_budget: None,
         embeddings: false,
         do_backfill_embeddings: false,
@@ -1040,7 +1151,6 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
         Vec::new(),
         WriterContext {
             index_root: paths.index.clone(),
-            defer_merges: false,
             embedding_budget: None,
             input_bytes: Some(0),
             embeddings: true,
@@ -1180,7 +1290,6 @@ fn parser_cancellation_preserves_active_vectors() {
     let ctx = WriterContext {
         index_root: PathBuf::new(),
         input_bytes: None,
-        defer_merges: false,
         embedding_budget: None,
         embeddings: true,
         do_backfill_embeddings: false,
@@ -2939,7 +3048,6 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         model: ModelChoice::default(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
-        defer_merges: false,
         embedding_budget: None,
         redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     };
@@ -3448,6 +3556,122 @@ fn unroutable_remote_runtime(dimensions: Option<usize>) -> EmbedRuntimeConfig {
     }
 }
 
+/// Answers OpenAI-style embedding requests with `width`-length vectors until 500 ms pass
+/// without one, then returns how many requests it served. Loading a remote model sends a
+/// probe, so the count also shows whether a refresh loaded one.
+fn serve_embeddings(width: usize) -> (EmbedRuntimeConfig, std::thread::JoinHandle<usize>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let address = server.server_addr().to_ip().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut served = 0;
+        while let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(500)) {
+            let mut body = String::new();
+            std::io::Read::read_to_string(request.as_reader(), &mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let count = body["input"].as_array().map_or(0, Vec::len);
+            let data = (0..count)
+                .map(|index| serde_json::json!({"index": index, "embedding": vec![0.5; width]}))
+                .collect::<Vec<_>>();
+            let response =
+                tiny_http::Response::from_string(serde_json::json!({ "data": data }).to_string())
+                    .with_header(
+                        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+                    );
+            request.respond(response).unwrap();
+            served += 1;
+        }
+        served
+    });
+    let mut runtime = unroutable_remote_runtime(Some(width));
+    runtime.remote.as_mut().unwrap().endpoint.base_url = format!("http://{address}/v1");
+    runtime.remote.as_mut().unwrap().endpoint.timeout = Duration::from_secs(5);
+    (runtime, handle)
+}
+
+/// A refresh whose new records are all tool calls and results has nothing to embed: it loads
+/// no model and leaves the published vector generation alone. The next embeddable record
+/// loads the model and is embedded.
+#[test]
+fn embedding_refresh_loads_the_model_only_for_records_it_embeds() {
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude_root = tmp.path().join("claude-projects");
+    let project = claude_root.join("project");
+    fs::create_dir_all(&project).expect("create project dir");
+    let transcript = project.join("session.jsonl");
+    let append = |lines: &str| {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&transcript)
+            .expect("open transcript")
+            .write_all(lines.as_bytes())
+            .expect("append transcript");
+    };
+    append(concat!(
+        r#"{"type":"user","uuid":"u1","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":"hello"}}"#,
+        "\n"
+    ));
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let lease = ingest_lease(&paths);
+    let mut options = ingest_options(false, ModelChoice::Remote("embed-small".to_string()));
+    options.claude_sources = vec![claude_root];
+    let ingest = |options: &IngestOptions| {
+        ingest_all(&paths, &open_search_index(&paths), options, &lease).expect("ingest")
+    };
+    assert_eq!(ingest(&options).records_added, 1);
+    let mut vectors = VectorIndex::open_or_create(&paths.vectors, 8, Some("remote:embed-small"))
+        .expect("open vector store");
+    open_search_index(&paths)
+        .for_each_record(|record| vectors.add(record.doc_id, &[0.5; 8]))
+        .expect("cover every record");
+    vectors.save().expect("save vectors");
+    drop(vectors);
+    let revision = || VectorIndex::snapshot_revision(&paths.vectors).expect("vector revision");
+    let published = revision();
+    options.embeddings = true;
+
+    append(concat!(
+        r#"{"type":"assistant","uuid":"a1","timestamp":"2026-11-01T00:00:01Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"Read","input":{"path":"a"}}]}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"r1","timestamp":"2026-11-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"contents"}]}}"#,
+        "\n"
+    ));
+    let (runtime, server) = serve_embeddings(8);
+    options.embed_runtime = runtime;
+    let report = ingest(&options);
+    assert_eq!(report.records_added, 2);
+    assert_eq!(report.records_embedded, 0);
+    assert_eq!(server.join().unwrap(), 0, "no model loads for tool records");
+    assert_eq!(revision(), published);
+
+    append(concat!(
+        r#"{"type":"user","uuid":"u2","timestamp":"2026-11-01T00:00:03Z","message":{"role":"user","content":"embed me"}}"#,
+        "\n"
+    ));
+    let (runtime, server) = serve_embeddings(8);
+    options.embed_runtime = runtime;
+    let report = ingest(&options);
+    assert_eq!(report.records_added, 1);
+    assert_eq!(report.records_embedded, 1);
+    assert!(server.join().unwrap() > 0);
+    assert_ne!(revision(), published);
+    let vectors = VectorIndex::open(&paths.vectors).expect("open vectors");
+    let mut embeddable = 0;
+    open_search_index(&paths)
+        .for_each_record(|record| {
+            if record_needs_embedding(&record) {
+                embeddable += 1;
+                assert!(vectors.contains(record.doc_id), "{}", record.text);
+            }
+            Ok(())
+        })
+        .expect("check coverage");
+    assert_eq!(embeddable, 2);
+}
+
 #[test]
 fn remote_noop_index_trusts_stored_identity_without_contacting_server() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3722,7 +3946,6 @@ fn ingest_pi_session_records_supported_message_shapes() {
         model: ModelChoice::default(),
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
-        defer_merges: false,
         embedding_budget: None,
         redaction: std::sync::Arc::new(crate::redact::Redactor::disabled()),
     };
@@ -4511,7 +4734,6 @@ fn writer_loop_accepts_copilot_source_progress() {
     let ctx = WriterContext {
         index_root: PathBuf::new(),
         input_bytes: None,
-        defer_merges: false,
         embedding_budget: None,
         embeddings: false,
         do_backfill_embeddings: false,
@@ -8216,7 +8438,6 @@ fn budgeted_embedding_writer(
     let ctx = WriterContext {
         index_root: paths.index.clone(),
         input_bytes: None,
-        defer_merges: false,
         embedding_budget,
         embeddings: true,
         do_backfill_embeddings: false,

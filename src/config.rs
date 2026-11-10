@@ -275,6 +275,10 @@ impl Default for IndexedToolContentLimits {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct UserConfig {
+    /// Data root this config was loaded from, by [`UserConfig::load`]; never read from or
+    /// written to config.toml.
+    #[serde(skip)]
+    pub(crate) data_root: Option<PathBuf>,
     /// Embedding mode: true or "local", "remote", or false (default).
     pub embeddings: Option<EmbeddingsMode>,
     pub auto_index_on_search: Option<bool>,
@@ -584,11 +588,18 @@ pub struct IndexBackendConfig {
 impl UserConfig {
     pub fn load(paths: &Paths) -> Result<Self> {
         let path = paths.root.join("config.toml");
+        let data_root = Some(paths.root.clone());
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                data_root,
+                ..Self::default()
+            });
         }
         let contents = std::fs::read_to_string(path)?;
-        let config: UserConfig = toml::from_str(&contents)?;
+        let config = UserConfig {
+            data_root,
+            ..toml::from_str::<UserConfig>(&contents)?
+        };
         for pattern in config.claude_paths.iter().flatten() {
             for component in Path::new(pattern.trim()).components() {
                 let text = component.as_os_str().to_string_lossy();
@@ -740,6 +751,10 @@ impl UserConfig {
     /// fixed output size.
     pub fn resolve_embed_runtime(&self) -> Result<EmbedRuntimeConfig> {
         let batch_size = self.resolve_embedding_batch_size()?;
+        let model_cache_dir = self
+            .data_root
+            .as_deref()
+            .map(crate::embed::default_model_cache_dir);
         if let Some(dimensions) = self.embedding_dimensions
             && !(1..=MAX_DIMENSIONS).contains(&dimensions)
         {
@@ -751,6 +766,7 @@ impl UserConfig {
             return Ok(EmbedRuntimeConfig {
                 batch_size,
                 remote: Some(self.resolve_remote_embed()?),
+                model_cache_dir,
                 ..EmbedRuntimeConfig::default()
             });
         }
@@ -770,6 +786,7 @@ impl UserConfig {
             cudnn_library_paths: self.resolve_cudnn_library_paths()?,
             batch_size,
             remote: None,
+            model_cache_dir,
         })
     }
 
@@ -1269,6 +1286,26 @@ mod tests {
             }
             .include_reasoning_default()
         );
+    }
+
+    #[test]
+    fn models_cache_under_the_loaded_data_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let without_file = Paths::new(Some(tmp.path().join("bare"))).unwrap();
+        let with_file = Paths::new(Some(tmp.path().join("configured"))).unwrap();
+        std::fs::create_dir_all(&with_file.root).unwrap();
+        std::fs::write(with_file.root.join("config.toml"), "embeddings = true\n").unwrap();
+
+        for paths in [without_file, with_file] {
+            let runtime = UserConfig::load(&paths)
+                .unwrap()
+                .resolve_embed_runtime()
+                .unwrap();
+            assert_eq!(
+                runtime.model_cache_dir,
+                Some(paths.root.join("embed-cache"))
+            );
+        }
     }
 
     #[test]

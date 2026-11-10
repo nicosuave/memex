@@ -2700,8 +2700,9 @@ pub(super) fn can_skip_fresh_scan(
     if !header.scan_cache.is_fresh(ttl_seconds) {
         return Ok(false);
     }
-    let analytics = AnalyticsStore::open(analytics_path(&paths.state))?;
-    if !analytics.complete()? && index.doc_count()? > 0 {
+    // Only a read: an unreadable or outdated store is incomplete, and the refresh that
+    // follows opens it for writing.
+    if !AnalyticsStore::is_complete(analytics_path(&paths.state)) && index.doc_count()? > 0 {
         return Ok(false);
     }
     can_skip_noop_index(paths, index, options)

@@ -1447,11 +1447,15 @@ pub(super) fn refresh_memories(
         );
     }
     if options.embeddings {
-        let _embedding_lease = IngestLease::acquire_embedding(
-            paths,
-            "ingest-memory-vectors",
-            crate::lease::INGEST_LEASE_TIMEOUT,
-        )?;
+        // Never wait for another embedding writer: a search-triggered refresh would stall
+        // behind a whole backfill. Skipped sections are embedded by the next refresh that
+        // finds the lease free, or by `memex embed`, which the daemon's embedding worker
+        // reruns whenever the memory snapshot changes.
+        let _embedding_lease =
+            match IngestLease::try_acquire_embedding(paths, "ingest-memory-vectors")? {
+                crate::lease::LeaseAttempt::Acquired(lease) => lease,
+                crate::lease::LeaseAttempt::Busy(_) => return Ok(()),
+            };
         let count = crate::memory_search::embed_memory(
             paths,
             &options.model,
@@ -1669,7 +1673,6 @@ pub(super) fn execute_refresh(
     let writer_ctx = WriterContext {
         index_root: paths.index.clone(),
         input_bytes,
-        defer_merges: options.defer_merges,
         embedding_budget: options.embedding_budget,
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings

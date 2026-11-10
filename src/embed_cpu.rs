@@ -37,9 +37,10 @@ pub(crate) struct CpuTextEmbedding {
 }
 
 impl CpuTextEmbedding {
-    pub(crate) fn try_new(model: &EmbeddingModel) -> Result<Self> {
+    /// Load `model`, downloading it into `cache_dir` if it is not there yet.
+    pub(crate) fn try_new(model: &EmbeddingModel, cache_dir: &Path) -> Result<Self> {
         let info = TextEmbedding::get_model_info(model)?;
-        let repo = model_repo(&info.model_code)?;
+        let repo = model_repo(&info.model_code, cache_dir)?;
         let model_file = repo
             .get(&info.model_file)
             .with_context(|| format!("failed to retrieve {}", info.model_file))?;
@@ -151,15 +152,12 @@ impl CpuTextEmbedding {
     }
 }
 
-/// Open the model repo in the same Hugging Face cache fastembed uses.
-fn model_repo(model_code: &str) -> Result<ApiRepo> {
-    let cache_dir = std::env::var("HF_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(fastembed::get_cache_dir()));
+/// Open the model repo in `cache_dir`, laid out as fastembed lays out its cache.
+fn model_repo(model_code: &str, cache_dir: &Path) -> Result<ApiRepo> {
     let endpoint =
         std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
     let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir)
+        .with_cache_dir(cache_dir.to_path_buf())
         .with_endpoint(endpoint)
         .with_progress(false)
         .build()?;
@@ -279,6 +277,8 @@ mod tests {
     }
 
     fn assert_matches_fastembed(pooling: Pooling) {
+        // These sessions bypass `EmbedderHandle`, which normally loads ONNX Runtime.
+        crate::embed::init_onnx_runtime().expect("load ONNX Runtime");
         let mut cpu = CpuTextEmbedding::from_files(
             &fixture("model.onnx"),
             |name| Ok(fixture(name)),

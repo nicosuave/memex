@@ -11,7 +11,8 @@ repository = "https://github.com/nicosuave/memex"
 default = ["ort-download-binaries"]
 # Nix supplies ONNX Runtime itself and builds with --no-default-features.
 ort-download-binaries = ["fastembed/ort-download-binaries-native-tls"]
-ort-load-dynamic = ["fastembed/ort-load-dynamic"]
+# Loads ONNX Runtime on first use from ORT_DYLIB_PATH, else the build-time MEMEX_ORT_DYLIB_PATH.
+ort-load-dynamic = ["fastembed/ort-load-dynamic", "ort/load-dynamic"]
 profiling = []
 cuda = ["ort/cuda", "dep:libloading"]
 

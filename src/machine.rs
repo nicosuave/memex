@@ -363,6 +363,10 @@ pub struct SessionListSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     pub project: Option<String>,
+    /// Grouping `project` is matched under; repository when absent. Older peers ignore it
+    /// and match the repository project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_grouping: Option<ProjectGrouping>,
     pub cwd: Option<String>,
     pub since_ms: Option<u64>,
     pub limit: usize,
@@ -392,6 +396,10 @@ pub struct Federated<T> {
     pub failures: Vec<(String, String)>,
     /// Number of candidates collected before the final result limit was applied.
     pub candidate_count: usize,
+    /// Whether some machine returned as many candidates as it was asked for, so a larger
+    /// request could find more. Only conversation search reports this; other federated
+    /// reads leave it false.
+    pub capped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,12 +622,16 @@ pub fn selected_machine_ids(config: &UserConfig, requested: &[String]) -> Result
     Ok(ids)
 }
 
+/// Search the requested machines concurrently. A selected machine listed in `known_failures`
+/// is not asked again: it is reported as failing with its recorded error, exactly as if it
+/// had failed once more.
 pub fn federated_search(
     paths: &Paths,
     config: &UserConfig,
     requested: &[String],
     spec: &SearchSpec,
     auto_index_local: bool,
+    known_failures: &[(String, String)],
 ) -> Result<Federated<LocatedRecord>> {
     let ids = selected_machine_ids(config, requested)?;
     let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
@@ -628,6 +640,10 @@ pub fn federated_search(
     std::thread::scope(|scope| {
         for id in &ids {
             let tx = tx.clone();
+            if let Some((_, error)) = known_failures.iter().find(|(machine, _)| machine == id) {
+                let _ = tx.send((id.clone(), Err(anyhow!("{error}"))));
+                continue;
+            }
             // Keep the pre-threshold count for deepening, but apply the threshold
             // to each peer's relevance scores before reciprocal-rank fusion.
             let spec = SearchSpec {
@@ -654,8 +670,13 @@ pub fn federated_search(
                     .expect("selected machines were validated")
                     .clone();
                 scope.spawn(move || {
-                    let result =
-                        rpc_records(&machine, RpcOperation::Search { spec }, timeout, "search");
+                    let result = rpc_records(
+                        paths,
+                        &machine,
+                        RpcOperation::Search { spec },
+                        timeout,
+                        "search",
+                    );
                     let _ = tx.send((machine.id.clone(), result));
                 });
             }
@@ -683,6 +704,9 @@ pub fn federated_search(
     let use_rrf = successes.len() > 1;
     let mut items = Vec::new();
     let candidate_count = successes.iter().map(|(_, records)| records.len()).sum();
+    let capped = successes
+        .iter()
+        .any(|(_, records)| records.len() >= spec.limit);
     for (machine, mut records) in successes {
         if let Some(min_score) = spec.min_score {
             records.retain(|(score, _)| *score >= min_score);
@@ -719,6 +743,7 @@ pub fn federated_search(
         items,
         failures,
         candidate_count,
+        capped,
     })
 }
 
@@ -754,6 +779,7 @@ pub fn federated_memory_search(
                 let machine = machine_by_id(config, id).expect("selected machines validated");
                 scope.spawn(move || {
                     let result = (|| match rpc(
+                        paths,
                         machine,
                         RpcOperation::MemorySearch { options },
                         timeout,
@@ -819,6 +845,7 @@ pub fn federated_memory_search(
         items,
         failures,
         candidate_count,
+        capped: false,
     })
 }
 
@@ -835,6 +862,7 @@ pub fn read_memory(
         let machine = machine_by_id(config, machine_id)
             .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
         match rpc(
+            paths,
             machine,
             RpcOperation::MemoryRead {
                 request: request.clone(),
@@ -863,88 +891,6 @@ pub fn read_memory(
     Ok(value)
 }
 
-pub fn federated_recent(
-    paths: &Paths,
-    config: &UserConfig,
-    requested: &[String],
-    limit: usize,
-    project_grouping: Option<ProjectGrouping>,
-    auto_index_local: bool,
-) -> Result<Federated<LocatedRecord>> {
-    let ids = selected_machine_ids(config, requested)?;
-    let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        for id in &ids {
-            let tx = tx.clone();
-            if id == LOCAL_MACHINE_ID {
-                let paths = paths.clone();
-                let config = config.clone();
-                scope.spawn(move || {
-                    let _ = tx.send((
-                        LOCAL_MACHINE_ID.to_string(),
-                        recent_local(&paths, &config, limit, project_grouping, auto_index_local),
-                    ));
-                });
-            } else {
-                let machine = config
-                    .machines
-                    .iter()
-                    .find(|machine| machine.id == *id)
-                    .expect("selected machines were validated")
-                    .clone();
-                scope.spawn(move || {
-                    let result = rpc_records(
-                        &machine,
-                        RpcOperation::Recent {
-                            limit,
-                            project_grouping,
-                        },
-                        timeout,
-                        "recent sessions",
-                    );
-                    let _ = tx.send((machine.id.clone(), result));
-                });
-            }
-        }
-        drop(tx);
-    });
-    let mut items = Vec::new();
-    let mut failures = Vec::new();
-    let mut successes = 0usize;
-    for (id, records) in rx {
-        match records {
-            Ok(records) => {
-                successes += 1;
-                items.extend(records.into_iter().map(|(score, record)| LocatedRecord {
-                    machine: id.clone(),
-                    score,
-                    record,
-                    rollup: None,
-                }));
-            }
-            Err(err) => failures.push((id, err.to_string())),
-        }
-    }
-    if successes == 0 {
-        bail!(
-            "all machines failed: {}",
-            failures
-                .iter()
-                .map(|(machine, error)| format!("{machine}: {error}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-    }
-    items.sort_by_key(|item| std::cmp::Reverse(item.record.ts));
-    let candidate_count = items.len();
-    Ok(Federated {
-        items,
-        failures,
-        candidate_count,
-    })
-}
-
 pub fn federated_sessions(
     paths: &Paths,
     config: &UserConfig,
@@ -970,7 +916,7 @@ pub fn federated_sessions(
                     .expect("selected machines were validated")
                     .clone();
                 scope.spawn(move || {
-                    let result = rpc_sessions(config, &machine, spec);
+                    let result = rpc_sessions(paths, config, &machine, spec);
                     let _ = tx.send((machine.id.clone(), result));
                 });
             }
@@ -1002,6 +948,138 @@ pub fn federated_sessions(
         spec.limit,
         spec.profile.as_deref(),
     ))
+}
+
+/// A federated session list in which peers too old for the sessions operation answered with
+/// their newest records.
+#[derive(Debug)]
+pub struct FederatedSessionList {
+    /// Rows of every machine that listed its sessions, merged as by [`federated_sessions`];
+    /// `failures` covers every selected machine.
+    pub sessions: Federated<LocatedSession>,
+    /// Newest records of each peer that predates the sessions operation, newest first, for the
+    /// caller to group into sessions and filter.
+    pub recent: Vec<LocatedRecord>,
+    /// The local machine was selected but has no session catalog yet; the caller lists its
+    /// sessions from the local index instead of reporting it unavailable.
+    pub local_without_catalog: bool,
+}
+
+enum MachineSessions {
+    Listed(Vec<SessionListing>),
+    Recent(Vec<(f32, Record)>),
+    WithoutCatalog,
+}
+
+/// [`federated_sessions`], except that a peer which rejects the sessions operation as an
+/// older Memex does answers with its `recent_limit` newest records instead of failing, and a
+/// local machine without a session catalog is left to the caller.
+pub fn federated_sessions_or_recent(
+    paths: &Paths,
+    config: &UserConfig,
+    requested: &[String],
+    spec: &SessionListSpec,
+    recent_limit: usize,
+) -> Result<FederatedSessionList> {
+    let ids = selected_machine_ids(config, requested)?;
+    let timeout = Duration::from_secs(config.multi_machine.timeout_seconds());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for id in &ids {
+            let tx = tx.clone();
+            let spec = spec.clone();
+            if id == LOCAL_MACHINE_ID {
+                let paths = paths.clone();
+                scope.spawn(move || {
+                    let result = sessions_local(&paths, &spec);
+                    let listed_any = matches!(&result, Ok(sessions) if !sessions.is_empty());
+                    let result =
+                        if !listed_any && !AnalyticsStore::is_ready(analytics_path(&paths.state)) {
+                            Ok(MachineSessions::WithoutCatalog)
+                        } else {
+                            result.map(MachineSessions::Listed)
+                        };
+                    let _ = tx.send((LOCAL_MACHINE_ID.to_string(), result));
+                });
+            } else {
+                let machine = config
+                    .machines
+                    .iter()
+                    .find(|machine| machine.id == *id)
+                    .expect("selected machines were validated")
+                    .clone();
+                scope.spawn(move || {
+                    let project_grouping = spec.project_grouping;
+                    let result = match rpc_sessions(paths, config, &machine, spec) {
+                        Err(error) if peer_rejected_request(&error) => rpc_records(
+                            paths,
+                            &machine,
+                            RpcOperation::Recent {
+                                limit: recent_limit,
+                                project_grouping,
+                            },
+                            timeout,
+                            "recent sessions",
+                        )
+                        .map(MachineSessions::Recent),
+                        result => result.map(MachineSessions::Listed),
+                    };
+                    let _ = tx.send((machine.id.clone(), result));
+                });
+            }
+        }
+        drop(tx);
+    });
+
+    let mut listed = Vec::new();
+    let mut recent = Vec::new();
+    let mut local_without_catalog = false;
+    let mut failures = Vec::new();
+    let mut successes = 0usize;
+    for (machine, result) in rx {
+        match result {
+            Ok(MachineSessions::Listed(sessions)) => {
+                successes += 1;
+                listed.push((machine, sessions));
+            }
+            Ok(MachineSessions::Recent(records)) => {
+                successes += 1;
+                recent.extend(records.into_iter().map(|(score, record)| LocatedRecord {
+                    machine: machine.clone(),
+                    score,
+                    record,
+                    rollup: None,
+                }));
+            }
+            Ok(MachineSessions::WithoutCatalog) => {
+                successes += 1;
+                local_without_catalog = true;
+            }
+            Err(err) => failures.push((machine, err.to_string())),
+        }
+    }
+    if successes == 0 {
+        bail!(
+            "all machine session queries failed: {}",
+            failures
+                .iter()
+                .map(|(machine, error)| format!("{machine}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    recent.sort_by_key(|item| std::cmp::Reverse(item.record.ts));
+    Ok(FederatedSessionList {
+        sessions: merge_sessions(listed, failures, spec.limit, spec.profile.as_deref()),
+        recent,
+        local_without_catalog,
+    })
+}
+
+/// True when a peer could not parse a request, as a Memex older than the operation cannot:
+/// it exits with this message for an unknown operation or an older shape of a known one.
+fn peer_rejected_request(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("invalid memex RPC request")
 }
 
 fn merge_sessions(
@@ -1052,6 +1130,7 @@ fn merge_sessions(
         items,
         failures,
         candidate_count,
+        capped: false,
     }
 }
 
@@ -1087,6 +1166,7 @@ pub fn session_context(
         .find(|machine| machine.id == machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     match rpc(
+        paths,
         machine,
         RpcOperation::Session {
             session_id: session_id.to_string(),
@@ -1118,6 +1198,7 @@ pub fn record_by_doc_id(
         .find(|machine| machine.id == machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     match rpc(
+        paths,
         machine,
         RpcOperation::Show { doc_id },
         Duration::from_secs(config.multi_machine.timeout_seconds()),
@@ -1150,6 +1231,7 @@ pub fn record_by_selector(
     let machine = machine_by_id(config, machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     match rpc(
+        paths,
         machine,
         RpcOperation::ResolveRecord {
             selector: selector.clone(),
@@ -1182,6 +1264,7 @@ pub fn context_on_machine(
     let machine = machine_by_id(config, machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     match rpc(
+        paths,
         machine,
         RpcOperation::Context {
             selector: selector.clone(),
@@ -1223,6 +1306,7 @@ pub fn read_record(
     let machine = machine_by_id(config, machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     let response = rpc(
+        paths,
         machine,
         RpcOperation::ReadRecord {
             selector: selector.clone(),
@@ -1273,6 +1357,7 @@ pub fn read_context(
     let machine = machine_by_id(config, machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     let response = rpc(
+        paths,
         machine,
         RpcOperation::ReadContext {
             selector: selector.clone(),
@@ -1316,6 +1401,7 @@ pub fn read_session_pages(
     let machine = machine_by_id(config, machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     let response = rpc(
+        paths,
         machine,
         RpcOperation::ReadSessionPages {
             requests: requests.to_vec(),
@@ -1353,6 +1439,7 @@ pub fn session_page_context(
         .find(|machine| machine.id == machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     match rpc(
+        paths,
         machine,
         RpcOperation::SessionPage {
             request: request.clone(),
@@ -1386,6 +1473,7 @@ pub fn batch_session_contexts(
         .find(|machine| machine.id == machine_id)
         .ok_or_else(|| anyhow!("unknown machine '{machine_id}'"))?;
     match rpc(
+        paths,
         machine,
         RpcOperation::SessionBatch {
             requests: requests.to_vec(),
@@ -1888,7 +1976,7 @@ pub fn federated_usage(
                     .expect("selected machines were validated")
                     .clone();
                 scope.spawn(move || {
-                    let result = match rpc(&machine, RpcOperation::Usage { spec }, timeout) {
+                    let result = match rpc(paths, &machine, RpcOperation::Usage { spec }, timeout) {
                         Ok(RpcPayload::Usage { report }) => Ok(*report),
                         Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
                         Ok(other) => Err(anyhow!("unexpected usage response: {other:?}")),
@@ -1950,8 +2038,12 @@ pub fn federated_usage_activity(
                     .expect("selected machines were validated")
                     .clone();
                 scope.spawn(move || {
-                    let result = match rpc(&machine, RpcOperation::UsageActivity { spec }, timeout)
-                    {
+                    let result = match rpc(
+                        paths,
+                        &machine,
+                        RpcOperation::UsageActivity { spec },
+                        timeout,
+                    ) {
                         Ok(RpcPayload::UsageActivity { points, partial }) => Ok((points, partial)),
                         Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
                         Ok(other) => Err(anyhow!("unexpected usage activity response: {other:?}")),
@@ -2020,15 +2112,19 @@ pub fn federated_session_activity(
                     .expect("selected machines were validated")
                     .clone();
                 scope.spawn(move || {
-                    let result =
-                        match rpc(&machine, RpcOperation::SessionActivity { spec }, timeout) {
-                            Ok(RpcPayload::SessionActivity { points }) => Ok(points),
-                            Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
-                            Ok(other) => {
-                                Err(anyhow!("unexpected session activity response: {other:?}"))
-                            }
-                            Err(err) => Err(err),
-                        };
+                    let result = match rpc(
+                        paths,
+                        &machine,
+                        RpcOperation::SessionActivity { spec },
+                        timeout,
+                    ) {
+                        Ok(RpcPayload::SessionActivity { points }) => Ok(points),
+                        Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
+                        Ok(other) => {
+                            Err(anyhow!("unexpected session activity response: {other:?}"))
+                        }
+                        Err(err) => Err(err),
+                    };
                     let _ = tx.send((machine.id.clone(), result));
                 });
             }
@@ -2079,12 +2175,14 @@ pub fn configured_machine_summaries(config: &UserConfig) -> Result<Vec<serde_jso
 }
 
 pub(crate) fn remote_project_summaries(
+    paths: &Paths,
     config: &UserConfig,
     id: &str,
     source: Option<SourceFilter>,
     tags: Vec<String>,
 ) -> Result<Vec<serde_json::Value>> {
     match metadata_rpc(
+        paths,
         config,
         id,
         RpcOperation::Projects { source, tags },
@@ -2096,11 +2194,13 @@ pub(crate) fn remote_project_summaries(
 }
 
 pub(crate) fn remote_sessions(
+    paths: &Paths,
     config: &UserConfig,
     id: &str,
     request: crate::cli::SessionsRequest,
 ) -> Result<Vec<serde_json::Value>> {
     match metadata_rpc(
+        paths,
         config,
         id,
         RpcOperation::Sessions {
@@ -2125,6 +2225,7 @@ pub fn session_assignment(
         return crate::session_meta::apply_local(paths, request);
     }
     match metadata_rpc(
+        paths,
         config,
         machine,
         RpcOperation::SessionAssignment {
@@ -2142,12 +2243,14 @@ pub fn session_assignment(
 }
 
 pub(crate) fn remote_session_count(
+    paths: &Paths,
     config: &UserConfig,
     id: &str,
     request: crate::cli::SessionsRequest,
     query: Option<String>,
 ) -> Result<crate::cli::SessionCount> {
     match metadata_rpc(
+        paths,
         config,
         id,
         RpcOperation::SessionCount { request, query },
@@ -2159,13 +2262,14 @@ pub(crate) fn remote_session_count(
 }
 
 pub(crate) fn remote_activity(
+    paths: &Paths,
     config: &UserConfig,
     id: &str,
     request: crate::web::ActivityRequest,
     now: u64,
 ) -> Result<crate::web::RawActivityPayload> {
     remote_activity_with(&request, now, |operation| {
-        metadata_rpc(config, id, operation, "activity")
+        metadata_rpc(paths, config, id, operation, "activity")
     })
 }
 
@@ -2248,6 +2352,7 @@ fn remote_activity_with(
 }
 
 fn metadata_rpc(
+    paths: &Paths,
     config: &UserConfig,
     id: &str,
     operation: RpcOperation,
@@ -2259,6 +2364,7 @@ fn metadata_rpc(
         .find(|machine| machine.id == id)
         .ok_or_else(|| anyhow!("unknown machine '{id}'"))?;
     let response = rpc(
+        paths,
         machine,
         operation,
         Duration::from_secs(config.multi_machine.timeout_seconds()),
@@ -2522,8 +2628,9 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
 }
 
 fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
-    let store =
-        AnalyticsStore::open_read_only(analytics_path(&paths.state))?.with_tags(spec.tags.clone());
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?
+        .with_tags(spec.tags.clone())
+        .with_selection_grouping(spec.project_grouping.unwrap_or(ProjectGrouping::Repository));
     let config = UserConfig::load(paths)?;
     let claude_sources = config.claude_sources();
     let cwd = crate::cli::canonical_cwd_filter(spec.cwd.as_ref().map(std::path::PathBuf::from));
@@ -2645,7 +2752,7 @@ pub(crate) fn usage_session_keys_for_kind(
     paths: &Paths,
     kind: SessionKindFilter,
 ) -> Result<HashSet<(String, String)>> {
-    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?.without_titles();
     let rows =
         store.query_sessions_filtered(None, None, None, ProjectGrouping::Flat, Some(kind), None)?;
     Ok(rows
@@ -3215,11 +3322,11 @@ fn refresh_sessions(
 fn refresh_index(paths: &Paths) -> Result<SearchIndex> {
     match SearchIndex::open_or_create(&paths.index) {
         Ok(index) if !index.is_writable() => Ok(index),
-        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index),
+        _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index),
     }
 }
 
-/// Search refreshes append without merging; once segments accumulate, one detached
+/// Refreshes append without merging; once segments accumulate, one detached
 /// `memex index compact` process folds the small ones into one segment and exits. The spawn
 /// is skipped while an ingest holds the lease, and the child takes a compaction lock, so a
 /// second child started in the gap exits instead of merging the same segments again.
@@ -3345,7 +3452,6 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         model: config.resolve_model(None)?,
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
-        defer_merges: true,
         embedding_budget: None,
         redaction: config.redactor()?,
     })
@@ -3390,12 +3496,13 @@ fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
 }
 
 fn rpc_records(
+    paths: &Paths,
     machine: &MachineConfig,
     operation: RpcOperation,
     timeout: Duration,
     context: &str,
 ) -> Result<Vec<(f32, Record)>> {
-    match rpc(machine, operation, timeout)? {
+    match rpc(paths, machine, operation, timeout)? {
         RpcPayload::Records { records } => Ok(records),
         RpcPayload::Error { message } => Err(anyhow!("{context} failed: {message}")),
         other => Err(anyhow!("{context} returned unexpected response: {other:?}")),
@@ -3403,12 +3510,14 @@ fn rpc_records(
 }
 
 fn rpc_sessions(
+    paths: &Paths,
     config: &UserConfig,
     machine: &MachineConfig,
     spec: SessionListSpec,
 ) -> Result<Vec<SessionListing>> {
     let tags = spec.tags.clone();
     match metadata_rpc(
+        paths,
         config,
         &machine.id,
         RpcOperation::Sessions {
@@ -3430,7 +3539,111 @@ fn rpc_sessions(
     }
 }
 
-fn rpc(machine: &MachineConfig, operation: RpcOperation, timeout: Duration) -> Result<RpcPayload> {
+/// Upper bound for SSH's TCP connect and handshake phase, independent of the request timeout.
+const SSH_MAX_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+/// Seconds an idle shared SSH connection stays open for later peer requests.
+#[cfg(unix)]
+const SSH_CONTROL_PERSIST_SECONDS: u64 = 300;
+/// A shared connection probes a silent peer this often and closes after this many unanswered
+/// probes, so requests stop queueing on a connection to a peer that went to sleep.
+#[cfg(unix)]
+const SSH_SERVER_ALIVE_INTERVAL_SECONDS: u64 = 5;
+#[cfg(unix)]
+const SSH_SERVER_ALIVE_COUNT_MAX: u64 = 2;
+/// Capacity of `sockaddr_un.sun_path`, including its terminating NUL.
+#[cfg(target_os = "linux")]
+const UNIX_SOCKET_PATH_CAPACITY: usize = 108;
+#[cfg(all(unix, not(target_os = "linux")))]
+const UNIX_SOCKET_PATH_CAPACITY: usize = 104;
+/// What ssh appends to the control directory when it binds a master socket: `/`, the
+/// 40-hex-digit `%C` connection hash, then `.` and 16 random characters of the temporary
+/// name it binds before linking the socket into place.
+#[cfg(unix)]
+const SSH_CONTROL_SOCKET_SUFFIX_BYTES: usize = 1 + 40 + 1 + 16;
+
+/// SSH options for every connection memex opens to a peer: one authenticated connection per
+/// host is shared through a private control socket under `state/ssh`, and the connect phase
+/// is bounded. Sharing is best effort; when the socket directory cannot be used, only the
+/// connect timeout applies.
+pub(crate) fn ssh_connection_options(state: &std::path::Path, timeout: Duration) -> Vec<String> {
+    let mut options = ssh_shared_connection_options(state);
+    let connect_timeout = timeout.as_secs().clamp(1, SSH_MAX_CONNECT_TIMEOUT_SECONDS);
+    options.extend([
+        "-o".to_string(),
+        format!("ConnectTimeout={connect_timeout}"),
+    ]);
+    options
+}
+
+/// Connection-sharing options, or none when the private control directory is unusable.
+/// A shared connection only hits `ConnectTimeout` when it is first opened, so it carries its
+/// own liveness probe; once it closes, the next request reconnects under the connect timeout.
+#[cfg(unix)]
+fn ssh_shared_connection_options(state: &std::path::Path) -> Vec<String> {
+    let control_dir = state.join("ssh");
+    let Some(control_path) = ssh_control_path(&control_dir) else {
+        return Vec::new();
+    };
+    if !ensure_private_dir(&control_dir) {
+        return Vec::new();
+    }
+    [
+        "ControlMaster=auto".to_string(),
+        format!("ControlPath={control_path}"),
+        format!("ControlPersist={SSH_CONTROL_PERSIST_SECONDS}"),
+        format!("ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL_SECONDS}"),
+        format!("ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}"),
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
+}
+
+/// SSH connection sharing needs Unix-domain control sockets.
+#[cfg(not(unix))]
+fn ssh_shared_connection_options(_state: &std::path::Path) -> Vec<String> {
+    Vec::new()
+}
+
+/// The `ControlPath` for sockets in `dir`, or `None` when ssh could not use it: the bound
+/// socket name must fit `sun_path`, and the value must pass through ssh's option tokenizing
+/// and `%`/`${}` expansion unchanged.
+#[cfg(unix)]
+fn ssh_control_path(dir: &std::path::Path) -> Option<String> {
+    let dir = dir.to_str()?;
+    let plain = dir.starts_with('/')
+        && dir
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'));
+    (plain && dir.len() + SSH_CONTROL_SOCKET_SUFFIX_BYTES < UNIX_SOCKET_PATH_CAPACITY)
+        .then(|| format!("{dir}/%C"))
+}
+
+/// Create `dir` with mode 0700 if needed; true only for a real directory that this user owns
+/// and nobody else can access.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    if let Some(parent) = dir.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return false;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return false,
+    }
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|metadata| metadata.is_dir() && crate::native::owned_private(&metadata))
+}
+
+fn rpc(
+    paths: &Paths,
+    machine: &MachineConfig,
+    operation: RpcOperation,
+    timeout: Duration,
+) -> Result<RpcPayload> {
     validate_machine(machine)?;
     if !machine.uses_remote_index() {
         bail!(
@@ -3448,7 +3661,9 @@ fn rpc(machine: &MachineConfig, operation: RpcOperation, timeout: Duration) -> R
         .ok_or_else(|| anyhow!("machine '{}' has no SSH control transport", machine.id))?;
     let command = format!("{} rpc", machine.command());
     let mut child = Command::new("ssh")
-        .args(["-T", "-o", "BatchMode=yes", "--", target, &command])
+        .args(["-T", "-o", "BatchMode=yes"])
+        .args(ssh_connection_options(&paths.state, timeout))
+        .args(["--", target, &command])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4338,6 +4553,7 @@ mod tests {
                 &[LOCAL_MACHINE_ID.to_string()],
                 &search_spec(mode),
                 false,
+                &[],
             )
             .unwrap();
 
@@ -4663,8 +4879,15 @@ mod tests {
         spec.cwd = Some("/fixture/repo".into());
         spec.session_scope = Some(scopes.clone());
         let config = UserConfig::default();
-        let result =
-            federated_search(&paths, &config, &[LOCAL_MACHINE_ID.into()], &spec, false).unwrap();
+        let result = federated_search(
+            &paths,
+            &config,
+            &[LOCAL_MACHINE_ID.into()],
+            &spec,
+            false,
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             result
                 .items
@@ -4676,15 +4899,29 @@ mod tests {
         assert_eq!(result.items[0].record.project, "repository");
         spec.session_scope = Some(vec![scopes[1].clone(), scopes[2].clone()]);
         assert!(
-            federated_search(&paths, &config, &[LOCAL_MACHINE_ID.into()], &spec, false)
-                .unwrap()
-                .items
-                .is_empty()
+            federated_search(
+                &paths,
+                &config,
+                &[LOCAL_MACHINE_ID.into()],
+                &spec,
+                false,
+                &[]
+            )
+            .unwrap()
+            .items
+            .is_empty()
         );
         spec.session_scope = None;
         spec.min_score = Some(f32::MAX);
-        let filtered =
-            federated_search(&paths, &config, &[LOCAL_MACHINE_ID.into()], &spec, false).unwrap();
+        let filtered = federated_search(
+            &paths,
+            &config,
+            &[LOCAL_MACHINE_ID.into()],
+            &spec,
+            false,
+            &[],
+        )
+        .unwrap();
         assert!(filtered.items.is_empty());
         assert_eq!(
             filtered.candidate_count, 1,
@@ -4989,6 +5226,94 @@ mod tests {
                 assert_eq!(mcp["results"][0]["resume_cmd"], sessions[0]["resume_cmd"]);
             }
         }
+    }
+
+    /// Stands in for a peer's `memex rpc` in tests that federate through a fake `ssh`: serves the
+    /// request on stdin from the root in `MEMEX_TEST_PEER_ROOT` and writes the response to
+    /// `MEMEX_TEST_PEER_RESPONSE`, apart from the test harness's own output. An ordinary test
+    /// run sets neither, and this does nothing.
+    #[test]
+    fn rpc_peer_child() {
+        let (Some(root), Some(response_path)) = (
+            std::env::var_os("MEMEX_TEST_PEER_ROOT"),
+            std::env::var_os("MEMEX_TEST_PEER_RESPONSE"),
+        ) else {
+            return;
+        };
+        let paths = Paths::new(Some(root.into())).unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let request: RpcRequest = serde_json::from_reader(std::io::stdin()).unwrap();
+        let response = handle_rpc(&paths, &config, request.request).unwrap_or_else(|error| {
+            RpcPayload::Error {
+                message: error.to_string(),
+            }
+        });
+        let response = RpcResponse {
+            protocol: RPC_PROTOCOL,
+            response,
+        };
+        std::fs::write(response_path, serde_json::to_vec(&response).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sessions_rpc_matches_the_project_under_the_requested_grouping() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (doc_id, session_id, project) in [(1, "worktree", "memex-wt"), (2, "checkout", "memex")]
+        {
+            let mut record = test_record(doc_id, session_id, &format!("/{session_id}.jsonl"), 1);
+            record.project = project.to_string();
+            analytics.record(&record).unwrap();
+        }
+        analytics.flush().unwrap();
+        rusqlite::Connection::open(analytics_path(&paths.state))
+            .unwrap()
+            .execute("UPDATE sessions SET repo_project = 'memex'", [])
+            .unwrap();
+        let listed = |project: &str, project_grouping: Option<ProjectGrouping>| {
+            let spec = SessionListSpec {
+                origin: None,
+                session_id: None,
+                session_ids: Vec::new(),
+                source_path: None,
+                source: None,
+                profile: None,
+                project: Some(project.to_string()),
+                project_grouping,
+                cwd: None,
+                since_ms: None,
+                limit: 10,
+                tags: Vec::new(),
+            };
+            let RpcPayload::Sessions { sessions } = rpc_handler_round_trip(
+                &paths,
+                &config,
+                RpcOperation::Sessions {
+                    input: SessionsInput::Spec { spec },
+                },
+            ) else {
+                panic!("expected sessions");
+            };
+            sessions
+                .iter()
+                .map(|session| session["session_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(listed("memex", None), ["checkout", "worktree"]);
+        assert_eq!(
+            listed("memex", Some(ProjectGrouping::Repository)),
+            ["checkout", "worktree"]
+        );
+        assert_eq!(listed("memex", Some(ProjectGrouping::Flat)), ["checkout"]);
+        assert_eq!(
+            listed("memex-wt", Some(ProjectGrouping::Flat)),
+            ["worktree"]
+        );
+        assert!(listed("memex-wt", None).is_empty());
     }
 
     #[test]
@@ -5502,5 +5827,132 @@ mod tests {
         let started = std::time::Instant::now();
         ensure_local_index(&paths, &bounded).expect("bounded search proceeds without a refresh");
         assert!(started.elapsed() < INGEST_LEASE_TIMEOUT / 2);
+    }
+
+    /// The platform temporary directory can be too long for a control socket (macOS
+    /// `/var/folders/...`), so these fixtures live directly under `/tmp`.
+    #[cfg(unix)]
+    fn short_temp_root() -> TempDir {
+        tempfile::Builder::new().tempdir_in("/tmp").unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_connection_options_share_a_private_control_socket_and_bound_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = short_temp_root();
+        let state = root.path().join("state");
+        let control_dir = state.join("ssh");
+        let control_path = format!("ControlPath={}/%C", control_dir.to_str().unwrap());
+        let shared = [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            control_path.as_str(),
+            "-o",
+            "ControlPersist=300",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=2",
+        ];
+
+        let options = ssh_connection_options(&state, Duration::from_secs(10));
+        assert_eq!(options[..shared.len()], shared);
+        assert_eq!(options[shared.len()..], ["-o", "ConnectTimeout=5"]);
+        let metadata = std::fs::symlink_metadata(&control_dir).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        // A shorter request timeout bounds the connect phase too, but never below a second.
+        for (timeout, expected) in [
+            (Duration::from_secs(2), "ConnectTimeout=2"),
+            (Duration::from_millis(300), "ConnectTimeout=1"),
+        ] {
+            let options = ssh_connection_options(&state, timeout);
+            assert_eq!(options[..shared.len()], shared);
+            assert_eq!(options[shared.len()..], ["-o", expected]);
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn ssh_connection_options_only_bound_connect_without_unix_sockets() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        assert_eq!(
+            ssh_connection_options(&state, Duration::from_secs(10)),
+            ["-o", "ConnectTimeout=5"]
+        );
+        assert!(!state.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_control_options_are_omitted_when_the_bound_socket_name_would_not_fit() {
+        let root = short_temp_root();
+        // While creating a master, ssh binds `<dir>/<%C hash>.<16 random characters>`.
+        let socket_name = format!("{}.{}", "0".repeat(40), "r".repeat(16));
+        let longest_dir = UNIX_SOCKET_PATH_CAPACITY - 1 - "/".len() - socket_name.len();
+        let base = root.path().to_str().unwrap().len();
+        let padding = longest_dir - base - "/".len() - "/ssh".len();
+        let fits = root.path().join("f".repeat(padding));
+        let too_long = root.path().join("t".repeat(padding + 1));
+        assert_eq!(fits.join("ssh").to_str().unwrap().len(), longest_dir);
+
+        let options = ssh_connection_options(&fits, Duration::from_secs(10));
+        assert!(
+            options.contains(&"ControlMaster=auto".to_string())
+                && options.contains(&"ServerAliveInterval=5".to_string()),
+            "{options:?}"
+        );
+        // The kernel accepts the longest name ssh will bind in an accepted directory ...
+        std::os::unix::net::UnixListener::bind(fits.join("ssh").join(&socket_name)).unwrap();
+
+        assert_eq!(
+            ssh_connection_options(&too_long, Duration::from_secs(10)),
+            ["-o", "ConnectTimeout=5"]
+        );
+        assert!(!too_long.join("ssh").exists());
+        // ... and rejects it one byte later, where the options are omitted.
+        std::fs::create_dir_all(too_long.join("ssh")).unwrap();
+        assert!(
+            std::os::unix::net::UnixListener::bind(too_long.join("ssh").join(&socket_name))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_control_options_are_omitted_when_the_directory_is_unusable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = short_temp_root();
+        let timeout = Duration::from_secs(10);
+        let connect_only = ["-o", "ConnectTimeout=5"];
+
+        let shared = root.path().join("shared");
+        std::fs::create_dir_all(shared.join("ssh")).unwrap();
+        std::fs::set_permissions(shared.join("ssh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(ssh_connection_options(&shared, timeout), connect_only);
+
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked.join("ssh")).unwrap();
+        assert_eq!(ssh_connection_options(&linked, timeout), connect_only);
+
+        let file = root.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(ssh_connection_options(&file, timeout), connect_only);
+
+        // ssh would split, percent-expand, or environment-expand these paths.
+        for name in ["with space", "percent%d", "dollar${HOME}"] {
+            let state = root.path().join(name);
+            assert_eq!(ssh_connection_options(&state, timeout), connect_only);
+            assert!(!state.exists());
+        }
     }
 }

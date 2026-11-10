@@ -4,11 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
 use model2vec_rs::model::StaticModel;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-#[cfg(feature = "cuda")]
-use std::path::Path;
 #[cfg(feature = "cuda")]
 use std::{collections::HashSet, mem, sync::OnceLock};
 
@@ -17,6 +15,15 @@ const MEMEX_CUDA_DEVICE_ID_ENV: &str = "MEMEX_CUDA_DEVICE_ID";
 const MEMEX_COMPUTE_UNITS_ENV: &str = "MEMEX_COMPUTE_UNITS";
 const MEMEX_CUDA_LIBRARY_PATHS_ENV: &str = "MEMEX_CUDA_LIBRARY_PATHS";
 const MEMEX_CUDNN_LIBRARY_PATHS_ENV: &str = "MEMEX_CUDNN_LIBRARY_PATHS";
+/// Model download directories honoured by fastembed, in this order.
+const HF_HOME_ENV: &str = "HF_HOME";
+const FASTEMBED_CACHE_DIR_ENV: &str = "FASTEMBED_CACHE_DIR";
+/// Runtime path of the ONNX Runtime library, read by ort's `load-dynamic` feature.
+#[cfg(feature = "ort-load-dynamic")]
+const ORT_DYLIB_PATH_ENV: &str = "ORT_DYLIB_PATH";
+/// ONNX Runtime library path set by the packager at build time.
+#[cfg(feature = "ort-load-dynamic")]
+const BAKED_ORT_DYLIB_PATH: Option<&str> = option_env!("MEMEX_ORT_DYLIB_PATH");
 
 #[cfg(all(feature = "cuda", windows))]
 const CUDA_DYLIBS: &[&str] = &[
@@ -285,6 +292,28 @@ pub struct EmbedRuntimeConfig {
     pub batch_size: Option<usize>,
     /// Endpoint for `remote:` models; `None` when remote embeddings are not configured.
     pub remote: Option<RemoteEmbedConfig>,
+    /// Where local models download when neither `HF_HOME` nor `FASTEMBED_CACHE_DIR` is
+    /// set: the data root's `embed-cache`. `None` uses the default data root's.
+    pub model_cache_dir: Option<PathBuf>,
+}
+
+/// Directory under a data root that holds downloaded local models.
+pub fn default_model_cache_dir(root: &Path) -> PathBuf {
+    root.join("embed-cache")
+}
+
+/// Directory local fastembed models download into: `HF_HOME`, else `FASTEMBED_CACHE_DIR`,
+/// else `default`. fastembed applies the same order, but its last resort is
+/// `.fastembed_cache` in the working directory, which scattered models across projects.
+fn resolve_model_cache_dir(
+    hf_home: Option<String>,
+    fastembed_cache_dir: Option<String>,
+    default: PathBuf,
+) -> PathBuf {
+    hf_home
+        .or(fastembed_cache_dir)
+        .map(PathBuf::from)
+        .unwrap_or(default)
 }
 
 /// Remote endpoint settings plus the requested output size.
@@ -307,12 +336,26 @@ impl EmbedRuntimeConfig {
             cudnn_library_paths: resolve_library_paths_from_env(MEMEX_CUDNN_LIBRARY_PATHS_ENV),
             batch_size: None,
             remote: None,
+            model_cache_dir: None,
         })
     }
 
     /// Inputs per embedding call and per vector flush.
     pub fn batch_size(&self) -> usize {
         self.batch_size.unwrap_or(DEFAULT_EMBED_BATCH_SIZE)
+    }
+
+    /// Directory local models download into; see [`resolve_model_cache_dir`].
+    fn resolved_model_cache_dir(&self) -> Result<PathBuf> {
+        let default = match &self.model_cache_dir {
+            Some(dir) => dir.clone(),
+            None => default_model_cache_dir(&crate::config::Paths::new(None)?.root),
+        };
+        Ok(resolve_model_cache_dir(
+            std::env::var(HF_HOME_ENV).ok(),
+            std::env::var(FASTEMBED_CACHE_DIR_ENV).ok(),
+            default,
+        ))
     }
 
     pub fn apply_env(&self) -> Result<()> {
@@ -643,12 +686,94 @@ fn normalize_existing_dirs(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+/// Load ONNX Runtime before the first ort session from `ORT_DYLIB_PATH`, else from the
+/// build-time `MEMEX_ORT_DYLIB_PATH`. With neither, this does nothing and ort looks up
+/// the library itself on first use, as it always has.
+///
+/// ort would load `ORT_DYLIB_PATH` itself, but panics when it cannot; loading it here
+/// turns that into an embedding error. Only embedder construction calls this, so
+/// commands that never embed never load the library. It runs once per process, and
+/// every caller gets that first result.
+#[cfg(feature = "ort-load-dynamic")]
+pub(crate) fn init_onnx_runtime() -> Result<()> {
+    static LOADED: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    LOADED
+        .get_or_init(|| {
+            let runtime_path = std::env::var(ORT_DYLIB_PATH_ENV).ok();
+            let Some(library) = ort_dylib_to_load(runtime_path.as_deref(), BAKED_ORT_DYLIB_PATH)
+            else {
+                return Ok(());
+            };
+            let path = library.path();
+            match ort::init_from(path) {
+                // Only the library is needed. Dropping the builder leaves ort to create its
+                // default environment with the first session, as it would without this call.
+                Ok(_environment) => Ok(()),
+                Err(err) => Err(match library {
+                    OrtDylib::Runtime(_) => format!(
+                        "failed to load ONNX Runtime from {path}, set by {ORT_DYLIB_PATH_ENV}: \
+                         {err}. Point {ORT_DYLIB_PATH_ENV} at an ONNX Runtime library, or unset \
+                         it to use the default"
+                    ),
+                    OrtDylib::Baked(_) => format!(
+                        "failed to load ONNX Runtime from {path}, the library this memex build \
+                         was configured with: {err}. Set {ORT_DYLIB_PATH_ENV} to the path of an \
+                         ONNX Runtime library to use instead"
+                    ),
+                }),
+            }
+        })
+        .clone()
+        .map_err(|message| anyhow!(message))
+}
+
+#[cfg(not(feature = "ort-load-dynamic"))]
+pub(crate) fn init_onnx_runtime() -> Result<()> {
+    Ok(())
+}
+
+/// Where the ONNX Runtime library to load ahead of ort comes from.
+#[cfg(any(test, feature = "ort-load-dynamic"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrtDylib<'a> {
+    /// `ORT_DYLIB_PATH` at runtime.
+    Runtime(&'a str),
+    /// `MEMEX_ORT_DYLIB_PATH` at build time.
+    Baked(&'a str),
+}
+
+#[cfg(feature = "ort-load-dynamic")]
+impl<'a> OrtDylib<'a> {
+    fn path(self) -> &'a str {
+        match self {
+            Self::Runtime(path) | Self::Baked(path) => path,
+        }
+    }
+}
+
+/// The library to load ahead of ort, or `None` to leave ort's own lookup alone. A
+/// runtime `ORT_DYLIB_PATH` always wins; like ort, an empty value counts as unset.
+#[cfg(any(test, feature = "ort-load-dynamic"))]
+fn ort_dylib_to_load<'a>(
+    runtime_path: Option<&'a str>,
+    baked: Option<&'a str>,
+) -> Option<OrtDylib<'a>> {
+    match runtime_path {
+        Some(path) if !path.is_empty() => Some(OrtDylib::Runtime(path)),
+        _ => baked.filter(|path| !path.is_empty()).map(OrtDylib::Baked),
+    }
+}
+
 fn init_options_for_model(
     model_type: EmbeddingModel,
     runtime: &EmbedRuntimeConfig,
+    cache_dir: PathBuf,
 ) -> Result<InitOptions> {
     let effective_provider = runtime.execution_provider.effective();
-    let opts = InitOptions::new(model_type).with_show_download_progress(false);
+    let opts = InitOptions::new(model_type)
+        .with_show_download_progress(false)
+        .with_cache_dir(cache_dir);
 
     match effective_provider {
         ExecutionProviderChoice::Auto => unreachable!("auto should resolve to a concrete provider"),
@@ -766,15 +891,21 @@ impl EmbedderHandle {
             }
             ModelChoice::Local(LocalModel::Fastembed(model_type)) => {
                 let dims = TextEmbedding::get_model_info(model_type)?.dim;
+                // Every ort session memex creates is built below, including the CUDA
+                // availability probe, so this is where ONNX Runtime gets loaded.
+                init_onnx_runtime()?;
+                let cache_dir = runtime.resolved_model_cache_dir()?;
                 let effective_provider = runtime.execution_provider.effective();
                 if effective_provider == ExecutionProviderChoice::Cpu {
                     return Ok(Self {
-                        backend: EmbedBackend::CpuFastembed(CpuTextEmbedding::try_new(model_type)?),
+                        backend: EmbedBackend::CpuFastembed(CpuTextEmbedding::try_new(
+                            model_type, &cache_dir,
+                        )?),
                         dims,
                         batch_size,
                     });
                 }
-                let opts = init_options_for_model(model_type.clone(), runtime)?;
+                let opts = init_options_for_model(model_type.clone(), runtime, cache_dir)?;
                 let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
                     ExecutionProviderChoice::Cuda => anyhow!(
                         "failed to initialize CUDA execution provider: {err}. Ensure the binary was \
@@ -920,6 +1051,12 @@ mod tests {
     #[cfg(feature = "cuda")]
     use tempfile::TempDir;
 
+    /// Keeps test downloads in the checkout's ignored `.fastembed_cache` rather than the
+    /// user's data root.
+    fn test_model_cache_dir() -> Option<PathBuf> {
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".fastembed_cache"))
+    }
+
     fn test_embedder_from_env() -> EmbedderHandle {
         let choice = std::env::var("MEMEX_MODEL")
             .ok()
@@ -927,7 +1064,39 @@ mod tests {
             .transpose()
             .expect("parse MEMEX_MODEL")
             .unwrap_or_default();
-        EmbedderHandle::with_model(&choice).expect("failed to init embedder")
+        let runtime = EmbedRuntimeConfig {
+            model_cache_dir: test_model_cache_dir(),
+            ..EmbedRuntimeConfig::from_env().expect("embedding runtime from env")
+        };
+        EmbedderHandle::with_model_and_runtime(&choice, &runtime).expect("failed to init embedder")
+    }
+
+    #[test]
+    fn model_cache_is_the_data_roots_unless_the_environment_names_one() {
+        let root = std::env::temp_dir().join("memex-data-root");
+        let data_root_cache = default_model_cache_dir(&root);
+        assert_eq!(data_root_cache, root.join("embed-cache"));
+        // Without either variable, the working directory plays no part.
+        let resolved = resolve_model_cache_dir(None, None, data_root_cache.clone());
+        assert_eq!(resolved, data_root_cache);
+        assert!(resolved.is_absolute());
+        // Each variable still overrides it, and HF_HOME still wins over FASTEMBED_CACHE_DIR.
+        assert_eq!(
+            resolve_model_cache_dir(None, Some("/fastembed".into()), data_root_cache.clone()),
+            PathBuf::from("/fastembed")
+        );
+        assert_eq!(
+            resolve_model_cache_dir(Some("/hf".into()), None, data_root_cache.clone()),
+            PathBuf::from("/hf")
+        );
+        assert_eq!(
+            resolve_model_cache_dir(
+                Some("/hf".into()),
+                Some("/fastembed".into()),
+                data_root_cache
+            ),
+            PathBuf::from("/hf")
+        );
     }
 
     #[test]
@@ -1044,6 +1213,32 @@ mod tests {
     }
 
     #[test]
+    fn runtime_ort_dylib_path_overrides_the_baked_one() {
+        let runtime = Some("/env/libonnxruntime.dylib");
+        let baked = Some("/baked/libonnxruntime.dylib");
+        assert_eq!(
+            ort_dylib_to_load(runtime, baked),
+            Some(OrtDylib::Runtime("/env/libonnxruntime.dylib"))
+        );
+        assert_eq!(
+            ort_dylib_to_load(runtime, None),
+            Some(OrtDylib::Runtime("/env/libonnxruntime.dylib"))
+        );
+        // ort ignores an empty ORT_DYLIB_PATH, so the baked path still applies.
+        assert_eq!(
+            ort_dylib_to_load(Some(""), baked),
+            Some(OrtDylib::Baked("/baked/libonnxruntime.dylib"))
+        );
+        assert_eq!(
+            ort_dylib_to_load(None, baked),
+            Some(OrtDylib::Baked("/baked/libonnxruntime.dylib"))
+        );
+        // With neither, ort's own lookup is left untouched.
+        assert_eq!(ort_dylib_to_load(None, None), None);
+        assert_eq!(ort_dylib_to_load(Some(""), Some("")), None);
+    }
+
+    #[test]
     fn non_finite_vectors_are_rejected() {
         assert!(check_finite(&[vec![0.5, -0.5]]).is_ok());
         let error = check_finite(&[vec![0.5], vec![f32::NAN]])
@@ -1060,6 +1255,7 @@ mod tests {
         let runtime = EmbedRuntimeConfig {
             execution_provider: ExecutionProviderChoice::CoreML,
             compute_units: Some("gpu".to_string()),
+            model_cache_dir: test_model_cache_dir(),
             ..EmbedRuntimeConfig::default()
         };
         let mut embedder =

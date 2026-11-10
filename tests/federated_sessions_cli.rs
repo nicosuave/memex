@@ -91,7 +91,8 @@ fn sessions_federate_exact_identities_and_keep_results_when_a_peer_fails() {
     .unwrap();
     std::fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
-    std::fs::write(&ssh, "#!/bin/sh\ncase \"$5\" in peer) cd \"$PEER_ROOT\" || exit 1; exec \"$TEST_MEMEX\" --no-update-check rpc --root \"$PEER_ROOT\";; *) echo unavailable >&2; exit 1;; esac\n").unwrap();
+    // The target follows `--`, after transport options whose count depends on the root path.
+    std::fs::write(&ssh, "#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\ncase \"$2\" in peer) cd \"$PEER_ROOT\" || exit 1; exec \"$TEST_MEMEX\" --no-update-check rpc --root \"$PEER_ROOT\";; *) echo unavailable >&2; exit 1;; esac\n").unwrap();
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let exact = [

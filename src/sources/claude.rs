@@ -374,22 +374,48 @@ fn fork_origin(bytes: &[u8]) -> Option<String> {
 ///
 /// Title records are metadata rather than transcript messages, so the search
 /// index intentionally does not contain them. The shared session catalog reads
-/// this metadata so every client sees saved names and subsequent renames.
+/// this metadata so every client sees saved names and subsequent renames; its
+/// listings cache the result per transcript version (`analytics::title_cache`).
 pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
-    use memchr::memchr;
-    use memmap2::Mmap;
     let file = File::open(path).ok()?;
-    let bytes = unsafe { Mmap::map(&file).ok()? };
-    let mut custom_title = None;
-    let mut ai_title = None;
-    let mut agent_name = None;
+    let bytes = unsafe { memmap2::Mmap::map(&file).ok()? };
+    let mut titles = SessionTitles::default();
+    let complete = titles.fold_lines(&bytes, session_id);
+    titles.fold_line(&bytes[complete..], session_id);
+    titles.title()
+}
 
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let remaining = &bytes[offset..];
-        let length = memchr(b'\n', remaining).unwrap_or(remaining.len());
-        let line = &remaining[..length];
-        offset += length + usize::from(length < remaining.len());
+/// The title lines of one session folded in file order: the last non-empty title of each
+/// kind wins, and a custom title outranks an AI title, which outranks an agent name.
+/// Folding is resumable, so the titles of an appended transcript extend from its old end.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionTitles {
+    pub custom_title: Option<String>,
+    pub ai_title: Option<String>,
+    pub agent_name: Option<String>,
+}
+
+impl SessionTitles {
+    pub(crate) fn title(&self) -> Option<String> {
+        self.custom_title
+            .clone()
+            .or_else(|| self.ai_title.clone())
+            .or_else(|| self.agent_name.clone())
+    }
+
+    /// Fold the newline-terminated lines of `bytes` and return their length. A trailing
+    /// line without a newline may still be being written, so it is left to [`Self::fold_line`]
+    /// and a later scan resumes at the returned offset.
+    pub(crate) fn fold_lines(&mut self, bytes: &[u8], session_id: &str) -> usize {
+        let mut offset = 0;
+        while let Some(length) = memchr::memchr(b'\n', &bytes[offset..]) {
+            self.fold_line(&bytes[offset..offset + length], session_id);
+            offset += length + 1;
+        }
+        offset
+    }
+
+    pub(crate) fn fold_line(&mut self, line: &[u8], session_id: &str) {
         // Most lines contain large transcript/tool bodies. Only metadata
         // candidates need JSON decoding; still inspect every line for renames.
         // Escaped JSON strings may encode the type using Unicode escapes.
@@ -402,20 +428,20 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
         .iter()
         .any(|needle| memmem::find(line, needle).is_some())
         {
-            continue;
+            return;
         }
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            continue;
+            return;
         };
         if value
             .get("sessionId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != session_id)
         {
-            continue;
+            return;
         }
         let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
-            continue;
+            return;
         };
         let title = match entry_type {
             "custom-title" => value
@@ -433,14 +459,12 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
         .filter(|title| !title.is_empty());
 
         match entry_type {
-            "custom-title" if title.is_some() => custom_title = title,
-            "ai-title" if title.is_some() => ai_title = title,
-            "agent-name" if title.is_some() => agent_name = title,
+            "custom-title" if title.is_some() => self.custom_title = title,
+            "ai-title" if title.is_some() => self.ai_title = title,
+            "agent-name" if title.is_some() => self.agent_name = title,
             _ => {}
         }
     }
-
-    custom_title.or(ai_title).or(agent_name)
 }
 
 pub fn discover(
