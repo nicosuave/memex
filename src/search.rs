@@ -67,6 +67,10 @@ pub(crate) fn collect(
     let mut candidate_limit = selection.limit.saturating_mul(5).max(100);
     let mut failures = Vec::new();
     let mut seen_failures = HashSet::new();
+    // A peer that failed is not asked again by later query views or rounds, so an
+    // unreachable peer costs one timeout per search. This machine is always asked again:
+    // only its first call refreshes the index, and its failures cost no network wait.
+    let mut failed_peers: Vec<(String, String)> = Vec::new();
     let mut first_round = true;
     let store = (selection.kind_filter != SessionKindFilter::All)
         .then(|| AnalyticsStore::open_read_only(analytics_path(&paths.state)).ok())
@@ -87,10 +91,20 @@ pub(crate) fn collect(
                 machines,
                 &request,
                 auto_index_local && first_round && query_index == 0,
+                &failed_peers,
             )?;
-            capped |= result.candidate_count >= candidate_limit;
+            // Deepen only when some machine filled its request; a sum over machines that
+            // each returned everything they have is not a sign that more exist.
+            capped |= result.capped;
             counts.push(result.candidate_count);
             for failure in result.failures {
+                if failure.0 != LOCAL_MACHINE_ID
+                    && !failed_peers
+                        .iter()
+                        .any(|(machine, _)| *machine == failure.0)
+                {
+                    failed_peers.push(failure.clone());
+                }
                 if seen_failures.insert(failure.clone()) {
                     failures.push(failure);
                 }

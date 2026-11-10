@@ -1196,6 +1196,17 @@ fn poll_daemon_defers_deletion_while_an_external_embedding_writer_holds_the_leas
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(VectorIndex::open(&paths.vectors).unwrap().is_empty());
+    // The refresh publishes the lexical generation before the vector generation, so the
+    // vector removal can land just after the document count reaches zero.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !VectorIndex::open(&paths.vectors).unwrap().is_empty() {
+        daemon.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "poll daemon did not remove the deleted record's vector: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     daemon.stop();
 }

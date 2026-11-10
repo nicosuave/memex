@@ -251,6 +251,106 @@ fn compaction_folds_the_tiny_segments_search_refreshes_leave_behind() {
     );
 }
 
+#[test]
+fn explicit_indexing_schedules_compaction_once_small_segments_pass_the_threshold() {
+    use memex::config::Paths;
+    use memex::index::{
+        COMPACTION_RETAINED_SEGMENTS, SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS, SearchIndex,
+    };
+    use memex::lease::CompactionLock;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let temp = fixture();
+    let root = temp.path().join("index");
+    let source = temp
+        .path()
+        .join(".claude/projects/private-project/private-session.jsonl");
+    let append = |uuid: String| {
+        let record = serde_json::json!({
+            "type": "user",
+            "timestamp": "2026-09-01T00:00:00Z",
+            "message": {"role": "user", "content": format!("privateneedle {uuid}")},
+            "uuid": uuid,
+        });
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source).unwrap(),
+            "{record}"
+        )
+        .unwrap();
+    };
+    for seed in 1..128 {
+        append(format!("private-seed-{seed}"));
+    }
+    let published = || SearchIndex::open_or_create(&root.join("index")).unwrap();
+
+    // Every explicit refresh appends one segment. Past the largest three, each one-record
+    // segment is a compaction candidate, so these leave exactly the threshold behind.
+    let quiet_appends = SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS + COMPACTION_RETAINED_SEGMENTS - 1;
+    let mut segments = Vec::new();
+    let mut seed_segment = None;
+    for append_number in 0..=quiet_appends {
+        if append_number > 0 {
+            append(format!("private-event-{append_number}"));
+        }
+        let output = run_index(temp.path(), &root, false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let current = published().index.searchable_segment_ids().unwrap();
+        assert!(
+            segments.iter().all(|id| current.contains(id)),
+            "explicit indexing merged existing segments"
+        );
+        assert_eq!(current.len(), append_number + 1);
+        seed_segment = seed_segment.or(current.first().copied());
+        segments = current;
+    }
+    let seed_segment = seed_segment.unwrap();
+    let paths = Paths::new(Some(root.clone())).unwrap();
+    let pending = paths.state.join("compaction.pending");
+    assert_eq!(
+        published()
+            .small_segment_count(COMPACTION_RETAINED_SEGMENTS)
+            .unwrap(),
+        SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS
+    );
+    assert!(!pending.exists());
+
+    append("private-event-threshold".to_owned());
+    let output = run_index(temp.path(), &root, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The refresh returns once it has spawned the detached `memex index compact`, which folds
+    // the small segments into one and keeps the largest three. Wait for it to publish and let
+    // go of its lock.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let index = published();
+        let current = index.index.searchable_segment_ids().unwrap();
+        if current.len() == COMPACTION_RETAINED_SEGMENTS + 1
+            && let Some(lock) = CompactionLock::try_acquire(&paths).unwrap()
+        {
+            drop(lock);
+            assert!(current.contains(&seed_segment));
+            assert_eq!(index.doc_count().unwrap(), 128 + quiet_appends + 1);
+            assert!(!pending.exists());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the detached compaction never folded the small segments: {} remain",
+            current.len()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(not(feature = "profiling"))]
 #[test]
 fn default_build_ignores_trace_environment_entirely() {

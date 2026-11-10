@@ -42,8 +42,6 @@ pub(super) fn writer_loop(
     }
     let index = if index.is_writable() {
         index
-    } else if ctx.defer_merges {
-        SearchIndex::open_or_create_for_search_refresh(&ctx.index_root)?
     } else {
         SearchIndex::open_or_create_for_continuous_ingest(&ctx.index_root)?
     };
@@ -53,7 +51,6 @@ pub(super) fn writer_loop(
     let WriterContext {
         index_root: _,
         input_bytes: _,
-        defer_merges: _,
         embedding_budget,
         embeddings,
         do_backfill_embeddings,
@@ -75,19 +72,24 @@ pub(super) fn writer_loop(
     for (path, (offset, metadata_offsets)) in codex_metadata_checkpoints {
         analytics.set_codex_metadata_checkpoint(path, offset, metadata_offsets);
     }
-    let mut scoped_doc_ids = HashSet::new();
+    // The vector store is the only consumer of these IDs, so they are looked up only when
+    // one is opened below.
+    let vector_store_exists = crate::vector::VectorIndex::exists(&vector_dir);
+    let scoped_doc_ids = if embeddings || vector_store_exists {
+        index.doc_ids_by_sources(
+            &scope_targets,
+            delete_paths
+                .iter()
+                .filter(|path| vector_delete_paths.contains(*path))
+                .map(String::as_str),
+        )?
+    } else {
+        HashSet::new()
+    };
     for scope in &scope_targets {
-        for doc_id in index.doc_ids_by_source_scope(scope)? {
-            scoped_doc_ids.insert(doc_id);
-        }
         index.delete_by_source_scope(&mut writer, scope)?;
     }
     for path in &delete_paths {
-        if vector_delete_paths.contains(path) {
-            for doc_id in index.doc_ids_by_source_path(path)? {
-                scoped_doc_ids.insert(doc_id);
-            }
-        }
         index.delete_by_source_path(&mut writer, path);
     }
     for (scope, cwd) in &opencode_session_cwds {
@@ -106,20 +108,23 @@ pub(super) fn writer_loop(
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
     let mut index_pending = [0u64; SOURCE_COUNT];
     let mut budget = EmbedBudget::new(embedding_budget);
+    let batch_size = embed_runtime.batch_size();
     if embeddings {
-        let handle = EmbedderHandle::with_model_and_runtime(&model, &embed_runtime)?;
-        let dims = handle.dims;
+        // A model whose vector size is known opens the store without loading; the model
+        // then loads on the first batch that needs it, so a refresh with nothing to embed
+        // never loads one.
+        let dims = match model.known_dimensions(&embed_runtime) {
+            Some(dims) => dims,
+            None => loaded_embedder(&mut embedder, &model, &embed_runtime)?.dims,
+        };
         vector_index = Some(open_vector_index_for_ingest(
             &vector_dir,
             dims,
             &model,
             reset_vector_store,
         )?);
-        embedder = Some(handle);
         progress.set_embed_ready();
-    } else if (reconcile_vector_ids || !scoped_doc_ids.is_empty())
-        && crate::vector::VectorIndex::exists(&vector_dir)
-    {
+    } else if (reconcile_vector_ids || !scoped_doc_ids.is_empty()) && vector_store_exists {
         vector_index = Some(crate::vector::VectorIndex::open(&vector_dir)?);
     }
     if let Some(vindex) = vector_index.as_mut() {
@@ -166,12 +171,10 @@ pub(super) fn writer_loop(
                     progress.add_embed_pending(source, 1);
                     embed_buffer.push((doc_id, text, source));
                 }
-                if let Some(emb) = embedder.as_mut()
-                    && embed_buffer.len() >= emb.batch_size()
-                {
+                if embed_buffer.len() >= batch_size {
                     embedded_count += flush_embeddings(
                         &mut embed_buffer,
-                        emb,
+                        loaded_embedder(&mut embedder, &model, &embed_runtime)?,
                         vector_index.as_mut().unwrap(),
                         &progress,
                     )?;
@@ -232,7 +235,7 @@ pub(super) fn writer_loop(
         } else if !embed_buffer.is_empty() {
             embedded_count += flush_embeddings(
                 &mut embed_buffer,
-                embedder.as_mut().unwrap(),
+                loaded_embedder(&mut embedder, &model, &embed_runtime)?,
                 vector_index.as_mut().unwrap(),
                 &progress,
             )?;
@@ -247,7 +250,9 @@ pub(super) fn writer_loop(
         if do_backfill_embeddings || needs_vector_backfill {
             embedded_count += backfill_embeddings(
                 &index,
-                embedder.as_mut().unwrap(),
+                &mut embedder,
+                &model,
+                &embed_runtime,
                 vector_index.as_mut().unwrap(),
                 &progress,
                 &mut budget,
@@ -255,12 +260,14 @@ pub(super) fn writer_loop(
         }
         budget.warn_if_skipped();
     }
-    if let Some(vindex) = vector_index.as_ref() {
+    // An unchanged store opened from a generation would stage a copy of what is published.
+    if let Some(vindex) = vector_index.as_ref()
+        && vindex.has_unpublished_changes()
+    {
         staged_vectors = Some(vindex.stage()?);
     }
-    if let Some(handle) = embedder.take() {
-        std::mem::forget(handle);
-    }
+    // Release the model now: a long-lived process refreshes many times.
+    drop(embedder);
     {
         crate::profiling::span!("lexical.merge_wait");
         writer.wait_merging_threads()?;
@@ -313,9 +320,23 @@ fn writer_fast_path_needs_vectors(index: &SearchIndex, ctx: &WriterContext) -> R
         || !vector_index_covers_embeddable_records(index, &vector_index)?)
 }
 
+/// The refresh's embedder, loaded by the first caller that has something to embed.
+fn loaded_embedder<'a>(
+    embedder: &'a mut Option<EmbedderHandle>,
+    model: &ModelChoice,
+    runtime: &EmbedRuntimeConfig,
+) -> Result<&'a mut EmbedderHandle> {
+    if embedder.is_none() {
+        *embedder = Some(EmbedderHandle::with_model_and_runtime(model, runtime)?);
+    }
+    Ok(embedder.as_mut().expect("embedder loaded above"))
+}
+
 pub(super) fn backfill_embeddings(
     index: &SearchIndex,
-    embedder: &mut EmbedderHandle,
+    embedder: &mut Option<EmbedderHandle>,
+    model: &ModelChoice,
+    runtime: &EmbedRuntimeConfig,
     vector_index: &mut crate::vector::VectorIndex,
     progress: &Arc<Progress>,
     budget: &mut EmbedBudget,
@@ -324,6 +345,7 @@ pub(super) fn backfill_embeddings(
     use std::cell::Cell;
     let embedded_count = Cell::new(0usize);
     let mut embed_buffer: Vec<(u64, String, SourceKind)> = Vec::new();
+    let batch_size = runtime.batch_size();
     index.for_each_record(|record| {
         if !record_needs_embedding(&record) || vector_index.contains(record.doc_id) {
             return Ok(());
@@ -340,7 +362,8 @@ pub(super) fn backfill_embeddings(
             truncate_for_embedding(record.text),
             record.source,
         ));
-        if embed_buffer.len() >= embedder.batch_size() {
+        if embed_buffer.len() >= batch_size {
+            let embedder = loaded_embedder(embedder, model, runtime)?;
             let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
             embedded_count.set(embedded_count.get() + n);
         }
@@ -349,6 +372,7 @@ pub(super) fn backfill_embeddings(
     if budget.spent() {
         budget.skip(&mut embed_buffer, progress);
     } else if !embed_buffer.is_empty() {
+        let embedder = loaded_embedder(embedder, model, runtime)?;
         let n = flush_embeddings(&mut embed_buffer, embedder, vector_index, progress)?;
         embedded_count.set(embedded_count.get() + n);
     }

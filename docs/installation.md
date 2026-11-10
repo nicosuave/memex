@@ -216,6 +216,37 @@ Binary:
 ```
 ./target/release/memex
 ```
+
+### Packaging with a system ONNX Runtime
+
+Default builds embed a downloaded ONNX Runtime (`ort-download-binaries`). To use an
+ONNX Runtime the package manager installs, build with `ort-load-dynamic` and name the
+library in `MEMEX_ORT_DYLIB_PATH` at build time:
+
+```bash
+MEMEX_ORT_DYLIB_PATH=/opt/homebrew/opt/onnxruntime/lib/libonnxruntime.dylib \
+  cargo install --locked --path . --no-default-features --features ort-load-dynamic
+```
+
+Memex then opens that library the first time it creates an embedding session, so
+`memex --version`, lexical search, and `memex index --no-embeddings` never load ONNX
+Runtime. If the library cannot be loaded, commands that embed fail with an error
+naming the path, and other commands are unaffected.
+
+At runtime, a non-empty `ORT_DYLIB_PATH` overrides the built-in path, and a value
+that cannot be loaded fails the same way, naming `ORT_DYLIB_PATH`. Without
+`MEMEX_ORT_DYLIB_PATH`, an `ort-load-dynamic` build needs `ORT_DYLIB_PATH` (the Nix
+package sets it in a wrapper) or a `libonnxruntime` on the dynamic loader's search
+path. `MEMEX_ORT_DYLIB_PATH` has no effect without `ort-load-dynamic`.
+
+Linking ONNX Runtime at load time instead (`--no-default-features` with
+`ORT_LIB_PATH` and `ORT_PREFER_DYNAMIC_LINK=1`) also works, but then every
+invocation loads ONNX Runtime and its dependencies at startup.
+
+Packages do not include embedding models. The first local embedding downloads the
+configured model into `<root>/embed-cache` (by default `~/.memex/embed-cache`); see
+[Configuration](configuration.md#embedding-model) for overrides.
+
 ## Setup (manual)
 
 If you built from source, install the skill embedded in that build:

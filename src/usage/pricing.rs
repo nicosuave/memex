@@ -4,7 +4,7 @@
 //! unpriced instead of inheriting a guessed family rate.
 
 use super::compact::UsageEventView;
-use super::{CacheWaste, CostMode, UsageEventData, UsageReport, UsageSummary};
+use super::{CacheWaste, CostMode, TokenBuckets, UsageEventData, UsageReport, UsageSummary};
 use std::collections::HashMap;
 
 impl CacheWaste {
@@ -79,10 +79,7 @@ pub(crate) fn compute_cache_waste<'a>(
             continue;
         }
         let tokens = &event.tokens;
-        let prompt_tokens = tokens
-            .uncached_input
-            .saturating_add(tokens.cache_read)
-            .saturating_add(tokens.cache_write);
+        let prompt_tokens = prompt_tokens(tokens);
         if prompt_tokens == 0 {
             continue;
         }
@@ -146,9 +143,10 @@ fn cache_miss_cost_usd_cached(
     let Some(model) = event.model else {
         return 0.0;
     };
-    let Some(rates) = cache.rates_for(event.provider, model) else {
+    let Some(prices) = cache.prices_for(event.provider, model) else {
         return 0.0;
     };
+    let rates = prices.rates_for_event(event);
     let cache_write_1h = event.tokens.cache_write_1h.min(event.tokens.cache_write);
     let cache_write_5m = event.tokens.cache_write - cache_write_1h;
     let paid_tokens = event
@@ -179,6 +177,53 @@ struct Rates {
     cache_write_5m: u64,
     cache_write_1h: u64,
     output: u64,
+}
+
+/// A model's catalog prices. Most models bill every request at `base`; a model priced by prompt
+/// length bills the whole request at its long-prompt rates once the prompt exceeds a threshold.
+#[derive(Clone, Copy)]
+struct ModelPrices {
+    base: Rates,
+    long_prompt: Option<LongPromptTier>,
+}
+
+#[derive(Clone, Copy)]
+struct LongPromptTier {
+    /// Requests whose prompt (uncached input, cache reads and cache writes) exceeds this many
+    /// tokens are billed entirely at `rates`.
+    above_tokens: u64,
+    rates: Rates,
+}
+
+impl ModelPrices {
+    fn flat(base: Rates) -> Self {
+        Self {
+            base,
+            long_prompt: None,
+        }
+    }
+
+    /// Aggregate rows sum many requests, so a per-request prompt threshold cannot be evaluated
+    /// on them; they keep the base rates, which can only undercount.
+    fn rates_for_event<S, P>(&self, event: &UsageEventData<S, P>) -> Rates {
+        match self.long_prompt {
+            Some(tier)
+                if !event.cache_chain_excluded
+                    && prompt_tokens(&event.tokens) > tier.above_tokens =>
+            {
+                tier.rates
+            }
+            _ => self.base,
+        }
+    }
+}
+
+/// Every input token a request sent: uncached input plus cache reads and writes.
+fn prompt_tokens(tokens: &TokenBuckets) -> u64 {
+    tokens
+        .uncached_input
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write)
 }
 
 const fn usd_per_million(value_milli_usd: u64) -> u64 {
@@ -221,20 +266,20 @@ pub(crate) fn event_cost_nanos_cached<S: std::ops::Deref<Target = str>, P>(
 /// avoids normalizing (allocating lowercase strings) on every event.
 #[derive(Default)]
 pub(crate) struct RateCache {
-    entries: Vec<(Option<String>, String, Option<Rates>)>,
+    entries: Vec<(Option<String>, String, Option<ModelPrices>)>,
 }
 
 impl RateCache {
-    fn rates_for(&mut self, provider: Option<&str>, model: &str) -> Option<Rates> {
-        for (cached_provider, cached_model, rates) in &self.entries {
+    fn prices_for(&mut self, provider: Option<&str>, model: &str) -> Option<ModelPrices> {
+        for (cached_provider, cached_model, prices) in &self.entries {
             if cached_provider.as_deref() == provider && cached_model == model {
-                return *rates;
+                return *prices;
             }
         }
-        let rates = rates_for(provider, model);
+        let prices = prices_for(provider, model);
         self.entries
-            .push((provider.map(str::to_owned), model.to_owned(), rates));
-        rates
+            .push((provider.map(str::to_owned), model.to_owned(), prices));
+        prices
     }
 }
 
@@ -250,7 +295,9 @@ fn calculated_cost_nanos_cached<S: std::ops::Deref<Target = str>, P>(
     event: &UsageEventData<S, P>,
     cache: &mut RateCache,
 ) -> Option<u64> {
-    let rates = cache.rates_for(event.provider.as_deref(), event.model.as_deref()?)?;
+    let rates = cache
+        .prices_for(event.provider.as_deref(), event.model.as_deref()?)?
+        .rates_for_event(event);
     let cache_write_1h = event.tokens.cache_write_1h.min(event.tokens.cache_write);
     let cache_write_5m = event.tokens.cache_write.saturating_sub(cache_write_1h);
     let total = (event.tokens.uncached_input as u128) * (rates.input as u128)
@@ -263,7 +310,7 @@ fn calculated_cost_nanos_cached<S: std::ops::Deref<Target = str>, P>(
     u64::try_from(total / 1_000_000).ok()
 }
 
-fn rates_for(provider: Option<&str>, model: &str) -> Option<Rates> {
+fn prices_for(provider: Option<&str>, model: &str) -> Option<ModelPrices> {
     let model = model.trim().to_ascii_lowercase();
     let provider = provider.unwrap_or("").trim().to_ascii_lowercase();
     let exact_or_snapshot = |base: &str| {
@@ -304,21 +351,32 @@ fn rates_for(provider: Option<&str>, model: &str) -> Option<Rates> {
 
     let anthropic = provider.is_empty() || provider.contains("anthropic");
     if anthropic {
-        if exact_or_snapshot("claude-fable-5-1") {
+        // Each Claude Mythos release is the same model, at the same prices, as its Fable release.
+        if exact_or_snapshot("claude-fable-5-2") || exact_or_snapshot("claude-mythos-5-2") {
+            return Some(claude_rates(8_000, 10_000, 16_000, 200, 40_000));
+        }
+        if exact_or_snapshot("claude-fable-5-1") || exact_or_snapshot("claude-mythos-5-1") {
             return Some(claude_rates(10_000, 12_500, 20_000, 250, 50_000));
         }
-        if exact_or_snapshot("claude-fable-5") {
+        if exact_or_snapshot("claude-fable-5") || exact_or_snapshot("claude-mythos-5") {
             return Some(claude_rates(10_000, 12_500, 20_000, 1_000, 50_000));
         }
         if exact_or_snapshot("claude-opus-5-5") {
             return Some(claude_rates(4_000, 5_000, 8_000, 200, 20_000));
         }
         if exact_or_snapshot("claude-sonnet-5-5") {
-            return Some(claude_rates(2_000, 2_500, 4_000, 200, 10_000));
+            return Some(claude_rates(2_000, 2_500, 4_000, 100, 10_000));
         }
         if exact_or_snapshot("claude-haiku-5-5") {
-            // Prompts up to 100K tokens; longer prompts bill at five times these rates.
-            return Some(claude_rates(100, 125, 200, 10, 500));
+            // Priced by prompt length: a request whose prompt exceeds 100K tokens, counting cache
+            // reads and writes, bills entirely at the higher row.
+            return Some(ModelPrices {
+                base: claude_row(100, 125, 200, 10, 500),
+                long_prompt: Some(LongPromptTier {
+                    above_tokens: 100_000,
+                    rates: claude_row(500, 625, 1_000, 50, 2_500),
+                }),
+            });
         }
         if [
             "claude-opus-5",
@@ -336,7 +394,7 @@ fn rates_for(provider: Option<&str>, model: &str) -> Option<Rates> {
             return Some(claude_rates(15_000, 18_750, 30_000, 1_500, 75_000));
         }
         if exact_or_snapshot("claude-sonnet-5") {
-            // Promotional rate valid on the catalog's 2026-07-15 effective date.
+            // Announced as introductory pricing through 2026-08-31, then kept as the standard rate.
             return Some(claude_rates(2_000, 2_500, 4_000, 200, 10_000));
         }
         if ["claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4"]
@@ -352,17 +410,22 @@ fn rates_for(provider: Option<&str>, model: &str) -> Option<Rates> {
     None
 }
 
-fn openai_rates(input: u64, cached: u64, output: u64) -> Rates {
-    Rates {
+fn openai_rates(input: u64, cached: u64, output: u64) -> ModelPrices {
+    ModelPrices::flat(Rates {
         input: usd_per_million(input),
         cache_read: usd_per_million(cached),
         cache_write_5m: usd_per_million(input),
         cache_write_1h: usd_per_million(input),
         output: usd_per_million(output),
-    }
+    })
 }
 
-fn claude_rates(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64) -> Rates {
+fn claude_rates(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64) -> ModelPrices {
+    ModelPrices::flat(claude_row(input, write_5m, write_1h, read, output))
+}
+
+/// One row of Anthropic's price table, in milli-USD per million tokens.
+fn claude_row(input: u64, write_5m: u64, write_1h: u64, read: u64, output: u64) -> Rates {
     Rates {
         input: usd_per_million(input),
         cache_read: usd_per_million(read),
@@ -682,9 +745,73 @@ mod tests {
         // One million uncached input tokens, priced at each model's list input rate.
         assert_eq!(cost("claude-opus-5-5"), Some(4_000_000_000));
         assert_eq!(cost("claude-opus-5"), Some(5_000_000_000));
+        assert_eq!(cost("claude-fable-5-2"), Some(8_000_000_000));
         assert_eq!(cost("claude-fable-5-1"), Some(10_000_000_000));
+        assert_eq!(cost("claude-mythos-5-2"), Some(8_000_000_000));
+        assert_eq!(cost("claude-mythos-5-1"), Some(10_000_000_000));
+        assert_eq!(cost("claude-mythos-5"), Some(10_000_000_000));
         assert_eq!(cost("claude-sonnet-5-5"), Some(2_000_000_000));
-        assert_eq!(cost("claude-haiku-5-5"), Some(100_000_000));
+        // A one-million-token prompt is over Haiku 5.5's 100K threshold: the higher row applies.
+        assert_eq!(cost("claude-haiku-5-5"), Some(500_000_000));
+    }
+
+    fn anthropic_cost(model: &str, tokens: TokenBuckets) -> Option<u64> {
+        let mut event = cache_event("s", 0, model, 0, 0, 0);
+        event.tokens = tokens;
+        calculated_cost_nanos(&event)
+    }
+
+    #[test]
+    fn claude_cache_reads_bill_at_each_models_own_rate() {
+        // One million cache-read tokens. Fable/Mythos 5.1 and later read at 0.025x input, Opus
+        // and Sonnet 5.5 at 0.05x, everything else at 0.1x.
+        let read = |model: &str| anthropic_cost(model, TokenBuckets::disjoint(0, 1_000_000, 0, 0));
+        assert_eq!(read("claude-fable-5-2"), Some(200_000_000));
+        assert_eq!(read("claude-mythos-5-2"), Some(200_000_000));
+        assert_eq!(read("claude-fable-5-1"), Some(250_000_000));
+        assert_eq!(read("claude-mythos-5-1"), Some(250_000_000));
+        assert_eq!(read("claude-fable-5"), Some(1_000_000_000));
+        assert_eq!(read("claude-mythos-5"), Some(1_000_000_000));
+        assert_eq!(read("claude-opus-5-5"), Some(200_000_000));
+        assert_eq!(read("claude-sonnet-5-5"), Some(100_000_000));
+        assert_eq!(read("claude-sonnet-5"), Some(200_000_000));
+    }
+
+    #[test]
+    fn claude_sonnet_5_5_cache_writes_and_output_bill_at_list_rates() {
+        let mut tokens = TokenBuckets::disjoint(0, 0, 3_000_000, 1_000_000);
+        tokens.cache_write_1h = 1_000_000;
+        // 2M 5m writes at $2.50 + 1M 1h writes at $4 + 1M output at $10.
+        assert_eq!(
+            anthropic_cost("claude-sonnet-5-5", tokens),
+            Some(19_000_000_000)
+        );
+    }
+
+    #[test]
+    fn claude_haiku_5_5_bills_prompts_over_100k_tokens_at_the_long_prompt_rates() {
+        // The prompt counts uncached input, cache reads and cache writes; uncached input alone
+        // stays far below the threshold on both sides of the boundary.
+        let at_threshold = TokenBuckets::disjoint(40_000, 30_000, 30_000, 1_000);
+        let over_threshold = TokenBuckets::disjoint(40_001, 30_000, 30_000, 1_000);
+        // 40k*$0.10 + 30k*$0.01 + 30k*$0.125 + 1k*$0.50
+        assert_eq!(
+            anthropic_cost("claude-haiku-5-5", at_threshold),
+            Some(8_550_000)
+        );
+        // The whole request moves to the higher row: 40,001*$0.50 + 30k*$0.05 + 30k*$0.625
+        // + 1k*$2.50.
+        assert_eq!(
+            anthropic_cost("claude-haiku-5-5", over_threshold.clone()),
+            Some(42_750_500)
+        );
+
+        // An aggregate row sums many requests, so its total prompt says nothing about any one
+        // request; it keeps the base rates.
+        let mut aggregate = cache_event("s", 0, "claude-haiku-5-5", 0, 0, 0);
+        aggregate.tokens = over_threshold;
+        aggregate.cache_chain_excluded = true;
+        assert_eq!(calculated_cost_nanos(&aggregate), Some(8_550_100));
     }
 
     #[test]

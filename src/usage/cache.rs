@@ -555,7 +555,9 @@ impl UsageCache {
     /// forks) that never reach the blob cache, so fact rows always describe the
     /// current assembly exactly. One transaction with the freshness fingerprint:
     /// a failed write leaves the previous partition intact, mirroring blob-save
-    /// failure semantics.
+    /// failure semantics. A call that changes no fact row and records the same
+    /// fingerprint, parser version, and warnings writes nothing and keeps the
+    /// facts generation.
     pub(crate) fn replace_partition_facts(
         &mut self,
         filter: SourceFilter,
@@ -646,6 +648,14 @@ impl UsageCache {
                 .map(String::as_str)
                 .filter(|path| !hashes.contains_key(path)),
         );
+        // The transaction is deferred and has only read so far. When no fact
+        // row changes and the sync row already records these inputs, nothing
+        // is written: a fresh generation would invalidate every retained
+        // snapshot of these same facts, in this and other processes.
+        if changed.is_empty() && fact_sync_matches(&transaction, filter, fingerprint, warnings)? {
+            transaction.commit()?;
+            return Ok(());
+        }
         let rows_start = Instant::now();
         {
             let mut delete =
@@ -840,13 +850,14 @@ fn insert_fact_events<'a>(
 /// Record a partition's freshness fingerprint atomically with its facts.
 /// Warnings are replaced, not merged: each build or facts refresh records the
 /// warnings of its own pass, so a file that now parses cleanly loses its
-/// warning on the next refresh.
+/// warning on the next refresh. Every call starts a new generation.
 pub(crate) fn write_fact_sync(
     connection: &Connection,
     filter: SourceFilter,
     fingerprint: &[(String, u64, i64)],
     warnings: &[String],
 ) -> Result<()> {
+    let (fingerprint, parser_version, warnings) = fact_sync_values(filter, fingerprint, warnings);
     connection.execute(
         "INSERT INTO usage_fact_sync(source, fingerprint, parser_version, warnings, generation)
          VALUES (?1, ?2, ?3, ?4, hex(randomblob(16)))
@@ -855,14 +866,43 @@ pub(crate) fn write_fact_sync(
              parser_version = excluded.parser_version,
              warnings = excluded.warnings,
              generation = excluded.generation",
-        params![
-            filter.as_str(),
-            fingerprint_files(&stable_triples(filter, fingerprint)),
-            source_spec(filter).parser_version,
-            serde_json::to_string(warnings).unwrap_or_else(|_| "[]".into()),
-        ],
+        params![filter.as_str(), fingerprint, parser_version, warnings],
     )?;
     Ok(())
+}
+
+/// Whether the partition's sync row already records exactly these inputs. A
+/// missing row (never written, or invalidated by a blob write) never matches.
+fn fact_sync_matches(
+    connection: &Connection,
+    filter: SourceFilter,
+    fingerprint: &[(String, u64, i64)],
+    warnings: &[String],
+) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let (fingerprint, parser_version, warnings) = fact_sync_values(filter, fingerprint, warnings);
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM usage_fact_sync
+             WHERE source = ?1 AND fingerprint = ?2 AND parser_version = ?3 AND warnings = ?4",
+            params![filter.as_str(), fingerprint, parser_version, warnings],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// The stored form of a sync row's inputs: fingerprint, parser version, warnings JSON.
+fn fact_sync_values(
+    filter: SourceFilter,
+    fingerprint: &[(String, u64, i64)],
+    warnings: &[String],
+) -> (String, i64, String) {
+    (
+        fingerprint_files(&stable_triples(filter, fingerprint)),
+        source_spec(filter).parser_version,
+        serde_json::to_string(warnings).unwrap_or_else(|_| "[]".into()),
+    )
 }
 
 impl UsageCache {

@@ -12,10 +12,72 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+mod title_cache;
+
 // Backfill parent session IDs so assignments can be inherited.
 const SCHEMA_VERSION: i64 = 8;
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
+// Read-write opens re-apply the DDL below only when its fingerprint, stored in `meta`,
+// changes, so editing it reaches existing stores without bumping `SCHEMA_VERSION`.
+const SCHEMA_DDL: &str = r#"
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        source TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        project TEXT NOT NULL,
+        cwd TEXT,
+        git_root TEXT,
+        git_common_dir TEXT,
+        repo_project TEXT,
+        started_at INTEGER NOT NULL,
+        last_at INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        resolution_status TEXT NOT NULL DEFAULT '',
+        label TEXT,
+        conversation_kind TEXT,
+        parent_session_id TEXT,
+        PRIMARY KEY (source, session_id, source_path)
+    );
+    CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
+    CREATE INDEX IF NOT EXISTS sessions_project_last_at_idx ON sessions(project, last_at);
+    CREATE INDEX IF NOT EXISTS sessions_repo_project_last_at_idx ON sessions(repo_project, last_at);
+    DROP INDEX IF EXISTS sessions_display_project_last_at_idx;
+    CREATE INDEX IF NOT EXISTS sessions_repository_project_last_at_idx
+        ON sessions(COALESCE(NULLIF(repo_project, ''), 'Unfiled'), last_at);
+    CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
+"#;
+// Additive migrations for existing databases: duplicate-column errors are ignored.
+const ADDED_COLUMNS: [&str; 3] = [
+    "ALTER TABLE sessions ADD COLUMN label TEXT",
+    "ALTER TABLE sessions ADD COLUMN conversation_kind TEXT",
+    "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
+];
+const SECONDARY_INDEXES_DDL: &str = "
+    CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
+    CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
+    CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);
+    CREATE INDEX IF NOT EXISTS sessions_session_id_idx ON sessions(session_id);
+";
+
+fn schema_ddl_fingerprint() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for sql in [SCHEMA_DDL]
+        .into_iter()
+        .chain(ADDED_COLUMNS)
+        .chain([SECONDARY_INDEXES_DDL])
+    {
+        hash.update((sql.len() as u64).to_le_bytes());
+        hash.update(sql.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 // The one place a session's project is resolved. A user assignment wins, first the
 // session's own and then its parent's (continuations and sub-agents inherit unless
 // they have their own); derived facts follow. Assignments live in the attached
@@ -196,6 +258,35 @@ pub struct SessionDetailRow {
     pub tags: Vec<String>,
 }
 
+impl SessionDetailRow {
+    /// The project `grouping` files this session under, as its project filter compares it.
+    pub fn grouped_project(&self, grouping: ProjectGrouping) -> &str {
+        let assigned = self.assigned_project.as_deref();
+        match grouping {
+            ProjectGrouping::Flat => assigned.unwrap_or(&self.project),
+            ProjectGrouping::Repository => assigned
+                .or(self.repo_project.as_deref())
+                .unwrap_or(UNFILED_PROJECT),
+        }
+    }
+
+    /// This session as [`AnalyticsStore::query_sessions`] lists it under `grouping`.
+    pub fn into_session_row(self, grouping: ProjectGrouping) -> SessionRow {
+        SessionRow {
+            display_project: display_project_name(self.grouped_project(grouping)),
+            source: self.source,
+            session_id: self.session_id,
+            source_path: self.source_path,
+            project: self.project,
+            cwd: self.cwd,
+            last_at: self.last_at,
+            message_count: self.message_count,
+            label: self.label,
+            conversation_kind: self.conversation_kind,
+        }
+    }
+}
+
 fn split_tags(joined: Option<String>) -> Vec<String> {
     joined
         .map(|joined| {
@@ -220,6 +311,12 @@ pub struct AnalyticsStore {
     conn: Connection,
     /// Every session query on this handle requires all of these tags.
     tags: Vec<String>,
+    /// Grouping a detailed session selection's project filter compares against.
+    selection_grouping: ProjectGrouping,
+    /// Session queries on this handle resolve provider titles into `label`.
+    resolve_titles: bool,
+    /// Directory of this store; the provider title cache lives beside it.
+    state_dir: PathBuf,
 }
 
 pub struct AnalyticsWriter {
@@ -272,6 +369,9 @@ impl AnalyticsStore {
         let store = Self {
             conn,
             tags: Vec::new(),
+            selection_grouping: ProjectGrouping::Repository,
+            resolve_titles: true,
+            state_dir: state_dir_of(path).to_path_buf(),
         };
         store.init()?;
         Ok(store)
@@ -291,6 +391,9 @@ impl AnalyticsStore {
         Ok(Self {
             conn,
             tags: Vec::new(),
+            selection_grouping: ProjectGrouping::Repository,
+            resolve_titles: true,
+            state_dir: state_dir_of(path).to_path_buf(),
         })
     }
 
@@ -299,6 +402,30 @@ impl AnalyticsStore {
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
         self
+    }
+
+    /// Match the project filter of detailed session selections on this handle under
+    /// `grouping` rather than the default repository grouping.
+    pub fn with_selection_grouping(mut self, grouping: ProjectGrouping) -> Self {
+        self.selection_grouping = grouping;
+        self
+    }
+
+    /// Return session rows without labels. Resolving a label can read the session's
+    /// transcript or provider store, so callers that only need session identities,
+    /// times or counts skip it.
+    pub fn without_titles(mut self) -> Self {
+        self.resolve_titles = false;
+        self
+    }
+
+    /// Titles for the given rows, or `None` when this handle does not resolve them.
+    fn title_lookup<'a>(
+        &self,
+        sessions: impl Iterator<Item = (SourceKind, &'a String)>,
+    ) -> Option<SessionTitleLookup> {
+        self.resolve_titles
+            .then(|| SessionTitleLookup::new(sessions).cached_in(&self.state_dir))
     }
 
     /// Distinct user tags with the number of sessions carrying each, most used first.
@@ -339,55 +466,29 @@ impl AnalyticsStore {
     fn init(&self) -> Result<()> {
         // Ingest state advances only after analytics commits. FULL keeps each WAL commit durable
         // before the cross-store publication can clear its recovery marker.
-        self.conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                source TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                source_path TEXT NOT NULL,
-                project TEXT NOT NULL,
-                cwd TEXT,
-                git_root TEXT,
-                git_common_dir TEXT,
-                repo_project TEXT,
-                started_at INTEGER NOT NULL,
-                last_at INTEGER NOT NULL,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                resolution_status TEXT NOT NULL DEFAULT '',
-                label TEXT,
-                conversation_kind TEXT,
-                parent_session_id TEXT,
-                PRIMARY KEY (source, session_id, source_path)
-            );
-            CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
-            CREATE INDEX IF NOT EXISTS sessions_project_last_at_idx ON sessions(project, last_at);
-            CREATE INDEX IF NOT EXISTS sessions_repo_project_last_at_idx ON sessions(repo_project, last_at);
-            DROP INDEX IF EXISTS sessions_display_project_last_at_idx;
-            CREATE INDEX IF NOT EXISTS sessions_repository_project_last_at_idx
-                ON sessions(COALESCE(NULLIF(repo_project, ''), 'Unfiled'), last_at);
-            CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
-            "#,
-        )?;
-        // Additive migrations for existing databases: ignore duplicate-column errors.
-        for sql in [
-            "ALTER TABLE sessions ADD COLUMN label TEXT",
-            "ALTER TABLE sessions ADD COLUMN conversation_kind TEXT",
-            "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT",
-        ] {
+        self.conn
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
+        // Every read-write open lands here, including refreshes that change nothing. A store
+        // already at this version and DDL needs neither the DDL nor the durable meta write.
+        let schema_version = SCHEMA_VERSION.to_string();
+        let ddl_fingerprint = schema_ddl_fingerprint();
+        let stored = |key: &str| {
+            self.conn
+                .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok()
+        };
+        if stored("schema_version") == Some(schema_version.clone())
+            && stored("schema_ddl") == Some(ddl_fingerprint.clone())
+        {
+            return Ok(());
+        }
+        self.conn.execute_batch(SCHEMA_DDL)?;
+        for sql in ADDED_COLUMNS {
             let _ = self.conn.execute(sql, []);
         }
-        self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
-             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
-             CREATE INDEX IF NOT EXISTS sessions_source_path_idx ON sessions(source_path);
-             CREATE INDEX IF NOT EXISTS sessions_session_id_idx ON sessions(session_id);",
-        )?;
+        self.conn.execute_batch(SECONDARY_INDEXES_DDL)?;
         let previous_schema_version: Option<i64> = self
             .conn
             .query_row(
@@ -420,9 +521,9 @@ impl AnalyticsStore {
             );
         }
         self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
+            "INSERT INTO meta(key, value) VALUES('schema_version', ?1), ('schema_ddl', ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![SCHEMA_VERSION.to_string()],
+            params![schema_version, ddl_fingerprint],
         )?;
         Ok(())
     }
@@ -614,14 +715,16 @@ impl AnalyticsStore {
         for row in rows {
             out.push(row?);
         }
-        let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
+        let titles = self.title_lookup(out.iter().map(|row| (row.source, &row.session_id)));
         for row in &mut out {
-            row.label = titles.resolve(
-                row.source,
-                &row.session_id,
-                &row.source_path,
-                row.label.as_deref(),
-            );
+            row.label = titles.as_ref().and_then(|titles| {
+                titles.resolve(
+                    row.source,
+                    &row.session_id,
+                    &row.source_path,
+                    row.label.as_deref(),
+                )
+            });
         }
         Ok(out)
     }
@@ -687,7 +790,7 @@ impl AnalyticsStore {
         );
         let (predicate, mut values) = session_selection_sql(
             source,
-            project,
+            project.map(|project| (project, self.selection_grouping)),
             cwd,
             since_ms,
             kind,
@@ -739,14 +842,16 @@ impl AnalyticsStore {
                 out.push(row);
             }
         }
-        let titles = SessionTitleLookup::new(out.iter().map(|row| (row.source, &row.session_id)));
+        let titles = self.title_lookup(out.iter().map(|row| (row.source, &row.session_id)));
         for row in &mut out {
-            row.label = titles.resolve(
-                row.source,
-                &row.session_id,
-                &row.source_path,
-                row.label.as_deref(),
-            );
+            row.label = titles.as_ref().and_then(|titles| {
+                titles.resolve(
+                    row.source,
+                    &row.session_id,
+                    &row.source_path,
+                    row.label.as_deref(),
+                )
+            });
         }
         Ok(out)
     }
@@ -798,7 +903,7 @@ impl AnalyticsStore {
     ) -> Result<u64> {
         let (predicate, values) = session_selection_sql(
             source,
-            project,
+            project.map(|project| (project, self.selection_grouping)),
             cwd,
             since_ms,
             kind,
@@ -2334,8 +2439,13 @@ impl OpencodeLookupCache {
 /// Resolve provider-owned names on the machine that owns the transcripts.
 /// Keeping this in the catalog read path also handles renames and old indexes,
 /// without replaying messages or changing session counts.
+#[derive(Default)]
 pub(crate) struct SessionTitleLookup {
     codex: HashMap<String, crate::sources::codex::SessionTitleMetadata>,
+    /// State directory holding the Claude title cache; without one, transcripts are read whole.
+    state_dir: Option<PathBuf>,
+    /// Opened on the first Claude title; `None` inside when it cannot be opened.
+    claude_cache: std::cell::OnceCell<Option<title_cache::TitleCache>>,
 }
 
 impl SessionTitleLookup {
@@ -2348,6 +2458,26 @@ impl SessionTitleLookup {
             .collect::<Vec<_>>();
         Self {
             codex: crate::sources::codex::session_title_metadata(&ids),
+            ..Self::default()
+        }
+    }
+
+    /// Reuse Claude titles cached in `state_dir` while their transcripts are unchanged.
+    pub(crate) fn cached_in(mut self, state_dir: &Path) -> Self {
+        self.state_dir = Some(state_dir.to_path_buf());
+        self
+    }
+
+    fn claude_title(&self, source_path: &str, session_id: &str) -> Option<String> {
+        let path = Path::new(source_path);
+        let cache = self.state_dir.as_deref().and_then(|state_dir| {
+            self.claude_cache
+                .get_or_init(|| title_cache::TitleCache::open(state_dir))
+                .as_ref()
+        });
+        match cache {
+            Some(cache) => cache.claude_title(path, session_id),
+            None => crate::sources::claude::session_title(path, session_id),
         }
     }
 
@@ -2364,9 +2494,7 @@ impl SessionTitleLookup {
             .filter(|_| source == SourceKind::Codex);
         let explicit = match source {
             SourceKind::Codex => codex.and_then(|metadata| metadata.title.clone()),
-            SourceKind::Claude => {
-                crate::sources::claude::session_title(Path::new(source_path), session_id)
-            }
+            SourceKind::Claude => self.claude_title(source_path, session_id),
             _ => None,
         };
         explicit
@@ -2672,7 +2800,7 @@ pub(crate) fn backfill_from_index_with_repositories(
 #[allow(clippy::too_many_arguments)]
 fn session_selection_sql(
     source: Option<SourceFilter>,
-    project: Option<&str>,
+    project: Option<(&str, ProjectGrouping)>,
     cwd: Option<&str>,
     since_ms: Option<u64>,
     kind: Option<SessionKindFilter>,
@@ -2721,8 +2849,8 @@ fn session_selection_sql(
                 .map(|label| rusqlite::types::Value::Text((*label).to_string())),
         );
     }
-    if let Some(project) = project {
-        clauses.push(format!("{} = ?", *REPOSITORY_PROJECT_SQL));
+    if let Some((project, grouping)) = project {
+        clauses.push(format!("{} = ?", project_sql(grouping)));
         values.push(rusqlite::types::Value::Text(project.to_string()));
     }
     push_tag_clauses(tags, &mut clauses, &mut values);
@@ -3940,6 +4068,287 @@ mod tests {
         );
     }
 
+    fn index_claude_session(db: &Path, transcript: &Path, session_id: &str) {
+        let mut request = record("proj", session_id, transcript, 10);
+        request.source = SourceKind::Claude;
+        request.text = "Opening request".into();
+        let mut writer = AnalyticsWriter::open(db).unwrap();
+        writer.record(&request).unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn title_line(kind: &str, session_id: &str, title: &str) -> String {
+        let field = match kind {
+            "custom-title" => "customTitle",
+            "ai-title" => "aiTitle",
+            _ => "agentName",
+        };
+        let mut line = serde_json::json!({"type": kind, "sessionId": session_id});
+        line[field] = title.into();
+        format!("{line}\n")
+    }
+
+    /// The label both listing queries give the only session, read like a refreshed listing.
+    fn listed_title(db: &Path) -> Option<String> {
+        let store = AnalyticsStore::open_read_only(db).unwrap();
+        let detailed = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .unwrap();
+        let regular = store
+            .query_sessions(None, None, None, ProjectGrouping::Flat, None)
+            .unwrap();
+        assert_eq!(detailed[0].label, regular[0].label);
+        detailed[0].label.clone()
+    }
+
+    #[test]
+    fn listed_claude_titles_follow_appended_title_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("s.jsonl");
+        let cache = tmp.path().join("session-titles.sqlite3");
+        fs::write(&transcript, title_line("ai-title", "s", "Generated")).unwrap();
+        // Indexed with no cached title, as every session indexed by an earlier version.
+        index_claude_session(&db, &transcript, "s");
+        assert!(!cache.exists());
+        assert_eq!(listed_title(&db).as_deref(), Some("Generated"));
+        assert!(cache.exists());
+
+        let append = |text: &str| {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let assert_listed = |expected: &str| {
+            assert_eq!(listed_title(&db).as_deref(), Some(expected));
+            // The same title a whole read of the transcript finds.
+            assert_eq!(
+                crate::sources::claude::session_title(&transcript, "s").as_deref(),
+                Some(expected)
+            );
+        };
+        append(&title_line("custom-title", "s", "Saved"));
+        assert_listed("Saved");
+        append(&title_line("custom-title", "other", "Other session"));
+        append(&title_line("ai-title", "s", "Later generated"));
+        assert_listed("Saved");
+        append(&title_line("custom-title", "s", "Renamed"));
+        assert_listed("Renamed");
+        // A title line still being written counts once it is complete.
+        let finished = title_line("custom-title", "s", "Finished");
+        let (head, tail) = finished.split_at(finished.len() / 2);
+        append(head);
+        assert_listed("Renamed");
+        append(tail);
+        assert_listed("Finished");
+        // A complete final line without its newline counts, and is read again once
+        // later lines follow it.
+        let unterminated = title_line("custom-title", "s", "Unterminated");
+        append(unterminated.trim_end());
+        assert_listed("Unterminated");
+        append("\n");
+        append(&title_line("agent-name", "s", "Agent"));
+        assert_listed("Unterminated");
+    }
+
+    #[test]
+    fn unchanged_claude_transcripts_are_not_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("s.jsonl");
+        fs::write(&transcript, title_line("custom-title", "s", "Saved title")).unwrap();
+        index_claude_session(&db, &transcript, "s");
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved title"));
+
+        // Rewrite the same file in place to the same length and restore its modification
+        // time: the listing keeps the title it read, so it did not read the file again.
+        let modified = fs::metadata(&transcript).unwrap().modified().unwrap();
+        fs::write(&transcript, title_line("custom-title", "s", "Other title")).unwrap();
+        let file = fs::File::options().write(true).open(&transcript).unwrap();
+        file.set_modified(modified).unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved title"));
+
+        // Any other modification time reads it again.
+        file.set_modified(modified + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Other title"));
+    }
+
+    #[test]
+    fn rewritten_claude_transcripts_are_read_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("s.jsonl");
+        let generated = title_line("ai-title", "s", "Generated");
+        fs::write(
+            &transcript,
+            format!("{generated}{}", title_line("custom-title", "s", "Saved")),
+        )
+        .unwrap();
+        index_claude_session(&db, &transcript, "s");
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved"));
+
+        // Longer and with the same first line, but the saved name is gone: resuming from
+        // the previous end would still report it.
+        let filler = serde_json::json!({"type":"assistant", "message":{"content":"x".repeat(64)}});
+        fs::write(&transcript, format!("{generated}{filler}\n")).unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Generated"));
+
+        // Shorter: read whole as well.
+        fs::write(&transcript, title_line("agent-name", "s", "Agent")).unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Agent"));
+
+        // A missing transcript has no title, with or without a cached one.
+        fs::remove_file(&transcript).unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Opening request"));
+    }
+
+    #[test]
+    fn claude_titles_edited_in_place_before_an_append_are_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("s.jsonl");
+        // The title sits far from both ends of the transcript.
+        let filler = format!(
+            "{}\n",
+            serde_json::json!({"type":"assistant", "message":{"content":"x".repeat(8192)}})
+        );
+        let original = title_line("custom-title", "s", "Saved one");
+        let edited = title_line("custom-title", "s", "Saved two");
+        assert_eq!(original.len(), edited.len());
+        fs::write(&transcript, format!("{filler}{original}{filler}")).unwrap();
+        index_claude_session(&db, &transcript, "s");
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved one"));
+
+        // Same inode, same bytes at both ends of the old content, and the file only grew:
+        // nothing but the content of the middle tells this from an append.
+        fs::write(&transcript, format!("{filler}{edited}{filler}{filler}")).unwrap();
+        assert_eq!(listed_title(&db).as_deref(), Some("Saved two"));
+    }
+
+    #[test]
+    fn untitled_listings_return_the_titled_rows_without_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        let transcript = tmp.path().join("claude.jsonl");
+        fs::write(&transcript, title_line("custom-title", "claude", "Saved")).unwrap();
+        index_claude_session(&db, &transcript, "claude");
+        let mut writer = AnalyticsWriter::open(&db).unwrap();
+        for (id, ts) in [("one", 20), ("two", 30)] {
+            let mut request = record("proj", id, &tmp.path().join(format!("{id}.jsonl")), ts);
+            request.text = format!("Request {id}");
+            writer.record(&request).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let detailed = |store: &AnalyticsStore| {
+            store
+                .query_sessions_detailed_selected(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(SessionKindFilter::All),
+                    &[],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+        let regular = |store: &AnalyticsStore| {
+            store
+                .query_sessions_filtered(None, None, None, ProjectGrouping::Flat, None, None)
+                .unwrap()
+        };
+        let untitled = AnalyticsStore::open_read_only(&db)
+            .unwrap()
+            .without_titles();
+        let untitled_detailed = detailed(&untitled);
+        let untitled_regular = regular(&untitled);
+        assert!(!tmp.path().join("session-titles.sqlite3").exists());
+        let titled = AnalyticsStore::open_read_only(&db).unwrap();
+        let mut titled_detailed = detailed(&titled);
+        let mut titled_regular = regular(&titled);
+
+        assert_eq!(
+            titled_detailed
+                .iter()
+                .map(|row| row.label.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("Request two"), Some("Request one"), Some("Saved")]
+        );
+        assert_eq!(titled_regular.len(), 3);
+        assert!(titled_regular.iter().all(|row| row.label.is_some()));
+        assert!(
+            untitled_detailed
+                .iter()
+                .chain(&titled_detailed)
+                .all(|row| row.profile.is_none())
+        );
+        for row in &mut titled_detailed {
+            row.label = None;
+        }
+        for row in &mut titled_regular {
+            row.label = None;
+        }
+        assert_eq!(
+            serde_json::to_value(&untitled_detailed).unwrap(),
+            serde_json::to_value(&titled_detailed).unwrap()
+        );
+        assert_eq!(
+            format!("{untitled_regular:?}"),
+            format!("{titled_regular:?}")
+        );
+    }
+
+    #[test]
+    fn reopening_a_current_store_skips_schema_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("analytics.sqlite");
+        AnalyticsStore::open(&db).unwrap().mark_complete().unwrap();
+        let total_changes = |store: &AnalyticsStore| -> i64 {
+            store
+                .conn
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap()
+        };
+        let reopened = AnalyticsStore::open(&db).unwrap();
+        assert_eq!(total_changes(&reopened), 0, "reopening wrote to the store");
+
+        // DDL changed since the store was created is applied without a version bump,
+        // which would discard completeness.
+        reopened
+            .conn
+            .execute_batch(
+                "DROP INDEX sessions_session_id_idx;
+                 UPDATE meta SET value = 'earlier' WHERE key = 'schema_ddl';",
+            )
+            .unwrap();
+        drop(reopened);
+        let migrated = AnalyticsStore::open(&db).unwrap();
+        let index_exists: bool = migrated
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'sessions_session_id_idx')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        assert!(migrated.complete().unwrap());
+        drop(migrated);
+        assert_eq!(
+            total_changes(&AnalyticsStore::open(&db).unwrap()),
+            0,
+            "the applied DDL was not recorded"
+        );
+    }
+
     #[test]
     fn reference_wrapper_titles_preserve_the_actual_request() {
         for header in [
@@ -3976,6 +4385,7 @@ mod tests {
                     agent_path: Some("/root/cache_invalidation".into()),
                 },
             )]),
+            ..SessionTitleLookup::default()
         };
         let resolve = |titles: &SessionTitleLookup, opening| {
             titles.resolve(SourceKind::Codex, "s", "/missing", opening)
@@ -4026,9 +4436,7 @@ mod tests {
                 {"type":"encrypted_content", "encrypted_content":"private-ciphertext"}
             ]
         }}).to_string()).unwrap();
-        let titles = SessionTitleLookup {
-            codex: HashMap::new(),
-        };
+        let titles = SessionTitleLookup::default();
         assert_eq!(
             titles
                 .resolve(

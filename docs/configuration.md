@@ -47,6 +47,14 @@ variant names, such as `BGELargeENV15` or `multilinguale5base`. See
 [fastembed's `EmbeddingModel` list](https://docs.rs/fastembed/5.17.4/fastembed/enum.EmbeddingModel.html)
 for the catalog; an unknown name fails with the list of supported models. Each local model
 produces its native vector size.
+
+A fastembed model downloads once into `<root>/embed-cache` (`~/.memex/embed-cache`, or under
+`--root`), shared by the CLI, MCP server, TUI, and daemon. `HF_HOME` overrides that
+directory, and `FASTEMBED_CACHE_DIR` does when `HF_HOME` is unset. Memex no longer
+downloads into a `.fastembed_cache` directory in the current working directory. Existing
+ones are left alone; you can delete them, or move their `models--*` directories into
+`embed-cache` to skip the download. `potion` downloads into the Hugging Face cache,
+`~/.cache/huggingface/hub`.
 ## Remote embeddings
 
 With `embeddings = "remote"`, memex computes embeddings with any OpenAI-compatible

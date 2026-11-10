@@ -1965,7 +1965,7 @@ pub fn run() -> Result<()> {
                 .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
             {
                 let config = UserConfig::load(&paths)?;
-                crate::machine::remote_project_summaries(&config, id, source, tags)?
+                crate::machine::remote_project_summaries(&paths, &config, id, source, tags)?
             } else {
                 collect_projects(&paths, source, tags)?
             };
@@ -2031,6 +2031,7 @@ pub fn run() -> Result<()> {
                     .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
                 {
                     crate::machine::remote_session_count(
+                        &paths,
                         &UserConfig::load(&paths)?,
                         id,
                         request,
@@ -2949,7 +2950,6 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         model: model_choice,
         embed_runtime,
         tool_content_limits,
-        defer_merges: false,
         embedding_budget: None,
         redaction: config.redactor()?,
     })
@@ -2982,7 +2982,7 @@ fn run_index_selection(
     } else {
         match SearchIndex::open_or_create(&paths.index)? {
             index if !index.is_writable() => index,
-            _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+            _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
         }
     };
 
@@ -3022,7 +3022,9 @@ fn run_index_selection(
         );
     }
     drop(lease);
-    if report.records_added > 0 {
+    // Indexing appends without merging, so this is what folds the segments it leaves behind;
+    // a pending marker retries a compaction that was discarded or could not be spawned.
+    if report.records_added > 0 || crate::machine::compaction_pending(&paths) {
         crate::machine::schedule_compaction_if_fragmented(&paths)?;
     }
     Ok(full_scan)
@@ -3093,6 +3095,10 @@ fn reset_reindex_artifacts(paths: &Paths, lease: &IngestLease) -> Result<()> {
         "usage-cache.sqlite3-wal",
         "usage-cache.sqlite3-shm",
         "usage-cache.sqlite3-journal",
+        "session-titles.sqlite3",
+        "session-titles.sqlite3-wal",
+        "session-titles.sqlite3-shm",
+        "session-titles.sqlite3-journal",
     ] {
         let path = paths.state.join(name);
         match std::fs::remove_file(&path) {
@@ -3121,9 +3127,9 @@ fn remove_generated_path(path: &Path) -> Result<()> {
     result.with_context(|| format!("remove reindex artifact {}", path.display()))
 }
 
-/// Search refreshes append without merging; this folds the accumulated small segments into
-/// one while leaving the largest untouched, so a compaction costs the small segments' size,
-/// not the corpus's.
+/// Refreshes append without merging; this folds the accumulated small segments into one
+/// while leaving the largest untouched, so a compaction costs the small segments' size, not
+/// the corpus's.
 ///
 /// The ingest lease is held only to stage from the current generation and to publish; the
 /// merge itself runs unleased so search refreshes never wait on it. Publication is skipped
@@ -3911,7 +3917,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
                 collect_projects(paths, None, Vec::new())?
             } else {
-                crate::machine::remote_project_summaries(&config, &machine, None, Vec::new())?
+                crate::machine::remote_project_summaries(
+                    paths,
+                    &config,
+                    &machine,
+                    None,
+                    Vec::new(),
+                )?
             };
             Ok(tag(items, machine))
         }
@@ -3936,7 +3948,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     Some(paths.root.clone()),
                 )?
             } else {
-                crate::machine::remote_sessions(&config, &machine, filters)?
+                crate::machine::remote_sessions(paths, &config, &machine, filters)?
             };
             Ok(tag(items, machine))
         }
@@ -3953,7 +3965,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             let count = if machine == crate::machine::LOCAL_MACHINE_ID {
                 collect_session_count(paths, filters, query)?
             } else {
-                crate::machine::remote_session_count(&config, &machine, filters, query)?
+                crate::machine::remote_session_count(paths, &config, &machine, filters, query)?
             };
             Ok(serde_json::to_value(count)?)
         }
@@ -5822,6 +5834,7 @@ fn run_sessions(
         &SessionListSpec {
             source,
             project,
+            project_grouping: None,
             tags: normalize_tags(&tags)?,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             since_ms: parse_ts_millis(since)?,
@@ -6068,7 +6081,8 @@ fn resume_target(
     source: Option<SourceFilter>,
 ) -> Result<ResumeTarget> {
     let claude_sources = config.claude_sources();
-    let store = open_analytics_read_only(paths)?;
+    // Resuming needs the session's identity and directory, never its title.
+    let store = open_analytics_read_only(paths)?.without_titles();
     let cwd_filter = canonical_cwd_filter(cwd);
 
     let mut rows =
@@ -6353,7 +6367,7 @@ fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
     let index = SearchIndex::open_or_create(&paths.index)?;
     let db = analytics_path(&paths.state);
     backfill_from_index(&db, &index)?;
-    let store = AnalyticsStore::open(&db)?;
+    let store = AnalyticsStore::open_read_only(&db)?;
     println!("analytics: {}", db.display());
     println!("documents: {}", index.doc_count()?);
     println!("sessions: {}", store.session_count()?);
@@ -8184,7 +8198,7 @@ fn service_environment_variables(paths: Option<&Paths>) -> Result<Vec<(String, S
     vars.push(("PATH".to_string(), path));
 
     if let Some(paths) = paths {
-        let embed_cache = paths.root.join("embed-cache");
+        let embed_cache = crate::embed::default_model_cache_dir(&paths.root);
         std::fs::create_dir_all(&embed_cache)?;
         let embed_cache = embed_cache.to_string_lossy().to_string();
         vars.push(("FASTEMBED_CACHE_DIR".to_string(), embed_cache.clone()));
@@ -9207,6 +9221,101 @@ mod tests {
             assert_eq!(vectors.model(), Some("remote:text-embedding-3-small"));
             assert_eq!(vectors.dimensions(), 8);
         }
+    }
+
+    /// Explicit `memex index` runs `run_index_selection` without a dirty set and the watch
+    /// daemon runs it with one; neither may merge segments that are already published.
+    #[test]
+    fn explicit_and_daemon_indexing_append_without_merging_existing_segments() {
+        use std::io::Write;
+
+        let _guard = env_lock();
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        let claude = temp.path().join("claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let cli = Cli::try_parse_from([
+            "memex",
+            "index",
+            "--root",
+            paths.root.to_str().unwrap(),
+            "--only-source",
+            "claude",
+            "--claude-path",
+            claude.to_str().unwrap(),
+            "--no-embeddings",
+        ])
+        .unwrap();
+        let Some(Commands::Index { index: args, .. }) = cli.command else {
+            panic!("expected index command");
+        };
+        let append = |path: &Path, records: std::ops::Range<usize>| {
+            let session = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            for record in records {
+                let line = serde_json::json!({
+                    "type": "user",
+                    "uuid": format!("{session}-{record}"),
+                    "timestamp": "2026-11-01T00:00:00Z",
+                    "message": {"role": "user", "content": format!("{session} record {record}")},
+                });
+                writeln!(file, "{line}").unwrap();
+            }
+        };
+        let published_segments = || {
+            SearchIndex::open_or_create(&paths.index)
+                .unwrap()
+                .index
+                .searchable_segment_ids()
+                .unwrap()
+        };
+
+        // Eight same-sized segments, as a rebuild publishes one per indexing thread.
+        let mut seeded = Vec::new();
+        for seed in 0..8 {
+            append(&claude.join(format!("seed-{seed}.jsonl")), 0..10);
+            run_index_selection(&args, false, None).unwrap();
+            let published = published_segments();
+            assert!(seeded.iter().all(|id| published.contains(id)));
+            seeded = published;
+        }
+        assert_eq!(seeded.len(), 8);
+
+        let transcript = claude.join("live.jsonl");
+        append(&transcript, 0..1);
+        run_index_selection(&args, false, None).unwrap();
+        let explicit = published_segments();
+        assert_eq!(explicit.len(), 9);
+        assert!(
+            seeded.iter().all(|id| explicit.contains(id)),
+            "explicit indexing merged existing segments"
+        );
+
+        append(&transcript, 1..2);
+        let dirty = HashSet::from([transcript]);
+        run_index_selection(&args, false, Some(&dirty)).unwrap();
+        let daemon = published_segments();
+        assert_eq!(daemon.len(), 10);
+        assert!(
+            explicit.iter().all(|id| daemon.contains(id)),
+            "daemon indexing merged existing segments"
+        );
+
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        assert_eq!(index.doc_count().unwrap(), 82);
+        // Segments at or above the 5 % share are never compaction candidates, so only the two
+        // one-record appends are, which stays under the scheduling threshold.
+        assert_eq!(
+            index
+                .small_segment_count(crate::index::COMPACTION_RETAINED_SEGMENTS)
+                .unwrap(),
+            2
+        );
+        assert!(!crate::machine::compaction_pending(&paths));
     }
 
     #[test]
@@ -10340,6 +10449,10 @@ arguments = {
             "usage-cache.sqlite3-wal",
             "usage-cache.sqlite3-shm",
             "usage-cache.sqlite3-journal",
+            "session-titles.sqlite3",
+            "session-titles.sqlite3-wal",
+            "session-titles.sqlite3-shm",
+            "session-titles.sqlite3-journal",
         ] {
             std::fs::write(paths.state.join(name), "derived").unwrap();
         }
@@ -10369,6 +10482,10 @@ arguments = {
             "usage-cache.sqlite3-wal",
             "usage-cache.sqlite3-shm",
             "usage-cache.sqlite3-journal",
+            "session-titles.sqlite3",
+            "session-titles.sqlite3-wal",
+            "session-titles.sqlite3-shm",
+            "session-titles.sqlite3-journal",
         ] {
             assert!(!paths.state.join(name).exists(), "preserved {name}");
         }

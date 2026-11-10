@@ -4,9 +4,10 @@ use crate::index::{QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
 use crate::machine::{
-    LOCAL_MACHINE_ID, SearchMode, SearchSpec, SessionActivitySpec, UsageSpec, federated_recent,
-    federated_session_activity, federated_usage_activity, machine_by_id, remote_shell_command,
-    session_context, session_records,
+    LOCAL_MACHINE_ID, LocatedRecord, LocatedSession, SearchMode, SearchSpec, SessionActivitySpec,
+    SessionListSpec, UsageSpec, federated_session_activity, federated_sessions_or_recent,
+    federated_usage_activity, machine_by_id, remote_shell_command, session_context,
+    session_records,
 };
 use crate::resume::{find_in_path, resume_template, shell_quote};
 use crate::types::{Record, SourceFilter, SourceKind};
@@ -1222,7 +1223,6 @@ impl App {
                     model: model_choice,
                     embed_runtime: config.resolve_embed_runtime()?,
                     tool_content_limits,
-                    defer_merges: true,
                     embedding_budget: Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET),
                     redaction: config.redactor()?,
                 };
@@ -1234,7 +1234,7 @@ impl App {
                 };
                 let index = match SearchIndex::open_or_create(&paths.index) {
                     Ok(index) if !index.is_writable() => index,
-                    _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
+                    _ => SearchIndex::open_or_create_for_continuous_ingest(&paths.index)?,
                 };
                 ingest_if_stale(&paths, &index, &opts, freshness?, &lease, Some(journal))
             })();
@@ -2841,7 +2841,12 @@ impl App {
                 shell_quote(&source_path)
             );
             std::process::Command::new("ssh")
-                .args(["-T", "--", target, &command])
+                .arg("-T")
+                .args(crate::machine::ssh_connection_options(
+                    &self.paths.state,
+                    Duration::from_secs(self.config.multi_machine.timeout_seconds()),
+                ))
+                .args(["--", target, &command])
                 .output()
         };
 
@@ -5699,7 +5704,8 @@ fn build_project_timeline(
     let now = now_ms();
     let since = range.since_ms(now);
     let rows: Vec<SessionSummary> = if query.trim().is_empty() {
-        let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+        // The timeline only counts sessions per project and time.
+        let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?.without_titles();
         store
             .query_sessions_filtered(source, since, None, display.grouping(), Some(kind), None)?
             .into_iter()
@@ -6028,40 +6034,7 @@ fn run_search_request(
     }
     let project = project.as_deref();
     if !config.machines.is_empty() {
-        let federated = federated_recent(
-            paths,
-            config,
-            &request.machines,
-            (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200),
-            Some(request.grouping),
-            false,
-        )?;
-        let failures = federated.failures;
-        let mut by_session = HashMap::new();
-        let matchers = crate::cli::build_matchers(&request.query)?;
-        for located in federated.items {
-            if request.since.is_some_and(|since| located.record.ts < since) {
-                continue;
-            }
-            if request
-                .source
-                .as_filter()
-                .is_some_and(|source| !source.matches(located.record.source))
-            {
-                continue;
-            }
-            add_located_record_to_session(&mut by_session, located, &matchers);
-        }
-        let mut sessions: Vec<_> = by_session.into_values().collect();
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts));
-        if let Some(project) = project {
-            sessions.retain(|session| session.project == project);
-        }
-        sessions.retain(|session| {
-            session_matches_kind(request.kind, session.conversation_kind.as_deref())
-        });
-        sessions.truncate(RESULT_LIMIT);
-        return Ok((sessions, failures));
+        return federated_recent_sessions(paths, config, index, &request, project);
     }
     let mut sessions = sessions_from_analytics_filtered(
         paths,
@@ -6072,20 +6045,130 @@ fn run_search_request(
         Some(request.kind),
     )
     .or_else(|_| {
-        let mut sessions =
-            sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
-        sessions.retain(|session| {
-            session_matches_kind(request.kind, session.conversation_kind.as_deref())
-        });
+        let sessions = sessions_from_index(index, &request, project)?;
         if sessions.is_empty() {
             anyhow::bail!("no analytics sessions");
         }
-        enrich_session_titles(index, &mut sessions);
         Ok(sessions)
     })?;
     sessions
         .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
     Ok((sessions, Vec::new()))
+}
+
+/// This machine's sessions from its newest index records, for when it has no session
+/// catalog to list them from.
+fn sessions_from_index(
+    index: &SearchIndex,
+    request: &SearchRequest,
+    project: Option<&str>,
+) -> Result<Vec<SessionSummary>> {
+    let mut sessions =
+        sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
+    sessions
+        .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
+    enrich_session_titles(index, &mut sessions);
+    Ok(sessions)
+}
+
+/// The unqueried session list across machines: each machine filters and limits its own
+/// session catalog, a peer too old to list it sends its newest records instead, and this
+/// machine falls back to its index while it has no catalog.
+fn federated_recent_sessions(
+    paths: &Paths,
+    config: &UserConfig,
+    index: &SearchIndex,
+    request: &SearchRequest,
+    project: Option<&str>,
+) -> SearchRequestResult {
+    let listed = federated_sessions_or_recent(
+        paths,
+        config,
+        &request.machines,
+        &SessionListSpec {
+            origin: Some(request.kind),
+            session_id: None,
+            session_ids: Vec::new(),
+            source_path: None,
+            source: request.source.as_filter(),
+            profile: None,
+            project: project.map(str::to_string),
+            project_grouping: Some(request.grouping),
+            cwd: None,
+            since_ms: request.since,
+            limit: RECENT_SESSIONS_LIMIT,
+            tags: Vec::new(),
+        },
+        (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200),
+    )?;
+    let mut sessions: Vec<_> = listed
+        .sessions
+        .items
+        .into_iter()
+        // Peers that predate grouped project filters already had their rows matched under
+        // the requested grouping; this keeps the list right if one answers differently.
+        .filter(|located| {
+            project
+                .is_none_or(|project| located.session.grouped_project(request.grouping) == project)
+        })
+        .map(|located| session_summary_from_located(located, request.grouping))
+        .collect();
+    sessions.extend(sessions_from_located_records(
+        listed.recent,
+        request,
+        project,
+    ));
+    let mut failures = listed.sessions.failures;
+    if listed.local_without_catalog {
+        match sessions_from_index(index, request, project) {
+            Ok(local) => sessions.extend(local),
+            Err(error) => failures.push((LOCAL_MACHINE_ID.to_string(), error.to_string())),
+        }
+    }
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts));
+    sessions.truncate(RESULT_LIMIT);
+    Ok((sessions, failures))
+}
+
+fn session_summary_from_located(
+    located: LocatedSession,
+    grouping: ProjectGrouping,
+) -> SessionSummary {
+    SessionSummary {
+        machine: located.machine,
+        ..session_summary_from_row(located.session.into_session_row(grouping))
+    }
+}
+
+/// Group the newest records of machines that cannot list sessions into the request's sessions.
+fn sessions_from_located_records(
+    records: Vec<LocatedRecord>,
+    request: &SearchRequest,
+    project: Option<&str>,
+) -> Vec<SessionSummary> {
+    let mut by_session = HashMap::new();
+    for located in records {
+        if request.since.is_some_and(|since| located.record.ts < since) {
+            continue;
+        }
+        if request
+            .source
+            .as_filter()
+            .is_some_and(|source| !source.matches(located.record.source))
+        {
+            continue;
+        }
+        add_located_record_to_session(&mut by_session, located, &[]);
+    }
+    let mut sessions: Vec<_> = by_session.into_values().collect();
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts));
+    if let Some(project) = project {
+        sessions.retain(|session| session.project == project);
+    }
+    sessions
+        .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
+    sessions.truncate(RESULT_LIMIT);
+    sessions
 }
 
 fn spawn_detail_worker(
@@ -7786,6 +7869,424 @@ mod tests {
             assert_eq!(sessions.len(), 2);
             assert_eq!(sessions[0].session_id, "gallery-1");
         }
+    }
+
+    /// `(source, session id, flat project, repository project, last activity, kind)`.
+    type FixtureSession = (
+        SourceKind,
+        &'static str,
+        &'static str,
+        &'static str,
+        u64,
+        Option<&'static str>,
+    );
+
+    /// One session per entry, each a single user record in the index and, unless named in
+    /// `index_only`, in the session catalog. Refreshing before a read is off.
+    fn seed_machine(root: &std::path::Path, sessions: &[FixtureSession], index_only: &[&str]) {
+        use crate::analytics::AnalyticsWriter;
+
+        let paths = Paths::new(Some(root.to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(root.join("config.toml"), "auto_index_on_search = false\n").unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (doc_id, &(source, session_id, project, _, ts, kind)) in (1..).zip(sessions) {
+            let mut event = record("user", &format!("opening of {session_id}"));
+            event.doc_id = doc_id;
+            event.source = source;
+            event.ts = ts;
+            event.project = project.to_string();
+            event.session_id = session_id.to_string();
+            event.source_path = format!("/{session_id}.jsonl");
+            event.links.conversation_kind = kind.map(str::to_string);
+            index.add_record(&mut writer, &event).unwrap();
+            if !index_only.contains(&session_id) {
+                analytics.record(&event).unwrap();
+            }
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+        analytics.flush().unwrap();
+        let catalog = rusqlite::Connection::open(analytics_path(&paths.state)).unwrap();
+        for &(_, session_id, _, repository, ..) in sessions {
+            catalog
+                .execute(
+                    "UPDATE sessions SET repo_project = ?1 WHERE session_id = ?2",
+                    rusqlite::params![repository, session_id],
+                )
+                .unwrap();
+        }
+    }
+
+    /// The local machine and four peers behind a fake `ssh` that runs
+    /// `machine::tests::rpc_peer_child` on each peer's own root: `mini` runs this Memex,
+    /// `legacy` ignores the project grouping as Memex 0.24 through 0.33 do, `old` predates the
+    /// sessions operation, and `offline` is unreachable. The fake `ssh` logs every host it is
+    /// asked to reach.
+    struct FederatedFixture {
+        paths: Paths,
+        config: UserConfig,
+        index: SearchIndex,
+        _path: crate::test_support::EnvVarGuard,
+        _source_roots: crate::test_support::EnvVarGuard,
+        temp: tempfile::TempDir,
+    }
+
+    impl FederatedFixture {
+        /// Callers hold `env_lock()` for as long as the fixture lives: it prepends the fake
+        /// `ssh` to `PATH` and pins every machine's source roots inside its directory.
+        fn new() -> Self {
+            use SourceKind::{Claude, Codex};
+
+            let temp = tempfile::tempdir().unwrap();
+            let source_roots = crate::test_support::pin_source_roots(&temp.path().join("roots"));
+            let local = temp.path().join("local");
+            let peers = temp.path().join("peers");
+            seed_machine(
+                &local,
+                &[
+                    (Codex, "local-new", "alpha", "alpha", 3_000, None),
+                    (Claude, "local-old", "beta", "beta", 1_000, None),
+                    (Codex, "local-unlisted", "alpha", "alpha", 9_000, None),
+                ],
+                &["local-unlisted"],
+            );
+            seed_machine(
+                &peers.join("mini"),
+                &[
+                    (Codex, "mini-a", "alpha-wt", "alpha", 4_000, None),
+                    (
+                        Codex,
+                        "mini-review",
+                        "alpha",
+                        "alpha",
+                        5_000,
+                        Some("guardian_review"),
+                    ),
+                ],
+                &[],
+            );
+            seed_machine(
+                &peers.join("legacy"),
+                &[(Codex, "legacy-a", "alpha-old", "alpha", 1_500, None)],
+                &[],
+            );
+            seed_machine(
+                &peers.join("old"),
+                &[
+                    (Claude, "old-a", "alpha", "alpha", 2_000, None),
+                    (Codex, "old-b", "gamma", "gamma", 6_000, None),
+                ],
+                &[],
+            );
+
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let ssh = bin.join("ssh");
+            std::fs::write(
+                &ssh,
+                format!(
+                    r#"#!/bin/sh
+# Called as `ssh [options] -- <host> <remote command>`.
+for argument in "$@"; do host="$previous"; previous="$argument"; done
+echo "$host" >> '{log}'
+request=$(cat)
+case "$host" in
+  offline) echo "ssh: Could not resolve hostname offline" >&2; exit 255;;
+  legacy) request=$(printf '%s' "$request" | sed 's/,"project_grouping":"[a-z]*"//');;
+  old) case "$request" in *'"op":"sessions"'*)
+    printf 'Error: invalid memex RPC request\n\nCaused by:\n    unknown variant `sessions`\n' >&2
+    exit 1;;
+  esac;;
+esac
+printf '%s' "$request" | MEMEX_TEST_PEER_ROOT='{peers}'/"$host" \
+  MEMEX_TEST_PEER_RESPONSE='{peers}'/"$host.response" \
+  '{exe}' --exact machine::tests::rpc_peer_child >/dev/null 2>&1 || exit 1
+cat '{peers}'/"$host.response"
+"#,
+                    log = temp.path().join("ssh.log").display(),
+                    peers = peers.display(),
+                    exe = std::env::current_exe().unwrap().display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )))
+            .unwrap();
+
+            let paths = Paths::new(Some(local)).unwrap();
+            std::fs::write(
+                paths.root.join("config.toml"),
+                "auto_index_on_search = false\n[multi_machine]\ntimeout_seconds = 60\n\
+                 [[machines]]\nid = 'mini'\nssh = 'mini'\n\
+                 [[machines]]\nid = 'legacy'\nssh = 'legacy'\n\
+                 [[machines]]\nid = 'old'\nssh = 'old'\n\
+                 [[machines]]\nid = 'offline'\nssh = 'offline'\n",
+            )
+            .unwrap();
+            Self {
+                config: UserConfig::load(&paths).unwrap(),
+                index: open_tui_index(&paths, false).unwrap(),
+                paths,
+                _path: crate::test_support::EnvVarGuard::set_os(&[(
+                    "PATH",
+                    Some(path.as_os_str()),
+                )]),
+                _source_roots: source_roots,
+                temp,
+            }
+        }
+
+        /// The unqueried session list for `machines` (empty: the default selection), after
+        /// `change` adjusts the request's filters.
+        fn sessions(
+            &self,
+            machines: &[&str],
+            change: impl FnOnce(&mut SearchRequest),
+        ) -> (Vec<SessionSummary>, MachineFailures) {
+            let mut request = SearchRequest {
+                request_id: 0,
+                query: String::new(),
+                project: String::new(),
+                machines: machines.iter().map(|id| id.to_string()).collect(),
+                source: SourceChoice::All,
+                since: None,
+                grouping: ProjectGrouping::Repository,
+                kind: crate::analytics::SessionKindFilter::Regular,
+            };
+            change(&mut request);
+            run_search_request(&self.paths, &self.config, &self.index, request).unwrap()
+        }
+
+        /// [`Self::sessions`] as rows and the machines that failed.
+        fn list(
+            &self,
+            machines: &[&str],
+            change: impl FnOnce(&mut SearchRequest),
+        ) -> (Vec<ListedRow>, Vec<String>) {
+            let (sessions, failures) = self.sessions(machines, change);
+            (
+                sessions
+                    .into_iter()
+                    .map(|session| {
+                        (
+                            session.machine,
+                            session.session_id,
+                            session.project,
+                            session.last_ts,
+                        )
+                    })
+                    .collect(),
+                failures.into_iter().map(|(machine, _)| machine).collect(),
+            )
+        }
+
+        fn take_ssh_log(&self) -> Vec<String> {
+            let log = self.temp.path().join("ssh.log");
+            let mut hosts: Vec<String> = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let _ = std::fs::remove_file(log);
+            hosts.sort();
+            hosts
+        }
+    }
+
+    /// A listed session as `(machine, session id, project, last activity)`.
+    type ListedRow = (String, String, String, u64);
+
+    fn row(machine: &str, session_id: &str, project: &str, ts: u64) -> ListedRow {
+        (
+            machine.to_string(),
+            session_id.to_string(),
+            project.to_string(),
+            ts,
+        )
+    }
+
+    #[test]
+    fn federated_home_list_reads_session_catalogs_and_falls_back_for_old_peers() {
+        let _lock = crate::test_support::env_lock();
+        let fixture = FederatedFixture::new();
+
+        let (rows, failures) = fixture.list(&[], |_| {});
+        // Catalog rows from local, mini and legacy; old-* grouped from the old peer's records.
+        assert_eq!(
+            rows,
+            [
+                row("old", "old-b", "gamma", 6_000),
+                row("mini", "mini-a", "alpha", 4_000),
+                row("local", "local-new", "alpha", 3_000),
+                row("old", "old-a", "alpha", 2_000),
+                row("legacy", "legacy-a", "alpha", 1_500),
+                row("local", "local-old", "beta", 1_000),
+            ]
+        );
+        assert_eq!(failures, ["offline"]);
+        // The old peer is asked for sessions, then for records; an unreachable one only once.
+        assert_eq!(
+            fixture.take_ssh_log(),
+            ["legacy", "mini", "offline", "old", "old"]
+        );
+
+        // Catalog rows carry the session title, as the single-machine list does; rows grouped
+        // from records keep the record excerpt.
+        let (sessions, _) = fixture.sessions(&["mini", "old"], |_| {});
+        let mini = sessions.iter().find(|session| session.machine == "mini");
+        let mini = mini.expect("mini lists its session");
+        assert_eq!(mini.title, "opening of mini-a");
+        assert_eq!(mini.label.as_deref(), Some("opening of mini-a"));
+        assert!(mini.snippet.is_empty());
+        let old = sessions.iter().find(|session| session.machine == "old");
+        let old = old.expect("old lists its sessions");
+        assert!(old.title.is_empty());
+        assert_eq!(old.snippet, format!("opening of {}", old.session_id));
+    }
+
+    #[test]
+    fn federated_home_list_applies_every_filter_on_each_machine() {
+        use crate::analytics::SessionKindFilter;
+
+        let _lock = crate::test_support::env_lock();
+        let fixture = FederatedFixture::new();
+
+        let (rows, _) = fixture.list(&[], |request| request.source = SourceChoice::Claude);
+        assert_eq!(
+            rows,
+            [
+                row("old", "old-a", "alpha", 2_000),
+                row("local", "local-old", "beta", 1_000),
+            ]
+        );
+        let (rows, _) = fixture.list(&[], |request| request.since = Some(2_500));
+        assert_eq!(
+            rows,
+            [
+                row("old", "old-b", "gamma", 6_000),
+                row("mini", "mini-a", "alpha", 4_000),
+                row("local", "local-new", "alpha", 3_000),
+            ]
+        );
+        let (rows, _) = fixture.list(&[], |request| request.project = "alpha".to_string());
+        assert_eq!(
+            rows,
+            [
+                row("mini", "mini-a", "alpha", 4_000),
+                row("local", "local-new", "alpha", 3_000),
+                row("old", "old-a", "alpha", 2_000),
+                row("legacy", "legacy-a", "alpha", 1_500),
+            ]
+        );
+        let (rows, _) = fixture.list(&["mini"], |request| request.kind = SessionKindFilter::All);
+        assert_eq!(
+            rows,
+            [
+                row("mini", "mini-review", "alpha", 5_000),
+                row("mini", "mini-a", "alpha", 4_000),
+            ]
+        );
+        // Flat projects; legacy-a is filed under alpha only by repository, which the legacy
+        // peer still compares against.
+        let flat = |project: &str| {
+            fixture
+                .list(&[], |request| {
+                    request.grouping = ProjectGrouping::Flat;
+                    request.project = project.to_string();
+                })
+                .0
+        };
+        assert_eq!(
+            flat("alpha"),
+            [
+                row("local", "local-new", "alpha", 3_000),
+                row("old", "old-a", "alpha", 2_000),
+            ]
+        );
+        assert_eq!(flat("alpha-wt"), [row("mini", "mini-a", "alpha-wt", 4_000)]);
+        // The legacy peer compares the flat name against repository projects and finds
+        // nothing, so it is asked again without the filter and its rows are matched here.
+        let _ = fixture.take_ssh_log();
+        assert_eq!(
+            flat("alpha-old"),
+            [row("legacy", "legacy-a", "alpha-old", 1_500)]
+        );
+        assert_eq!(
+            fixture.take_ssh_log(),
+            ["legacy", "legacy", "mini", "offline", "old", "old"]
+        );
+    }
+
+    #[test]
+    fn federated_home_list_for_only_local_contacts_no_peer() {
+        let _lock = crate::test_support::env_lock();
+        let fixture = FederatedFixture::new();
+
+        let (rows, failures) = fixture.list(&[LOCAL_MACHINE_ID], |_| {});
+        // From the session catalog: the record of a session missing from it is not read.
+        assert_eq!(
+            rows,
+            [
+                row("local", "local-new", "alpha", 3_000),
+                row("local", "local-old", "beta", 1_000),
+            ]
+        );
+        assert!(failures.is_empty());
+        assert!(fixture.take_ssh_log().is_empty());
+    }
+
+    #[test]
+    fn federated_home_list_lists_local_from_its_index_without_a_session_catalog() {
+        let _lock = crate::test_support::env_lock();
+        let fixture = FederatedFixture::new();
+        let catalog = analytics_path(&fixture.paths.state);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = catalog.clone().into_os_string();
+            path.push(suffix);
+            let _ = std::fs::remove_file(path);
+        }
+        assert!(!catalog.exists());
+
+        // As the single-machine list does, every session in the local index is listed,
+        // including the one the catalog never had, under its indexed project.
+        let local = [
+            row("local", "local-unlisted", "alpha", 9_000),
+            row("local", "local-new", "alpha", 3_000),
+            row("local", "local-old", "beta", 1_000),
+        ];
+        let (rows, failures) = fixture.list(&[LOCAL_MACHINE_ID], |_| {});
+        assert_eq!(rows, local);
+        assert!(failures.is_empty());
+        assert!(fixture.take_ssh_log().is_empty());
+        let (sessions, _) = fixture.sessions(&[LOCAL_MACHINE_ID], |_| {});
+        assert_eq!(sessions[0].title, "opening of local-unlisted");
+
+        let (rows, failures) = fixture.list(&[], |_| {});
+        assert_eq!(
+            rows,
+            [
+                local[0].clone(),
+                row("old", "old-b", "gamma", 6_000),
+                row("mini", "mini-a", "alpha", 4_000),
+                local[1].clone(),
+                row("old", "old-a", "alpha", 2_000),
+                row("legacy", "legacy-a", "alpha", 1_500),
+                local[2].clone(),
+            ]
+        );
+        assert_eq!(failures, ["offline"]);
+
+        let (rows, _) = fixture.list(&[LOCAL_MACHINE_ID], |request| {
+            request.source = SourceChoice::Claude;
+        });
+        assert_eq!(rows, local[2..]);
     }
 
     #[test]

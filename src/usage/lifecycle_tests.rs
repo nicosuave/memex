@@ -565,6 +565,76 @@ fn failed_facts_commit_is_retried_from_raw_cached_occurrences() {
 }
 
 #[test]
+fn unchanged_rebuild_keeps_the_facts_generation_and_retained_snapshots() {
+    use super::cache::UsageCache;
+    use super::snapshot::legacy_refresh_partition;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let projects = temp.path().join("projects/memex");
+    fs::create_dir_all(&projects).unwrap();
+    let transcript = projects.join("session.jsonl");
+    fs::write(&transcript, claude_line("first", 10)).unwrap();
+    let _env = EnvVarGuard::set_os(&[("CLAUDE_CONFIG_DIR", Some(temp.path().as_os_str()))]);
+    let query = claude_query(&temp);
+    let path = query.cache_path.as_deref().unwrap();
+    let key = (SourceFilter::Claude, query.cache_path.clone());
+    let generation = || {
+        UsageCache::open(path)
+            .unwrap()
+            .fact_generation("claude")
+            .unwrap()
+    };
+    let retained_assembly = || lock_partitions().get(&key).unwrap().assembly.clone();
+    // Another process rebuilding the Claude partition, e.g. a one-shot report
+    // whose cold facts path failed on some other source.
+    let rebuild_elsewhere = || {
+        let mut cache = UsageCache::open_for_refresh(path).unwrap();
+        let mut warnings = Vec::new();
+        legacy_refresh_partition(
+            SourceFilter::Claude,
+            Some(&mut cache),
+            &mut warnings,
+            None,
+            &query.claude_roots(),
+        );
+        assert!(warnings.is_empty());
+    };
+
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+    let built = generation();
+    assert!(built.is_some());
+    let retained = retained_assembly();
+
+    rebuild_elsewhere();
+    assert_eq!(
+        generation(),
+        built,
+        "a rebuild that changes no facts must keep the generation"
+    );
+    expire(&query);
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+    assert!(
+        Arc::ptr_eq(&retained_assembly(), &retained),
+        "the retained snapshot must still validate"
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(claude_line("second", 30).as_bytes())
+        .unwrap();
+    rebuild_elsewhere();
+    assert_ne!(generation(), built);
+    expire(&query);
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 40);
+    assert!(!Arc::ptr_eq(&retained_assembly(), &retained));
+}
+
+#[test]
 fn unresolved_codex_facts_reuse_until_a_parent_appears() {
     use super::cache::UsageCache;
 

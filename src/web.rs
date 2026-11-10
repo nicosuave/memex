@@ -639,7 +639,8 @@ pub(crate) fn raw_activity_payload(
             false
         }
         (ActivityMetric::Sessions, Some(matching_scopes)) => {
-            let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+            let store =
+                AnalyticsStore::open_read_only(analytics_path(&paths.state))?.without_titles();
             for session in store.query_sessions_filtered(
                 params.source,
                 since_ms,
@@ -667,7 +668,8 @@ pub(crate) fn raw_activity_payload(
         }
         (ActivityMetric::Tokens, _) if !token_usage_enabled => false,
         (ActivityMetric::Tokens, Some(matching_scopes)) => {
-            let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+            let store =
+                AnalyticsStore::open_read_only(analytics_path(&paths.state))?.without_titles();
             let allowed_scopes = store
                 .query_sessions_filtered(
                     params.source,
@@ -742,7 +744,8 @@ pub(crate) fn raw_activity_payload(
             ) {
                 None
             } else {
-                let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+                let store =
+                    AnalyticsStore::open_read_only(analytics_path(&paths.state))?.without_titles();
                 let keys = store
                     .query_sessions_filtered(
                         params.source,
@@ -869,7 +872,7 @@ pub(crate) fn single_machine_activity_payload(
     if machine == crate::machine::LOCAL_MACHINE_ID {
         raw_activity_payload(paths, params, now)
     } else {
-        crate::machine::remote_activity(&config, machine, params.clone(), now)
+        crate::machine::remote_activity(paths, &config, machine, params.clone(), now)
     }
 }
 
@@ -900,7 +903,7 @@ pub(crate) fn machine_activity_payload(
                 let result = if id == crate::machine::LOCAL_MACHINE_ID {
                     raw_activity_payload(paths, params, now)
                 } else {
-                    crate::machine::remote_activity(config, id, params.clone(), now)
+                    crate::machine::remote_activity(paths, config, id, params.clone(), now)
                 };
                 let _ = sender.send((id.clone(), result));
             });

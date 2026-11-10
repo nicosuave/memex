@@ -86,9 +86,6 @@ pub struct IngestOptions {
     pub model: ModelChoice,
     pub embed_runtime: EmbedRuntimeConfig,
     pub tool_content_limits: IndexedToolContentLimits,
-    /// Search-triggered refreshes append without foreground merges; compaction is scheduled
-    /// separately once segments accumulate.
-    pub defer_merges: bool,
     /// Wall-clock time this refresh may spend embedding; `None` is unbounded. Once it is
     /// spent the remaining records publish without vectors, and a later refresh or
     /// `memex index embed` backfills them. Read-triggered refreshes set it so a slow
@@ -223,7 +220,6 @@ struct WriterContext {
     repositories: Arc<crate::repository::RepositoryResolver>,
     codex_metadata_checkpoints: HashMap<String, (u64, Vec<u64>)>,
     vector_delete_paths: HashSet<String>,
-    defer_merges: bool,
     embedding_budget: Option<std::time::Duration>,
 }
 

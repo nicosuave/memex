@@ -191,6 +191,7 @@ pub fn gather(
             source: options.source,
             profile: None,
             project: options.project.clone(),
+            project_grouping: None,
             cwd: None,
             since_ms: Some(options.since_ms.saturating_add(1)),
             limit: listing_limit,

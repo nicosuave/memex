@@ -63,7 +63,11 @@ enabled = false
         .unwrap();
         let executable = directory.path().join("ssh");
         std::fs::write(&executable, r#"#!/bin/sh
-[ "$1" = '-T' ] && [ "$2" = '-o' ] && [ "$3" = 'BatchMode=yes' ] && [ "$4" = '--' ] && [ "$5" = 'fixture-host' ] && [ "$6" = '/verified/memex rpc' ] || exit 19
+[ "$1" = '-T' ] && [ "$2" = '-o' ] && [ "$3" = 'BatchMode=yes' ] || exit 19
+shift 3
+# Connection-sharing options depend on the root path's length; tests/multi_machine.rs pins them.
+while [ "$#" -gt 3 ] && [ "$1" = '-o' ]; do shift 2; done
+[ "$#" = 3 ] && [ "$1" = '--' ] && [ "$2" = 'fixture-host' ] && [ "$3" = '/verified/memex rpc' ] || exit 19
 if [ "$MEMEX_TEST_LEGACY" = 1 ]; then
     cat > /dev/null
     echo "Error: invalid memex RPC request: unknown variant 'projects'" >&2

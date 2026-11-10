@@ -23,7 +23,7 @@ use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWrite
 use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
-use tantivy::merge_policy::{LogMergePolicy, NoMergePolicy};
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, Occur, Query, RangeQuery,
     TermQuery,
@@ -79,7 +79,6 @@ pub struct SearchIndex {
     writable: bool,
     pending_generation: Option<Arc<PendingGeneration>>,
     _generation_lease: Option<Arc<GenerationLease>>,
-    incremental_merge_policy: bool,
     defer_merges: bool,
     bulk_rebuild: bool,
     shared_reader: Arc<OnceLock<IndexReader>>,
@@ -88,11 +87,20 @@ pub struct SearchIndex {
 const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "CURRENT";
 const GENERATION_LEASE_FILE: &str = ".lease";
+/// A rebuild of at most this much source indexes on one thread.
 const SMALL_INGEST_MAX_BYTES: u64 = 1024 * 1024;
 /// Rebuild arena across tantivy's indexing threads; bigger arenas flush fewer, larger segments.
 const REBUILD_MEMORY_BUDGET_BYTES: usize = 1 << 30;
+/// New source bytes per indexing worker of a refresh. Every worker that receives a record
+/// publishes its own segment, and one worker indexes this much as fast as tantivy's eight
+/// (measured on local transcripts), so a refresh gets a further worker per this much input.
+const INGEST_BYTES_PER_WRITER_THREAD: u64 = 8 * 1024 * 1024;
+/// Arena shared by a refresh's indexing workers when there is more than one.
+const INGEST_MEMORY_BUDGET_BYTES: usize = 256_000_000;
+/// Tantivy's own cap on indexing threads.
+const MAX_INGEST_WRITER_THREADS: usize = 8;
 const CONTINUOUS_MAX_SEGMENTS: usize = 4096;
-/// Small-segment count above which a search-triggered refresh schedules background compaction.
+/// Small-segment count above which a refresh that added records schedules background compaction.
 pub const SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS: usize = 8;
 /// Largest segments a background compaction leaves alone; everything smaller merges into one.
 pub const COMPACTION_RETAINED_SEGMENTS: usize = 3;
@@ -717,27 +725,20 @@ impl SearchIndex {
         }
     }
 
-    pub fn open_or_create_for_ingest(dir: &Path) -> Result<Self> {
-        Self::open_or_create_for_ingest_with_merge_policy(dir, false)
-    }
-
-    pub fn open_or_create_for_continuous_ingest(dir: &Path) -> Result<Self> {
-        Self::open_or_create_for_ingest_with_merge_policy(dir, true)
-    }
-
-    /// Search-triggered refreshes never merge in the foreground. A detached
-    /// `memex index compact` process folds the small segments once their count passes
+    /// Every incremental refresh (explicit `memex index`, the watch daemon, and read-triggered
+    /// refreshes) appends without merging in the foreground. A detached `memex index compact`
+    /// process folds the small segments once their count passes
     /// [`SEARCH_REFRESH_COMPACTION_SMALL_SEGMENTS`].
-    pub fn open_or_create_for_search_refresh(dir: &Path) -> Result<Self> {
-        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, true)?;
+    pub fn open_or_create_for_continuous_ingest(dir: &Path) -> Result<Self> {
+        let mut index = Self::open_or_create_for_ingest(dir)?;
         index.defer_merges = true;
         Ok(index)
     }
 
-    /// A rebuild writes with no merges and a large arena; the segments it publishes are folded
-    /// afterwards by the detached compaction, never in the foreground.
+    /// A rebuild writes with no merges and a large arena and publishes its segments as
+    /// written. The detached compaction folds only the ones under its small-segment share.
     pub fn open_or_create_for_rebuild(dir: &Path) -> Result<Self> {
-        let mut index = Self::open_or_create_for_ingest_with_merge_policy(dir, false)?;
+        let mut index = Self::open_or_create_for_ingest(dir)?;
         index.defer_merges = true;
         index.bulk_rebuild = true;
         Ok(index)
@@ -783,10 +784,7 @@ impl SearchIndex {
         Ok(remainder.len())
     }
 
-    fn open_or_create_for_ingest_with_merge_policy(
-        dir: &Path,
-        incremental_merge_policy: bool,
-    ) -> Result<Self> {
+    pub fn open_or_create_for_ingest(dir: &Path) -> Result<Self> {
         crate::profiling::span!("lexical.stage");
         fs::create_dir_all(dir)?;
         let generations = dir.join(GENERATIONS_DIR);
@@ -854,7 +852,6 @@ impl SearchIndex {
             writable: true,
             pending_generation: Some(pending),
             _generation_lease: None,
-            incremental_merge_policy,
             defer_merges: false,
             bulk_rebuild: false,
             shared_reader: Arc::new(OnceLock::new()),
@@ -878,7 +875,6 @@ impl SearchIndex {
                 writable: true,
                 pending_generation: None,
                 _generation_lease: None,
-                incremental_merge_policy: false,
                 defer_merges: false,
                 bulk_rebuild: false,
                 shared_reader: Arc::new(OnceLock::new()),
@@ -921,20 +917,26 @@ impl SearchIndex {
         {
             bail!("cannot create a writer for a sealed index generation");
         }
-        let writer = if input_bytes.is_some_and(|bytes| bytes <= SMALL_INGEST_MAX_BYTES) {
-            crate::profiling::count!("lexical.single_thread_batches", 1);
-            self.index.writer_with_num_threads(1, 64_000_000)?
-        } else if self.bulk_rebuild {
-            self.index.writer(REBUILD_MEMORY_BUDGET_BYTES)?
+        let threads = if self.bulk_rebuild {
+            input_bytes
+                .is_some_and(|bytes| bytes <= SMALL_INGEST_MAX_BYTES)
+                .then_some(1)
         } else {
-            self.index.writer(256_000_000)?
+            ingest_writer_threads(input_bytes)
+        };
+        let writer = match threads {
+            Some(1) => {
+                crate::profiling::count!("lexical.single_thread_batches", 1);
+                self.index.writer_with_num_threads(1, 64_000_000)?
+            }
+            Some(threads) => self
+                .index
+                .writer_with_num_threads(threads, INGEST_MEMORY_BUDGET_BYTES)?,
+            None if self.bulk_rebuild => self.index.writer(REBUILD_MEMORY_BUDGET_BYTES)?,
+            None => self.index.writer(INGEST_MEMORY_BUDGET_BYTES)?,
         };
         if self.defer_merges {
             writer.set_merge_policy(Box::new(NoMergePolicy));
-        } else if self.incremental_merge_policy {
-            let mut policy = LogMergePolicy::default();
-            policy.set_min_layer_size(1);
-            writer.set_merge_policy(Box::new(policy));
         }
         Ok(writer)
     }
@@ -966,8 +968,11 @@ impl SearchIndex {
         &self.snapshot_version
     }
 
+    /// Continuous refreshes append a segment per commit and leave folding to the detached
+    /// compaction; this bounds what they can accumulate when compaction never publishes.
     pub(crate) fn check_continuous_segment_limit(&self) -> Result<()> {
-        if !self.incremental_merge_policy || self.pending_generation.is_none() {
+        let continuous = self.defer_merges && !self.bulk_rebuild;
+        if !continuous || self.pending_generation.is_none() {
             return Ok(());
         }
         let segments = self.index.searchable_segment_metas()?;
@@ -1045,10 +1050,6 @@ impl SearchIndex {
         writer.delete_term(term);
     }
 
-    pub fn doc_ids_by_source_scope(&self, scope: &SessionScope) -> Result<Vec<u64>> {
-        self.doc_ids_matching_query(Box::new(source_scope_query(&self.fields, scope)))
-    }
-
     pub(crate) fn source_paths_with_records(
         &self,
         candidates: &HashSet<String>,
@@ -1074,31 +1075,40 @@ impl SearchIndex {
     }
 
     pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
-        let query = TermQuery::new(
-            Term::from_field_text(self.fields.source_path, path),
-            IndexRecordOption::Basic,
-        );
-        self.doc_ids_matching_query(Box::new(query))
+        let mut doc_ids = self
+            .doc_ids_by_sources(&[], [path])?
+            .into_iter()
+            .collect::<Vec<_>>();
+        doc_ids.sort_unstable();
+        Ok(doc_ids)
     }
 
-    fn doc_ids_matching_query(&self, query: Box<dyn Query>) -> Result<Vec<u64>> {
+    /// Document IDs of the committed records under `scopes` and `paths`. They come from the
+    /// `doc_id` fast field, which every schema has carried, through one searcher: deletes
+    /// issued on a writer meanwhile stay invisible to it until they are committed.
+    pub(crate) fn doc_ids_by_sources<'a>(
+        &self,
+        scopes: &[SessionScope],
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashSet<u64>> {
         crate::profiling::span!("lexical.source_ids");
-        let reader = self.reader()?;
-        let searcher = reader.searcher();
-        let limit = (searcher.num_docs() as usize).max(1);
-        let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(limit))?;
-        let mut doc_ids = Vec::with_capacity(top_docs.len());
-        for (_, address) in top_docs {
-            let doc = searcher.doc::<TantivyDocument>(address)?;
-            if let Some(doc_id) = doc
-                .get_first(self.fields.doc_id)
-                .and_then(|value| value.as_u64())
-            {
-                doc_ids.push(doc_id);
-            }
+        let searcher = self.reader()?.searcher();
+        let mut doc_ids = HashSet::new();
+        let path_queries = paths.into_iter().map(|path| {
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.source_path, path),
+                IndexRecordOption::Basic,
+            )) as Box<dyn Query>
+        });
+        let scope_queries = scopes
+            .iter()
+            .map(|scope| Box::new(source_scope_query(&self.fields, scope)) as Box<dyn Query>);
+        for query in scope_queries.chain(path_queries) {
+            doc_ids.extend(searcher.search(query.as_ref(), &DocIdCollector)?);
+            crate::profiling::count!("lexical.source_id_queries", 1);
         }
-        doc_ids.sort_unstable();
-        crate::profiling::count!("lexical.source_id_queries", 1);
+        // The collector reads a record without a doc_id as u64::MAX; there is none to remove.
+        doc_ids.remove(&u64::MAX);
         crate::profiling::count!("lexical.source_ids_found", doc_ids.len());
         Ok(doc_ids)
     }
@@ -2028,9 +2038,15 @@ impl SearchIndex {
         Ok(records)
     }
 
+    /// Live documents of the committed generation. meta.json records each segment's document
+    /// and delete counts, so counting opens no segment reader.
     pub fn doc_count(&self) -> Result<usize> {
-        let reader = self.reader()?;
-        Ok(reader.searcher().num_docs() as usize)
+        Ok(self
+            .index
+            .searchable_segment_metas()?
+            .iter()
+            .map(|segment| segment.num_docs() as usize)
+            .sum())
     }
 
     pub fn for_each_record<F>(&self, mut f: F) -> Result<()>
@@ -2368,6 +2384,20 @@ fn check_term_dictionary_format(index: &Index, fields: &IndexFields, dir: &Path)
     }
 }
 
+/// Indexing workers for a refresh of `input_bytes` new source bytes: one per
+/// [`INGEST_BYTES_PER_WRITER_THREAD`], or `None` for tantivy's default writer once that many
+/// reach its worker count. An unknown volume keeps the default writer too: legacy OpenCode
+/// session files do not reflect the size of the message and part files they read.
+fn ingest_writer_threads(input_bytes: Option<u64>) -> Option<usize> {
+    let default_threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_INGEST_WRITER_THREADS);
+    let threads = input_bytes?.div_ceil(INGEST_BYTES_PER_WRITER_THREAD).max(1);
+    usize::try_from(threads)
+        .ok()
+        .filter(|threads| *threads < default_threads.max(2))
+}
+
 fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
     let schema = build_schema()?;
     let index = Index::create_in_dir(dir, schema.clone())?;
@@ -2379,7 +2409,6 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
         writable: true,
         pending_generation: None,
         _generation_lease: None,
-        incremental_merge_policy: false,
         defer_merges: false,
         bulk_rebuild: false,
         shared_reader: Arc::new(OnceLock::new()),
@@ -2412,7 +2441,6 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
         writable: false,
         pending_generation: None,
         _generation_lease: Some(generation_lease),
-        incremental_merge_policy: false,
         defer_merges: false,
         bulk_rebuild: false,
         shared_reader: Arc::new(OnceLock::new()),
@@ -3337,10 +3365,164 @@ mod tests {
         assert_eq!(index.doc_count().unwrap(), 32);
     }
 
+    /// Every indexing worker that receives a record publishes its own segment, so a refresh of
+    /// a few megabytes and a few hundred records must be indexed by one worker.
     #[test]
-    fn search_refresh_never_merges_and_the_shared_reader_sees_each_commit() {
+    fn a_few_megabytes_of_new_input_index_into_one_segment() {
         let temp = tempfile::tempdir().unwrap();
-        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(4 * 1024 * 1024)).unwrap();
+        for id in 0..300 {
+            let text = format!("record {id} ").repeat(1500);
+            index
+                .add_record(&mut writer, &test_record(id, &text))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 1);
+        assert_eq!(index.doc_count().unwrap(), 300);
+        // Past one worker's share, a refresh still indexes in parallel.
+        assert_ne!(
+            ingest_writer_threads(Some(4 * INGEST_BYTES_PER_WRITER_THREAD)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn doc_count_from_segment_metas_matches_a_searcher() {
+        let searched = |index: &SearchIndex| index.reader().unwrap().searcher().num_docs() as usize;
+        let temp = tempfile::tempdir().unwrap();
+        let staging = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
+        let mut writer = staging.writer_for_ingest(Some(1024)).unwrap();
+        for id in 0..10 {
+            let mut record = test_record(id, "counted");
+            record.source_path = format!("{}.jsonl", id % 3);
+            staging.add_record(&mut writer, &record).unwrap();
+            if id % 4 == 3 {
+                writer.commit().unwrap();
+            }
+        }
+        writer.commit().unwrap();
+        staging.delete_by_source_path(&mut writer, "1.jsonl");
+        // Neither count sees a delete before it is committed.
+        assert_eq!(staging.doc_count().unwrap(), 10);
+        assert_eq!(searched(&staging), 10);
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert!(staging.segment_count().unwrap() > 1);
+        assert_eq!(staging.doc_count().unwrap(), 7);
+        assert_eq!(staging.doc_count().unwrap(), searched(&staging));
+
+        staging.publish_generation().unwrap();
+        let sealed = SearchIndex::open_or_create(temp.path()).unwrap();
+        assert!(!sealed.is_writable());
+        assert_eq!(sealed.doc_count().unwrap(), 7);
+        assert_eq!(sealed.doc_count().unwrap(), searched(&sealed));
+    }
+
+    /// The stored-document lookup that `doc_ids_by_sources` replaced.
+    fn stored_doc_ids(index: &SearchIndex, query: &dyn Query) -> HashSet<u64> {
+        let searcher = index.reader().unwrap().searcher();
+        let limit = (searcher.num_docs() as usize).max(1);
+        searcher
+            .search(query, &TopDocs::with_limit(limit))
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, address)| {
+                searcher
+                    .doc::<TantivyDocument>(address)
+                    .unwrap()
+                    .get_first(index.fields.doc_id)
+                    .and_then(|value| value.as_u64())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_doc_ids_from_the_fast_field_match_the_stored_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
+        let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
+        let mut doc_id = 0;
+        for _segment in 0..3 {
+            for path in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+                for session in ["s1", "s2"] {
+                    let mut record = test_record(doc_id, "text");
+                    record.source_path = path.to_string();
+                    record.session_id = session.to_string();
+                    index.add_record(&mut writer, &record).unwrap();
+                    doc_id += 1;
+                }
+            }
+            writer.commit().unwrap();
+        }
+        let scope = |path: &str, session: &str| SessionScope {
+            source_path: path.to_string(),
+            session_id: session.to_string(),
+        };
+        // A committed delete leaves tombstones in every segment.
+        index
+            .delete_by_source_scope(&mut writer, &scope("b.jsonl", "s2"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 3);
+
+        let paths = ["a.jsonl", "b.jsonl", "c.jsonl", "missing.jsonl"];
+        let scopes = [
+            scope("a.jsonl", "s1"),
+            scope("b.jsonl", "s2"),
+            scope("c.jsonl", "s2"),
+            scope("c.jsonl", "missing"),
+        ];
+        let path_query = |path: &str| {
+            TermQuery::new(
+                Term::from_field_text(index.fields.source_path, path),
+                IndexRecordOption::Basic,
+            )
+        };
+        let mut everything = HashSet::new();
+        for path in paths {
+            let expected = stored_doc_ids(&index, &path_query(path));
+            assert_eq!(
+                index.doc_ids_by_sources(&[], [path]).unwrap(),
+                expected,
+                "{path}"
+            );
+            let mut sorted = expected.iter().copied().collect::<Vec<_>>();
+            sorted.sort_unstable();
+            assert_eq!(index.doc_ids_by_source_path(path).unwrap(), sorted);
+            everything.extend(expected);
+        }
+        for scope in &scopes {
+            let expected = stored_doc_ids(&index, &source_scope_query(&index.fields, scope));
+            assert_eq!(
+                index
+                    .doc_ids_by_sources(std::slice::from_ref(scope), std::iter::empty())
+                    .unwrap(),
+                expected,
+                "{scope:?}"
+            );
+            everything.extend(expected);
+        }
+        assert!(
+            index
+                .doc_ids_by_source_path("missing.jsonl")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            index.doc_ids_by_sources(&scopes, paths).unwrap(),
+            everything
+        );
+        assert_eq!(everything.len(), 15);
+    }
+
+    #[test]
+    fn continuous_ingest_never_merges_and_the_shared_reader_sees_each_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
         let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
         for id in 0..6 {
             index
@@ -3356,7 +3538,7 @@ mod tests {
     #[test]
     fn compaction_folds_small_segments_and_keeps_the_largest() {
         let temp = tempfile::tempdir().unwrap();
-        let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+        let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
         let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
         for id in 0..40 {
             index
@@ -3382,7 +3564,7 @@ mod tests {
     fn compaction_includes_one_document_below_five_percent() {
         for total in [20, 21, 39, 40] {
             let temp = tempfile::tempdir().unwrap();
-            let index = SearchIndex::open_or_create_for_search_refresh(temp.path()).unwrap();
+            let index = SearchIndex::open_or_create_for_continuous_ingest(temp.path()).unwrap();
             let mut writer = index.writer_for_ingest(Some(1024)).unwrap();
             for id in 0..total - 1 {
                 index
@@ -4530,7 +4712,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_refreshes_compact_small_peers_and_retain_large_inherited_segment() {
+    fn continuous_refreshes_append_without_merging_until_compaction_folds_small_peers() {
         const SEED_RECORDS: u64 = 1024;
         const REFRESHES: u64 = 129;
 
@@ -4553,6 +4735,7 @@ mod tests {
         let seed_segment = seed_segments[0];
         drop(first);
 
+        let mut previous_segments = seed_segments;
         for refresh_number in 1..=REFRESHES {
             let refresh = SearchIndex::open_or_create_for_continuous_ingest(tmp.path())
                 .expect("continuous refresh");
@@ -4575,26 +4758,37 @@ mod tests {
 
             let segments = refresh
                 .index
-                .searchable_segment_metas()
+                .searchable_segment_ids()
                 .expect("searchable segments");
             assert!(
-                segments.iter().any(|segment| segment.id() == seed_segment),
-                "small peer merges must retain the large inherited segment"
+                previous_segments.iter().all(|id| segments.contains(id)),
+                "a continuous refresh must not merge existing segments"
             );
-            if refresh_number >= 8 {
-                assert!(
-                    segments.len() < refresh_number as usize + 1,
-                    "small peers must compact once eight peers accumulate"
-                );
-                assert!(
-                    segments
-                        .iter()
-                        .any(|segment| { segment.id() != seed_segment && segment.num_docs() > 1 })
-                );
-            }
+            assert_eq!(segments.len(), refresh_number as usize + 1);
+            previous_segments = segments;
         }
 
+        let compaction =
+            SearchIndex::open_or_create_for_ingest(tmp.path()).expect("compaction staging");
+        assert_eq!(
+            compaction
+                .compact_small_segments(COMPACTION_RETAINED_SEGMENTS)
+                .expect("compact small peers"),
+            REFRESHES as usize - (COMPACTION_RETAINED_SEGMENTS - 1)
+        );
+        compaction.publish_generation().expect("publish compaction");
+        drop(compaction);
+
         let published = SearchIndex::open_or_create(tmp.path()).expect("published index");
+        let segments = published
+            .index
+            .searchable_segment_ids()
+            .expect("compacted segments");
+        assert!(
+            segments.contains(&seed_segment),
+            "compaction must retain the large inherited segment"
+        );
+        assert_eq!(segments.len(), COMPACTION_RETAINED_SEGMENTS + 1);
         assert_eq!(
             published.doc_count().expect("document count"),
             (SEED_RECORDS + REFRESHES) as usize

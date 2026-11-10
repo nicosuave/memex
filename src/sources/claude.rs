@@ -374,22 +374,42 @@ fn fork_origin(bytes: &[u8]) -> Option<String> {
 ///
 /// Title records are metadata rather than transcript messages, so the search
 /// index intentionally does not contain them. The shared session catalog reads
-/// this metadata so every client sees saved names and subsequent renames.
+/// this metadata so every client sees saved names and subsequent renames; its
+/// listings cache the result per transcript version (`analytics::title_cache`).
 pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
-    use memchr::memchr;
-    use memmap2::Mmap;
     let file = File::open(path).ok()?;
-    let bytes = unsafe { Mmap::map(&file).ok()? };
-    let mut custom_title = None;
-    let mut ai_title = None;
-    let mut agent_name = None;
+    let bytes = unsafe { memmap2::Mmap::map(&file).ok()? };
+    SessionTitles::of_transcript(&bytes, session_id).title()
+}
 
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let remaining = &bytes[offset..];
-        let length = memchr(b'\n', remaining).unwrap_or(remaining.len());
-        let line = &remaining[..length];
-        offset += length + usize::from(length < remaining.len());
+/// The title lines of one session folded in file order: the last non-empty title of each
+/// kind wins, and a custom title outranks an AI title, which outranks an agent name.
+#[derive(Debug, Default)]
+pub(crate) struct SessionTitles {
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    agent_name: Option<String>,
+}
+
+impl SessionTitles {
+    /// The titles of `session_id` in a whole transcript, including a final line that has
+    /// no newline yet.
+    pub(crate) fn of_transcript(bytes: &[u8], session_id: &str) -> Self {
+        let mut titles = Self::default();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            titles.fold_line(line, session_id);
+        }
+        titles
+    }
+
+    pub(crate) fn title(&self) -> Option<String> {
+        self.custom_title
+            .clone()
+            .or_else(|| self.ai_title.clone())
+            .or_else(|| self.agent_name.clone())
+    }
+
+    fn fold_line(&mut self, line: &[u8], session_id: &str) {
         // Most lines contain large transcript/tool bodies. Only metadata
         // candidates need JSON decoding; still inspect every line for renames.
         // Escaped JSON strings may encode the type using Unicode escapes.
@@ -402,20 +422,20 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
         .iter()
         .any(|needle| memmem::find(line, needle).is_some())
         {
-            continue;
+            return;
         }
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
-            continue;
+            return;
         };
         if value
             .get("sessionId")
             .and_then(Value::as_str)
             .is_some_and(|id| id != session_id)
         {
-            continue;
+            return;
         }
         let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
-            continue;
+            return;
         };
         let title = match entry_type {
             "custom-title" => value
@@ -433,14 +453,12 @@ pub fn session_title(path: &Path, session_id: &str) -> Option<String> {
         .filter(|title| !title.is_empty());
 
         match entry_type {
-            "custom-title" if title.is_some() => custom_title = title,
-            "ai-title" if title.is_some() => ai_title = title,
-            "agent-name" if title.is_some() => agent_name = title,
+            "custom-title" if title.is_some() => self.custom_title = title,
+            "ai-title" if title.is_some() => self.ai_title = title,
+            "agent-name" if title.is_some() => self.agent_name = title,
             _ => {}
         }
     }
-
-    custom_title.or(ai_title).or(agent_name)
 }
 
 pub fn discover(

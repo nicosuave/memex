@@ -135,7 +135,7 @@ fn remove_owned_socket(path: &Path, identity: (u64, u64)) {
     }
 }
 
-fn owned_private(metadata: &fs::Metadata) -> bool {
+pub(crate) fn owned_private(metadata: &fs::Metadata) -> bool {
     // SAFETY: geteuid has no arguments or memory preconditions.
     metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0
 }
