@@ -24,7 +24,11 @@ The main search, indexing, and maintenance commands are organized as follows:
 
 Conversation relevance search favors matching user/assistant text over matching
 tool records. Ordinary unquoted multi-word queries also reward conversational
-records that cover the whole query, before the candidate limit is applied. Partial
+records that cover the whole query, before the candidate limit is applied. Covering
+the query means containing its informative words: a word found in more than 0.5% of
+indexed records (and in at least 100) is common, and a record does not need it to
+count as covering. `did we ever figure out quillmark` is covered by any record about
+`quillmark`. A query made only of common words still requires all of them. Partial
 matches and tool evidence remain eligible. Explicit role/tool filters bypass these
 preferences; quoted phrases, Boolean operators and field syntax keep their match
 semantics. This applies to shared lexical retrieval used by CLI, MCP, native app, TUI and web search.
@@ -39,7 +43,7 @@ the result limit and preserved when local results are grouped into conversations
 Fallback scores remain on the BM25 scale; phrase scores receive an additive
 bonus based on the strongest fallback match, independent of the result limit.
 The TUI uses relevance ordering with or without configured machines. Explicit CLI
-recency boosts, hybrid search, multi-query fusion and multi-machine rank fusion
+recency boosts, hybrid search, multi-query fusion and multi-machine merging
 can change the final order; they do not promise global phrase-first ordering.
 
 All five surfaces use the same relevance ranking and conversation selection.
@@ -50,9 +54,15 @@ outrank weak conversational matches. `min_score` applies to the resulting scores
 Recency boosting is disabled by default; `--recency-weight` remains an explicit
 option. Equal lexical scores sort by timestamp descending, then document ID
 ascending, before truncation. Federated ties also use machine identity.
+Lexical results from several machines merge by score, so one machine's strong
+matches rank above another's weak ones; see [Multiple machines](machines.md).
 Conversation views keep the first ranked record for each machine/source/session/
 source-path identity and deepen retrieval until enough conversations are found
-or candidates are exhausted. CLI record mode still returns individual records;
+or candidates are exhausted. A transcript stored twice on one machine, such as a
+Claude project directory left behind when its repository moved, is one
+conversation: results show each of its records once, from the best-ranked copy.
+Copies are recognized by source-native event IDs, so sources without them keep
+separate rows. CLI record mode still returns individual records;
 use `--unique-session` to compare it with conversation views. Explicit newest/
 oldest sorts and different corpora, filters, or machine selections can differ.
 

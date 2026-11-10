@@ -649,7 +649,7 @@ pub fn federated_search(
                 continue;
             }
             // Keep the pre-threshold count for deepening, but apply the threshold
-            // to each peer's relevance scores before reciprocal-rank fusion.
+            // to each peer's relevance scores before the machines are merged.
             let spec = SearchSpec {
                 min_score: None,
                 ..spec.clone()
@@ -705,12 +705,32 @@ pub fn federated_search(
         bail!("all machine searches failed: {message}");
     }
 
-    let use_rrf = successes.len() > 1;
-    let mut items = Vec::new();
     let candidate_count = successes.iter().map(|(_, records)| records.len()).sum();
     let capped = successes
         .iter()
         .any(|(_, records)| records.len() >= spec.limit);
+    Ok(Federated {
+        items: merge_machine_results(successes, spec),
+        failures,
+        candidate_count,
+        capped,
+    })
+}
+
+/// Merge each machine's scored hits into one ranked list of at most `spec.limit`.
+///
+/// Lexical scores come from the same scoring pipeline on every machine, so they
+/// order the merged list directly; fusing per-machine ranks instead made every
+/// machine's best hit tie however well it matched. Term statistics stay per
+/// machine, so a very rare term cannot score as high in a small index as in a
+/// large one. Semantic and hybrid searches keep rank fusion, because a peer
+/// without vectors answers with lexical scores, which are on a different scale.
+fn merge_machine_results(
+    successes: Vec<(String, Vec<(f32, Record)>)>,
+    spec: &SearchSpec,
+) -> Vec<LocatedRecord> {
+    let use_rrf = successes.len() > 1 && spec.mode != SearchMode::Lexical;
+    let mut items = Vec::new();
     for (machine, mut records) in successes {
         if let Some(min_score) = spec.min_score {
             records.retain(|(score, _)| *score >= min_score);
@@ -740,15 +760,8 @@ pub fn federated_search(
         );
     }
     items.sort_by(crate::search::compare_records);
-    if items.len() > spec.limit {
-        items.truncate(spec.limit);
-    }
-    Ok(Federated {
-        items,
-        failures,
-        candidate_count,
-        capped,
-    })
+    items.truncate(spec.limit);
+    items
 }
 
 /// Query each selected machine's memory snapshot using the same routing and
@@ -4401,6 +4414,93 @@ mod tests {
             tool_output: None,
             links: RecordLinks::default(),
             source_path: source_path.to_string(),
+        }
+    }
+
+    /// One machine's scored hits; each record's `doc_id` names it in assertions.
+    fn machine_hits(machine: &str, hits: &[(f32, u64)]) -> (String, Vec<(f32, Record)>) {
+        let records = hits
+            .iter()
+            .map(|&(score, doc_id)| (score, test_record(doc_id, machine, "session.jsonl", 1)))
+            .collect();
+        (machine.to_string(), records)
+    }
+
+    fn merged_order(results: &[LocatedRecord]) -> Vec<(&str, u64)> {
+        results
+            .iter()
+            .map(|result| (result.machine.as_str(), result.record.doc_id))
+            .collect()
+    }
+
+    #[test]
+    fn lexical_machines_merge_by_score_instead_of_interleaving_ranks() {
+        // The laptop's best hit is weaker than every hit on the devbox.
+        let successes = vec![
+            machine_hits("laptop", &[(4.0, 1), (1.0, 2)]),
+            machine_hits("devbox", &[(42.0, 3), (39.0, 4)]),
+        ];
+        let merged = merge_machine_results(successes, &search_spec(SearchMode::Lexical));
+
+        assert_eq!(
+            merged_order(&merged),
+            vec![("devbox", 3), ("devbox", 4), ("laptop", 1), ("laptop", 2)]
+        );
+        let scores: Vec<f32> = merged.iter().map(|result| result.score).collect();
+        assert_eq!(scores, vec![42.0, 39.0, 4.0, 1.0]);
+    }
+
+    #[test]
+    fn lexical_merge_applies_min_score_and_limit_across_machines() {
+        let successes = vec![
+            machine_hits("laptop", &[(4.0, 1), (1.0, 2)]),
+            machine_hits("devbox", &[(42.0, 3), (3.0, 4)]),
+        ];
+        let spec = SearchSpec {
+            min_score: Some(2.0),
+            limit: 2,
+            ..search_spec(SearchMode::Lexical)
+        };
+
+        let merged = merge_machine_results(successes, &spec);
+
+        assert_eq!(merged_order(&merged), vec![("devbox", 3), ("laptop", 1)]);
+    }
+
+    #[test]
+    fn semantic_and_hybrid_machines_keep_rank_fusion() {
+        // A peer without vectors falls back to lexical scores on a much larger
+        // scale than the other peer's similarities, so ranks order the merge.
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let successes = vec![
+                machine_hits("laptop", &[(0.9, 1), (0.8, 2)]),
+                machine_hits("devbox", &[(42.0, 3), (39.0, 4)]),
+            ];
+            let merged = merge_machine_results(successes, &search_spec(mode));
+
+            // Equal ranks tie and fall back to the newer record.
+            assert_eq!(
+                merged_order(&merged),
+                vec![("devbox", 3), ("laptop", 1), ("devbox", 4), ("laptop", 2)],
+                "{mode:?}"
+            );
+            assert_eq!(merged[0].score, merged[1].score, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_single_machine_keeps_its_own_scores_in_every_mode() {
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Semantic,
+            SearchMode::Hybrid,
+        ] {
+            let merged = merge_machine_results(
+                vec![machine_hits("laptop", &[(0.9, 1), (0.8, 2)])],
+                &search_spec(mode),
+            );
+            let scores: Vec<f32> = merged.iter().map(|result| result.score).collect();
+            assert_eq!(scores, vec![0.9, 0.8], "{mode:?}");
         }
     }
 

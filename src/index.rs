@@ -35,7 +35,7 @@ use tantivy::schema::{
 };
 use tantivy::store::StoreReader;
 use tantivy::{
-    DocId, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, SegmentReader,
+    DocId, Index, IndexReader, IndexWriter, Order, ReloadPolicy, Score, Searcher, SegmentReader,
     TantivyDocument, Term,
 };
 
@@ -1367,7 +1367,8 @@ impl SearchIndex {
             },
             ..options.clone()
         };
-        let queries = build_relevance_queries(&self.fields, &query_options, &self.index)?;
+        let queries =
+            build_relevance_queries(&self.fields, &query_options, &self.index, &searcher)?;
         let retrieve = |query: &dyn Query, limit| {
             let collector = TopDocs::with_limit(limit).tweak_score(RelevanceScorerFactory);
             if let Some(scopes) = scope {
@@ -2933,10 +2934,60 @@ struct RelevanceQueries {
     phrase: Option<Box<dyn Query>>,
 }
 
+/// A query word is common when more than this share of indexed records contain it...
+const COMMON_WORD_RECORD_SHARE: f64 = 0.005;
+/// ...and at least this many do, so every word stays informative in a small index.
+const COMMON_WORD_MIN_RECORDS: f64 = 100.0;
+
+/// The query words that say what the search is about: those that are not common.
+///
+/// "did we ever figure out what quillmark is" is about `quillmark`; the other words occur in a large
+/// share of all records and match by accident. A word that tokenizes into several terms
+/// (`fuse_ranked_queries`) is judged by its rarest term.
+fn informative_words<'a>(
+    words: &[&'a str],
+    fields: &IndexFields,
+    index: &Index,
+    searcher: &Searcher,
+) -> Result<Vec<&'a str>> {
+    let mut tokenizer = index.tokenizer_for_field(fields.text)?;
+    // Document frequencies count deleted records until their segment is merged, so the total
+    // has to count them too.
+    let indexed: u64 = searcher
+        .segment_readers()
+        .iter()
+        .map(|segment| u64::from(segment.max_doc()))
+        .sum();
+    let common_above = (indexed as f64 * COMMON_WORD_RECORD_SHARE).max(COMMON_WORD_MIN_RECORDS);
+    let mut informative = Vec::new();
+    for word in words {
+        let mut rarest: Option<u64> = None;
+        let mut tokens = tokenizer.token_stream(word);
+        while let Some(token) = tokens.next() {
+            let records = searcher.doc_freq(&Term::from_field_text(fields.text, &token.text))?;
+            rarest = Some(rarest.map_or(records, |fewest| fewest.min(records)));
+        }
+        if rarest.is_some_and(|records| records as f64 <= common_above) {
+            informative.push(*word);
+        }
+    }
+    Ok(informative)
+}
+
+/// Query syntax matching each word literally, whatever characters it contains.
+fn quoted_words(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|word| format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn build_relevance_queries(
     fields: &IndexFields,
     options: &QueryOptions,
     index: &Index,
+    searcher: &Searcher,
 ) -> Result<RelevanceQueries> {
     use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
     let base = build_query(fields, options, index)?;
@@ -3005,10 +3056,31 @@ fn build_relevance_queries(
             phrase: None,
         });
     }
+    let words: Vec<&str> = children
+        .iter()
+        .map(|(_, child)| {
+            let UserInputAst::Leaf(leaf) = child else {
+                unreachable!()
+            };
+            let UserInputLeaf::Literal(literal) = leaf.as_ref() else {
+                unreachable!()
+            };
+            literal.phrase.as_str()
+        })
+        .collect();
     let mut parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
     parser.set_conjunction_by_default();
+    // Covering the query means covering what it is about. Requiring its common words too
+    // rewarded records that happen to contain "did", "we" and "the" over records about the
+    // subject. A query made only of common words keeps every word.
+    let informative = informative_words(&words, fields, index, searcher)?;
+    let covered = if informative.is_empty() || informative.len() == words.len() {
+        parser.parse_query(&options.query)?
+    } else {
+        parser.parse_query(&quoted_words(&informative))?
+    };
     let all_terms: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
-        (Occur::Must, parser.parse_query(&options.query)?),
+        (Occur::Must, covered),
         (Occur::Must, role_filter.box_clone()),
     ]));
     clauses.push((Occur::Should, Box::new(BoostQuery::new(all_terms, 2.0))));
@@ -3022,19 +3094,7 @@ fn build_relevance_queries(
             phrase: None,
         });
     }
-    let phrase_text = children
-        .iter()
-        .map(|(_, child)| {
-            let UserInputAst::Leaf(leaf) = child else {
-                unreachable!()
-            };
-            let UserInputLeaf::Literal(literal) = leaf.as_ref() else {
-                unreachable!()
-            };
-            literal.phrase.as_str()
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let phrase_text = words.join(" ");
     let phrase: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
         (
             Occur::Must,
@@ -4941,7 +5001,8 @@ mod tests {
 
         let reader = index.reader().unwrap();
         let searcher = reader.searcher();
-        let queries = build_relevance_queries(&index.fields, &options, &index.index).unwrap();
+        let queries =
+            build_relevance_queries(&index.fields, &options, &index.index, &searcher).unwrap();
         let raw_fallback = searcher
             .search(&queries.fallback, &TopDocs::with_limit(20))
             .unwrap();
@@ -4955,7 +5016,8 @@ mod tests {
         options.limit = 1;
         let no_phrase = index.search(&options).unwrap();
         assert_eq!(no_phrase[0].1.doc_id, 3);
-        let queries = build_relevance_queries(&index.fields, &options, &index.index).unwrap();
+        let queries =
+            build_relevance_queries(&index.fields, &options, &index.index, &searcher).unwrap();
         let raw_fallback = searcher
             .search(&queries.fallback, &TopDocs::with_limit(1))
             .unwrap();
@@ -5026,6 +5088,48 @@ mod tests {
         options.query = "museum".into();
         options.role = Some("assistant".into());
         assert!(index.search(&options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn covering_a_query_means_covering_its_informative_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        // Enough ordinary chatter that "did we ever figure out" is in most records.
+        for id in 1..=150 {
+            let chatter = test_record(id, "did we ever figure out what happened here");
+            index.add_record(&mut writer, &chatter).unwrap();
+        }
+        let question_id = 200;
+        let question = test_record(question_id, "did we ever figure out what quillmark means");
+        let answer_id = 201;
+        let answer = test_record(
+            answer_id,
+            "the quillmark stamp dates the quillmark ledger page",
+        );
+        index.add_record(&mut writer, &question).unwrap();
+        index.add_record(&mut writer, &answer).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+
+        let options = QueryOptions {
+            query: "did we ever figure out quillmark".into(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 3,
+        };
+        let hits = index.search(&options).unwrap();
+
+        // The question repeats every query word; the answer only shares the subject. Both
+        // cover what the query is about, so the record that says more about it ranks first.
+        assert_eq!(hits[0].1.doc_id, answer_id);
+        assert_eq!(hits[1].1.doc_id, question_id);
     }
 
     #[test]

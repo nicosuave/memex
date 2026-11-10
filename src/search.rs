@@ -2,6 +2,7 @@
 use crate::analytics::{AnalyticsStore, SessionKindFilter, analytics_path};
 use crate::config::{Paths, UserConfig};
 use crate::machine::{LOCAL_MACHINE_ID, LocatedRecord, SearchSpec, federated_search};
+use crate::retrieval::canonical_record_id;
 use crate::retrieval_eval::fuse_ranked_queries;
 use crate::types::Record;
 use anyhow::Result;
@@ -423,22 +424,114 @@ fn select_results(
         }
     }
 
-    if let Some(k) = selection.top_n_per_session {
-        let mut per_session: HashMap<ConversationKey, usize> = HashMap::new();
-        results.retain(|result| {
-            let count = per_session
-                .entry(ConversationKey::shown(result))
-                .or_default();
-            if *count >= k {
-                return false;
-            }
-            *count += 1;
-            true
-        });
-    }
+    // Group transcript copies over every candidate before dropping any, so the
+    // grouping does not depend on which copy of which record ranks first.
+    let mut copies = TranscriptCopies::default();
+    let placed: Vec<Placement> = results.iter().map(|result| copies.place(result)).collect();
+    let mut placed = placed.into_iter();
+    let mut per_conversation: HashMap<usize, usize> = HashMap::new();
+    results.retain(|_| {
+        let Placement {
+            conversation,
+            is_copy,
+        } = placed.next().expect("one placement per result");
+        // The best-ranked copy of a record stands for the others.
+        if is_copy {
+            return false;
+        }
+        let Some(k) = selection.top_n_per_session else {
+            return true;
+        };
+        let count = per_conversation
+            .entry(copies.group(conversation))
+            .or_default();
+        if *count >= k {
+            return false;
+        }
+        *count += 1;
+        true
+    });
 
     results.truncate(selection.limit);
     results
+}
+
+/// Where one ranked hit sits among the transcript copies of its result list.
+struct Placement {
+    /// Number of the conversation the hit is shown under.
+    conversation: usize,
+    /// Whether a better-ranked hit is the same record in another transcript.
+    is_copy: bool,
+}
+
+/// The first ranked sighting of a record identity.
+struct FirstSighting {
+    conversation: usize,
+    source_path: String,
+}
+
+/// Transcripts in one result list that are copies of the same session.
+///
+/// Moving a repository leaves a session's transcript under both the old and
+/// the new project directory. Both files are indexed, so each of its records
+/// arrives once per copy, under a different source path and project. A record
+/// whose canonical ID already appeared on the same machine from another
+/// transcript is such a copy, and the conversations the two are shown under
+/// are one conversation. Records without a source-native event identity keep
+/// their source path in the canonical ID and are never treated as copies.
+#[derive(Default)]
+struct TranscriptCopies {
+    conversations: HashMap<ConversationKey, usize>,
+    /// Union-find parents over conversation numbers; the lowest number, the
+    /// best-ranked copy, is the root of its group.
+    parents: Vec<usize>,
+    /// Keyed by machine and canonical record ID.
+    first_sightings: HashMap<(String, String), FirstSighting>,
+}
+
+impl TranscriptCopies {
+    /// Place the next hit in ranked order, joining its conversation with the
+    /// one that already showed the same record from another transcript.
+    fn place(&mut self, result: &LocatedRecord) -> Placement {
+        let next = self.parents.len();
+        let conversation = *self
+            .conversations
+            .entry(ConversationKey::shown(result))
+            .or_insert(next);
+        if conversation == next {
+            self.parents.push(next);
+        }
+        let record = (result.machine.clone(), canonical_record_id(&result.record));
+        let first = self
+            .first_sightings
+            .entry(record)
+            .or_insert_with(|| FirstSighting {
+                conversation,
+                source_path: result.record.source_path.clone(),
+            });
+        let first_conversation = first.conversation;
+        let is_copy = first.source_path != result.record.source_path;
+        if is_copy {
+            self.join(first_conversation, conversation);
+        }
+        Placement {
+            conversation,
+            is_copy,
+        }
+    }
+
+    fn join(&mut self, left: usize, right: usize) {
+        let (left, right) = (self.group(left), self.group(right));
+        self.parents[left.max(right)] = left.min(right);
+    }
+
+    fn group(&mut self, mut conversation: usize) -> usize {
+        while self.parents[conversation] != conversation {
+            self.parents[conversation] = self.parents[self.parents[conversation]];
+            conversation = self.parents[conversation];
+        }
+        conversation
+    }
 }
 
 #[cfg(test)]
@@ -681,6 +774,76 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A hit on one source event of session `moved`, read from the transcript
+    /// copy under `project_dir`.
+    fn copied_hit(
+        machine: &str,
+        project_dir: &str,
+        event: &str,
+        doc_id: u64,
+        score: f32,
+    ) -> LocatedRecord {
+        let mut result = hit(machine, "moved", "main", None, doc_id, score);
+        result.record.links.event_id = Some(event.to_string());
+        result.record.source_path = format!("/projects/{project_dir}/moved.jsonl");
+        result
+    }
+
+    fn doc_ids(results: &[LocatedRecord]) -> Vec<u64> {
+        results.iter().map(|result| result.record.doc_id).collect()
+    }
+
+    #[test]
+    fn transcript_copies_of_a_session_show_as_one_conversation() {
+        // Hybrid ranks give the copies of one record different scores, so a
+        // copy's second-best record can rank between the other copy's records.
+        let results = vec![
+            copied_hit(LOCAL_MACHINE_ID, "old", "first", 1, 4.0),
+            copied_hit(LOCAL_MACHINE_ID, "new", "second", 12, 3.5),
+            copied_hit(LOCAL_MACHINE_ID, "old", "second", 2, 3.0),
+            copied_hit(LOCAL_MACHINE_ID, "new", "first", 11, 2.5),
+            hit(LOCAL_MACHINE_ID, "other", "main", None, 20, 1.0),
+        ];
+
+        let rows = select_results(
+            results.clone(),
+            &conversations(SessionKindFilter::All),
+            None,
+        );
+        assert_eq!(doc_ids(&rows), vec![1, 20]);
+
+        // Record listings show each source event once, from its best-ranked copy.
+        let selection = Selection {
+            top_n_per_session: None,
+            ..conversations(SessionKindFilter::All)
+        };
+        let rows = select_results(results, &selection, None);
+        assert_eq!(doc_ids(&rows), vec![1, 12, 20]);
+    }
+
+    #[test]
+    fn same_session_on_another_machine_is_not_a_copy() {
+        let results = vec![
+            copied_hit(LOCAL_MACHINE_ID, "old", "first", 1, 2.0),
+            copied_hit("devbox", "old", "first", 1, 1.0),
+        ];
+        let selected = select_results(results, &conversations(SessionKindFilter::All), None);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn transcripts_sharing_a_session_id_without_event_ids_stay_separate() {
+        // Imported or legacy files can reuse a session ID for unrelated content.
+        let mut imported = hit(LOCAL_MACHINE_ID, "reused", "main", None, 2, 1.0);
+        imported.record.source_path = "/imports/reused.jsonl".to_string();
+        let results = vec![
+            hit(LOCAL_MACHINE_ID, "reused", "main", None, 1, 2.0),
+            imported,
+        ];
+        let selected = select_results(results, &conversations(SessionKindFilter::All), None);
+        assert_eq!(doc_ids(&selected), vec![1, 2]);
     }
 
     #[test]
