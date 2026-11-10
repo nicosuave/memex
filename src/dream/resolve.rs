@@ -281,6 +281,7 @@ impl EvidenceSource for LiveEvidence<'_> {
             &[machine.to_string()],
             &spec,
             false,
+            &[],
         ) {
             Ok(found) if found.items.is_empty() => Lookup::Missing,
             Ok(found) => Lookup::Found(found.items.into_iter().map(|item| item.record).collect()),
