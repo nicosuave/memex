@@ -104,6 +104,28 @@ rm "$scratch/repo/untracked"
 REMOTE_COMMIT=wrong expect_failure 'does not match HEAD' "$release" 1.2.3
 ASSET_EXISTS=yes expect_failure 'assets already exist' "$release" 1.2.3
 expect_failure 'Set CODESIGN_IDENTITY' env -u CODESIGN_IDENTITY "$release" 1.2.3
+MEMEX_RELEASE_RUNTIME=locked expect_failure 'releases are history-only' "$release" 1.2.3
+
+# The app build refuses to guess its runtime mode, before any compilation.
+build_release="$ROOT/apps/macos/scripts/build-release.sh"
+expect_failure 'Set MEMEX_RELEASE_RUNTIME' env -u MEMEX_RELEASE_RUNTIME "$build_release"
+MEMEX_RELEASE_RUNTIME=bundled expect_failure 'Set MEMEX_RELEASE_RUNTIME' "$build_release"
+MEMEX_RELEASE_RUNTIME=locked MEMEX_HISTORY_ONLY=1 expect_failure 'cannot be combined' "$build_release"
+MEMEX_RELEASE_RUNTIME=locked MEMEX_RUNTIME_DEVELOPMENT=1 expect_failure 'cannot be combined' "$build_release"
+
+# Bundle contents must match the declared runtime mode in both directions.
+verify_mode="$ROOT/apps/macos/scripts/verify-runtime-mode.sh"
+fixture_app="$scratch/Fixture.app"
+mkdir -p "$fixture_app/Contents/Helpers" "$fixture_app/Contents/Resources"
+bash "$verify_mode" "$fixture_app" history-only >/dev/null
+expect_failure 'missing' bash "$verify_mode" "$fixture_app" locked
+touch "$fixture_app/Contents/Helpers/claude-agent-sdk-host"
+expect_failure 'unexpectedly contains' bash "$verify_mode" "$fixture_app" history-only
+touch "$fixture_app/Contents/Helpers/MemexExecutionHost"
+echo '{"mode":"development"}' > "$fixture_app/Contents/Resources/runtime-provenance.json"
+expect_failure 'does not record mode locked' bash "$verify_mode" "$fixture_app" locked
+echo '{"mode":"locked"}' > "$fixture_app/Contents/Resources/runtime-provenance.json"
+bash "$verify_mode" "$fixture_app" locked >/dev/null
 
 renderer="$ROOT/apps/macos/scripts/render-cask.sh"
 publisher="$ROOT/apps/macos/scripts/publish-cask.sh"
@@ -137,6 +159,7 @@ expect_failure 'checksum mismatch' "$publisher" 1.2.3
 # Exercise partial-upload recovery through the actual release command. Only OS
 # validation and external services are faked; control flow and file comparisons run.
 mkdir -p "$scratch/repo/apps/macos/scripts" "$scratch/remote"
+cp "$verify_mode" "$scratch/repo/apps/macos/scripts/"
 cat > "$scratch/repo/apps/macos/scripts/publish-cask.sh" <<'EOF'
 #!/usr/bin/env bash
 touch "$TEST_SCRATCH/cask-invoked"
@@ -153,12 +176,14 @@ asset=memex-app-1.2.3-macos-arm64.zip
 cp "$scratch/asset.zip" "$artifacts/$asset"
 (cd "$artifacts" && shasum -a 256 "$asset" > "$asset.sha256")
 echo "$TEST_COMMIT" > "$artifacts/commit.txt"
+echo history-only > "$artifacts/runtime-mode.txt"
 cat > "$scratch/bin/ditto" <<'EOF'
 #!/usr/bin/env bash
 dest=${!#}
 mkdir -p "$dest/Memex.app/Contents/Helpers"
 printf '#!/usr/bin/env bash\necho "memex 1.2.3"\n' > "$dest/Memex.app/Contents/Helpers/memex"
 chmod +x "$dest/Memex.app/Contents/Helpers/memex"
+[[ "${FIXTURE_RUNTIME_BUNDLE:-no}" != yes ]] || touch "$dest/Memex.app/Contents/Helpers/claude-agent-sdk-host"
 EOF
 cat > "$scratch/bin/plutil" <<'EOF'
 #!/usr/bin/env bash
@@ -173,6 +198,11 @@ cat > "$scratch/bin/spctl" <<'EOF'
 EOF
 chmod +x "$scratch/bin/"*
 export UPLOAD_TEST=yes
+FIXTURE_RUNTIME_BUNDLE=yes expect_failure 'unexpectedly contains' "$release" --publish-only 1.2.3
+[[ ! -f "$scratch/uploads" ]]
+echo locked > "$artifacts/runtime-mode.txt"
+expect_failure 'do not record runtime mode history-only' "$release" --publish-only 1.2.3
+echo history-only > "$artifacts/runtime-mode.txt"
 GATEKEEPER_FAIL=yes expect_failure 'Gatekeeper rejected' "$release" --publish-only 1.2.3
 [[ ! -f "$scratch/uploads" ]]
 FAIL_UPLOAD_CHECKSUM=yes expect_failure 'checksum upload failure' "$release" --publish-only 1.2.3
@@ -195,7 +225,7 @@ expect_failure 'refusing to overwrite' "$release" --publish-only 1.2.3
 cat > "$scratch/repo/apps/macos/scripts/build-release.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "$SIGNING_MODE" == developer-id ]]
+[[ "$SIGNING_MODE" == developer-id && "$MEMEX_RELEASE_RUNTIME" == history-only ]]
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/build/Memex.app/Contents/Helpers"
 printf '#!/usr/bin/env bash\necho "memex 1.2.3"\n' > "$root/build/Memex.app/Contents/Helpers/memex"

@@ -5,6 +5,72 @@ import Testing
 
 @Suite(.serialized) @MainActor
 struct RenderingTests {
+    @Test(arguments: [false, true])
+    func streamingRetainsExistingCellsAndSelectionWhileUpdatingContentAndHeight(recreateFonts: Bool) throws {
+        let controller = TranscriptController()
+        // Give the ordered window a viewport before installing the controller;
+        // its zero-sized initial view otherwise makes every row offscreen.
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 600)
+        let window = readerWindow(controller)
+        defer { window.close() }
+        // NSTableView only installs and retains visible row views in an ordered
+        // window. Keep the test window offscreen and never make it key.
+        window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
+        window.orderBack(nil)
+        var records = ["Earlier answer", "Streaming"].enumerated().map { index, text in
+            TranscriptRecord(recordID: "stream-\(index)", record: Message(role: "assistant", text: text,
+                toolName: nil, toolInput: nil, toolOutput: nil))
+        }
+        controller.update(sessionID: "stream", records: records, provider: "codex", followLatest: true)
+        pump(window)
+        try #require(!controller.table.visibleRect.isEmpty)
+        let firstCell = try #require(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true))
+        let firstText = try #require(descendants(of: firstCell, as: NSTextView.self).first)
+        let selected = NSRange(location: 0, length: 7)
+        firstText.setSelectedRange(selected)
+        let streamingCell = try #require(controller.table.view(atColumn: 0, row: 1, makeIfNecessary: true))
+        let originalHeight = controller.table.rect(ofRow: 1).height
+
+        records[1] = TranscriptRecord(recordID: "stream-1", record: Message(role: "assistant",
+            text: "Streaming a longer answer.\n\nSecond paragraph.\n\nThird paragraph.",
+            toolName: nil, toolInput: nil, toolOutput: nil))
+        let bodyFont = NSFont.systemFont(ofSize: 14)
+        let codeFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        controller.update(sessionID: "stream", records: records, provider: "codex", followLatest: true,
+            bodyFont: recreateFonts ? try #require(NSFont(descriptor: bodyFont.fontDescriptor, size: 14)) : bodyFont,
+            codeFont: recreateFonts ? try #require(NSFont(descriptor: codeFont.fontDescriptor, size: 12)) : codeFont)
+        pump(window)
+        #expect(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true) === firstCell)
+        #expect(firstText.selectedRange() == selected)
+        #expect(controller.table.view(atColumn: 0, row: 1, makeIfNecessary: true) === streamingCell)
+        #expect(controller.table.rect(ofRow: 1).height > originalHeight)
+        let streamingText = try #require(descendants(of: streamingCell, as: NSTextView.self).first)
+        #expect(streamingText.string.contains("Third paragraph."))
+
+        records.append(TranscriptRecord(recordID: "stream-2", record: Message(role: "user", text: "Next request",
+            toolName: nil, toolInput: nil, toolOutput: nil)))
+        controller.update(sessionID: "stream", records: records, provider: "codex", followLatest: true)
+        pump(window)
+        #expect(controller.table.numberOfRows == 3)
+        #expect(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true) === firstCell)
+        #expect(firstText.selectedRange() == selected)
+    }
+
+    @Test func fontPreferenceChangesRemeasureExistingText() {
+        let controller = TranscriptController()
+        controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 600)
+        let records = [TranscriptRecord(recordID: "font", record: Message(role: "assistant",
+            text: "The same answer at a larger reading size.", toolName: nil, toolInput: nil, toolOutput: nil))]
+        controller.update(sessionID: "font", records: records, provider: "codex", followLatest: true)
+        let original = controller.measurement(at: 0)
+        controller.update(sessionID: "font", records: records, provider: "codex", followLatest: true,
+            bodyFont: .systemFont(ofSize: 24))
+        let enlarged = controller.measurement(at: 0)
+        #expect(enlarged.font.pointSize == 24)
+        #expect(enlarged.height > original.height)
+        #expect(enlarged.body == original.body)
+    }
+
     @Test func messagesUseUnlabelledContentSizedBubblesAndKeepAccessibleSpeakers() throws {
         let controller = TranscriptController()
         let window = readerWindow(controller)
@@ -43,7 +109,8 @@ struct RenderingTests {
             let readerWidth = controller.table.bounds.width
             let value = controller.measurement(at: 0)
             #expect(value.contentWidth <= min(800, readerWidth - 60) * 0.77)
-            #expect(abs(value.contentX + value.contentWidth - (readerWidth - 30)) < 1)
+            let laneWidth = min(800, readerWidth - 60)
+            #expect(abs(value.contentX + value.contentWidth - (readerWidth + laneWidth) / 2) < 1)
             let cell = try #require(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true))
             cell.layoutSubtreeIfNeeded()
             let text = try #require(descendants(of: cell, as: NSTextView.self).first)
@@ -54,7 +121,7 @@ struct RenderingTests {
         }
     }
 
-    @Test func wideReaderKeepsAssistantAndToolsAtLeftGutter() {
+    @Test func wideReaderCentersOneLaneForAssistantToolsAndUser() {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 1600, height: 700)
         let records = [
@@ -63,10 +130,11 @@ struct RenderingTests {
             TranscriptRecord(recordID: "user", record: Message(role: "user", text: "Reply", toolName: nil, toolInput: nil, toolOutput: nil))
         ]
         controller.update(sessionID: "wide", records: records, provider: "codex")
-        #expect(controller.measurement(at: 0).contentX == 30)
-        #expect(controller.measurement(at: 1).contentX == 30)
+        let laneX = (controller.table.bounds.width - 800) / 2
+        #expect(controller.measurement(at: 0).contentX == laneX)
+        #expect(controller.measurement(at: 1).contentX == laneX)
         let user = controller.measurement(at: 2)
-        #expect(abs(user.contentX + user.contentWidth - (controller.table.bounds.width - 30)) < 1)
+        #expect(abs(user.contentX + user.contentWidth - (laneX + 800)) < 1)
     }
 
     @Test func bubbleEdgesDoNotMeasureBlankLinesAndKeepInteriorFormatting() {
@@ -202,7 +270,7 @@ struct RenderingTests {
         #expect(controller.measurement(at: 0).body == "Complete instructions")
     }
 
-    @Test func longMessagesRetainFullSelectableTextBehindShowAll() throws {
+    @Test func longMessagesShowFullSelectableTextWithoutCollapseControls() throws {
         let controller = TranscriptController()
         controller.view.frame = NSRect(x: 0, y: 0, width: 700, height: 600)
         let text = String(repeating: "Complete message content. ", count: 400) + "END OF MESSAGE"
@@ -214,8 +282,10 @@ struct RenderingTests {
             #expect(controller.measurement(at: row).body == text)
             let cell = try #require(controller.table.view(atColumn: 0, row: row, makeIfNecessary: true))
             #expect(descendants(of: cell, as: NSTextView.self).contains { $0.string.hasSuffix("END OF MESSAGE") })
-            #expect(descendants(of: cell, as: NSButton.self).contains { !$0.isHidden && $0.title == "Show all" })
-            #expect(controller.measurement(at: row).textHeight < controller.measurement(at: row).fullTextHeight)
+            #expect(!descendants(of: cell, as: NSButton.self).contains {
+                !$0.isHidden && ["Show all", "Show less"].contains($0.title)
+            })
+            #expect(controller.measurement(at: row).textHeight == controller.measurement(at: row).fullTextHeight)
             controller.toggleFullBody(controller.rows[row].id)
             #expect(controller.measurement(at: row).textHeight == controller.measurement(at: row).fullTextHeight)
         }

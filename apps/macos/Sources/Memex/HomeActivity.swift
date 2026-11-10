@@ -497,7 +497,9 @@ private struct ActivityPlotLayoutKey: PreferenceKey {
 private struct HomeActivityPendingBars: View {
     let bars: [ActivityPendingBar]
     let barWidth: CGFloat
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.memexReduceMotion) private var appReduceMotion
+    private var reduceMotion: Bool { systemReduceMotion || appReduceMotion }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.8)) { context in
@@ -523,7 +525,9 @@ private struct HomeActivityLoadingBars: View {
     let barCount: Int
     let height: CGFloat
     let barWidth: CGFloat
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.memexReduceMotion) private var appReduceMotion
+    private var reduceMotion: Bool { systemReduceMotion || appReduceMotion }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 0.8)) { context in

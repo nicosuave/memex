@@ -5,6 +5,7 @@ import Markdown
 /// Local paths are meaningful only when the session's exact host is this host.
 struct RichContentContext: Equatable {
     var isLocalHost = false
+    var mcpAppTransport: NativeMcpAppTransport? = nil
 }
 
 struct ContentLocation: Equatable {
@@ -50,42 +51,173 @@ struct ContentLocation: Equatable {
 }
 
 enum RichContentBlock: Equatable {
+    case mcpApp(NativeMcpAppDescriptor)
     case attributed(NSAttributedString)
     case markdown(String)
     case code(String, language: String)
     case attachment(label: String, source: String, image: Bool)
     case attachmentNotice(label: String, detail: String)
     case embeddedImage(label: String, data: Data, mimeType: String)
+
+    var isRich: Bool { if case .markdown = self { false } else { true } }
 }
 
 struct RichContentDocument {
     let blocks: [RichContentBlock]
-    var hasRichBlocks: Bool { blocks.contains { if case .markdown = $0 { false } else { true } } }
+    var hasRichBlocks: Bool { blocks.contains(where: \.isRich) }
 
     init(_ source: String) {
+        blocks = Document(parsing: source).children.flatMap { Self.blocks(for: $0) }
+    }
+
+    /// Blocks for one top-level node; a document is the concatenation, so a
+    /// streaming message can keep the blocks of nodes that settled.
+    static func blocks(for node: any Markup) -> [RichContentBlock] {
         var result: [RichContentBlock] = []
-        for node in Document(parsing: source).children {
-            if let code = node as? CodeBlock {
-                result.append(.code(code.code, language: code.language ?? "text"))
-            } else if let paragraph = node as? Paragraph,
-                      paragraph.children.contains(where: { $0 is Markdown.Image }) {
-                var prose = ""
-                for child in paragraph.children {
-                    if let image = child as? Markdown.Image, let source = image.source {
-                        if !prose.isEmpty { result.append(.markdown(prose)); prose = "" }
-                        result.append(.attachment(label: image.plainText, source: source, image: true))
-                    } else { prose += child.detachedFromParent.format() }
-                }
-                if !prose.isEmpty { result.append(.markdown(prose)) }
-            } else if let paragraph = node as? Paragraph, paragraph.childCount == 1,
-                      let link = paragraph.child(at: 0) as? Markdown.Link,
-                      let source = link.destination, ContentLocation.parse(source)?.url.isFileURL == true {
-                result.append(.attachment(label: link.plainText, source: source, image: false))
-            } else {
-                result.append(.markdown(node.detachedFromParent.format()))
+        if let code = node as? CodeBlock {
+            result.append(.code(code.code, language: code.language ?? "text"))
+        } else if let paragraph = node as? Paragraph,
+                  paragraph.children.contains(where: { $0 is Markdown.Image }) {
+            var prose = ""
+            for child in paragraph.children {
+                if let image = child as? Markdown.Image, let source = image.source {
+                    if !prose.isEmpty { result.append(.markdown(prose)); prose = "" }
+                    result.append(.attachment(label: image.plainText, source: source, image: true))
+                } else { prose += child.detachedFromParent.format() }
+            }
+            if !prose.isEmpty { result.append(.markdown(prose)) }
+        } else if let paragraph = node as? Paragraph, paragraph.childCount == 1,
+                  let link = paragraph.child(at: 0) as? Markdown.Link,
+                  let source = link.destination, ContentLocation.parse(source)?.url.isFileURL == true {
+            result.append(.attachment(label: link.plainText, source: source, image: false))
+        } else {
+            result.append(.markdown(node.detachedFromParent.format()))
+        }
+        return result
+    }
+}
+
+/// TextKit can measure attributed prose and tables without constructing an
+/// NSTextView. The visible view adopts this exact container and shaped glyphs.
+@MainActor final class RichContentTextLayout {
+    let storage: NSTextStorage
+    let manager = NSLayoutManager()
+    let container = NSTextContainer(size: .zero)
+
+    init(_ text: NSAttributedString) {
+        storage = NSTextStorage(attributedString: text)
+        container.lineFragmentPadding = 0
+        container.widthTracksTextView = false
+        container.heightTracksTextView = false
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+    }
+
+    func size(for width: CGFloat) -> NSSize {
+        // Reassigning an unchanged size could discard layout that a streaming
+        // message keeps for its settled blocks.
+        let size = NSSize(width: max(1, width), height: .greatestFiniteMagnitude)
+        if container.containerSize != size { container.containerSize = size }
+        manager.ensureLayout(for: container)
+        let rect = manager.usedRect(for: container)
+        return NSSize(width: ceil(rect.width), height: ceil(rect.height))
+    }
+}
+
+/// Retain exact layout, not controls, for offscreen rows. Only a displayed cell
+/// owns the materialized view; recycling that cell can release its entire tree.
+@MainActor final class RichContentLayout {
+    @MainActor enum Item {
+        case mcpApp(NativeMcpAppDescriptor)
+        case text(RichContentTextLayout)
+        case code(CodeContentLayout)
+        case attachment(AttachmentContent)
+
+        func height(for width: CGFloat) -> CGFloat {
+            switch self {
+            case .mcpApp: NativeMcpAppHost.height
+            case .text(let text): text.size(for: width).height
+            case .code(let code): code.height(for: width)
+            case .attachment(let attachment): attachment.height
             }
         }
-        blocks = result
+
+        /// The same retained layout object, whose view can be kept as is.
+        func isSameContent(as other: Item) -> Bool {
+            switch (self, other) {
+            case (.text(let lhs), .text(let rhs)): lhs === rhs
+            case (.code(let lhs), .code(let rhs)): lhs === rhs
+            default: false
+            }
+        }
+    }
+
+    let items: [Item]
+    let context: RichContentContext
+    private(set) weak var materializedView: RichContentView?
+
+    init(blocks: [RichContentBlock], font: NSFont, context: RichContentContext) {
+        self.context = context
+        items = blocks.map { Self.item(for: $0, font: font, context: context) }
+    }
+
+    /// Assembles retained items, such as the settled blocks of a streaming message.
+    init(items: [Item], context: RichContentContext) {
+        self.context = context
+        self.items = items
+    }
+
+    static func item(for block: RichContentBlock, font: NSFont, context: RichContentContext) -> Item {
+        switch block {
+        case .mcpApp(let app):
+            guard app.allowsInteraction, context.mcpAppTransport != nil else {
+                return .text(RichContentTextLayout(NSAttributedString(
+                    string: "Interactive app unavailable for this connection. The original tool result remains below.",
+                    attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor])))
+            }
+            return .mcpApp(app)
+        case .markdown, .attributed:
+            let rendered: NSAttributedString
+            if case .markdown(let source) = block { rendered = RichTextRenderer.renderMarkdown(source, font: font) }
+            else if case .attributed(let content) = block { rendered = content }
+            else { rendered = NSAttributedString(string: "") }
+            let content = NSMutableAttributedString(attributedString: rendered)
+            content.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: content.length)) { value, range, _ in
+                guard let source = value as? String, let location = ContentLocation.parse(source), location.canOpen(in: context) else { return }
+                content.addAttribute(.link, value: source, range: range)
+                content.addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
+            }
+            return .text(RichContentTextLayout(content))
+        case .code(let source, let language): return .code(CodeContentLayout(code: source, language: language, font: font))
+        case .embeddedImage(let label, let data, let mimeType):
+            return .attachment(AttachmentContent(label: label, source: "Embedded image · \(mimeType)", isImage: true, context: context, embeddedData: data))
+        case .attachmentNotice(let label, let detail):
+            return .attachment(AttachmentContent(label: label, source: "", isImage: false, context: context, unavailableDetail: detail))
+        case .attachment(let label, let source, let image):
+            return .attachment(AttachmentContent(label: label, source: source, isImage: image, context: context))
+        }
+    }
+
+    func height(for width: CGFloat) -> CGFloat {
+        max(0, items.reduce(CGFloat(0)) { $0 + $1.height(for: width) + 8 } - 8)
+    }
+
+    func view() -> RichContentView {
+        if let materializedView { return materializedView }
+        let view = RichContentView()
+        view.configure(layout: self)
+        materializedView = view
+        return view
+    }
+
+    /// Takes over a displayed view of an earlier layout of the same message.
+    /// Item views whose layout objects are retained stay in place, with their
+    /// selection and horizontal scroll position; only changed items are rebuilt.
+    func adoptMaterializedView(from previous: RichContentLayout?) {
+        guard materializedView == nil, let previous, previous !== self, let view = previous.materializedView else { return }
+        previous.materializedView = nil
+        view.configure(layout: self)
+        materializedView = view
     }
 }
 
@@ -94,6 +226,7 @@ struct RichContentDocument {
     var onOpenLocation: ((ContentLocation) -> Void)?
     private var context = RichContentContext()
     private var items: [NSView] = []
+    private var contentLayout: RichContentLayout?
     override var isFlipped: Bool { true }
 
     func configure(text: String, font: NSFont, context: RichContentContext) {
@@ -101,37 +234,35 @@ struct RichContentDocument {
     }
 
     func configure(blocks: [RichContentBlock], font: NSFont, context: RichContentContext) {
-        self.context = context
-        items.forEach { $0.removeFromSuperview() }
-        items = blocks.map { block in
-            switch block {
-            case .markdown, .attributed:
-                let view = Self.textView()
-                let rendered: NSAttributedString
-                if case .markdown(let source) = block { rendered = RichTextRenderer.renderMarkdown(source, font: font) }
-                else if case .attributed(let content) = block { rendered = content }
-                else { rendered = NSAttributedString(string: "") }
-                let content = NSMutableAttributedString(attributedString: rendered)
-                content.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: content.length)) { value, range, _ in
-                    guard let source = value as? String, let location = ContentLocation.parse(source), location.canOpen(in: context) else { return }
-                    content.addAttribute(.link, value: source, range: range)
-                    content.addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
-                }
-                view.textStorage?.setAttributedString(content)
+        configure(layout: RichContentLayout(blocks: blocks, font: font, context: context))
+    }
+
+    fileprivate func configure(layout: RichContentLayout) {
+        // Keep the leading views whose layout objects did not change. A fresh
+        // view has none; a streaming message keeps its settled blocks' views.
+        let previous = contentLayout?.context == layout.context ? contentLayout?.items ?? [] : []
+        var kept = 0
+        while kept < min(previous.count, layout.items.count, items.count),
+              previous[kept].isSameContent(as: layout.items[kept]) { kept += 1 }
+        contentLayout = layout
+        context = layout.context
+        items[kept...].forEach { $0.removeFromSuperview() }
+        let created = layout.items[kept...].map { item -> NSView in
+            switch item {
+            case .mcpApp(let app): return NativeMcpAppHost.view(app: app, transport: context.mcpAppTransport)
+            case .text(let text):
+                let view = Self.textView(container: text.container)
                 view.delegate = self
                 return view
-            case .code(let source, let language): return CodeContentView(code: source, language: language, font: font)
-            case .embeddedImage(let label, let data, let mimeType):
-                return AttachmentContentView(label: label, source: "Embedded image · \(mimeType)", isImage: true, context: context, embeddedData: data)
-            case .attachmentNotice(let label, let detail):
-                return AttachmentContentView(label: label, source: "", isImage: false, context: context, unavailableDetail: detail)
-            case .attachment(let label, let source, let image):
-                let card = AttachmentContentView(label: label, source: source, isImage: image, context: context)
+            case .code(let code): return CodeContentView(content: code)
+            case .attachment(let attachment):
+                let card = AttachmentContentView(content: attachment)
                 card.onOpenLocation = { [weak self] location in self?.open(location) }
                 return card
             }
         }
-        items.forEach { addSubview($0) }
+        items = Array(items[..<kept]) + created
+        created.forEach { addSubview($0) }
         needsLayout = true
     }
 
@@ -150,12 +281,8 @@ struct RichContentDocument {
 
     @discardableResult func height(for width: CGFloat) -> CGFloat {
         var y: CGFloat = 0
-        for item in items {
-            let height: CGFloat
-            if let text = item as? NSTextView { height = Self.textHeight(text, width: width) }
-            else if let code = item as? CodeContentView { height = code.height(for: width) }
-            else if let attachment = item as? AttachmentContentView { height = attachment.contentHeight }
-            else { height = 0 }
+        for (item, layout) in zip(items, contentLayout?.items ?? []) {
+            let height = layout.height(for: width)
             item.frame = NSRect(x: 0, y: y, width: max(1, width), height: height)
             y += height + 8
         }
@@ -164,8 +291,8 @@ struct RichContentDocument {
 
     override func layout() { super.layout(); height(for: bounds.width) }
 
-    static func textView() -> NSTextView {
-        let view = NSTextView()
+    static func textView(container: NSTextContainer? = nil) -> NSTextView {
+        let view = container.map { TranscriptSelectionTextView(frame: .zero, textContainer: $0) } ?? TranscriptSelectionTextView()
         view.isEditable = false
         view.isSelectable = true
         view.drawsBackground = false
@@ -217,20 +344,58 @@ struct RichContentDocument {
     func refreshVisibility() { alphaValue = isCardHovered || window?.firstResponder === self ? 1 : 0 }
 }
 
-@MainActor final class CodeContentView: NSView {
+@MainActor final class CodeContentLayout {
     let code: String
     let language: String
-    private let label: NSTextField
-    private let copyButton = CodeCopyButton(title: "", target: nil, action: nil)
-    private var hoverTracking: NSTrackingArea?
-    let scrollView = CodeHorizontalScrollView()
-    let textView = RichContentView.textView()
-    override var isFlipped: Bool { true }
+    let text: RichContentTextLayout
+    var horizontalOffset: CGFloat = 0
 
     init(code: String, language: String, font: NSFont) {
         self.code = code
         self.language = language
-        label = NSTextField(labelWithString: language)
+        // A fence terminator contributes one final newline. Do not draw its
+        // empty line, but retain the exact original code for the Copy action.
+        let displayCode = code.hasSuffix("\r\n") || code.hasSuffix("\n") ? String(code.dropLast()) : code
+        text = RichContentTextLayout(CodeSyntax.render(displayCode, language: language, font: font))
+    }
+
+    func metrics() -> (height: CGFloat, width: CGFloat) {
+        let size = text.size(for: 1_000_000)
+        return (size.height, size.width + 4)
+    }
+
+    func height(for width: CGFloat) -> CGFloat {
+        let size = metrics()
+        let overflow = size.width > max(1, width - 24)
+        // Only overflowing code needs a scrollbar. Reserve legacy thickness
+        // there so either macOS scrollbar preference leaves every line visible.
+        let scrollbar = overflow ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
+        return size.height + 40 + scrollbar
+    }
+}
+
+@MainActor final class CodeContentView: NSView {
+    let code: String
+    let language: String
+    private let content: CodeContentLayout
+    private let label: NSTextField
+    private let copyButton = CodeCopyButton(title: "", target: nil, action: nil)
+    private var hoverTracking: NSTrackingArea?
+    private var positioning = false
+    let scrollView = CodeHorizontalScrollView()
+    let textView: NSTextView
+    override var isFlipped: Bool { true }
+
+    convenience init(code: String, language: String, font: NSFont) {
+        self.init(content: CodeContentLayout(code: code, language: language, font: font))
+    }
+
+    init(content: CodeContentLayout) {
+        self.content = content
+        code = content.code
+        language = content.language
+        label = NSTextField(labelWithString: content.language)
+        textView = RichContentView.textView(container: content.text.container)
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 8
@@ -244,10 +409,6 @@ struct RichContentDocument {
         copyButton.alphaValue = 0
         copyButton.target = self
         copyButton.action = #selector(copyCode)
-        // A fence terminator contributes one final newline. Do not draw its
-        // empty line, but retain the exact original code for the Copy action.
-        let displayCode = code.hasSuffix("\r\n") || code.hasSuffix("\n") ? String(code.dropLast()) : code
-        textView.textStorage?.setAttributedString(CodeSyntax.render(displayCode, language: language, font: font))
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
         textView.autoresizingMask = []
@@ -261,24 +422,14 @@ struct RichContentDocument {
         scrollView.verticalScrollElasticity = .none
         scrollView.autohidesScrollers = true
         scrollView.documentView = textView
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(horizontalScrolled),
+            name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
         addSubview(label); addSubview(copyButton); addSubview(scrollView)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    private func metrics() -> (height: CGFloat, width: CGFloat) {
-        let height = RichContentView.textHeight(textView, width: 1_000_000)
-        let usedWidth = textView.layoutManager.flatMap { manager in textView.textContainer.map { manager.usedRect(for: $0).width } } ?? 0
-        return (height, ceil(usedWidth) + 4)
-    }
-
-    func height(for width: CGFloat) -> CGFloat {
-        let size = metrics()
-        let overflow = size.width > max(1, width - 24)
-        // Only overflowing code needs a scrollbar. Reserve legacy thickness
-        // there so either macOS scrollbar preference leaves every line visible.
-        let scrollbar = overflow ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
-        return size.height + 40 + scrollbar
-    }
+    func height(for width: CGFloat) -> CGFloat { content.height(for: width) }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -292,17 +443,66 @@ struct RichContentDocument {
 
     override func layout() {
         super.layout()
+        let horizontalOffset = content.horizontalOffset
+        positioning = true
+        defer { positioning = false }
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
         }
         label.frame = NSRect(x: 12, y: 8, width: max(0, bounds.width - 90), height: 18)
         copyButton.frame = NSRect(x: max(0, bounds.width - 36), y: 5, width: 24, height: 24)
-        let size = metrics()
+        let size = content.metrics()
         scrollView.hasHorizontalScroller = size.width > max(1, bounds.width - 24)
         scrollView.frame = NSRect(x: 12, y: 32, width: max(1, bounds.width - 24), height: max(1, bounds.height - 40))
         textView.frame = NSRect(x: 0, y: 0, width: max(scrollView.contentSize.width, size.width), height: size.height)
+        // Recycling controls must not reset a code card's horizontal position.
+        let x = min(horizontalOffset, max(0, textView.frame.width - scrollView.contentSize.width))
+        scrollView.contentView.scroll(to: NSPoint(x: x, y: 0))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        content.horizontalOffset = x
+    }
+    @objc private func horizontalScrolled() {
+        if !positioning { content.horizontalOffset = scrollView.contentView.bounds.minX }
     }
     @objc private func copyCode() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(code, forType: .string) }
+}
+
+/// Decode the bounded thumbnail once so offscreen and visible attachment heights
+/// agree even if a local file changes between measurement and display.
+@MainActor struct AttachmentContent {
+    let title: String
+    let detail: String
+    let location: ContentLocation?
+    let context: RichContentContext
+    let embeddedData: Data?
+    let unavailableDetail: String?
+    let thumbnail: NSImage?
+    var height: CGFloat { thumbnail == nil ? 70 : 260 }
+
+    init(label: String, source: String, isImage: Bool, context: RichContentContext, embeddedData: Data? = nil, unavailableDetail: String? = nil) {
+        let location = ContentLocation.parse(source)
+        self.location = location
+        self.context = context
+        self.unavailableDetail = unavailableDetail
+        let embeddedData = embeddedData.flatMap { $0.count <= 20_000_000 ? $0 : nil }
+        self.embeddedData = embeddedData
+        title = label.isEmpty ? (location?.url.lastPathComponent ?? "Attachment") : label
+        detail = unavailableDetail ?? (source + ((location?.url.isFileURL == true && !context.isLocalHost) ? " · Recorded on another host" : ""))
+        // Never interpret another machine's absolute path on this machine, and
+        // never fetch remote media as a side effect of reading a transcript.
+        var thumbnail: NSImage?
+        var imageSource: CGImageSource?
+        if isImage, let embeddedData { imageSource = CGImageSourceCreateWithData(embeddedData as CFData, nil) }
+        else if isImage, context.isLocalHost, let url = location?.url, url.isFileURL {
+            imageSource = CGImageSourceCreateWithURL(url as CFURL, nil)
+        }
+        if let imageSource, let cgImage = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 600,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+           ] as CFDictionary) { thumbnail = NSImage(cgImage: cgImage, size: .zero) }
+        self.thumbnail = thumbnail
+    }
 }
 
 @MainActor final class AttachmentContentView: NSView {
@@ -318,28 +518,18 @@ struct RichContentDocument {
     let contentHeight: CGFloat
     override var isFlipped: Bool { true }
 
-    init(label: String, source: String, isImage: Bool, context: RichContentContext, embeddedData: Data? = nil, unavailableDetail: String? = nil) {
-        let location = ContentLocation.parse(source)
-        self.location = location
-        self.context = context
-        let embeddedData = embeddedData.flatMap { $0.count <= 20_000_000 ? $0 : nil }
-        self.embeddedData = embeddedData
-        title = NSTextField(labelWithString: label.isEmpty ? (location?.url.lastPathComponent ?? "Attachment") : label)
-        detail = NSTextField(wrappingLabelWithString: unavailableDetail ?? (source + ((location?.url.isFileURL == true && !context.isLocalHost) ? " · Recorded on another host" : "")))
-        // Never interpret another machine's absolute path on this machine, and
-        // never fetch remote media as a side effect of reading a transcript.
-        var thumbnail: NSImage?
-        var imageSource: CGImageSource?
-        if isImage, let embeddedData { imageSource = CGImageSourceCreateWithData(embeddedData as CFData, nil) }
-        else if isImage, context.isLocalHost, let url = location?.url, url.isFileURL {
-            imageSource = CGImageSourceCreateWithURL(url as CFURL, nil)
-        }
-        if let imageSource, let cgImage = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceThumbnailMaxPixelSize: 600,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-           ] as CFDictionary) { thumbnail = NSImage(cgImage: cgImage, size: .zero) }
-        contentHeight = thumbnail == nil ? 70 : 260
+    convenience init(label: String, source: String, isImage: Bool, context: RichContentContext, embeddedData: Data? = nil, unavailableDetail: String? = nil) {
+        self.init(content: AttachmentContent(label: label, source: source, isImage: isImage, context: context,
+                                            embeddedData: embeddedData, unavailableDetail: unavailableDetail))
+    }
+
+    init(content: AttachmentContent) {
+        title = NSTextField(labelWithString: content.title)
+        detail = NSTextField(wrappingLabelWithString: content.detail)
+        location = content.location
+        context = content.context
+        embeddedData = content.embeddedData
+        contentHeight = content.height
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 8
@@ -348,11 +538,11 @@ struct RichContentDocument {
         detail.font = .systemFont(ofSize: 11)
         detail.textColor = .secondaryLabelColor
         detail.isSelectable = true
-        preview.image = thumbnail
+        preview.image = content.thumbnail
         preview.imageScaling = .scaleProportionallyUpOrDown
-        openButton.title = thumbnail == nil ? "Open" : "Enlarge"
-        openButton.isHidden = unavailableDetail != nil
-        openButton.isEnabled = thumbnail != nil || location?.canOpen(in: context) == true
+        openButton.title = content.thumbnail == nil ? "Open" : "Enlarge"
+        openButton.isHidden = content.unavailableDetail != nil
+        openButton.isEnabled = content.thumbnail != nil || location?.canOpen(in: context) == true
         openButton.target = self
         openButton.action = #selector(openAttachment)
         addSubview(title); addSubview(detail); addSubview(preview); addSubview(openButton)

@@ -496,11 +496,15 @@ export const MessageContent = memo(function MessageContent({
     },
     [message.content, message.role],
   )
+  const toolResult = useMemo(
+    () => message.role === "tool_result" ? formatJsonBlocks(message.content, false).content : null,
+    [message.content, message.role],
+  )
   if (message.role === "tool_use")
     return <ToolCallContent content={message.content} />
 
   if (message.role === "tool_result")
-    return <pre className="tool-content">{formatJsonBlocks(message.content, false).content}</pre>
+    return <pre className="tool-content">{toolResult}</pre>
 
   if (rendered?.parts) return <ContextContent parts={rendered.parts} />
   if (rendered?.xml) return <XmlMessage parsed={rendered.xml} />

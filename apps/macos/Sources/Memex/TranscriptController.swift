@@ -21,9 +21,18 @@ struct NativeTranscript: NSViewControllerRepresentable {
     var findGeneration = 0
     var rawTranscript = false
     var isLocalHost = false
+    var mcpAppTransport: NativeMcpAppTransport? = nil
     var sourcePath = ""
     var requestedRecordID: String?
     var requestGeneration = 0
+    var followLatest = false
+    /// The conversation's provider is running a turn: the last assistant
+    /// message may still be growing and is rendered and revealed as a stream.
+    var isStreaming = false
+    var bottomInset: CGFloat = 0
+    var onAddSelection: ((TranscriptSelection) -> String?)?
+    var selectionReveal: TranscriptSelectionReveal?
+    var onSelectionRevealResult: ((UUID, String?) -> Void)?
 
     func makeNSViewController(context: Context) -> TranscriptController { TranscriptController() }
     func updateNSViewController(_ controller: TranscriptController, context: Context) {
@@ -33,7 +42,16 @@ struct NativeTranscript: NSViewControllerRepresentable {
                           navigation: navigation, onLoadEarlier: onLoadEarlier,
                           findQuery: findQuery, findHit: findHit, findGeneration: findGeneration,
                           rawTranscript: rawTranscript, isLocalHost: isLocalHost, sourcePath: sourcePath,
-                          requestedRecordID: requestedRecordID, requestGeneration: requestGeneration)
+                          requestedRecordID: requestedRecordID, requestGeneration: requestGeneration,
+                          followLatest: followLatest, isStreaming: isStreaming, bottomInset: bottomInset,
+                          mcpAppTransport: mcpAppTransport,
+                          bodyFont: AppPreferences.shared.bodyNSFont, codeFont: AppPreferences.shared.codeNSFont)
+        controller.onAddSelection = onAddSelection
+        if let selectionReveal {
+            controller.revealSelection(selectionReveal) { error in
+                Task { @MainActor in onSelectionRevealResult?(selectionReveal.id, error) }
+            }
+        }
     }
 }
 
@@ -49,6 +67,9 @@ struct NativeTranscript: NSViewControllerRepresentable {
     }
     @ObservationIgnored var positions: [String: Position] = [:]
     var visibleRecordID: String?
+    /// False once the reader scrolls away from the end of a live transcript;
+    /// a "jump to latest" control can show while it is false.
+    var followsLatest = true
     @ObservationIgnored private var order: [String] = []
 
     func save(_ position: Position, for key: String) {
@@ -63,6 +84,10 @@ struct NativeTranscript: NSViewControllerRepresentable {
 final class TranscriptController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     let table = TranscriptTableView()
     let scrollView = TranscriptScrollView()
+    let selectionActions = TranscriptSelectionActions()
+    var onAddSelection: ((TranscriptSelection) -> String?)? {
+        didSet { if onAddSelection == nil { selectionActions.dismiss() } }
+    }
     private(set) var rows: [Row] = []
     private var sessionID = ""
     private var records: [TranscriptRecord] = []
@@ -73,14 +98,18 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     private var fullBodies = Set<String>()
     private var rawTranscript = false
     private var isLocalHost = false
+    private var mcpAppTransport: NativeMcpAppTransport?
+    private var bodyFont = NSFont.systemFont(ofSize: 14)
+    private var codeFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     private var sourcePath = ""
     private var appliedRequestGeneration = -1
+    private var appliedSelectionRevealID: UUID?
+    private weak var revealedSelectionView: NSTextView?
     private var measurements: [String: Measurement] = [:]
     private var measuredWidth: CGFloat = 0
     private var notifiedWidth: CGFloat = 0
     private var textLayouts: [String: TranscriptTextLayout] = [:]
-    private var richLayouts: [String: RichContentView] = [:]
-    private var findRecordBodies: [String: String] = [:]
+    private var richLayouts: [String: RichContentLayout] = [:]
     private var hasMore = false
     private var isLoading = false
     private var pageRequested = false
@@ -92,12 +121,26 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     private var anchorID: String?
     private var navigation = TranscriptNavigationState()
     private var needsInitialPosition = true
+    private var bottomInset: CGFloat = 0
     private var findQuery = ""
     private var findHit: ConversationFindHit?
     private var findGeneration = 0
     private var appliedFindGeneration: Int?
     private(set) var selectedFindRange: NSRange?
     private weak var selectedFindCell: TranscriptCell?
+    private var followLatest = false
+    /// Follow-or-detach for live transcripts, driven by the reader's own scrolling.
+    private(set) var follow = TranscriptFollowState()
+    var onFollowStateChange: ((Bool) -> Void)?
+    /// Scrolls the controller performs itself; they never express reader intent.
+    private var programmaticScrolls = 0
+    private var lastClipSize: NSSize = .zero
+    private var lastLaidOutClipHeight: CGFloat = 0
+    private var streamingRow: TranscriptStreamingRow?
+    private var revealClock: CADisplayLink?
+    /// Rows whose cached layouts survive a rebuild because they were chosen
+    /// when a stream finished.
+    private var preservedLayoutIDs: Set<String> = []
 
     enum Row {
         case message(TranscriptRecord)
@@ -118,6 +161,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             }
         }
     }
+
+    /// Heights, in points, above which a row collapses and how much stays visible.
+    static let longDetailCollapse: (threshold: CGFloat, preview: CGFloat) = (440, 360)
+    static let longMessageCollapse: (threshold: CGFloat, preview: CGFloat) = (4_000, 1_200)
 
     struct Measurement {
         let rowID: String
@@ -142,15 +189,24 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         var fullTextHeight: CGFloat = 0
         var originalRecords: [TranscriptRecord] = []
         var originalBody: String { originalRecords.map { $0.rawTranscriptBody }.joined(separator: "\n\n") }
-        var richContent: RichContentView?
+        var richLayout: RichContentLayout?
+        // Materialize only when a cell (or an explicit caller) needs the view.
+        // Height calculation and cached measurements retain no view hierarchy.
+        @MainActor var richContent: RichContentView? { richLayout?.view() }
+        var findRange: NSRange?
         var isLocalHost = false
-        var hasBody: Bool { !body.isEmpty || richContent != nil }
+        // A disclosure with nothing behind it is a plain status line.
+        var canExpand = true
+        /// Set for a streaming row: how much of `attributedBody` repeats earlier versions.
+        var textRevision: TranscriptTextRevision?
+        var hasBody: Bool { !body.isEmpty || richLayout != nil }
     }
 
     override func loadView() {
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
+        scrollView.automaticallyAdjustsContentInsets = false
         table.headerView = nil
         table.backgroundColor = .clear
         table.intercellSpacing = .zero
@@ -171,6 +227,11 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(scrolled),
             name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
+        // Posted only for user gestures and scroller tracking, never for scroll(to:).
+        NotificationCenter.default.addObserver(self, selector: #selector(liveScrollBegan),
+            name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
+        NotificationCenter.default.addObserver(self, selector: #selector(liveScrollEnded),
+            name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
             NotificationCenter.default.addObserver(self, selector: #selector(refreshVisibleActions), name: name, object: nil)
         }
@@ -183,15 +244,55 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 navigation: TranscriptNavigationState? = nil, onLoadEarlier: (() -> Void)? = nil,
                 findQuery: String = "", findHit: ConversationFindHit? = nil, findGeneration: Int = 0,
                 rawTranscript: Bool = false, isLocalHost: Bool = false, sourcePath: String = "",
-                requestedRecordID: String? = nil, requestGeneration: Int = 0) {
+                requestedRecordID: String? = nil, requestGeneration: Int = 0, followLatest: Bool = false,
+                isStreaming: Bool = false,
+                bottomInset: CGFloat = 0, mcpAppTransport: NativeMcpAppTransport? = nil,
+                bodyFont: NSFont = .systemFont(ofSize: 14),
+                codeFont: NSFont = .monospacedSystemFont(ofSize: 12, weight: .regular)) {
         _ = view
         let changedSession = self.sessionID != sessionID
+        let wasAtEnd = !rows.isEmpty && distanceFromEnd < 60
+        let changedInset = self.bottomInset != bottomInset
+        // A live transcript follows the reader's intent, recorded as they scroll;
+        // a growing reply or the controller's own pinning never changes it.
+        // Elsewhere only the composer inset keeps an end that was in view.
+        let shouldFollow = followLatest
+            ? !changedSession && findQuery.isEmpty && follow.shouldPin
+            : changedInset && !changedSession && findQuery.isEmpty && wasAtEnd
+        self.followLatest = followLatest
+        if changedInset {
+            programmaticScroll {
+                self.bottomInset = max(0, bottomInset)
+                scrollView.contentInsets.bottom = self.bottomInset
+                scrollView.scrollerInsets.bottom = self.bottomInset
+            }
+        }
+        // Compare typography, not resolved NSFont instances: AppKit can recreate
+        // system fonts between updates without changing the requested descriptor.
+        // A spurious change here reloads every row and drops text selections.
+        let changedFonts = self.bodyFont.fontDescriptor != bodyFont.fontDescriptor
+            || self.codeFont.fontDescriptor != codeFont.fontDescriptor
+        self.bodyFont = bodyFont
+        self.codeFont = codeFont
+        let changedTransport = self.mcpAppTransport != mcpAppTransport
+        self.mcpAppTransport = mcpAppTransport
+        if changedTransport || changedFonts {
+            measurements.removeAll(); richLayouts.removeAll(); textLayouts.removeAll()
+        }
         let changedMode = self.rawTranscript != rawTranscript
         self.rawTranscript = rawTranscript
         self.isLocalHost = isLocalHost
         self.sourcePath = sourcePath
         let changedQuery = self.findQuery != findQuery
         let changedFind = self.findQuery != findQuery || self.findHit != findHit || self.findGeneration != findGeneration
+        if changedSession || changedMode || changedFind || changedFonts { selectionActions.dismiss() }
+        if changedFind {
+            let affected = Set([self.findHit?.recordID, findHit?.recordID].compactMap { $0 })
+            for row in rows where row.records.contains(where: { affected.contains($0.id) }) {
+                measurements.removeValue(forKey: row.id)
+                textLayouts.removeValue(forKey: row.id)
+            }
+        }
         self.findQuery = findQuery
         self.findHit = findHit
         self.findGeneration = findGeneration
@@ -209,7 +310,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             applyFindPosition()
             if let requestedRecordID, appliedRequestGeneration != requestGeneration,
                let row = rowIndex(for: requestedRecordID) {
-                table.scrollRowToVisible(row)
+                // Asking for the newest row (a message the reader just sent, or
+                // "Jump to latest") also resumes following.
+                if followLatest, row == rows.count - 1 { jumpToLatest() } else { table.scrollRowToVisible(row) }
                 appliedRequestGeneration = requestGeneration
                 savePosition()
             }
@@ -227,30 +330,33 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         self.hasMore = hasMore
         self.isLoading = isLoading
         self.onLoadMore = onLoadMore
-        guard changedSession || changedMode || changedFind || self.records != records || self.provider != provider else {
+        let changedProvider = self.provider != provider
+        let rerendersAll = changedSession || changedTransport || changedFonts || changedMode || changedQuery || changedProvider
+        let finalization = prepareStreaming(records: records, isStreaming: isStreaming, rerendersAll: rerendersAll)
+        guard changedSession || changedTransport || changedFonts || changedMode || changedFind || self.records != records
+                || changedProvider || finalization != nil else {
+            if shouldFollow { scrollToEnd() }
             if changedQuery { table.reloadData() }
             return
         }
         updatingRows = true
         defer { updatingRows = false }
-        let appendOnly = !changedSession && self.provider == provider && records.starts(with: self.records)
-        let prependOnly = !changedSession && self.provider == provider
-            && records.suffix(self.records.count).elementsEqual(self.records)
+        // While a reply streams only its text changes; the conversation's
+        // grouping cannot, so the last row is replaced without regrouping.
+        let patchesLastRow = followLatest && !rerendersAll && !changedFind && !rawTranscript && findQuery.isEmpty
+            && Self.onlyLastTextChanged(from: self.records, to: records)
         let oldOrigin = scrollView.contentView.bounds.origin
         let visiblePosition = changedSession ? nil : currentPosition()
-        if appendOnly, self.records != records, let last = rows.last {
-            // The final tool/instruction group may gain records across pages.
-            measurements.removeValue(forKey: last.id)
-            textLayouts.removeValue(forKey: last.id)
-            richLayouts.removeValue(forKey: last.id)
-        }
-        findRecordBodies.removeAll(keepingCapacity: true)
         self.sessionID = sessionID
         self.records = records
         self.provider = provider
         if changedSession {
+            appliedSelectionRevealID = nil
+            revealedSelectionView = nil
             table.minimumDocumentHeight = 0
             needsInitialPosition = true
+            // The initial position decides again whether the new session follows.
+            updateFollow(.jumpToLatest)
             rawTools = self.navigation.positions[sessionID]?.rawRows ?? []
             fullBodies = self.navigation.positions[sessionID]?.fullBodies ?? []
             appliedRequestGeneration = -1
@@ -264,16 +370,330 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 expanded.insert("activity:\(activity.id)")
             }
         }
-        // Both paging directions retain unchanged layouts; rebuildRows invalidates
-        // boundary groups whose records or nesting changed.
-        rebuildRows(resetMeasurements: !(appendOnly || prependOnly) || changedMode || changedQuery)
-        if needsInitialPosition {
-            applyInitialPosition()
-        } else if let visiblePosition {
-            restore(visiblePosition)
+        let anchor: LayoutAnchor = needsInitialPosition ? .none
+            : shouldFollow ? .end : visiblePosition.map { .position($0) } ?? .origin(oldOrigin)
+        performLayoutChange(anchor: anchor) {
+            if let finalization {
+                // Seed the layouts chosen when the stream finished so the rebuild keeps them.
+                textLayouts[finalization.rowID] = finalization.textLayout
+                if let rich = finalization.richLayout { richLayouts[finalization.rowID] = rich }
+                else { richLayouts.removeValue(forKey: finalization.rowID) }
+                preservedLayoutIDs = [finalization.rowID]
+            }
+            if !(patchesLastRow && patchLastRow(with: records[records.count - 1])) {
+                // Both paging directions retain unchanged layouts; rebuildRows invalidates
+                // boundary groups whose records or nesting changed.
+                rebuildRows(resetMeasurements: rerendersAll,
+                            incrementally: followLatest && !changedTransport && !changedFonts && !changedSession && !changedProvider && !changedMode && !changedFind)
+            }
+            preservedLayoutIDs = []
+            if let stream = streamingRow, rows.last?.id != stream.rowID {
+                // Grouping moved the reply off the last row: show it rendered whole.
+                dropStreaming()
+                textLayouts.removeValue(forKey: stream.rowID)
+                richLayouts.removeValue(forKey: stream.rowID)
+                refreshRow(stream.rowID)
+            }
+            if let finalization { refreshRow(finalization.rowID) }
+        }
+        if needsInitialPosition { applyInitialPosition() }
+    }
+
+    // MARK: Streaming
+
+    /// Which record is being written while the provider runs a turn. Returns
+    /// the layouts to keep for a row that just stopped streaming.
+    private func prepareStreaming(records: [TranscriptRecord], isStreaming: Bool, rerendersAll: Bool) -> StreamingFinalization? {
+        // Every row is rendered again; a stream restarts from what is shown.
+        if rerendersAll { dropStreaming() }
+        let candidate = isStreaming && !rawTranscript && findQuery.isEmpty ? Self.streamingCandidate(records) : nil
+        var finalization: StreamingFinalization?
+        if let stream = streamingRow, candidate?.id != stream.recordID {
+            finalization = finalLayouts(for: stream, in: records)
+            dropStreaming()
+        }
+        guard let candidate else { return finalization }
+        let text = candidate.record.text
+        if let stream = streamingRow {
+            if StreamingMarkdownRenderer.utf8(text, hasPrefix: stream.target) { stream.extend(to: text, at: CACurrentMediaTime()) }
+            else { stream.restart(with: text) }
         } else {
-            scrollView.contentView.scroll(to: oldOrigin)
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            streamingRow = TranscriptStreamingRow(record: candidate, font: bodyFont)
+        }
+        if let stream = streamingRow {
+            if !pacesReveal(stream) { stream.pacer.flush() }
+            else if !stream.pacer.isComplete { startRevealClock() }
+        }
+        return finalization
+    }
+
+    /// The last record when it is an assistant reply shown as its own message.
+    private static func streamingCandidate(_ records: [TranscriptRecord]) -> TranscriptRecord? {
+        guard let last = records.last, !last.isRawOnly, last.record.role == "assistant",
+              SourceContent.blocks(last.record).isEmpty else { return nil }
+        let projected = TranscriptPresentation.project([last])
+        guard projected.count == 1, projected[0].id == last.id, projected[0].record.role == "assistant" else { return nil }
+        return projected[0]
+    }
+
+    /// One authoritative render of a finished stream. The streamed layouts stay
+    /// when they already show exactly that, so the row neither flashes nor
+    /// loses a selection; otherwise the full render replaces them.
+    private func finalLayouts(for stream: TranscriptStreamingRow, in records: [TranscriptRecord]) -> StreamingFinalization? {
+        guard let shown = stream.textLayout, !stream.requiresFullRender,
+              let source = records.last(where: { $0.id == stream.recordID }),
+              let record = TranscriptPresentation.project([source]).first(where: { $0.id == stream.recordID }) else { return nil }
+        let text = record.record.text
+        let full = TranscriptTextLayout(text: text, font: bodyFont)
+        let textLayout = shown.attributedText.isEqual(to: full.attributedText) ? shown : full
+        var richLayout: RichContentLayout?
+        if SourceContent.blocks(record.record).isEmpty, Self.mayHaveRichBlocks(text) {
+            let document = RichContentDocument(text)
+            if document.hasRichBlocks {
+                if let streamed = stream.richLayout, stream.richBlocks == document.blocks {
+                    richLayout = streamed
+                } else {
+                    let layout = RichContentLayout(blocks: document.blocks, font: bodyFont,
+                                                   context: RichContentContext(isLocalHost: isLocalHost, mcpAppTransport: mcpAppTransport))
+                    layout.adoptMaterializedView(from: stream.richLayout)
+                    richLayout = layout
+                }
+            }
+        }
+        return StreamingFinalization(rowID: stream.rowID, textLayout: textLayout, richLayout: richLayout)
+    }
+
+    private func dropStreaming() {
+        streamingRow = nil
+        stopRevealClock()
+    }
+
+    /// Lets tests drive the paced reveal without an onscreen window.
+    var pacesRevealOffscreen = false
+
+    private func pacesReveal(_ stream: TranscriptStreamingRow) -> Bool {
+        let window = view.window
+        return !stream.requiresFullRender && StreamingReveal.shouldPace(
+            windowVisible: pacesRevealOffscreen || window?.isVisible == true && window?.occlusionState.contains(.visible) == true,
+            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || AppPreferences.shared.reduceMotion,
+            findActive: !findQuery.isEmpty, userSelecting: stream.revealsAtOnce)
+    }
+
+    /// The streaming row's text and rich layouts for the revealed prefix,
+    /// rendering only what changed since the last call.
+    private func streamingPresentation(for row: Row) -> (text: TranscriptTextLayout, rich: RichContentLayout?, revision: TranscriptTextRevision?)? {
+        guard let stream = streamingRow, stream.rowID == row.id, rows.last?.id == row.id, !stream.requiresFullRender,
+              findQuery.isEmpty, !rawTranscript, !rawTools.contains(row.id) else { return nil }
+        if stream.renderedLength != stream.pacer.revealed || stream.textLayout == nil {
+            let output = stream.renderer.render(stream.displayedSource)
+            if output.requiresFullRender {
+                stream.requiresFullRender = true
+                stream.pacer.flush()
+                return nil
+            }
+            let range = TranscriptTextLayout.trimmedRange(output.text.string as NSString)
+            let trimmed = range.map { output.text.attributedSubstring(from: $0) } ?? NSAttributedString(string: "")
+            // The settled prefix survives trimming only past the leading newlines.
+            let stable = range.map { max(0, min(output.settledLength - $0.location, $0.length)) } ?? 0
+            if let layout = stream.textLayout, let revision = stream.revision, revision.generation == output.generation {
+                layout.replace(with: trimmed, unchangedPrefix: min(revision.stablePrefix, stable))
+            } else {
+                stream.textLayout = TranscriptTextLayout(rendered: trimmed, trimEdges: false)
+            }
+            stream.revision = TranscriptTextRevision(generation: output.generation, stablePrefix: stable)
+            if output.isRich {
+                let context = RichContentContext(isLocalHost: isLocalHost, mcpAppTransport: mcpAppTransport)
+                let content = stream.renderer.richContent(context: context)
+                let layout = RichContentLayout(items: content.items, context: context)
+                layout.adoptMaterializedView(from: stream.richLayout)
+                stream.richLayout = layout
+                stream.richBlocks = content.blocks
+            } else {
+                stream.richLayout = nil
+                stream.richBlocks = []
+            }
+            stream.renderedLength = stream.pacer.revealed
+        }
+        guard let text = stream.textLayout else { return nil }
+        return (text, stream.richLayout, stream.revision)
+    }
+
+    /// Moves the reveal forward on a display frame and re-lays out the row at
+    /// a rate bounded by what a layout pass costs.
+    fileprivate func advanceReveal(at time: CFTimeInterval) {
+        guard let stream = streamingRow else { stopRevealClock(); return }
+        guard pacesReveal(stream) else { flushStreamingReveal(); return }
+        let desired = stream.pacer.advance(to: time)
+        stream.pacer.commit(StreamingReveal.cut(in: stream.targetText, from: stream.pacer.revealed, toward: desired))
+        guard stream.pacer.revealed != stream.renderedLength else {
+            if stream.pacer.isComplete { stopRevealClock() }
+            return
+        }
+        guard time - stream.lastLayoutTime >= StreamingReveal.layoutInterval(forCost: stream.layoutCost) else { return }
+        applyStreamingLayout(stream, at: time)
+        if stream.pacer.isComplete { stopRevealClock() }
+    }
+
+    /// Shows all received text of the streaming row now.
+    private func flushStreamingReveal() {
+        stopRevealClock()
+        guard let stream = streamingRow else { return }
+        stream.pacer.flush()
+        if stream.renderedLength != stream.pacer.revealed { applyStreamingLayout(stream) }
+    }
+
+    private func applyStreamingLayout(_ stream: TranscriptStreamingRow, at time: CFTimeInterval = CACurrentMediaTime()) {
+        guard let index = rows.indices.last, rows[index].id == stream.rowID else { return }
+        let started = CACurrentMediaTime()
+        performLayoutChange {
+            measurements.removeValue(forKey: stream.rowID)
+            table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: index))
+            if let cell = table.view(atColumn: 0, row: index, makeIfNecessary: false) as? TranscriptCell {
+                configure(cell, row: index)
+            }
+        }
+        stream.layoutCost = CACurrentMediaTime() - started
+        stream.lastLayoutTime = time
+    }
+
+    private func startRevealClock() {
+        guard revealClock == nil else { return }
+        let clock = view.displayLink(target: TranscriptRevealClockTarget(controller: self),
+                                     selector: #selector(TranscriptRevealClockTarget.tick(_:)))
+        // Common modes keep text arriving while the reader scrolls.
+        clock.add(to: .main, forMode: .common)
+        revealClock = clock
+    }
+
+    private func stopRevealClock() {
+        revealClock?.invalidate()
+        revealClock = nil
+    }
+
+    /// Selecting in the streaming row shows all of it and stops pacing there.
+    private func readerBeganSelecting(inRow id: String) {
+        guard let stream = streamingRow, stream.rowID == id, !stream.revealsAtOnce else { return }
+        stream.revealsAtOnce = true
+        flushStreamingReveal()
+    }
+
+    /// Advances the reveal of the streaming row as a display frame would; for tests.
+    func advanceStreamingReveal(at time: CFTimeInterval) { advanceReveal(at: time) }
+    var streamingRevealedText: String? { streamingRow?.displayedSource }
+    var isFollowingLatest: Bool { follow.isFollowing }
+
+    /// Shows the latest content and follows it again.
+    func jumpToLatest() {
+        updateFollow(.jumpToLatest)
+        scrollToEnd()
+    }
+
+    // MARK: Layout changes
+
+    private enum LayoutAnchor {
+        case end
+        case position(TranscriptNavigationState.Position)
+        case origin(NSPoint)
+        case none
+    }
+
+    /// Every layout change of a live transcript goes through here: decide
+    /// follow-or-anchor before, mutate rows without animation, then pin to the
+    /// end or restore the first visible row in the same pass.
+    private func performLayoutChange(anchor explicitAnchor: LayoutAnchor? = nil, _ mutate: () -> Void) {
+        let anchor = explicitAnchor ?? (followLatest && findQuery.isEmpty && follow.shouldPin ? .end
+            : currentPosition().map { .position($0) } ?? .none)
+        let wasUpdating = updatingRows
+        updatingRows = true
+        defer { updatingRows = wasUpdating }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            mutate()
+        }
+        switch anchor {
+        case .end: scrollToEnd()
+        case .position(let position): restore(position)
+        case .origin(let origin):
+            programmaticScroll {
+                scrollView.contentView.scroll(to: origin)
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
+        case .none: break
+        }
+        updateFollow(.contentChanged)
+    }
+
+    private func programmaticScroll(_ change: () -> Void) {
+        programmaticScrolls += 1
+        defer { programmaticScrolls -= 1 }
+        change()
+    }
+
+    /// Content below the reader's viewport, in points; negative past the end.
+    private var distanceFromEnd: CGFloat {
+        guard !rows.isEmpty else { return 0 }
+        return table.rect(ofRow: rows.count - 1).maxY - (scrollView.contentView.bounds.maxY - bottomInset)
+    }
+
+    private func updateFollow(_ event: TranscriptFollowState.Event) {
+        let wasFollowing = follow.isFollowing
+        follow.handle(event)
+        guard follow.isFollowing != wasFollowing else { return }
+        let following = follow.isFollowing
+        onFollowStateChange?(following)
+        let navigation = navigation
+        Task { @MainActor in
+            if navigation.followsLatest != following { navigation.followsLatest = following }
+        }
+    }
+
+    /// Re-reads follow state after a move the controller made for the reader,
+    /// such as revealing a Find match or opening a disclosure.
+    private func noteNavigation() { updateFollow(.readerMoved(distanceFromEnd: distanceFromEnd)) }
+
+    @objc private func liveScrollBegan(_ notification: Notification) { updateFollow(.liveScrollBegan) }
+    @objc private func liveScrollEnded(_ notification: Notification) {
+        updateFollow(.liveScrollEnded(distanceFromEnd: distanceFromEnd))
+    }
+
+    /// Only the last record's text differs, as while a reply streams.
+    private static func onlyLastTextChanged(from old: [TranscriptRecord], to new: [TranscriptRecord]) -> Bool {
+        guard let before = old.last, let after = new.last, old.count == new.count, before.id == after.id,
+              before.sourceRecordID == after.sourceRecordID, before.isRawOnly == after.isRawOnly else { return false }
+        var expected = before.record
+        expected.text = after.record.text
+        return expected == after.record && old.dropLast() == new.dropLast()
+    }
+
+    /// Replaces the last message row in place when its grouping cannot change.
+    private func patchLastRow(with record: TranscriptRecord) -> Bool {
+        guard let last = rows.last, case .message(let shown) = last, shown.id == record.id,
+              let item = groupedItems.last, item.records.count == 1, item.records[0].id == record.id,
+              !item.isActivity, !item.isInstructions else { return false }
+        let projected = TranscriptPresentation.project([record])
+        guard projected.count == 1, projected[0].id == record.id else { return false }
+        groupedItems[groupedItems.count - 1] = TranscriptItem(records: projected)
+        rows[rows.count - 1] = .message(projected[0])
+        measurements.removeValue(forKey: last.id)
+        if !preservedLayoutIDs.contains(last.id) {
+            textLayouts.removeValue(forKey: last.id)
+            richLayouts.removeValue(forKey: last.id)
+        }
+        refreshRow(last.id)
+        return true
+    }
+
+    /// Re-measures one row and reconfigures its cell, keeping other cells.
+    private func refreshRow(_ id: String) {
+        guard let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        measurements.removeValue(forKey: id)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: index))
+        }
+        if let cell = table.view(atColumn: 0, row: index, makeIfNecessary: false) as? TranscriptCell {
+            configure(cell, row: index)
         }
     }
 
@@ -284,7 +704,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         updatingRows = true
         defer { updatingRows = wasUpdating }
         var opened = Set<String>()
-        if records.first(where: { $0.id == hit.recordID })?.record.isRoutineTurnBoundary == true {
+        if let record = records.first(where: { $0.id == hit.recordID }),
+           record.record.isRoutineTurnBoundary || record.isRawOnly {
             let id = "message:\(hit.recordID)"
             if expanded.insert(id).inserted { opened.insert(id) }
         }
@@ -310,40 +731,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         guard let row = rowIndex(for: hit.recordID) else { return }
         needsInitialPosition = false
         let value = measurement(at: row)
-        // Locate each record inside the displayed logical row. Input/Output
-        // labels added by pairing are not searchable transcript occurrences.
-        let rendered = value.attributedBody.string as NSString
-        var searchOffset = 0
-        selectedFindRange = nil
-        for record in rows[row].records {
-            let body: String
-            if rows[row].records.count == 1 {
-                body = value.attributedBody.string
-            } else if let cached = findRecordBodies[record.id] {
-                body = cached
-            } else {
-                body = record.record.isActivity && !record.record.isInstruction && record.record.role != "reasoning"
-                    ? ToolContentRenderer.render([record], raw: true).string
-                    : TranscriptTextLayout(text: ConversationMatcher.body(record), font: value.font).attributedText.string
-                findRecordBodies[record.id] = body
-            }
-            let section = rendered.range(of: body, options: .literal,
-                                         range: NSRange(location: searchOffset, length: rendered.length - searchOffset))
-            guard section.location != NSNotFound else { continue }
-            if record.id == hit.recordID {
-                let matches = ConversationMatcher.ranges(in: body, query: findQuery)
-                // Markdown can hide source matches (for example a link target).
-                // If occurrence counts differ, reveal the message rather than
-                // falsely selecting another visible occurrence of the same word.
-                let sourceCount = ConversationMatcher.ranges(in: ConversationMatcher.body(record), query: findQuery).count
-                if matches.count == sourceCount, matches.indices.contains(hit.occurrence) {
-                    let range = matches[hit.occurrence]
-                    selectedFindRange = NSRange(location: section.location + range.location, length: range.length)
-                }
-                break
-            }
-            searchOffset = NSMaxRange(section)
-        }
+        selectedFindRange = value.findRange
         table.scrollRowToVisible(row)
         if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: true) as? TranscriptCell,
            let range = selectedFindRange {
@@ -353,9 +741,99 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         }
         appliedFindGeneration = findGeneration
         savePosition()
+        noteNavigation()
     }
 
     private func recordID(at row: Int) -> String { rows[row].records[0].id }
+
+    func revealSelection(_ request: TranscriptSelectionReveal, completion: (String?) -> Void) {
+        guard request.transcriptKey == sessionID, appliedSelectionRevealID != request.id, !isLoading else { return }
+        appliedSelectionRevealID = request.id
+        selectionActions.dismiss()
+        // The passage may be in the reply still being revealed.
+        flushStreamingReveal()
+        revealedSelectionView?.setSelectedRange(NSRange(location: 0, length: 0))
+        revealedSelectionView = nil
+        let sourceIDs = Set(request.selection.sourceIDs)
+        let matchesSource: (TranscriptRecord) -> Bool = { sourceIDs.contains($0.sourceID) }
+        // Disclosures opened only to search for the passage are closed again
+        // unless they contain it, so a reveal does not rewrite the reader's layout.
+        var openedDisclosures = Set<String>()
+        var openedBodies = Set<String>()
+        for item in TranscriptItem.group(records) where item.records.contains(where: matchesSource) {
+            var ids: [String] = []
+            if item.isActivity || item.isInstructions { ids.append("group:\(item.id)") }
+            for activity in item.activities where activity.records.contains(where: matchesSource) {
+                ids.append("activity:\(activity.id)")
+            }
+            for record in item.records where matchesSource(record) { ids.append("message:\(record.id)") }
+            for id in ids where expanded.insert(id).inserted { openedDisclosures.insert(id) }
+        }
+        // A selected passage may live inside a previously collapsed tool result.
+        rebuildRows()
+        let candidates = rows.indices.filter { index in
+            if case .group = rows[index] { return false }
+            return rows[index].records.contains(where: matchesSource)
+        }
+        var matches: [(NSTextView, NSRange)] = []
+        var matchedRowID: String?
+        for index in candidates {
+            let id = rows[index].id
+            if fullBodies.insert(id).inserted {
+                openedBodies.insert(id)
+                measurements.removeValue(forKey: id)
+                table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: index))
+            }
+            guard let cell = table.view(atColumn: 0, row: index, makeIfNecessary: true) as? TranscriptCell else { continue }
+            configure(cell, row: index)
+            cell.layoutSubtreeIfNeeded()
+            let found = request.selection.matches(in: cell.selectionTextViews)
+            if !found.isEmpty { matchedRowID = id }
+            matches += found
+        }
+        let unique = matches.count == 1
+        var keep = Set<String>()
+        if unique, let matchedRowID, let matched = rows.first(where: { $0.id == matchedRowID }) {
+            keep.insert(matchedRowID)
+            for row in rows {
+                if case .group = row, row.records.contains(matched.records[0]) { keep.insert(row.id) }
+            }
+        }
+        let closedDisclosures = openedDisclosures.subtracting(keep)
+        let closedBodies = openedBodies.subtracting(keep)
+        if !closedDisclosures.isEmpty || !closedBodies.isEmpty {
+            expanded.subtract(closedDisclosures)
+            fullBodies.subtract(closedBodies)
+            for id in closedDisclosures.union(closedBodies) { measurements.removeValue(forKey: id) }
+            rebuildRows(regroup: false)
+            // Reloading may replace cells; locate the passage again in its row.
+            if unique, let index = rows.firstIndex(where: { $0.id == matchedRowID }),
+               let cell = table.view(atColumn: 0, row: index, makeIfNecessary: true) as? TranscriptCell {
+                configure(cell, row: index)
+                cell.layoutSubtreeIfNeeded()
+                matches = request.selection.matches(in: cell.selectionTextViews)
+            } else if unique {
+                matches = []
+            }
+        }
+        guard matches.count == 1, let (text, range) = matches.first else {
+            completion("The saved passage cannot be located uniquely in this transcript. Its captured text is still attached.")
+            return
+        }
+        needsInitialPosition = false
+        // Select without taking focus: the user is still typing in the composer.
+        text.setSelectedRange(range)
+        if let manager = text.layoutManager, let container = text.textContainer {
+            manager.ensureLayout(for: container)
+            let glyphs = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            let rect = manager.boundingRect(forGlyphRange: glyphs, in: container)
+                .offsetBy(dx: text.textContainerOrigin.x, dy: text.textContainerOrigin.y)
+            text.scrollToVisible(rect.insetBy(dx: 0, dy: -30))
+        }
+        revealedSelectionView = text
+        savePosition()
+        completion(nil)
+    }
 
     private func rowIndex(for recordID: String) -> Int? {
         // Prefer an expanded logical operation over its outer summary.
@@ -390,8 +868,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
 
     private func restore(_ position: TranscriptNavigationState.Position) {
         guard let row = rows.firstIndex(where: { $0.id == position.rowID }) ?? rowIndex(for: position.recordID) else { return }
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, table.rect(ofRow: row).minY + position.offset)))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+        programmaticScroll {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, table.rect(ofRow: row).minY + position.offset)))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
     }
 
     private func applyInitialPosition() {
@@ -399,21 +879,32 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         needsInitialPosition = false
         let wasUpdating = updatingRows
         updatingRows = true
-        defer { updatingRows = wasUpdating }
+        defer {
+            updatingRows = wasUpdating
+            noteNavigation()
+        }
         if let saved = navigation.positions[sessionID] {
             restore(saved)
         } else if let anchorID, let row = rowIndex(for: anchorID) {
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: table.rect(ofRow: row).minY))
         } else if startsAtEnd {
-            let end = table.rect(ofRow: rows.count - 1).maxY
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, end - scrollView.contentView.bounds.height)))
+            scrollToEnd()
         } else {
             scrollView.contentView.scroll(to: .zero)
         }
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
-    private func rebuildRows(resetMeasurements: Bool = false, regroup: Bool = true) {
+    private func scrollToEnd() {
+        guard !rows.isEmpty else { return }
+        let end = table.rect(ofRow: rows.count - 1).maxY + bottomInset
+        programmaticScroll {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, end - scrollView.contentView.bounds.height)))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    private func rebuildRows(resetMeasurements: Bool = false, regroup: Bool = true, incrementally: Bool = false) {
         if regroup {
             groupedItems = rawTranscript ? [] : TranscriptItem.group(records).map { entry in
                 var item = entry
@@ -421,6 +912,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 return item
             }
         }
+        let previousRows = rows
         let previous = Dictionary(rows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let openedRecords = Set(rows.filter {
             if case .activity = $0 { return expanded.contains($0.id) }
@@ -479,18 +971,39 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             for row in rows {
                 if (previous[row.id]?.records ?? measurements[row.id]?.originalRecords) != row.records {
                     measurements.removeValue(forKey: row.id)
-                    textLayouts.removeValue(forKey: row.id)
-                    richLayouts.removeValue(forKey: row.id)
+                    if !preservedLayoutIDs.contains(row.id) {
+                        textLayouts.removeValue(forKey: row.id)
+                        richLayouts.removeValue(forKey: row.id)
+                    }
                 } else if case .activity(_, let nested) = row {
                     if case .activity(_, let wasNested)? = previous[row.id], nested != wasNested {
                         measurements.removeValue(forKey: row.id)
-                    } else if let measurement = measurements[row.id], measurement.contentX != (nested ? 50 : 30) {
+                    } else if let measurement = measurements[row.id],
+                              measurement.contentX != ConversationReadingLane.origin(in: max(200, table.bounds.width)) + (nested ? 20 : 0) {
                         measurements.removeValue(forKey: row.id)
                     }
                 }
             }
         }
-        table.reloadData()
+        if incrementally, !resetMeasurements, rows.map(\.id).starts(with: previousRows.map(\.id)) {
+            // Streaming changes the last message frequently. Keep existing cells
+            // and selections intact; only measure/configure changed content.
+            let changed = IndexSet(previousRows.indices.filter { previousRows[$0].records != rows[$0].records })
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                if rows.count > previousRows.count {
+                    table.insertRows(at: IndexSet(integersIn: previousRows.count..<rows.count), withAnimation: [])
+                }
+                table.noteHeightOfRows(withIndexesChanged: changed)
+            }
+            for row in changed {
+                if let cell = table.view(atColumn: 0, row: row, makeIfNecessary: false) as? TranscriptCell {
+                    configure(cell, row: row)
+                }
+            }
+        } else {
+            table.reloadData()
+        }
     }
 
     func toggle(_ id: String) {
@@ -523,6 +1036,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         defer {
             updatingRows = wasUpdating
             savePosition()
+            // Opening something at the end of a live reply stops following it.
+            noteNavigation()
         }
         change()
         // Collapsing the final row must not clamp the clip view upward. Keep
@@ -532,7 +1047,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         measurements.removeValue(forKey: id)
         if resetText { textLayouts.removeValue(forKey: id) }
         // A tool's formatted contents do not change when hidden or shown. Keep
-        // its rich view, and refresh only this row unless a group changes membership.
+        // its rich layout, and refresh only this row unless a group changes membership.
         if case .group = rows[row] {
             rebuildRows(regroup: false)
         } else {
@@ -557,14 +1072,28 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
     @objc private func scrolled(_ notification: Notification) {
         refreshVisibleActions()
         if !updatingRows {
+            selectionActions.dismiss()
             if table.minimumDocumentHeight > scrollView.contentView.bounds.maxY {
-                table.minimumDocumentHeight = scrollView.contentView.bounds.maxY
-                let contentHeight = rows.isEmpty ? 0 : table.rect(ofRow: rows.count - 1).maxY
-                table.setFrameSize(NSSize(width: table.frame.width, height: contentHeight))
+                programmaticScroll {
+                    table.minimumDocumentHeight = scrollView.contentView.bounds.maxY
+                    let contentHeight = rows.isEmpty ? 0 : table.rect(ofRow: rows.count - 1).maxY
+                    table.setFrameSize(NSSize(width: table.frame.width, height: contentHeight))
+                }
             }
             savePosition()
         }
+        noteReaderScroll()
         loadNextPageIfNeeded()
+    }
+
+    /// Any viewport move the controller did not make is the reader's: a wheel
+    /// or trackpad gesture, the scroller, paging keys, text-selection autoscroll.
+    /// A change of viewport size (window resize, composer inset) is not.
+    private func noteReaderScroll() {
+        let size = scrollView.contentView.bounds.size
+        defer { lastClipSize = size }
+        guard programmaticScrolls == 0, !updatingRows, size == lastClipSize else { return }
+        updateFollow(.readerMoved(distanceFromEnd: distanceFromEnd))
     }
 
     @objc private func refreshVisibleActions() {
@@ -593,6 +1122,13 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         super.viewDidLayout()
         resizeRowsIfNeeded()
         applyInitialPosition()
+        // A taller or shorter window keeps a followed transcript at its end.
+        lastClipSize = scrollView.contentView.bounds.size
+        let clipHeight = scrollView.contentView.bounds.height
+        if clipHeight != lastLaidOutClipHeight {
+            lastLaidOutClipHeight = clipHeight
+            if followLatest, !needsInitialPosition, findQuery.isEmpty, follow.shouldPin { scrollToEnd() }
+        }
     }
 
     func tableViewColumnDidResize(_ notification: Notification) { resizeRowsIfNeeded() }
@@ -613,7 +1149,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 configure(cell, row: row)
             }
         }
-        if let position { restore(position) }
+        if followLatest, !needsInitialPosition, findQuery.isEmpty, follow.shouldPin { scrollToEnd() }
+        else if let position { restore(position) }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -629,6 +1166,43 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         cell.configure(measurement(at: row), toggle: { [weak self] in self?.toggle(id) },
                        toggleRaw: { [weak self] in self?.toggleRaw(id) },
                        toggleFull: { [weak self] in self?.toggleFullBody(id) })
+        cell.onDismissSelection = { [weak self] in
+            self?.selectionActions.dismiss()
+            // Called as a selection gesture begins in this row.
+            self?.readerBeganSelecting(inRow: id)
+        }
+        cell.onSelection = { [weak self, weak cell] textView in
+            guard let self, let cell, self.onAddSelection != nil,
+                  let row = self.rows.first(where: { $0.id == id }) else { return }
+            let sessionID = self.sessionID
+            let records = row.records
+            let views = cell.selectionTextViews
+            let location = views.firstIndex(where: { $0 === textView }).map {
+                TranscriptSelection.Location(viewIndex: $0, range: textView.selectedRange(), renderedRowDigest: TranscriptSelection.digest(views))
+            }
+            self.selectionActions.show(in: textView, sourceIDs: records.map(\.sourceID), location: location, isCurrent: { [weak self, weak cell] in
+                guard let self, let cell else { return false }
+                return self.sessionID == sessionID && cell.isDescendant(of: self.table)
+                    && self.rows.contains { $0.id == id && $0.records == records }
+            }, add: { [weak self] selection in
+                guard let add = self?.onAddSelection else { return "This conversation no longer accepts context." }
+                return add(selection)
+            })
+        }
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        selectionActions.dismiss()
+        // No reveal runs offscreen; show everything received.
+        flushStreamingReveal()
+    }
+
+    /// Whether expanding a record would show anything beyond its header.
+    private static func hasDetail(_ entry: TranscriptRecord) -> Bool {
+        let message = entry.record
+        return [message.text, message.toolInput, message.toolOutput].contains { $0?.nilIfBlank != nil }
+            || message.mcpAppJSON != nil || !SourceContent.blocks(message).isEmpty
     }
 
     func measurement(at index: Int) -> Measurement {
@@ -648,6 +1222,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         let indent: CGFloat
         var symbolName: String?
         var hasFailure = false
+        var isConversationMessage = false
+        var canExpand = true
         switch row {
         case .group(let item):
             title = item.activitySummary
@@ -662,7 +1238,9 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             isTool = entry.records[0].record.isActivity && entry.records[0].record.role != "reasoning"
             indent = nested ? 20 : 0
             if isExpanded { fullText = entry.body }
+            canExpand = entry.records.contains(where: Self.hasDetail)
         case .message(let entry):
+            isConversationMessage = ["user", "assistant"].contains(entry.record.role)
             isUser = !rawTranscript && entry.record.role == "user"
             isDisclosure = !rawTranscript && !["user", "assistant"].contains(entry.record.role)
             isTool = false; indent = 0
@@ -670,7 +1248,13 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 switch event {
                 case "task_complete": title = "Completed"; symbolName = "checkmark.circle"
                 case "turn_aborted": title = "Interrupted"; symbolName = "pause.circle"; hasFailure = true
+                case "turn_failed": title = "Turn failed"; symbolName = "exclamationmark.circle"; hasFailure = true
                 case "task_started": title = "Turn started"; symbolName = "clock"
+                case "context_compacted", "compact_boundary": title = "Context compacted"; symbolName = "arrow.down.right.and.arrow.up.left"
+                case "retry", "retrying": title = "Retrying"; symbolName = "arrow.clockwise"
+                case "handoff": title = "Handed off"; symbolName = "arrow.triangle.branch"
+                case "branch": title = "Conversation branch"; symbolName = "arrow.triangle.branch"
+                case "selection_change": title = "Conversation context changed"; symbolName = "arrow.triangle.branch"
                 default: title = entry.record.text; symbolName = "info.circle"
                 }
             } else {
@@ -678,62 +1262,91 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 symbolName = isDisclosure ? "doc.text" : nil
             }
             if !isDisclosure || isExpanded { fullText = entry.record.text }
+            if isDisclosure { canExpand = Self.hasDetail(entry) }
         }
         let rawMessage: Bool
         if case .activity = row { rawMessage = rawTranscript || (rawTools.contains(row.id) && !isTool) }
-        else { rawMessage = rawTranscript || rawTools.contains(row.id) }
+        else { rawMessage = rawTranscript || rawTools.contains(row.id) || row.records.contains(where: \.isRawOnly) }
         if rawMessage { fullText = row.records.map { $0.rawTranscriptBody }.joined(separator: "\n\n") }
         let body = fullText
-        let font: NSFont = isTool ? .monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 14)
-        let available = max(120, min(800, width - 60) - indent)
+        let font: NSFont = isTool ? codeFont : bodyFont
+        let laneWidth = ConversationReadingLane.width(in: width)
+        let laneX = ConversationReadingLane.origin(in: width)
+        let available = max(120, laneWidth - indent)
         let maximumContentWidth = isUser ? available * 0.77 : available
-        let showsRaw = rawMessage || rawTools.contains(row.id) || !findQuery.isEmpty
-        let attachments = !showsRaw && !isTool ? row.records.flatMap { SourceContent.blocks($0.record) } : []
-        let textLayout: TranscriptTextLayout
+        var showsRaw = rawMessage || rawTools.contains(row.id)
+        let attachments = !showsRaw && (!isTool || isExpanded) ? row.records.flatMap { SourceContent.blocks($0.record) } : []
+        let hasMcpApp = isTool && isExpanded && !ToolContentRenderer.mcpApps(row.records).isEmpty
+        let hasPartialOutput = isTool && isExpanded && row.records.contains { $0.record.outputCompleteness == "partial" }
+        var textLayout: TranscriptTextLayout
         var renderedTool: NSAttributedString?
-        if body.isEmpty { textLayout = TranscriptTextLayout(text: "", font: font) }
+        // The reply being written renders only its revealed prefix, incrementally.
+        let streamed = showsRaw || !attachments.isEmpty ? nil : streamingPresentation(for: row)
+        if let streamed { textLayout = streamed.text }
+        else if body.isEmpty { textLayout = TranscriptTextLayout(text: "", font: font) }
         else if let cached = textLayouts[row.id] { textLayout = cached }
         else if rawMessage {
-            textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: body, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular), .foregroundColor: NSColor.labelColor]), trimEdges: false)
+            textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: body, attributes: [.font: codeFont, .foregroundColor: NSColor.labelColor]), trimEdges: false)
         } else if isTool && isExpanded && !body.isEmpty {
-            let rendered = ToolContentRenderer.render(row.records, raw: showsRaw)
+            let rendered = ToolContentRenderer.render(row.records, raw: showsRaw, proseFont: bodyFont)
             renderedTool = rendered
             textLayout = TranscriptTextLayout(rendered: rendered, trimEdges: !showsRaw)
-        } else if !findQuery.isEmpty {
-            // Source-only matches (Markdown destinations and context wrappers)
-            // remain selectable at their exact occurrence in plain source text.
-            textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: body, attributes: [.font: font, .foregroundColor: NSColor.labelColor]), trimEdges: false)
         } else { textLayout = TranscriptTextLayout(text: body, font: font) }
-        if !body.isEmpty { textLayouts[row.id] = textLayout }
+        var findRange: NSRange?
+        if !findQuery.isEmpty, let hit = findHit, let record = row.records.first(where: { $0.id == hit.recordID }), !body.isEmpty {
+            let source = ConversationMatcher.body(record)
+            findRange = RenderedFindMapping.range(source: source, hit: hit.range, rendered: textLayout.attributedText.string) { token in
+                if isTool {
+                    return TranscriptTextLayout(rendered: ToolContentRenderer.render(row.records, raw: showsRaw, replacing: hit, with: token, proseFont: bodyFont), trimEdges: !showsRaw).attributedText.string
+                }
+                guard row.records.count == 1, !rawMessage else { return "" }
+                let changed = (source as NSString).replacingCharacters(in: hit.range, with: token)
+                return TranscriptTextLayout(text: changed, font: font).attributedText.string
+            }
+            if findRange == nil {
+                // This exact source occurrence has no proven readable counterpart.
+                // Reveal that record verbatim, including hidden Markdown targets,
+                // JSON escapes, opaque payloads and matches across field boundaries.
+                showsRaw = true
+                textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: source, attributes: [.font: font, .foregroundColor: NSColor.labelColor]), trimEdges: false)
+                findRange = hit.range
+            }
+        }
+        if !body.isEmpty && streamed == nil { textLayouts[row.id] = textLayout }
         let contentWidth = isUser && attachments.isEmpty
             ? min(maximumContentWidth, max(44, textLayout.width(for: maximumContentWidth - 24) + 24))
             : maximumContentWidth
-        let contentX = isUser ? width - 30 - contentWidth : 30 + indent
+        let contentX = isUser ? laneX + laneWidth - contentWidth : laneX + indent
         let bodyWidth = contentWidth - (isUser || isDisclosure ? 24 : 0)
-        var richContent: RichContentView?
-        let mayHaveRichBlocks = !PromptSections.hasOpeningSection(body) && (body.contains("```") || body.contains("~~~") || body.contains("![") || body.contains("](/") || body.contains("](file:"))
-        if !showsRaw && (!attachments.isEmpty || (!body.isEmpty && (isTool || (mayHaveRichBlocks && RichContentDocument(body).hasRichBlocks)))) {
-            if let cached = richLayouts[row.id] { richContent = cached }
+        var richLayout: RichContentLayout?
+        if let streamed {
+            richLayout = streamed.rich
+        } else if !showsRaw && findQuery.isEmpty && (hasMcpApp || hasPartialOutput || !attachments.isEmpty || (!body.isEmpty && (isTool || (Self.mayHaveRichBlocks(body) && RichContentDocument(body).hasRichBlocks)))) {
+            if let cached = richLayouts[row.id] { richLayout = cached }
             else {
-                let view = RichContentView()
+                let blocks: [RichContentBlock]
                 if isTool {
-                    view.configure(blocks: ToolContentRenderer.richBlocks(row.records, rendered: renderedTool), font: font, context: RichContentContext(isLocalHost: isLocalHost))
+                    blocks = ToolContentRenderer.richBlocks(row.records, rendered: renderedTool)
                 } else {
-                    view.configure(blocks: RichContentDocument(body).blocks + attachments, font: font, context: RichContentContext(isLocalHost: isLocalHost))
+                    blocks = RichContentDocument(body).blocks + attachments
                 }
-                richLayouts[row.id] = view
-                richContent = view
+                let layout = RichContentLayout(blocks: blocks, font: font, context: RichContentContext(isLocalHost: isLocalHost, mcpAppTransport: mcpAppTransport))
+                richLayouts[row.id] = layout
+                richLayout = layout
             }
         }
-        let fullTextHeight = richContent?.height(for: bodyWidth) ?? textLayout.height(for: bodyWidth)
-        let isLong = fullTextHeight > 440
-        let showsFullBody = fullBodies.contains(row.id) || !findQuery.isEmpty
-        let textHeight = isLong && !showsFullBody ? 360 : fullTextHeight
-        let hasBody = !body.isEmpty || richContent != nil
-        let showsRawControl = isTool && isExpanded && !body.isEmpty && !findQuery.isEmpty
-        let bodyY: CGFloat = isDisclosure ? (showsRawControl ? 74 : 44) : 16
+        let fullTextHeight = richLayout?.height(for: bodyWidth) ?? textLayout.height(for: bodyWidth)
+        // Ordinary chat messages stay expanded; only pathological ones (a pasted
+        // log or file) collapse so the reader does not lay out the whole body.
+        let collapse = isConversationMessage ? Self.longMessageCollapse : Self.longDetailCollapse
+        let isLong = fullTextHeight > collapse.threshold
+        let showsFullBody = !isLong || fullBodies.contains(row.id) || !findQuery.isEmpty
+        let textHeight = isLong && !showsFullBody ? collapse.preview : fullTextHeight
+        let hasBody = !body.isEmpty || richLayout != nil
+        let showsRawControl = isTool && isExpanded && !body.isEmpty && !findQuery.isEmpty && showsRaw
+        let bodyY: CGFloat = isDisclosure ? (showsRawControl ? 74 : 44) : 8
         let bodyBottom = bodyY + textHeight + (isUser ? 16 : 0)
-        let height: CGFloat = hasBody ? bodyBottom + (isLong ? 26 : 0) + (isDisclosure ? 12 : 0) + 4 + 18 + 10 : 38
+        let height: CGFloat = hasBody ? bodyBottom + (isLong ? 26 : 0) + (isDisclosure ? 12 : 0) + (isDisclosure ? 32 : 24) : 38
         let highlighted: NSAttributedString
         if findQuery.isEmpty {
             highlighted = textLayout.attributedText
@@ -752,10 +1365,93 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         result.showsFullBody = showsFullBody
         result.fullTextHeight = fullTextHeight
         result.originalRecords = row.records
-        result.richContent = richContent
+        result.richLayout = richLayout
+        result.findRange = findRange
         result.isLocalHost = isLocalHost
+        result.canExpand = canExpand
+        result.textRevision = streamed?.revision
         measurements[row.id] = result
         return result
+    }
+
+    /// Cheap test before parsing a message for code cards, images and file links.
+    private static func mayHaveRichBlocks(_ body: String) -> Bool {
+        !PromptSections.hasOpeningSection(body) && StreamingMarkdownRenderer.mayHaveRichPattern(body)
+    }
+}
+
+/// How much of a streaming row's text repeats its previous versions.
+struct TranscriptTextRevision: Equatable {
+    /// Identifies one run of settled blocks; prefixes compare only within it.
+    let generation: Int
+    /// UTF-16 prefix of the displayed text that later versions keep unchanged.
+    let stablePrefix: Int
+}
+
+/// The layouts a row keeps after its stream finishes.
+private struct StreamingFinalization {
+    let rowID: String
+    let textLayout: TranscriptTextLayout
+    let richLayout: RichContentLayout?
+}
+
+/// The last assistant message while the provider writes it: the full text
+/// received, the paced prefix shown, and the incremental renderer.
+@MainActor private final class TranscriptStreamingRow {
+    let rowID: String
+    let recordID: String
+    let renderer: StreamingMarkdownRenderer
+    private(set) var target: String
+    private(set) var targetText: NSString
+    var pacer: StreamingRevealPacer
+    /// Pacing stopped for this row, as when the reader selects in it.
+    var revealsAtOnce = false
+    /// The message needs the ordinary renderer; it is shown whole.
+    var requiresFullRender = false
+    var textLayout: TranscriptTextLayout?
+    var richLayout: RichContentLayout?
+    var richBlocks: [RichContentBlock] = []
+    var revision: TranscriptTextRevision?
+    /// Revealed length the layouts were rendered for.
+    var renderedLength = -1
+    var layoutCost: CFTimeInterval = 0
+    var lastLayoutTime: CFTimeInterval = 0
+
+    init(record: TranscriptRecord, font: NSFont) {
+        rowID = "message:\(record.id)"
+        recordID = record.id
+        renderer = StreamingMarkdownRenderer(font: font)
+        target = record.record.text
+        targetText = target as NSString
+        pacer = StreamingRevealPacer(length: targetText.length)
+    }
+
+    var displayedSource: String { targetText.substring(to: pacer.revealed) }
+
+    func extend(to text: String, at time: CFTimeInterval) {
+        target = text
+        targetText = text as NSString
+        pacer.extend(to: targetText.length, at: time)
+    }
+
+    /// The text was rewritten rather than appended to: show it whole. The
+    /// renderer keeps whichever settled blocks still match.
+    func restart(with text: String) {
+        target = text
+        targetText = text as NSString
+        pacer = StreamingRevealPacer(length: targetText.length)
+        renderedLength = -1
+    }
+}
+
+/// Holds the controller weakly; a display link retains its target. A link
+/// that outlives its controller stops itself on the next frame.
+@MainActor private final class TranscriptRevealClockTarget: NSObject {
+    private weak var controller: TranscriptController?
+    init(controller: TranscriptController) { self.controller = controller }
+    @objc func tick(_ link: CADisplayLink) {
+        guard let controller else { link.invalidate(); return }
+        controller.advanceReveal(at: CACurrentMediaTime())
     }
 }
 
@@ -770,10 +1466,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
 }
 
 @MainActor
-private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
+private final class TranscriptCell: NSTableCellView, NSTextViewDelegate, TranscriptSelectionTarget {
     private let disclosure = TranscriptDisclosureButton()
     private let rawDisclosure = NSButton()
-    private let message = NSTextView()
+    private let message = TranscriptSelectionTextView()
     private let bubble = NSView()
     private let activityIcon = NSImageView()
     private let detailPanel = NSView()
@@ -787,6 +1483,11 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
     private var onToggleRaw: (() -> Void)?
     private var onToggleFull: (() -> Void)?
     private var displayedText: NSAttributedString?
+    private var displayedRevision: TranscriptTextRevision?
+    private var displayedRowID: String?
+    private var displayedLocalHost = false
+    var onSelection: ((NSTextView) -> Void)?
+    var onDismissSelection: (() -> Void)?
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
@@ -851,6 +1552,18 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    func dismissSelectionActions() { onDismissSelection?() }
+    func showSelectionActions(in textView: NSTextView) { onSelection?(textView) }
+
+    var selectionTextViews: [NSTextView] {
+        func collect(_ view: NSView) -> [NSTextView] {
+            guard !view.isHidden else { return [] }
+            if let text = view as? TranscriptSelectionTextView { return [text] }
+            return view.subviews.flatMap(collect)
+        }
+        return subviews.flatMap(collect)
+    }
+
     func configure(_ value: TranscriptController.Measurement, toggle: @escaping () -> Void, toggleRaw: @escaping () -> Void,
                    toggleFull: @escaping () -> Void) {
         measurement = value
@@ -862,7 +1575,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         showAll.isEnabled = !value.finding
         refreshActions()
         rawDisclosure.isHidden = !value.showsRawControl
-        rawDisclosure.title = value.finding ? "Raw content shown for Find" : (value.showsRaw ? "Show formatted content" : "Show raw content")
+        rawDisclosure.title = value.finding && value.showsRaw ? "Raw content shown for Find" : (value.showsRaw ? "Show formatted content" : "Show raw content")
         rawDisclosure.isEnabled = !value.finding
         message.setAccessibilityLabel(value.title)
         activityIcon.isHidden = value.isDisclosure || value.symbolName == nil
@@ -873,33 +1586,57 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         detailPanel.isHidden = !value.isDisclosure || !value.hasBody
         disclosure.isHidden = !value.isDisclosure
         disclosure.title = value.title
-        disclosure.image = NSImage(systemSymbolName: value.isExpanded ? "chevron.down" : "chevron.right",
-                                   accessibilityDescription: nil)?.withSymbolConfiguration(
-                                    NSImage.SymbolConfiguration(pointSize: 10, weight: .light))
+        disclosure.image = value.canExpand
+            ? NSImage(systemSymbolName: value.isExpanded ? "chevron.down" : "chevron.right",
+                      accessibilityDescription: nil)?.withSymbolConfiguration(
+                        NSImage.SymbolConfiguration(pointSize: 10, weight: .light))
+            : nil
         disclosure.setAccessibilityLabel(value.title)
-        disclosure.setAccessibilityValue(value.isExpanded ? "Expanded" : "Collapsed")
+        disclosure.setAccessibilityValue(value.canExpand ? (value.isExpanded ? "Expanded" : "Collapsed") : nil)
         if displayedText !== value.attributedBody {
-            let rendered = NSMutableAttributedString(attributedString: value.attributedBody)
-            rendered.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: rendered.length)) { source, range, _ in
-                if value.isLocalHost, let source = source as? String {
-                    rendered.addAttributes([.link: source, .foregroundColor: NSColor.linkColor], range: range)
-                }
+            let body = value.attributedBody
+            if let revision = value.textRevision, let shown = displayedRevision, shown.generation == revision.generation,
+               displayedRowID == value.rowID, displayedLocalHost == value.isLocalHost, let storage = message.textStorage {
+                // A streaming row repeats its settled prefix: edit only the tail,
+                // so TextKit keeps the prefix's layout and a selection inside it.
+                let kept = min(shown.stablePrefix, revision.stablePrefix, storage.length, body.length)
+                let tail = Self.linked(body.attributedSubstring(from: NSRange(location: kept, length: body.length - kept)),
+                                       isLocalHost: value.isLocalHost)
+                let selection = message.selectedRange()
+                storage.replaceCharacters(in: NSRange(location: kept, length: storage.length - kept), with: tail)
+                message.setSelectedRange(NSMaxRange(selection) <= kept ? selection : NSRange(location: 0, length: 0))
+            } else {
+                message.textStorage?.setAttributedString(Self.linked(body, isLocalHost: value.isLocalHost))
+                message.setSelectedRange(NSRange(location: 0, length: 0))
             }
-            message.textStorage?.setAttributedString(rendered)
-            message.setSelectedRange(NSRange(location: 0, length: 0))
-            displayedText = value.attributedBody
+            displayedText = body
+            displayedRevision = value.textRevision
+            displayedRowID = value.rowID
+            displayedLocalHost = value.isLocalHost
         }
-        if installedRichContent !== value.richContent {
+        let richContent = value.richContent
+        if installedRichContent !== richContent {
             installedRichContent?.removeFromSuperview()
-            if let rich = value.richContent { richClip.addSubview(rich) }
-            installedRichContent = value.richContent
+            if let richContent { richClip.addSubview(richContent) }
+            installedRichContent = richContent
         }
-        richClip.isHidden = value.richContent == nil
-        message.isHidden = !value.hasBody || value.richContent != nil
+        richClip.isHidden = richContent == nil
+        message.isHidden = !value.hasBody || richContent != nil
         bubble.isHidden = !value.isUser || !value.hasBody
         updateBubbleColor()
         needsLayout = true
         message.alphaValue = 1
+    }
+
+    /// Local source locations become links only when this host can open them.
+    private static func linked(_ text: NSAttributedString, isLocalHost: Bool) -> NSAttributedString {
+        let rendered = NSMutableAttributedString(attributedString: text)
+        rendered.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: rendered.length)) { source, range, _ in
+            if isLocalHost, let source = source as? String {
+                rendered.addAttributes([.link: source, .foregroundColor: NSColor.linkColor], range: range)
+            }
+        }
+        return rendered
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -924,7 +1661,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         let actionGutter: CGFloat = value.isDisclosure ? 32 : 0
         disclosure.frame = NSRect(x: x, y: 8, width: max(0, width - actionGutter), height: 22)
         rawDisclosure.frame = NSRect(x: x + 12, y: 44, width: width - 24, height: 22)
-        let bodyY: CGFloat = value.isDisclosure ? (value.showsRawControl ? 74 : 44) : 16
+        let bodyY: CGFloat = value.isDisclosure ? (value.showsRawControl ? 74 : 44) : 8
         let inset: CGFloat = value.isUser || value.isDisclosure ? 12 : 0
         let verticalInset: CGFloat = value.isUser ? 8 : 0
         message.frame = NSRect(x: x + inset, y: bodyY + verticalInset, width: width - 2 * inset, height: value.textHeight)
@@ -936,7 +1673,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         detailPanel.frame = NSRect(x: x, y: 32, width: width, height: max(0, footerY - 4 - 32))
         showAll.frame = NSRect(x: x + inset, y: bodyBottom + 4, width: 100, height: 22)
         let actionY = value.hasBody ? footerY : 10
-        copyButton.frame = NSRect(x: x + width - 24, y: actionY - 3, width: 24, height: 24)
+        copyButton.frame = NSRect(x: x + width - 24, y: actionY - 4, width: 24, height: 24)
         refreshActions()
     }
 
@@ -952,7 +1689,10 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         message.scrollToVisible(rect.insetBy(dx: 0, dy: -30))
     }
 
-    @objc private func toggle() { onToggle?() }
+    @objc private func toggle() {
+        guard measurement?.canExpand != false else { return }
+        onToggle?()
+    }
     @objc private func toggleRaw() { onToggleRaw?() }
     @objc private func toggleFull() { onToggleFull?() }
     @objc private func copyBody() {
@@ -1049,7 +1789,7 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
 /// Retain glyph shaping across width changes and use the same TextKit settings
 /// as the displayed NSTextView. Width changes only recompute line wrapping.
 @MainActor private final class TranscriptTextLayout {
-    let attributedText: NSAttributedString
+    private(set) var attributedText: NSAttributedString
     private let storage: NSTextStorage
     private let manager = NSLayoutManager()
     private let container = NSTextContainer(size: .zero)
@@ -1061,15 +1801,10 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
     init(rendered: NSAttributedString, trimEdges: Bool = true) {
         // Markdown block separators belong between paragraphs, not at the
         // bubble edges where TextKit would measure an extra empty line.
-        let value = rendered.string as NSString
-        let content = CharacterSet.newlines.inverted
-        let first = value.rangeOfCharacter(from: content)
-        let last = value.rangeOfCharacter(from: content, options: .backwards)
         if !trimEdges {
             attributedText = rendered
-        } else if first.location != NSNotFound {
-            attributedText = rendered.attributedSubstring(from: NSRange(
-                location: first.location, length: NSMaxRange(last) - first.location))
+        } else if let range = Self.trimmedRange(rendered.string as NSString) {
+            attributedText = rendered.attributedSubstring(from: range)
         } else {
             attributedText = NSAttributedString(string: "")
         }
@@ -1079,9 +1814,29 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate {
         storage.addLayoutManager(manager)
     }
 
+    /// The text between leading and trailing newlines; nil when there is none.
+    static func trimmedRange(_ value: NSString) -> NSRange? {
+        let content = CharacterSet.newlines.inverted
+        let first = value.rangeOfCharacter(from: content)
+        guard first.location != NSNotFound else { return nil }
+        let last = value.rangeOfCharacter(from: content, options: .backwards)
+        return NSRange(location: first.location, length: NSMaxRange(last) - first.location)
+    }
+
+    /// Replaces the text after an unchanged prefix in place, so TextKit keeps
+    /// the layout of that prefix and lays out only the edited tail.
+    func replace(with value: NSAttributedString, unchangedPrefix: Int) {
+        let kept = max(0, min(unchangedPrefix, storage.length, value.length))
+        storage.replaceCharacters(in: NSRange(location: kept, length: storage.length - kept),
+                                  with: value.attributedSubstring(from: NSRange(location: kept, length: value.length - kept)))
+        attributedText = value
+    }
+
     func height(for width: CGFloat) -> CGFloat {
         guard storage.length > 0 else { return 0 }
-        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        // Reassigning an unchanged size could discard layout kept for a stream.
+        let size = NSSize(width: width, height: .greatestFiniteMagnitude)
+        if container.containerSize != size { container.containerSize = size }
         manager.ensureLayout(for: container)
         return ceil(manager.usedRect(for: container).height)
     }

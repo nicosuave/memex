@@ -5,12 +5,19 @@ import Foundation
 /// wrappers appearing after user prose remain normal message content.
 enum TranscriptPresentation {
     static func project(_ records: [TranscriptRecord]) -> [TranscriptRecord] {
-        records.flatMap { sourceEntry in
+        records.filter { !$0.isRawOnly }.flatMap { sourceEntry in
             if let reply = questionReply(sourceEntry) { return reply }
             var displayMessage = sourceEntry.record
             displayMessage.text = SourceContent.displayText(displayMessage)
             if displayMessage.role == "assistant" {
                 displayMessage.text = assistantDisplayText(displayMessage.text)
+            }
+            // Encrypted or signature-only reasoning has nothing readable to show.
+            // It remains in the raw transcript instead of an empty disclosure.
+            if displayMessage.role == "reasoning",
+               displayMessage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               SourceContent.blocks(displayMessage).isEmpty {
+                return []
             }
             let entry = TranscriptRecord(recordID: sourceEntry.id, record: displayMessage,
                                          sourceRecordID: sourceEntry.sourceRecordID,
@@ -171,6 +178,38 @@ enum TranscriptPresentation {
             guard afterHeading.hasPrefix("<INSTRUCTIONS>"),
                   let close = afterHeading.range(of: "</INSTRUCTIONS>") else { return nil }
             return (close.upperBound, "Project instructions")
+        }
+        return nil
+    }
+
+    /// A reasoning summary commonly opens with a one-line bold or Markdown
+    /// heading. Plain reasoning prose has no heading and returns nil.
+    static func reasoningHeading(_ text: String) -> String? {
+        guard let line = text.split(whereSeparator: \.isNewline)
+            .first(where: { String($0).nilIfBlank != nil })?.trimmingCharacters(in: .whitespaces) else { return nil }
+        var heading: Substring
+        if line.hasPrefix("**"), line.hasSuffix("**"), line.count > 4 {
+            heading = line.dropFirst(2).dropLast(2)
+            guard !heading.contains("**") else { return nil }
+        } else if line.hasPrefix("#") {
+            heading = line.drop(while: { $0 == "#" })
+            guard heading.first == " " else { return nil }
+        } else { return nil }
+        return String(heading).nilIfBlank?.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// What a running conversation is doing now, from its current turn: the
+    /// call still awaiting a result, else the latest reasoning heading.
+    static func liveStatus(_ records: [TranscriptRecord]) -> String? {
+        var latestRecord = true
+        for entry in records.reversed() where !entry.isRawOnly && !entry.record.isRoutineTurnBoundary {
+            let message = entry.record
+            if message.role == "user" && !message.isInstruction { return nil }
+            // Results arrive after their call, so only the latest record can still be pending.
+            if latestRecord, message.role == "tool_use",
+               let active = TranscriptActivity(records: [entry]).presentation.activeTitle { return active }
+            latestRecord = false
+            if message.role == "reasoning", let heading = reasoningHeading(message.text) { return heading }
         }
         return nil
     }

@@ -23,6 +23,26 @@ struct ActivityPresentationTests {
         }
     }
 
+    @Test func pendingCallsHaveAPresentTenseTitleForTheSameSubject() {
+        #expect(activity("Bash", input: #"{"command":"swift test"}"#).presentation.activeTitle == "Running swift test")
+        #expect(activity("Read", input: #"{"path":"a.swift"}"#).presentation.activeTitle == "Reading a.swift")
+        #expect(activity("Glob").presentation.activeTitle == "Listing files")
+        #expect(activity("apply_patch").presentation.activeTitle == "Applying patch")
+        #expect(activity("lookup_issue").presentation.activeTitle == "Using Lookup Issue")
+        #expect(activity(nil).presentation.activeTitle == nil)
+    }
+
+    @Test func reasoningIsTitledByItsSummaryHeading() {
+        func reasoning(_ text: String) -> ActivityPresentation {
+            TranscriptActivity(records: [TranscriptRecord(recordID: "r", record: Message(role: "reasoning", text: text,
+                toolName: nil, toolInput: nil, toolOutput: nil))]).presentation
+        }
+        #expect(reasoning("**Planning the fix**\n\nFirst read the file.").title == "Thought · Planning the fix")
+        #expect(reasoning("\n## Checking tests\nbody").title == "Thought · Checking tests")
+        #expect(reasoning("I should **look** at the reader first.").title == "Thought")
+        #expect(reasoning("**Bold** start then prose").title == "Thought")
+    }
+
     @Test func unknownAndExecutableInputsAreNeverInterpreted() {
         let unknown = activity("custom_magic", input: #"{"command":"delete everything","path":"secret"}"#)
         #expect(unknown.presentation.title == "Custom Magic")
