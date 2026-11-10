@@ -233,3 +233,36 @@ func liveProjectCatalogMatchesRepositorySessions() async throws {
     await old.value
     #expect(store.projects.map(\.project) == ["local project"])
 }
+
+@MainActor @Test func cancelledProjectLoadWaitsForPendingPeersWithoutPublishing() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let local = ProjectFetchGate()
+    let remote = ProjectFetchGate()
+    let catalog = ProjectCatalog(client: MemexClient(root: "/fixture-cancel-projects"), cacheDirectory: directory,
+        machineFetch: { machine in try await (machine == "local" ? local : remote).fetch() })
+    let store = Store(projectCatalog: catalog)
+    store.machines = [.local, MachineChoice(id: "nicbook-atm", label: "nicbook-atm")]
+    store.machineSelection = .all
+    var finished = false
+    let load = Task {
+        await store.loadProjects()
+        finished = true
+    }
+    await local.waitUntilStarted()
+    await remote.waitUntilStarted()
+    load.cancel()
+    await local.finish(.success(projectFixture))
+    // A peer can finish after cancellation (for example, a subprocess being
+    // reaped). The parent must wait until that peer has returned.
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(!finished)
+    #expect(store.loadingProjects)
+    #expect(store.projects.isEmpty)
+    await remote.finish(.success(projectFixture))
+    await load.value
+    #expect(finished)
+    #expect(!store.loadingProjects)
+    #expect(store.projects.isEmpty)
+    #expect(store.projectsError == nil)
+}

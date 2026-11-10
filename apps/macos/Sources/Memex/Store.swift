@@ -197,23 +197,43 @@ final class Store {
             applyProjects(snapshot)
         }
         let service = projectCatalog
-        await withTaskGroup(of: (String, String?).self) { group in
-            for machine in ids {
-                group.addTask {
-                    do { return (machine, try await service.refresh(machine: machine).cacheWarning) }
-                    catch { return (machine, error.localizedDescription) }
-                }
+        // Keep peer ownership explicit: optimized Swift 6.4 startup can destroy
+        // a project task group while cancelled requests are still finishing.
+        let updates = AsyncStream<(String, String?)>.makeStream()
+        let requests = ids.map { machine in
+            Task {
+                let error: String?
+                do { error = try await service.refresh(machine: machine).cacheWarning }
+                catch let failure { error = failure.localizedDescription }
+                updates.continuation.yield((machine, error))
             }
+        }
+        let completion = Task {
+            for request in requests { await request.value }
+            updates.continuation.finish()
+        }
+        await withTaskCancellationHandler {
             var errors: [String: String] = [:]
-            for await (machine, error) in group {
-                guard projectGeneration == generation, !Task.isCancelled else { group.cancelAll(); return }
+            for await (machine, error) in updates.stream {
+                guard projectGeneration == generation, !Task.isCancelled else {
+                    for request in requests { request.cancel() }
+                    break
+                }
                 if let error { errors[machine] = machine == "local" ? error : "\(machine): \(error)" }
                 if let snapshot = await service.combinedSnapshot(machines: ids) {
-                    guard projectGeneration == generation, !Task.isCancelled else { group.cancelAll(); return }
+                    guard projectGeneration == generation, !Task.isCancelled else {
+                        for request in requests { request.cancel() }
+                        break
+                    }
                     applyProjects(snapshot)
                 }
                 projectsError = errors.keys.sorted().compactMap { errors[$0] }.joined(separator: "\n").nilIfBlank
             }
+            // A cancelled stream stops yielding before its workers are reaped.
+            await completion.value
+        } onCancel: {
+            for request in requests { request.cancel() }
+            updates.continuation.finish()
         }
     }
 
