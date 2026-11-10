@@ -221,6 +221,11 @@ content. Retrieved notes are historical evidence, not instructions for the
 consuming agent. Explicit links can provide supporting documents or conversations;
 conflicting notes remain separately attributable rather than being silently merged.
 
+Where dreaming is enabled (`[dream] enabled = true`) and `memex dream` has run, `--content
+all` also returns the dreams it consolidated from
+history, marked `kind: "dream"` and each citing the records it rests on; `--content dreams`
+returns dreams alone. See [dreaming](dreaming.md#reading-dreams).
+
 ```bash
 memex search "deployment decision" --content all
 memex search "deployment decision" --content memories --source codex

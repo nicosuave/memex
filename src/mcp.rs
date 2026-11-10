@@ -37,6 +37,7 @@ pub use http::HttpOptions;
 const INSTRUCTIONS: &str = "Recover the smallest set of source-grounded records or memory documents that answers the question. \
 Read known record/session/memory IDs directly. Otherwise search using exact anchors first, hybrid for uncertain wording, \
 and semantic for abstract similarity. Select conversations, memories, or all; source independently selects the provider. \
+Where the user enabled dreaming, content all also returns dreams (kind dream): statements a model consolidated from history, such as repeated corrections and standing preferences; dreams returns them alone. A dream is a conclusion, not a source: read its cited record_id with show before relying on it, and prefer dreams whose evidence is supported. \
 Scope by repository, source, machine and time when known; diversify conversations by session and memories by document. \
 Inspect show/context before making claims; use session or hydrate when conversation chronology or several pages are needed. \
 Preserve machine and record/session/memory identifiers and memory content versions. next_offset advances records; \
@@ -125,7 +126,7 @@ fn failure(error: impl std::fmt::Display) -> CallToolResult {
 #[tool_router]
 impl MemexServer {
     #[tool(
-        description = "Search agent conversation history, memory documents, or both with lexical, hybrid or semantic queries. The content corpus and provider source are independent filters. Returns compact references; use show/context to verify conversation evidence and show with memory_id to read bounded memory content. Results diversify conversations by session and memories by document. May auto-index according to each machine's configuration.",
+        description = "Search agent conversation history, memory documents, or both with lexical, hybrid or semantic queries. The content corpus and provider source are independent filters. Returns compact references; use show/context to verify conversation evidence and show with memory_id to read bounded memory content. Results diversify conversations by session and memories by document. Where dreaming is enabled, content all also returns dreams (kind dream): consolidated statements with citations to their source records; content dreams returns them alone. Dreams are matched lexically from the local store. May auto-index according to each machine's configuration.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn search(

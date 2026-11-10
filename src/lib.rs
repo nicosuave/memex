@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod cli;
 pub mod config;
 pub mod daemon_runtime;
+pub mod dream;
 pub mod embed;
 mod embed_cpu;
 pub mod herdr;

@@ -115,7 +115,7 @@ versions need this change before they can run `mcp`.
 
 | Tool | Behavior |
 | --- | --- |
-| `search` | Compact hits with provenance, match snippets, selected machines, and failures. Shares CLI ranking, multi-query fusion, filters and projection. |
+| `search` | Compact hits with provenance, match snippets, selected machines, and failures. Shares CLI ranking, multi-query fusion, filters and projection. `content: "all"` also returns dreams consolidated by [`memex dream`](dreaming.md#reading-dreams) as `kind: "dream"` hits with citations; `content: "dreams"` returns them alone. |
 | `sessions` | Recent local sessions, including resumption commands as data. Reads existing analytics without auto-indexing. |
 | `show` | Direct record read; supports stable `record_id`, legacy `doc_id`, or scoped `event_id`, and continuation within a field. |
 | `context` | Anchor-first neighborhood, optionally expanding directly owned tool interactions. |

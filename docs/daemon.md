@@ -76,6 +76,13 @@ provider changes its vector size; run `memex embed` once to rebuild. Changing re
 embedding settings, such as the base URL, API key, timeout, or retries, restarts the embed
 worker. A failing embed worker is restarted with exponential backoff of up to 5 minutes.
 
+### Scheduled dreams
+
+With `[dream] enabled = true` and `auto = true`, the daemon starts `memex dream run` in a
+child process once enough new sessions have accumulated and none has been active for a
+while. Both are off by default; see [dreaming](dreaming.md#scheduling). `memex dream status` shows whether the gate
+is open.
+
 ### Reclaiming obsolete index generations
 
 After an upgrade, normal indexing automatically migrates a legacy index and removes obsolete

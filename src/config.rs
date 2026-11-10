@@ -404,6 +404,9 @@ pub struct UserConfig {
     /// Secret redaction settings.
     #[serde(default)]
     pub redaction: RedactionConfig,
+    /// Dream settings.
+    #[serde(default)]
+    pub dream: DreamConfig,
 }
 
 /// `[redaction]`: secrets removed from indexed transcript content and from content that leaves
@@ -423,6 +426,80 @@ pub struct RedactionConfig {
     /// Redact MCP HTTP responses and remote embedding requests (default true), independent
     /// of `enabled`.
     pub egress: Option<bool>,
+}
+
+/// `[dream]`: the offline pass that consolidates agent history into cited dreams. Opt-in:
+/// nothing here has any effect until `enabled = true`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct DreamConfig {
+    /// Master switch (default false). Off, no dream run starts, the daemon schedules none,
+    /// and search returns no dreams, whatever the other keys say.
+    pub enabled: Option<bool>,
+    /// Let the daemon start dream runs when the gate below opens (default false). Needs
+    /// `enabled`.
+    pub auto: Option<bool>,
+    /// Agent CLI that judges a dream run: "claude" or "codex". Unset picks whichever is on PATH.
+    pub executor: Option<String>,
+    /// Custom executor argv, replacing `executor`: prompt on stdin, answer on stdout.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Model name passed to the claude or codex CLI.
+    pub model: Option<String>,
+    /// Longest an executor run may take, in seconds (default 900).
+    pub timeout_secs: Option<u64>,
+    /// New sessions since the last dream run before the daemon starts one (default 5).
+    pub min_new_sessions: Option<usize>,
+    /// Shortest time between daemon-started runs, in hours (default 24).
+    pub min_interval_hours: Option<u64>,
+    /// Minutes without session activity before the daemon starts a run (default 30).
+    pub idle_minutes: Option<u64>,
+    /// How far back the first run reads, in days (default 7).
+    pub lookback_days: Option<u64>,
+    /// Most sessions one run reads, newest first (default 40).
+    pub max_sessions: Option<usize>,
+    /// Prompt size budget in characters (default 240000).
+    pub max_prompt_chars: Option<usize>,
+    /// Machines whose sessions a run reads (default: this machine only).
+    #[serde(default)]
+    pub machines: Vec<String>,
+}
+
+impl DreamConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn auto(&self) -> bool {
+        self.auto.unwrap_or(false)
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs.unwrap_or(900).max(10))
+    }
+
+    pub fn min_new_sessions(&self) -> usize {
+        self.min_new_sessions.unwrap_or(5).max(1)
+    }
+
+    pub fn min_interval(&self) -> Duration {
+        Duration::from_secs(self.min_interval_hours.unwrap_or(24) * 3600)
+    }
+
+    pub fn idle(&self) -> Duration {
+        Duration::from_secs(self.idle_minutes.unwrap_or(30) * 60)
+    }
+
+    pub fn lookback(&self) -> Duration {
+        Duration::from_secs(self.lookback_days.unwrap_or(7).max(1) * 86_400)
+    }
+
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions.unwrap_or(40).clamp(1, 500)
+    }
+
+    pub fn max_prompt_chars(&self) -> usize {
+        self.max_prompt_chars.unwrap_or(240_000).max(20_000)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
