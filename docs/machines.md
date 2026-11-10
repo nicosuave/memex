@@ -77,7 +77,7 @@ Without a query, each machine lists the sessions matching these filters from its
 session catalog, as `memex sessions` does; until this machine has a catalog, its sessions
 come from its newest index records. A machine too old for federated session lists
 sends its newest records instead, grouped into sessions locally; one too old to filter by
-flat project matches the repository project and has its rows filtered locally.
+flat project is asked for its unfiltered session list, which is filtered locally.
 
 ### Opening federated results
 

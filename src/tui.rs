@@ -6105,7 +6105,8 @@ fn federated_recent_sessions(
         .sessions
         .items
         .into_iter()
-        // A peer older than grouped project filters matches the repository project instead.
+        // Peers that predate grouped project filters already had their rows matched under
+        // the requested grouping; this keeps the list right if one answers differently.
         .filter(|located| {
             project
                 .is_none_or(|project| located.session.grouped_project(request.grouping) == project)
@@ -8210,6 +8211,17 @@ cat '{peers}'/"$host.response"
             ]
         );
         assert_eq!(flat("alpha-wt"), [row("mini", "mini-a", "alpha-wt", 4_000)]);
+        // The legacy peer compares the flat name against repository projects and finds
+        // nothing, so it is asked again without the filter and its rows are matched here.
+        let _ = fixture.take_ssh_log();
+        assert_eq!(
+            flat("alpha-old"),
+            [row("legacy", "legacy-a", "alpha-old", 1_500)]
+        );
+        assert_eq!(
+            fixture.take_ssh_log(),
+            ["legacy", "legacy", "mini", "offline", "old", "old"]
+        );
     }
 
     #[test]

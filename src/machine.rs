@@ -514,6 +514,10 @@ enum RpcPayload {
     },
     Sessions {
         sessions: Vec<serde_json::Value>,
+        /// Grouping the peer matched a spec's project filter under. Absent from peers that
+        /// predate grouped project filters, which match the repository project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_grouping: Option<ProjectGrouping>,
     },
     SessionCount {
         count: crate::cli::SessionCount,
@@ -2208,7 +2212,7 @@ pub(crate) fn remote_sessions(
         },
         "sessions",
     )? {
-        RpcPayload::Sessions { sessions } => Ok(sessions),
+        RpcPayload::Sessions { sessions, .. } => Ok(sessions),
         _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
     }
 }
@@ -2467,6 +2471,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                 request.origin,
                 Some(paths.root.clone()),
             )?,
+            project_grouping: None,
         }),
         RpcOperation::SessionCount { request, query } => Ok(RpcPayload::SessionCount {
             count: crate::cli::collect_session_count(paths, request, query)?,
@@ -2620,6 +2625,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                 .into_iter()
                 .map(serde_json::to_value)
                 .collect::<std::result::Result<_, _>>()?,
+            project_grouping: spec.project_grouping,
         }),
         RpcOperation::HomeActivity { request, now } => Ok(RpcPayload::HomeActivity {
             activity: crate::web::raw_activity_payload(paths, &request, now)?,
@@ -3515,6 +3521,34 @@ fn rpc_sessions(
     machine: &MachineConfig,
     spec: SessionListSpec,
 ) -> Result<Vec<SessionListing>> {
+    let flat_project = spec
+        .project
+        .clone()
+        .filter(|_| spec.project_grouping == Some(ProjectGrouping::Flat));
+    let (listings, applied_grouping) = rpc_sessions_once(paths, config, machine, spec.clone())?;
+    let Some(project) = flat_project.filter(|_| applied_grouping != Some(ProjectGrouping::Flat))
+    else {
+        return Ok(listings);
+    };
+    // A peer older than grouped project filters compared the flat name against repository
+    // projects, so its answer can miss sessions. Ask it for its unfiltered list and match
+    // the flat project here.
+    let unfiltered = SessionListSpec {
+        project: None,
+        ..spec
+    };
+    let (mut listings, _) = rpc_sessions_once(paths, config, machine, unfiltered)?;
+    listings.retain(|listing| listing.session.grouped_project(ProjectGrouping::Flat) == project);
+    Ok(listings)
+}
+
+/// One sessions request: the peer's rows and the grouping it reports having applied.
+fn rpc_sessions_once(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &MachineConfig,
+    spec: SessionListSpec,
+) -> Result<(Vec<SessionListing>, Option<ProjectGrouping>)> {
     let tags = spec.tags.clone();
     match metadata_rpc(
         paths,
@@ -3525,14 +3559,17 @@ fn rpc_sessions(
         },
         "sessions",
     )? {
-        RpcPayload::Sessions { sessions } => {
+        RpcPayload::Sessions {
+            sessions,
+            project_grouping,
+        } => {
             let mut listings = sessions
                 .into_iter()
                 .map(serde_json::from_value)
                 .collect::<std::result::Result<Vec<SessionListing>, _>>()?;
             // A peer too old to filter by tag reports none; never show its unfiltered rows.
             listings.retain(|listing| tags.iter().all(|tag| listing.session.tags.contains(tag)));
-            Ok(listings)
+            Ok((listings, project_grouping))
         }
         RpcPayload::Error { message } => Err(anyhow!("sessions failed: {message}")),
         other => Err(anyhow!("sessions returned unexpected response: {other:?}")),
@@ -5208,7 +5245,8 @@ mod tests {
             })
             .unwrap();
             let decoded: RpcOperation = serde_json::from_slice(&encoded).unwrap();
-            let RpcPayload::Sessions { sessions } = handle_rpc(&paths, &config, decoded).unwrap()
+            let RpcPayload::Sessions { sessions, .. } =
+                handle_rpc(&paths, &config, decoded).unwrap()
             else {
                 panic!("expected sessions metadata");
             };
@@ -5288,7 +5326,7 @@ mod tests {
                 limit: 10,
                 tags: Vec::new(),
             };
-            let RpcPayload::Sessions { sessions } = rpc_handler_round_trip(
+            let RpcPayload::Sessions { sessions, .. } = rpc_handler_round_trip(
                 &paths,
                 &config,
                 RpcOperation::Sessions {
