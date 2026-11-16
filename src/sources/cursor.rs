@@ -342,10 +342,7 @@ fn is_subagent_event(
         if let Some(s) = v.as_str() {
             return s.eq_ignore_ascii_case("subagent") || s.eq_ignore_ascii_case("true");
         }
-        if v.as_object().is_some() {
-            return true;
-        }
-        false
+        v.as_object().is_some()
     };
 
     for key in [
