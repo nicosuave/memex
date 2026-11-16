@@ -464,7 +464,13 @@ struct RichContentDocument {
     @objc private func horizontalScrolled() {
         if !positioning { content.horizontalOffset = scrollView.contentView.bounds.minX }
     }
-    @objc private func copyCode() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(code, forType: .string) }
+    /// Where the copy button sends the code. Tests replace it so they neither
+    /// depend on nor overwrite the system clipboard.
+    var copyToClipboard: (String) -> Void = { text in
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+    @objc private func copyCode() { copyToClipboard(code) }
 }
 
 /// Decode the bounded thumbnail once so offscreen and visible attachment heights

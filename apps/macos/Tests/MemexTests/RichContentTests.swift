@@ -171,22 +171,13 @@ import Testing
     #expect(button.frame == buttonFrame)
     _ = window.makeFirstResponder(nil)
     #expect(button.alphaValue == 0)
-    let pasteboard = NSPasteboard.general
-    let previous = (pasteboard.pasteboardItems ?? []).map { item in
-        item.types.compactMap { type in item.data(forType: type).map { (type, $0) } }
-    }
-    defer {
-        pasteboard.clearContents()
-        let items = previous.map { representations in
-            let item = NSPasteboardItem()
-            for (type, data) in representations { item.setData(data, forType: type) }
-            return item
-        }
-        pasteboard.writeObjects(items)
-    }
+    // The system clipboard is not available to every test host, and using it
+    // would overwrite whatever the developer last copied.
+    var copied: [String] = []
+    card.copyToClipboard = { copied.append($0) }
     let copyAction = try #require(button.action)
     #expect(NSApplication.shared.sendAction(copyAction, to: button.target, from: button))
-    #expect(pasteboard.string(forType: .string) == original)
+    #expect(copied == [original])
 }
 
 @MainActor @Test func codeDisplayRemovesOnlyOneTerminalNewline() {
