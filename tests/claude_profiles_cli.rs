@@ -174,6 +174,7 @@ fn default_profile_resume_clears_an_inherited_different_profile() {
             project: "tmp",
             source_path: &path,
             source_dir: "unused",
+            recorded_cwd: Some("/tmp"),
             claude_config_dir: selected,
         };
         let template = default_resume_template("claude", true).unwrap();
