@@ -374,6 +374,10 @@ EXAMPLES:
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Exit when stdin closes: the daemon's embedding worker holds a pipe from the
+        /// daemon there, which closes when the daemon exits however it exits
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Search indexed conversation history and memory
     #[command(after_help = "\
@@ -1537,7 +1541,14 @@ pub fn run() -> Result<()> {
             dry_run,
             offline,
         } => run_index_gc(root, dry_run, offline)?,
-        Commands::Embed { model, root } => {
+        Commands::Embed {
+            model,
+            root,
+            supervised,
+        } => {
+            if supervised {
+                exit_when_stdin_closes();
+            }
             run_embed(model, root)?;
         }
         Commands::Search {
@@ -2468,16 +2479,30 @@ fn retry_after_stopping_embedder<P: ChildProcess, T>(
 }
 
 fn spawn_embedding_process(index: &IndexArgs, spec: &EmbedWorkerSpec) -> Result<SystemChild> {
+    // `stop` and `Drop` end the worker when the daemon shuts down; the stdin pipe, kept
+    // open in the `Child`, ends it when the daemon dies without running either.
     Ok(SystemChild(
         Command::new(std::env::current_exe()?)
             .args(build_embed_command_args(index, &spec.model))
+            .stdin(std::process::Stdio::piped())
             .spawn()?,
     ))
+}
+
+/// Exit once stdin reaches end of file. The supervising daemon never writes to the
+/// pipe, so this happens only when its last write end closes, when the daemon exits.
+fn exit_when_stdin_closes() {
+    std::thread::spawn(|| {
+        let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+        eprintln!("embedding worker stopping: its daemon exited");
+        std::process::exit(1);
+    });
 }
 
 fn build_embed_command_args(index: &IndexArgs, model: &ModelChoice) -> Vec<String> {
     let mut args = vec![
         "embed".to_string(),
+        "--supervised".to_string(),
         "--model".to_string(),
         model.identity().into_owned(),
     ];
