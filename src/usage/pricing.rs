@@ -407,7 +407,45 @@ fn prices_for(provider: Option<&str>, model: &str) -> Option<ModelPrices> {
             return Some(claude_rates(1_000, 1_250, 2_000, 100, 5_000));
         }
     }
-    None
+    listed_prices(&provider, &model)
+}
+
+/// Models without a row above (Gemini, DeepSeek, Mistral, xAI, Bedrock, newer releases) take
+/// their provider's list price from llm-prices; ids it does not list stay unpriced.
+fn listed_prices(provider: &str, model: &str) -> Option<ModelPrices> {
+    let price = match llm_prices::Provider::parse(provider) {
+        Some(provider) => provider.lookup(model),
+        None => llm_prices::lookup(model),
+    }?;
+    let nanos = |usd: f64| (usd * 1_000_000_000.0).round() as u64;
+    let row = |input: f64, output: f64, cache_read: Option<f64>, cache_write: &[(&str, f64)]| {
+        let write = |ttl: &str| {
+            cache_write
+                .iter()
+                .find(|(k, _)| *k == ttl)
+                .map_or(input, |(_, v)| *v)
+        };
+        Rates {
+            input: nanos(input),
+            cache_read: nanos(cache_read.unwrap_or(input)),
+            cache_write_5m: nanos(write("5m")),
+            cache_write_1h: nanos(write("1h")),
+            output: nanos(output),
+        }
+    };
+    let base = row(
+        price.input?,
+        price.output?,
+        price.cache_read,
+        price.cache_write,
+    );
+    let long_prompt = price.long_context.and_then(|tier| {
+        Some(LongPromptTier {
+            above_tokens: tier.threshold_tokens,
+            rates: row(tier.input?, tier.output?, tier.cache_read, tier.cache_write),
+        })
+    });
+    Some(ModelPrices { base, long_prompt })
 }
 
 fn openai_rates(input: u64, cached: u64, output: u64) -> ModelPrices {
@@ -841,5 +879,50 @@ mod tests {
         };
         assert_eq!(event_cost_nanos(&event, CostMode::Auto), Some(0));
         assert_eq!(event_cost_nanos(&event, CostMode::Reprice), Some(300_000));
+    }
+
+    #[test]
+    fn models_outside_the_built_in_rows_bill_at_listed_prices() {
+        let cost = |provider: &str, model: &str, tokens: TokenBuckets| {
+            let mut event = cache_event("s", 0, model, 0, 0, 0);
+            event.provider = Some(provider.to_string());
+            event.tokens = tokens;
+            calculated_cost_nanos(&event)
+        };
+        // Gemini 2.5 Pro: $1.25 input, $10 output; prompts over 200K tokens bill at $2.50 / $15.
+        assert_eq!(
+            cost(
+                "google",
+                "gemini-2.5-pro",
+                TokenBuckets::disjoint(100_000, 0, 0, 100_000)
+            ),
+            Some(1_125_000_000)
+        );
+        assert_eq!(
+            cost(
+                "google",
+                "gemini-2.5-pro",
+                TokenBuckets::disjoint(1_000_000, 0, 0, 0)
+            ),
+            Some(2_500_000_000)
+        );
+        // DeepSeek V4 Pro: $3.96 output, cache reads at $0.044.
+        assert_eq!(
+            cost(
+                "deepseek",
+                "deepseek-v4-pro",
+                TokenBuckets::disjoint(0, 1_000_000, 0, 1_000_000)
+            ),
+            Some(4_004_000_000)
+        );
+        // Ids nobody lists stay unpriced.
+        assert_eq!(
+            cost(
+                "kilo",
+                "kilo/space-bunny",
+                TokenBuckets::disjoint(1_000, 0, 0, 1_000)
+            ),
+            None
+        );
     }
 }
