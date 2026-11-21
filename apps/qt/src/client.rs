@@ -365,6 +365,7 @@ fn validate_response(request: &Value, value: Value) -> Result<Value, String> {
                                     "label",
                                     "last_at",
                                     "resume_cmd",
+                                    "resume_cwd",
                                     "cwd",
                                     "snippet",
                                     "repo_project",

@@ -278,6 +278,8 @@ when `execution_provider = "cuda"`.
 
 Resume command templates accept `{session_id}`, `{project}`, `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, plus shell-quoted `{source_path_shell}`, `{source_dir_shell}`, and `{cwd_shell}`. `{claude_env}` expands to `CLAUDE_CONFIG_DIR='<dir>' ` for a local Claude session read from a configured profile, or `env -u CLAUDE_CONFIG_DIR ` for the default `~/.claude` and `~/.config/claude` directories so another account's inherited setting cannot select the wrong profile. Remote sessions and unrecognized roots leave it empty; the default Claude template uses it.
 
+`{cwd}` and `{cwd_shell}` use the original workspace when it exists, then the transcript's directory if it is outside the agent's state store, then the user's home directory. In `memex sessions` output, `cwd` is the recorded workspace and `resume_cwd` is the resolved launch directory. The built-in Claude template uses `{claude_resume_target}` to resume by session ID in the original workspace or by absolute JSONL path when it needs a fallback directory.
+
 Workflow agent transcripts may have overlapping direct and workflow copies. Indexing merges
 their unique events into one session, and token usage counts each shared response once, so
 resuming a tail-only copy preserves the history that exists only in the workflow copy.

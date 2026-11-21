@@ -4,11 +4,13 @@
 //! `claude_resume_cmd`) or derived from built-in defaults when the agent
 //! binary is on PATH. Templates expand `{session_id}`, `{project}`,
 //! `{source}`, `{source_path}`, `{source_dir}`, `{cwd}`, the shell-quoted
-//! `*_shell` variants, and `{claude_env}`.
+//! `*_shell` variants, `{claude_env}`, and `{claude_resume_target}`.
 
 use crate::config::UserConfig;
 use crate::types::SourceKind;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// Everything a template can reference about a session.
 pub struct ResumeSession<'a> {
@@ -17,6 +19,7 @@ pub struct ResumeSession<'a> {
     pub project: &'a str,
     pub source_path: &'a str,
     pub source_dir: &'a str,
+    pub recorded_cwd: Option<&'a str>,
     /// For `{claude_env}`: the local session's Claude config directory, including its defaults.
     /// Remote sessions leave this unset so the remote environment selects its own directory.
     pub claude_config_dir: Option<PathBuf>,
@@ -29,23 +32,22 @@ pub fn is_state_store_dir(dir: &str, claude_sources: &[PathBuf]) -> bool {
     crate::sources::is_state_store_dir(Path::new(dir), claude_sources)
 }
 
-/// Last-resort cwd for a resume command: the transcript's own directory when
-/// it could plausibly be a workspace, otherwise the user's home directory.
-pub fn fallback_resume_cwd(source_dir: &str, claude_sources: &[PathBuf]) -> String {
-    if !source_dir.is_empty() && !is_state_store_dir(source_dir, claude_sources) {
-        source_dir.to_string()
-    } else {
-        crate::sources::common::home()
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
 /// Select a resume directory using the environment of the machine that owns
-/// the session. Remote callers must use its result without applying local roots.
-pub fn resume_cwd(cwd: Option<String>, source_dir: &str, claude_sources: &[PathBuf]) -> String {
-    cwd.filter(|dir| !dir.is_empty() && !is_state_store_dir(dir, claude_sources))
-        .unwrap_or_else(|| fallback_resume_cwd(source_dir, claude_sources))
+/// the session. Deleted workspaces fall back to an existing transcript directory
+/// outside the agent's state store, or to the user's home.
+pub fn resume_cwd(cwd: Option<&str>, source_dir: &str, claude_sources: &[PathBuf]) -> String {
+    cwd.into_iter()
+        .chain([source_dir])
+        .find(|dir| {
+            let path = Path::new(dir);
+            path.is_absolute() && path.is_dir() && !is_state_store_dir(dir, claude_sources)
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            crate::sources::common::home()
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 /// The configured template for a source, falling back to built-in defaults.
@@ -81,9 +83,9 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
 
 pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
     match cmd {
-        "claude" if remote || find_in_path("claude").is_some() => {
-            Some("cd {cwd_shell} && {claude_env}claude --resume {session_id}".to_string())
-        }
+        "claude" if remote || find_in_path("claude").is_some() => Some(
+            "cd -- {cwd_shell} && {claude_env}claude --resume {claude_resume_target}".to_string(),
+        ),
         "codex" if remote || find_in_path("codex").is_some() => {
             Some("codex resume {session_id}".to_string())
         }
@@ -102,55 +104,76 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
             Some("copilot --resume {session_id}".to_string())
         }
         "jcode" if remote || find_in_path("jcode").is_some() => {
-            Some("cd {cwd_shell} && jcode --resume {session_id}".to_string())
+            Some("cd -- {cwd_shell} && jcode --resume {session_id}".to_string())
         }
         "muse" if remote || find_in_path("muse").is_some() => {
-            Some("cd {cwd_shell} && muse resume {session_id}".to_string())
+            Some("cd -- {cwd_shell} && muse resume {session_id}".to_string())
         }
         "grok" if remote || find_in_path("grok").is_some() => {
-            Some("cd {cwd_shell} && grok --resume {session_id}".to_string())
+            Some("cd -- {cwd_shell} && grok --resume {session_id}".to_string())
         }
         "antigravity" if remote || find_in_path("agy").is_some() => {
-            Some("cd {cwd_shell} && agy --conversation {session_id}".to_string())
+            Some("cd -- {cwd_shell} && agy --conversation {session_id}".to_string())
         }
         "antigravity" if find_in_path("antigravity").is_some() => {
-            Some("cd {cwd_shell} && antigravity --conversation {session_id}".to_string())
+            Some("cd -- {cwd_shell} && antigravity --conversation {session_id}".to_string())
         }
         "bob" if remote || find_in_path("bob").is_some() => {
-            Some("cd {cwd_shell} && bob --resume {session_id}".to_string())
+            Some("cd -- {cwd_shell} && bob --resume {session_id}".to_string())
         }
         "kilocode" if remote || find_in_path("kilo").is_some() => {
-            Some("cd {cwd_shell} && kilo --session {session_id}".to_string())
+            Some("cd -- {cwd_shell} && kilo --session {session_id}".to_string())
         }
         "kimi" if remote || find_in_path("kimi").is_some() => {
-            Some("cd {cwd_shell} && kimi --session {session_id}".to_string())
+            Some("cd -- {cwd_shell} && kimi --session {session_id}".to_string())
         }
-        "goose" if remote || find_in_path("goose").is_some() => {
-            Some("cd {cwd_shell} && goose session --resume --session-id {session_id}".to_string())
-        }
+        "goose" if remote || find_in_path("goose").is_some() => Some(
+            "cd -- {cwd_shell} && goose session --resume --session-id {session_id}".to_string(),
+        ),
         _ => None,
     }
 }
 
 pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str) -> String {
+    static PLACEHOLDER: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\{[a-z_]+\}").expect("valid placeholder pattern"));
     let session_id = match session.source {
         SourceKind::Kimi => crate::sources::kimi::resume_session_id(session.session_id),
         _ => session.session_id,
     };
-    // Session ids come from transcript content and every default template runs
-    // `{session_id}` through a shell, so an id that is not a plain word is quoted.
-    // It is expanded last so placeholders inside the id are never expanded.
-    template
-        .replace("{claude_env}", &claude_env(session))
-        .replace("{project}", session.project)
-        .replace("{source}", session.source.label())
-        .replace("{source_path_shell}", &shell_quote(session.source_path))
-        .replace("{source_path}", session.source_path)
-        .replace("{source_dir_shell}", &shell_quote(session.source_dir))
-        .replace("{source_dir}", session.source_dir)
-        .replace("{cwd_shell}", &shell_quote(cwd))
-        .replace("{cwd}", cwd)
-        .replace("{session_id}", &shell_word(session_id))
+    // Expand only the original template so braces in paths and session IDs stay literal.
+    PLACEHOLDER
+        .replace_all(template, |capture: &regex::Captures<'_>| {
+            match capture.get(0).expect("full placeholder match").as_str() {
+                "{claude_env}" => Cow::Owned(claude_env(session)),
+                "{claude_resume_target}" => claude_resume_target(session, cwd),
+                "{project}" => Cow::Borrowed(session.project),
+                "{source}" => Cow::Borrowed(session.source.label()),
+                "{source_path_shell}" => Cow::Owned(shell_quote(session.source_path)),
+                "{source_path}" => Cow::Borrowed(session.source_path),
+                "{source_dir_shell}" => Cow::Owned(shell_quote(session.source_dir)),
+                "{source_dir}" => Cow::Borrowed(session.source_dir),
+                "{cwd_shell}" => Cow::Owned(shell_quote(cwd)),
+                "{cwd}" => Cow::Borrowed(cwd),
+                "{session_id}" => shell_word(session_id),
+                _ => Cow::Owned(capture[0].to_string()),
+            }
+        })
+        .into_owned()
+}
+
+fn claude_resume_target<'a>(session: &ResumeSession<'a>, cwd: &str) -> Cow<'a, str> {
+    let transcript = Path::new(session.source_path);
+    // Claude may fail to find the UUID from a fallback cwd. Its absolute transcript
+    // path works even when the original project directory has been removed.
+    if session.recorded_cwd != Some(cwd)
+        && transcript.is_absolute()
+        && transcript.extension().is_some_and(|ext| ext == "jsonl")
+    {
+        Cow::Owned(shell_quote(session.source_path))
+    } else {
+        shell_word(session.session_id)
+    }
 }
 
 /// `value` unchanged when the shell reads it as one literal word, otherwise quoted.
@@ -243,6 +266,7 @@ mod tests {
             project: "memex",
             source_path: "/logs/it's.jsonl",
             source_dir: "/logs",
+            recorded_cwd: None,
             claude_config_dir: None,
         }
     }
@@ -321,6 +345,7 @@ mod tests {
                     project: "memex",
                     source_path: "/unused",
                     source_dir: "/unused",
+                    recorded_cwd: Some("/repo"),
                     claude_config_dir,
                 },
                 "/repo",
@@ -328,9 +353,9 @@ mod tests {
         };
         assert_eq!(
             resume(Some(PathBuf::from("/home/u/.claude-profiles/work"))),
-            "cd '/repo' && CLAUDE_CONFIG_DIR='/home/u/.claude-profiles/work' claude --resume abc"
+            "cd -- '/repo' && CLAUDE_CONFIG_DIR='/home/u/.claude-profiles/work' claude --resume abc"
         );
-        assert_eq!(resume(None), "cd '/repo' && claude --resume abc");
+        assert_eq!(resume(None), "cd -- '/repo' && claude --resume abc");
     }
 
     #[test]
@@ -340,13 +365,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_resume_targets_the_exact_transcript_when_using_a_fallback_directory() {
+        let template = default_resume_template("claude", true).unwrap();
+        let session = ResumeSession {
+            source_path: "/logs/{project}/it's.jsonl",
+            recorded_cwd: Some("/deleted"),
+            ..session()
+        };
+        assert_eq!(
+            expand_resume_template(&template, &session, "/home/u"),
+            "cd -- '/home/u' && claude --resume '/logs/{project}/it'\\''s.jsonl'"
+        );
+        assert_eq!(
+            expand_resume_template(&template, &session, "/deleted"),
+            "cd -- '/deleted' && claude --resume abc-123"
+        );
+        assert_eq!(
+            expand_resume_template("claude --resume {session_id}", &session, "/home/u"),
+            "claude --resume abc-123"
+        );
+    }
+
+    #[test]
     fn shell_quote_handles_empty_and_quotes() {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
-    fn fallback_resume_cwd_never_enters_state_stores() {
+    fn resume_uses_existing_workspaces_and_falls_back_from_state_stores() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::env_lock();
         let _env = crate::test_support::pin_source_roots(temp.path());
@@ -359,16 +406,21 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let workspace = temp.path().join("my-repo").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&brain_logs).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
         assert!(is_state_store_dir(&brain_logs, &[]));
         assert!(!is_state_store_dir(&workspace, &[]));
         // A plausible transcript directory is kept as the last resort; agent
         // state stores (and empty paths) fall back to the user's home.
-        assert_eq!(fallback_resume_cwd(&workspace, &[]), workspace);
-        assert_eq!(fallback_resume_cwd(&brain_logs, &[]), home);
-        assert_eq!(fallback_resume_cwd("", &[]), home);
+        assert_eq!(resume_cwd(Some(&workspace), &brain_logs, &[]), workspace);
+        let missing = temp.path().join("deleted").to_string_lossy().into_owned();
+        assert_eq!(resume_cwd(Some(&missing), &workspace, &[]), workspace);
+        assert_eq!(resume_cwd(Some(&missing), &brain_logs, &[]), home);
+        assert_eq!(resume_cwd(None, &missing, &[]), home);
+        assert_eq!(resume_cwd(None, "", &[]), home);
         // Configured Claude roots are state stores too.
         assert_eq!(
-            fallback_resume_cwd(&workspace, &[temp.path().join("my-repo")]),
+            resume_cwd(None, &workspace, &[temp.path().join("my-repo")]),
             home
         );
     }
@@ -398,12 +450,13 @@ mod tests {
             project: "repo",
             source_path: "/k/sessions/wd/session_a/agents/agent-0/wire.jsonl",
             source_dir: "/k/sessions/wd/session_a/agents/agent-0",
+            recorded_cwd: None,
             claude_config_dir: None,
         };
         for session_id in ["session_a", "session_a:agent-0"] {
             assert_eq!(
                 expand_resume_template(&template, &session(session_id), "/repo"),
-                "cd '/repo' && kimi --session session_a"
+                "cd -- '/repo' && kimi --session session_a"
             );
         }
     }
@@ -412,7 +465,7 @@ mod tests {
     fn remote_antigravity_default_prefers_agy() {
         assert_eq!(
             default_resume_template("antigravity", true).as_deref(),
-            Some("cd {cwd_shell} && agy --conversation {session_id}")
+            Some("cd -- {cwd_shell} && agy --conversation {session_id}")
         );
     }
 }

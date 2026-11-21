@@ -200,8 +200,11 @@ impl SessionContext {
         let path = std::path::Path::new(source_path);
         let cwd = discover_cwd(path, session_id);
         let source_dir = path.parent().unwrap_or_else(|| std::path::Path::new(""));
-        let resume_cwd =
-            crate::resume::resume_cwd(cwd.clone(), &source_dir.to_string_lossy(), claude_sources);
+        let resume_cwd = crate::resume::resume_cwd(
+            cwd.as_deref(),
+            &source_dir.to_string_lossy(),
+            claude_sources,
+        );
         Self {
             records,
             cwd,
@@ -380,6 +383,7 @@ pub struct LocatedSession {
     pub machine: String,
     pub session: SessionDetailRow,
     pub resume_cmd: Option<String>,
+    pub resume_cwd: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -388,6 +392,8 @@ struct SessionListing {
     session: SessionDetailRow,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_cmd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_cwd: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1118,6 +1124,7 @@ fn merge_sessions(
                     machine: machine.clone(),
                     session: listing.session,
                     resume_cmd: listing.resume_cmd,
+                    resume_cwd: listing.resume_cwd,
                 }
             })
         })
@@ -2672,11 +2679,12 @@ fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionLi
     Ok(rows
         .into_iter()
         .map(|session| {
-            let resume_cmd = crate::cli::session_resume_command(&config, &session, &claude_sources)
-                .map(|(command, _)| command);
+            let (resume_cmd, resume_cwd) =
+                crate::cli::session_resume_command(&config, &session, &claude_sources).unzip();
             SessionListing {
                 session,
                 resume_cmd,
+                resume_cwd,
             }
         })
         .collect())
@@ -4045,9 +4053,11 @@ mod tests {
             std::fs::create_dir_all(&store).unwrap();
             let path = store.join("session.jsonl");
             let worktree = server.join("CODEX_HOME/worktrees/24d4/memex");
+            std::fs::create_dir_all(&worktree).unwrap();
             let cases = [
                 (None, server.join("HOME")),
                 (Some(store.clone()), server.join("HOME")),
+                (Some(server.join("deleted")), server.join("HOME")),
                 (Some(worktree.clone()), worktree),
             ];
             cases
@@ -5627,6 +5637,7 @@ mod tests {
     fn session_feed_keeps_successes_and_machine_provenance() {
         let session = |id: &str, last_at: u64| SessionListing {
             resume_cmd: None,
+            resume_cwd: None,
             session: SessionDetailRow {
                 label: None,
                 conversation_kind: None,
@@ -5667,6 +5678,7 @@ mod tests {
     fn session_feed_filters_profiles_of_older_machines_before_the_limit() {
         let session = |id: &str, profile: &str, last_at: u64, reported: bool| SessionListing {
             resume_cmd: None,
+            resume_cwd: None,
             session: SessionDetailRow {
                 label: None,
                 conversation_kind: None,

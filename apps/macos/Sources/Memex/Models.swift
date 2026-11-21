@@ -9,6 +9,7 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
     var lastAt: String?
     var resumeCommand: String?
     var cwd: String?
+    var resumeCWD: String?
     var snippet: String?
     var repoProject: String?
     var machine: String?
@@ -61,6 +62,7 @@ struct Session: Decodable, Identifiable, Hashable, Sendable {
         case source, project, label, cwd, snippet, machine
         case sessionID = "session_id", sourcePath = "source_path"
         case lastAt = "last_at", resumeCommand = "resume_cmd"
+        case resumeCWD = "resume_cwd"
         case repoProject = "repo_project"
         case searchRecordID = "search_record_id"
         case messageCount = "message_count"

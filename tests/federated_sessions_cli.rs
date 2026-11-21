@@ -112,6 +112,7 @@ fn sessions_federate_exact_identities_and_keep_results_when_a_peer_fails() {
     assert_eq!(selected[1]["machine"], "local");
     assert_eq!(selected[1]["resume_cmd"], "local-resume shared");
     for row in &selected {
+        assert_eq!(row["resume_cwd"], row["cwd"]);
         assert_eq!(row["session_id"], "shared");
         assert_eq!(row["source_path"], "/shared.jsonl");
         assert_eq!(row["source"], "codex");

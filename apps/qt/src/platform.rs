@@ -30,7 +30,10 @@ fn resume_payload(session: &Value) -> Result<String, String> {
     let command = field(session, &["resume_cmd", "resume_command", "resumeCommand"])
         .filter(|value| !value.trim().is_empty())
         .ok_or("No resume command is available for this conversation.")?;
-    let cwd = field(session, &["cwd"]).filter(|value| !value.trim().is_empty());
+    let cwd = [session["resume_cwd"].as_str(), session["cwd"].as_str()]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty());
     if command.contains('\0') || cwd.is_some_and(|value| value.contains('\0')) {
         return Err("The resume command or working directory is invalid.".into());
     }
@@ -485,6 +488,19 @@ mod tests {
             resume(remote, "missing".into())
                 .unwrap_err()
                 .contains("nicbook-atm")
+        );
+    }
+
+    #[test]
+    fn resume_uses_resolved_cwd_when_the_recorded_workspace_is_gone() {
+        let session = json!({
+            "resume_cmd": "claude --resume abc",
+            "cwd": "/deleted",
+            "resume_cwd": "/fallback"
+        });
+        assert_eq!(
+            resume_payload(&session).unwrap(),
+            "cd -- '/fallback' || exit\nclaude --resume abc"
         );
     }
 
