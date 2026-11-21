@@ -2494,7 +2494,8 @@ fn spawn_embedding_process(index: &IndexArgs, spec: &EmbedWorkerSpec) -> Result<
 fn exit_when_stdin_closes() {
     std::thread::spawn(|| {
         let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
-        eprintln!("embedding worker stopping: its daemon exited");
+        // The daemon's stderr may be gone too; a failed write must not stop the exit.
+        let _ = writeln!(io::stderr(), "embedding worker stopping: its daemon exited");
         std::process::exit(1);
     });
 }
