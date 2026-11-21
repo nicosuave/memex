@@ -12,7 +12,7 @@ private func resumableSession(machine: String = "local", command: String? = "cod
     let command = "CUSTOM=value codex resume 'a b' --flag; printf '%s' \"$CUSTOM\""
     let cwd = "/tmp/a'b $(touch nope)\nline"
     let session = resumableSession(command: command, cwd: cwd)
-    let launch = "/bin/zsh -lic " + ResumeLaunchPlan.shellQuote("cd -- " + ResumeLaunchPlan.shellQuote(cwd) + " || exit\n" + command)
+    let launch = "/bin/zsh -lic " + ResumeLaunchPlan.shellQuote("builtin cd -- " + ResumeLaunchPlan.shellQuote(cwd) + " || exit\n" + command)
     for destination in [ResumeDestination.ghostree, .ghostty, .terminal] {
         let plan = try ResumeLaunchPlan(session: session, destination: destination)
         #expect(plan.destination == destination)
@@ -26,6 +26,14 @@ private func resumableSession(machine: String = "local", command: String? = "cod
             #expect(plan.script.contains("wait after command:true"))
         }
     }
+}
+
+@Test func resumeLaunchUsesResolvedDirectoryInsteadOfHistoricalWorkspace() throws {
+    let session = try JSONDecoder().decode(Session.self, from: Data(
+        #"{ "source": "claude", "session_id": "abc", "source_path": "/transcript", "project": "project", "resume_cmd": "claude --resume abc", "cwd": "/deleted", "resume_cwd": "/fallback" }"#.utf8
+    ))
+    #expect(session.cwd == "/deleted")
+    #expect(try ResumeLaunchPlan.payload(for: session) == "builtin cd -- '/fallback' || exit\nclaude --resume abc")
 }
 
 @Test func resumeRejectsRemoteMissingAndInvalidCommands() {

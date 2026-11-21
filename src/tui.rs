@@ -594,7 +594,7 @@ struct App {
     active_project_request: u64,
     results: Vec<SessionSummary>,
     sessions_state: LoadState,
-    sessions_since: Option<u64>,
+    timeline_drill_down_range: Option<TimelineRange>,
     active_search_request: u64,
     pending_home_search: Option<Instant>,
     selected: ListState,
@@ -1052,7 +1052,7 @@ impl App {
             active_project_request: 0,
             results: Vec::new(),
             sessions_state: LoadState::Idle,
-            sessions_since: None,
+            timeline_drill_down_range: None,
             active_search_request: 0,
             pending_home_search: None,
             selected: ListState::default(),
@@ -1135,7 +1135,13 @@ impl App {
     }
 
     fn home_chart_uses_search_results(&self) -> bool {
-        !self.query.trim().is_empty()
+        !self.query.trim().is_empty() || !split_project_filter(&self.project).1.is_empty()
+    }
+
+    fn search_since(&self, now: u64) -> Option<u64> {
+        self.timeline_drill_down_range
+            .unwrap_or(self.home_activity_range)
+            .since_ms(now)
     }
 
     fn home_chart_activity(&self) -> &[HomeChartPoint] {
@@ -1351,7 +1357,6 @@ impl App {
         self.sessions_state = LoadState::Loading;
         self.last_spinner_at = Instant::now();
         let query = self.query.trim().to_string();
-        let query_is_empty = query.is_empty();
         self.set_status("searching...");
         let request = SearchRequest {
             request_id,
@@ -1359,7 +1364,7 @@ impl App {
             project: self.project.trim().to_string(),
             machines: self.selected_machines(),
             source: self.source,
-            since: self.sessions_since,
+            since: self.search_since(now_ms()),
             grouping: self.project_display.grouping(),
             kind: self.session_kind,
         };
@@ -1369,7 +1374,7 @@ impl App {
             if refresh_home_tokens {
                 self.home_token_activity_state = LoadState::Error(message);
             }
-        } else if refresh_home_tokens && query_is_empty {
+        } else if refresh_home_tokens && !self.home_chart_uses_search_results() {
             self.kickoff_home_token_activity();
         }
     }
@@ -1558,7 +1563,7 @@ impl App {
                 }),
             };
         });
-        if refresh_tokens {
+        if refresh_tokens && !self.home_chart_uses_search_results() {
             self.kickoff_home_token_activity();
         }
     }
@@ -1580,7 +1585,9 @@ impl App {
         let source = self.source.as_filter();
         let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
-        let session_keys = home_token_session_keys(&self.query, &self.results);
+        let session_keys = self
+            .home_chart_uses_search_results()
+            .then(|| home_token_session_keys(&self.results));
         let local_session_keys = session_keys.as_ref().map(|keys| {
             keys.iter()
                 .filter(|(machine, _, _)| machine == LOCAL_MACHINE_ID)
@@ -1853,9 +1860,6 @@ impl App {
                     .get(idx)
                     .copied()
                     .unwrap_or(TimelineRange::Month);
-                // The timeframe filters the chart and the recent list alike:
-                // sync the list's `since` bound (All clears it back to None).
-                self.sessions_since = self.home_activity_range.since_ms(now_ms());
                 true
             }
             HomeDropdown::Machine => {
@@ -1937,13 +1941,13 @@ impl App {
     }
 
     fn go_home(&mut self) {
-        let had_session_range = self.sessions_since.take().is_some();
+        let had_drill_down_range = self.timeline_drill_down_range.take().is_some();
         self.layout_mode = LayoutMode::Home;
         self.focus = Focus::Query;
         self.quick_popup = false;
         self.quick_lines.clear();
         self.close_home_dropdown();
-        if !self.query.is_empty() || !self.find_query.is_empty() || had_session_range {
+        if !self.query.is_empty() || !self.find_query.is_empty() || had_drill_down_range {
             self.query.clear();
             self.find_query.clear();
             self.kickoff_search();
@@ -1970,7 +1974,7 @@ impl App {
         if self.home_chart_mode != HomeChartMode::Tokens {
             return;
         }
-        if !self.query.trim().is_empty() {
+        if self.home_chart_uses_search_results() {
             match &self.sessions_state {
                 LoadState::Loading => {
                     self.invalidate_home_token_activity();
@@ -2105,7 +2109,7 @@ impl App {
                 self.update_detail();
                 if self.layout_mode == LayoutMode::Home
                     && self.home_chart_mode == HomeChartMode::Tokens
-                    && !self.query.trim().is_empty()
+                    && self.home_chart_uses_search_results()
                 {
                     if self.results.is_empty() {
                         self.invalidate_home_token_activity();
@@ -2166,7 +2170,7 @@ impl App {
                 self.sessions_state = LoadState::Error(message.clone());
                 if self.layout_mode == LayoutMode::Home
                     && self.home_chart_mode == HomeChartMode::Tokens
-                    && !self.query.trim().is_empty()
+                    && self.home_chart_uses_search_results()
                 {
                     self.invalidate_home_token_activity();
                     self.home_token_activity_state = LoadState::Error(message.clone());
@@ -2528,7 +2532,7 @@ impl App {
         self.session_kind = kind;
         self.query = query;
         self.project = project;
-        self.sessions_since = range.since_ms(now_ms());
+        self.timeline_drill_down_range = Some(range);
         self.layout_mode = LayoutMode::List;
         self.focus = Focus::List;
         self.quick_popup = false;
@@ -2642,7 +2646,8 @@ impl App {
             self.set_status("resume command not configured in config.toml");
             return Ok(());
         };
-        let cwd = if remote {
+        let claude_sources = self.config.claude_sources();
+        let (cwd, recorded_cwd) = if remote {
             let context = match session_context(
                 &self.paths,
                 &self.config,
@@ -2662,13 +2667,15 @@ impl App {
                 );
                 return Ok(());
             };
-            cwd
+            (cwd, context.cwd)
         } else {
-            crate::resume::resume_cwd(
-                resolve_session_cwd(&session),
+            let recorded_cwd = resolve_session_cwd(&session);
+            let cwd = crate::resume::resume_cwd(
+                recorded_cwd.as_deref(),
                 &session.source_dir,
-                &self.config.claude_sources(),
-            )
+                &claude_sources,
+            );
+            (cwd, recorded_cwd)
         };
         // Only this machine's roots locate a config directory; a remote session resumes in the
         // remote environment's own.
@@ -2677,11 +2684,23 @@ impl App {
                 crate::resume::claude_config_dir(
                     session.source,
                     &session.source_path,
-                    &self.config.claude_sources(),
+                    &claude_sources,
                 )
             })
             .flatten();
-        let local_command = expand_resume_template(&template, &session, &cwd, claude_config_dir);
+        let local_command = crate::resume::expand_resume_template(
+            &template,
+            &crate::resume::ResumeSession {
+                source: session.source,
+                session_id: &session.session_id,
+                project: &session.project,
+                source_path: &session.source_path,
+                source_dir: &session.source_dir,
+                recorded_cwd: recorded_cwd.as_deref(),
+                claude_config_dir,
+            },
+            &cwd,
+        );
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)
                 .ok_or_else(|| anyhow::anyhow!("unknown machine '{}'", session.machine))?;
@@ -2772,7 +2791,7 @@ impl App {
                 }
             }
         }
-        run_external_command(self, terminal, &command)?;
+        run_external_command(self, terminal, &command, (!remote).then_some(cwd.as_str()))?;
         self.set_status(format!("ran: {command}"));
         Ok(())
     }
@@ -3943,22 +3962,17 @@ fn home_token_usage_query(
     }
 }
 
-fn home_token_session_keys(
-    query: &str,
-    sessions: &[SessionSummary],
-) -> Option<HashSet<(String, String, String)>> {
-    (!query.trim().is_empty()).then(|| {
-        sessions
-            .iter()
-            .map(|session| {
-                (
-                    session.machine.clone(),
-                    session.source.label().to_string(),
-                    session.session_id.clone(),
-                )
-            })
-            .collect()
-    })
+fn home_token_session_keys(sessions: &[SessionSummary]) -> HashSet<(String, String, String)> {
+    sessions
+        .iter()
+        .map(|session| {
+            (
+                session.machine.clone(),
+                session.source.label().to_string(),
+                session.session_id.clone(),
+            )
+        })
+        .collect()
 }
 
 fn activity_count_in_bounds(points: &[HomeChartPoint], bounds: (u64, u64)) -> usize {
@@ -6346,33 +6360,20 @@ fn build_detail_lines_from_records(
     Ok(lines)
 }
 
-fn expand_resume_template(
-    template: &str,
-    session: &SessionSummary,
-    cwd: &str,
-    claude_config_dir: Option<PathBuf>,
-) -> String {
-    crate::resume::expand_resume_template(
-        template,
-        &crate::resume::ResumeSession {
-            source: session.source,
-            session_id: &session.session_id,
-            project: &session.project,
-            source_path: &session.source_path,
-            source_dir: &session.source_dir,
-            claude_config_dir,
-        },
-        cwd,
-    )
-}
-
-fn run_external_command(app: &mut App, terminal: &mut TuiTerminal, command: &str) -> Result<()> {
+fn run_external_command(
+    app: &mut App,
+    terminal: &mut TuiTerminal,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<()> {
     app.restore_stdio()?;
     exit_terminal(terminal)?;
-    let status = std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(command)
-        .status();
+    let mut shell = std::process::Command::new("sh");
+    shell.args(["-lc", command]);
+    if let Some(cwd) = cwd {
+        shell.current_dir(cwd);
+    }
+    let status = shell.status();
     match status {
         Ok(status) => {
             println!("command exited with {status}");
@@ -8693,10 +8694,18 @@ cat '{peers}'/"$host.response"
     }
 
     #[test]
-    fn tui_starts_on_home_with_search_focused() {
-        let (_tmp, app) = test_app();
+    fn tui_starts_on_home_with_search_focused_and_uses_the_displayed_range() {
+        let (_tmp, mut app) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.search_request_tx = tx;
+        let now = now_ms();
+        app.kickoff_search();
         assert_eq!(app.layout_mode, LayoutMode::Home);
         assert!(matches!(app.focus, Focus::Query));
+        assert_eq!(app.home_activity_range, TimelineRange::Month);
+        let since = rx.try_recv().unwrap().since.unwrap();
+        assert!(since >= TimelineRange::Month.since_ms(now).unwrap());
+        assert!(since <= TimelineRange::Month.since_ms(now_ms()).unwrap());
     }
 
     #[test]
@@ -8833,12 +8842,13 @@ cat '{peers}'/"$host.response"
         app.layout_mode = LayoutMode::Split;
         app.focus = Focus::List;
         app.query = "foo".to_string();
-        app.sessions_since = Some(123);
+        app.timeline_drill_down_range = Some(TimelineRange::All);
         app.go_home();
         assert_eq!(app.layout_mode, LayoutMode::Home);
         assert!(matches!(app.focus, Focus::Query));
         assert!(app.query.is_empty());
-        assert_eq!(app.sessions_since, None);
+        assert_eq!(app.timeline_drill_down_range, None);
+        assert_eq!(app.search_since(0), app.home_activity_range.since_ms(0));
     }
 
     #[test]
@@ -8910,7 +8920,7 @@ cat '{peers}'/"$host.response"
     }
 
     #[test]
-    fn home_chart_uses_full_activity_unless_a_text_query_is_active() {
+    fn home_chart_uses_search_results_for_text_and_tags() {
         let (_tmp, mut app) = test_app();
         app.home_activity = vec![HomeChartPoint {
             source: SourceKind::Claude,
@@ -8932,6 +8942,12 @@ cat '{peers}'/"$host.response"
         );
 
         app.query.clear();
+        app.project = "#release".into();
+        assert_eq!(
+            app.home_chart_activity(),
+            app.home_result_activity.as_slice()
+        );
+        app.project.clear();
         app.source = SourceChoice::Codex;
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
 
@@ -9205,13 +9221,12 @@ cat '{peers}'/"$host.response"
             },
         ];
 
-        let keys = home_token_session_keys("needle", &sessions).expect("session keys");
+        let keys = home_token_session_keys(&sessions);
 
         assert!(keys.contains(&("local".into(), "codex".into(), "shared".into())));
         assert!(keys.contains(&("local".into(), "claude".into(), "shared".into())));
         assert!(keys.contains(&("mini".into(), "codex".into(), "shared".into())));
         assert_eq!(keys.len(), 3);
-        assert!(home_token_session_keys("  ", &sessions).is_none());
     }
 
     #[test]
@@ -9420,7 +9435,7 @@ cat '{peers}'/"$host.response"
 
         // "All" clears the list's `since` bound and restarts the search.
         assert_eq!(app.home_activity_range, TimelineRange::All);
-        assert_eq!(app.sessions_since, None);
+        assert_eq!(app.search_since(123), None);
         assert_ne!(app.active_search_request, 7);
         assert_eq!(app.home_activity_state, LoadState::Loading);
 
@@ -9429,9 +9444,8 @@ cat '{peers}'/"$host.response"
         app.move_home_dropdown_selection(-2);
         app.apply_home_dropdown();
         assert_eq!(app.home_activity_range, TimelineRange::Week);
-        let since = app.sessions_since.expect("bounded range sets since");
         let now = now_ms();
-        assert!(since <= now && since > now.saturating_sub(8 * 86_400_000));
+        assert_eq!(app.search_since(now), TimelineRange::Week.since_ms(now));
     }
 
     #[test]
@@ -9817,7 +9831,7 @@ cat '{peers}'/"$host.response"
         assert_eq!(app.session_kind, crate::analytics::SessionKindFilter::All);
         assert_eq!(app.source, SourceChoice::Claude);
         assert_eq!(app.project_display, ProjectDisplayMode::Flat);
-        assert!(app.sessions_since.is_some());
+        assert_eq!(app.timeline_drill_down_range, Some(TimelineRange::Week));
     }
 
     #[test]

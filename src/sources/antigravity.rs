@@ -1800,12 +1800,13 @@ mod tests {
             project: &record.project,
             source_path: &record.source_path,
             source_dir: path.parent().unwrap().to_str().unwrap(),
+            recorded_cwd: Some("/repo"),
             claude_config_dir: None,
         };
         let template = crate::resume::default_resume_template("antigravity", true).unwrap();
         assert_eq!(
             crate::resume::expand_resume_template(&template, &session, "/repo"),
-            "cd '/repo' && agy --conversation e2a4562b-5476-4222-84bf-5110195946bf"
+            "cd -- '/repo' && agy --conversation e2a4562b-5476-4222-84bf-5110195946bf"
         );
     }
 

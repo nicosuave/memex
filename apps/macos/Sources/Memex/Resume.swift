@@ -56,20 +56,28 @@ struct ResumeLaunchPlan: Equatable, Sendable {
     let destination: ResumeDestination
     let script: String
 
+    static func workingDirectory(for session: Session) -> String? {
+        session.resumeCWD?.nilIfBlank ?? session.cwd?.nilIfBlank
+    }
+
     static func unavailableReason(for session: Session) -> String? {
         if session.machineID != "local" { return "Resume is available on the session’s machine (\(session.machineID))." }
         guard let command = session.resumeCommand?.nilIfBlank else { return "No resume command is available for this conversation." }
-        if command.contains("\0") || session.cwd?.contains("\0") == true { return "The resume command or working directory is invalid." }
+        let cwd = workingDirectory(for: session)
+        if command.contains("\0") || cwd?.contains("\0") == true { return "The resume command or working directory is invalid." }
         return nil
     }
 
+    static func payload(for session: Session) throws -> String {
+        if let reason = unavailableReason(for: session) { throw ResumeError(message: reason) }
+        let cwd = workingDirectory(for: session)
+        return (cwd.map { "builtin cd -- \(shellQuote($0)) || exit\n" } ?? "") + session.resumeCommand!
+    }
+
     init(session: Session, destination: ResumeDestination) throws {
-        if let reason = Self.unavailableReason(for: session) { throw ResumeError(message: reason) }
         // The CLI owns the configured shell command. Treat it as one shell argument;
         // never reconstruct a command from IDs, source paths, labels or snippets.
-        let cwd = session.cwd?.nilIfBlank
-        let payload = (cwd.map { "cd -- \(Self.shellQuote($0)) || exit\n" } ?? "") + session.resumeCommand!
-        let launch = "/bin/zsh -lic " + Self.shellQuote(payload)
+        let launch = "/bin/zsh -lic " + Self.shellQuote(try Self.payload(for: session))
         self.destination = destination
         switch destination {
         case .terminal:
@@ -176,12 +184,20 @@ struct ResumeError: LocalizedError {
             do {
                 if destination == .chatgpt {
                     try await ChatGPTResume.open(session)
-                } else if let adapter = destination.terminalAdapter, let url = destination.appURL {
-                    if let reason = ResumeLaunchPlan.unavailableReason(for: session) { throw ResumeError(message: reason) }
-                    let payload = (session.cwd?.nilIfBlank.map { "cd -- \(ResumeLaunchPlan.shellQuote($0)) || exit\n" } ?? "") + session.resumeCommand!
-                    try await adapter.launch(payload: payload, appURL: url).run()
                 } else {
-                    try await ResumeLaunchPlan(session: session, destination: destination).run()
+                    var launchSession = session
+                    if let cwd = ResumeLaunchPlan.workingDirectory(for: session) {
+                        var isDirectory: ObjCBool = false
+                        if !FileManager.default.fileExists(atPath: cwd, isDirectory: &isDirectory) || !isDirectory.boolValue {
+                            launchSession = try await store.client.sessionDetails(for: session)
+                        }
+                    }
+                    if let adapter = destination.terminalAdapter, let url = destination.appURL {
+                        let payload = try ResumeLaunchPlan.payload(for: launchSession)
+                        try await adapter.launch(payload: payload, appURL: url).run()
+                    } else {
+                        try await ResumeLaunchPlan(session: launchSession, destination: destination).run()
+                    }
                 }
             } catch {
                 let alert = NSAlert()

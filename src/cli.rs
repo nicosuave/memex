@@ -5787,7 +5787,7 @@ pub(crate) fn session_resume_command(
     let source_dir = source_dir_of(&row.source_path);
     // Transcript stores are never workspaces: falling back into one makes the
     // resumed CLI ask the user to trust an agent's internal state directory.
-    let cwd = crate::resume::resume_cwd(row.cwd.clone(), &source_dir, claude_sources);
+    let cwd = crate::resume::resume_cwd(row.cwd.as_deref(), &source_dir, claude_sources);
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {
@@ -5796,6 +5796,7 @@ pub(crate) fn session_resume_command(
             project: &row.project,
             source_path: &row.source_path,
             source_dir: &source_dir,
+            recorded_cwd: row.cwd.as_deref(),
             claude_config_dir: crate::resume::claude_config_dir(
                 row.source,
                 &row.source_path,
@@ -5855,13 +5856,15 @@ fn run_sessions(
     let mut items = Vec::new();
     for located in result.items {
         let row = located.session;
-        let resume_cmd = located.resume_cmd;
         let mut value = serde_json::to_value(&row)?;
         value["machine"] = Value::String(located.machine);
         value["started_at"] = Value::String(format_ts(row.started_at));
         value["last_at"] = Value::String(format_ts(row.last_at));
-        if let Some(command) = resume_cmd {
+        if let Some(command) = located.resume_cmd {
             value["resume_cmd"] = Value::String(command);
+        }
+        if let Some(cwd) = located.resume_cwd {
+            value["resume_cwd"] = Value::String(cwd);
         }
         items.push(value);
     }
@@ -5921,8 +5924,6 @@ pub(crate) fn collect_sessions(
 
     let mut items = Vec::new();
     for row in &rows {
-        let resume_cmd =
-            session_resume_command(&config, row, &claude_sources).map(|(command, _)| command);
         let mut value = serde_json::to_value(row)?;
         let object = value
             .as_object_mut()
@@ -5932,8 +5933,11 @@ pub(crate) fn collect_sessions(
             Value::String(format_ts(row.started_at)),
         );
         object.insert("last_at".into(), Value::String(format_ts(row.last_at)));
-        if let Some(resume_cmd) = resume_cmd {
+        if let Some((resume_cmd, resume_cwd)) =
+            session_resume_command(&config, row, &claude_sources)
+        {
             object.insert("resume_cmd".into(), Value::String(resume_cmd));
+            object.insert("resume_cwd".into(), Value::String(resume_cwd));
         }
         items.push(value);
     }
@@ -6123,6 +6127,7 @@ fn resume_target(
 /// Outside a terminal multiplexer, run the resume command directly.
 fn run_resume_inline(target: &ResumeTarget) -> Result<()> {
     let status = std::process::Command::new("sh")
+        .current_dir(&target.cwd)
         .args(["-lc", &target.command])
         .status()?;
     if !status.success() {
