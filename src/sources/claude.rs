@@ -1811,6 +1811,7 @@ mod tests {
             ("/work/cafe\u{301}", "-work-cafe-"),
             // Windows separators and drive colons are ordinary non-alphanumeric characters.
             ("/work/C:\\Users\\nico", "-work-C--Users-nico"),
+            // Not traced (no Windows run): derived from the same rule as the case above.
             ("C:\\Users\\nico\\Code\\memex", "C--Users-nico-Code-memex"),
         ];
         for (cwd, expected) in cases {
