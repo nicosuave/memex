@@ -1,5 +1,6 @@
 use crate::config::default_claude_source;
 use crate::index::SearchIndex;
+use crate::sources::claude::claude_project_dir;
 use crate::types::{Record, SourceFilter, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -783,12 +784,11 @@ fn write_claude_session_jsonl(
     target_session_id: &str,
     dry_run: bool,
 ) -> Result<PathBuf> {
+    let project_dir = claude_project_dir(&conversation.cwd.to_string_lossy());
     let dir = if dry_run {
-        memex_transfer_dir()?
-            .join("claude")
-            .join(sanitize_claude_cwd(&conversation.cwd))
+        memex_transfer_dir()?.join("claude").join(project_dir)
     } else {
-        claude_projects_dir()?.join(sanitize_claude_cwd(&conversation.cwd))
+        claude_projects_dir()?.join(project_dir)
     };
     fs::create_dir_all(&dir).with_context(|| {
         format!(
@@ -1794,19 +1794,6 @@ fn sanitize_pi_cwd(cwd: &Path) -> String {
     format!("--{}--", normalized.replace('/', "-"))
 }
 
-fn sanitize_claude_cwd(cwd: &Path) -> String {
-    let normalized = cwd
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_matches('/')
-        .to_string();
-    if normalized.is_empty() {
-        "-".to_string()
-    } else {
-        format!("-{}", normalized.replace('/', "-"))
-    }
-}
-
 fn sanitize_cursor_cwd(cwd: &Path) -> String {
     let normalized = cwd
         .to_string_lossy()
@@ -2067,18 +2054,6 @@ mod tests {
         assert_eq!(
             pi_resume_command(Path::new("/tmp/My Project/session file.jsonl")),
             "pi --session '/tmp/My Project/session file.jsonl'"
-        );
-    }
-
-    #[test]
-    fn claude_sanitizes_cwd_like_projects_dir() {
-        assert_eq!(
-            sanitize_claude_cwd(Path::new("/Users/nico/Code/memex")),
-            "-Users-nico-Code-memex"
-        );
-        assert_eq!(
-            sanitize_claude_cwd(Path::new("C:\\Users\\nico\\Code\\memex")),
-            "-C:-Users-nico-Code-memex"
         );
     }
 

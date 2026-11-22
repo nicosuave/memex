@@ -591,6 +591,49 @@ fn decode_project_name(folder_name: &str) -> String {
     }
 }
 
+/// Longest project directory name Claude Code uses before it appends a hash.
+const PROJECT_DIR_MAX: usize = 200;
+
+/// Claude Code's directory name below `projects` for a working directory, as Claude Code
+/// 2.1.330 computes it: every UTF-16 code unit that is not an ASCII letter or digit becomes
+/// `-`, and a name longer than 200 is cut to 200 and followed by `-` and the base-36 absolute
+/// value of the Java-style 32-bit string hash of the directory.
+pub fn claude_project_dir(cwd: &str) -> String {
+    let units: Vec<u16> = cwd.encode_utf16().collect();
+    let name: String = units
+        .iter()
+        .map(|&unit| match u8::try_from(unit) {
+            Ok(byte) if byte.is_ascii_alphanumeric() => char::from(byte),
+            _ => '-',
+        })
+        .collect();
+    if name.len() <= PROJECT_DIR_MAX {
+        return name;
+    }
+    let hash = units.iter().fold(0i32, |hash, &unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    });
+    format!(
+        "{}-{}",
+        &name[..PROJECT_DIR_MAX],
+        base36(hash.unsigned_abs())
+    )
+}
+
+fn base36(mut value: u32) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut digits = Vec::new();
+    loop {
+        digits.push(char::from(DIGITS[(value % 36) as usize]));
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_iter(digits)
+}
+
 /// Index of the `projects` component that roots a Claude transcript path. Encoded cwd
 /// directories start with `-`, so the last component named `projects` is the root's.
 fn projects_component(path: &Path) -> Option<usize> {
@@ -1750,6 +1793,61 @@ fn choose_usage(left: &UsageEvent, right: &UsageEvent) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Expected names are the directories Claude Code 2.1.330 looked in for each working
+    /// directory, observed by tracing `claude -p --resume` on Linux.
+    #[test]
+    fn project_dirs_match_what_claude_code_uses() {
+        let cases = [
+            ("/work/plain", "-work-plain"),
+            ("/work/my.app_x", "-work-my-app-x"),
+            ("/work/a b", "-work-a-b"),
+            ("/home/a/.claude", "-home-a--claude"),
+            ("/", "-"),
+            // One dash per UTF-16 code unit: é is one unit, the astral 𝄞 two, and a
+            // decomposed e + U+0301 keeps the e and is not normalised.
+            ("/work/caf\u{e9}", "-work-caf-"),
+            ("/work/\u{1d11e}", "-work---"),
+            ("/work/cafe\u{301}", "-work-cafe-"),
+            // Windows separators and drive colons are ordinary non-alphanumeric characters.
+            ("/work/C:\\Users\\nico", "-work-C--Users-nico"),
+            ("C:\\Users\\nico\\Code\\memex", "C--Users-nico-Code-memex"),
+        ];
+        for (cwd, expected) in cases {
+            assert_eq!(claude_project_dir(cwd), expected, "{cwd:?}");
+        }
+    }
+
+    #[test]
+    fn long_project_dirs_are_cut_and_hashed_like_claude_code() {
+        let exactly_200 = format!("/work/{}", "a".repeat(194));
+        assert_eq!(
+            claude_project_dir(&exactly_200),
+            format!("-work-{}", "a".repeat(194))
+        );
+        let cases = [
+            (
+                format!("/work/{}", "a".repeat(195)),
+                format!("-work-{}-9suycy", "a".repeat(194)),
+            ),
+            (
+                format!("/work/{}/{}", "a".repeat(120), "b".repeat(123)),
+                format!("-work-{}-{}-kvy58e", "a".repeat(120), "b".repeat(73)),
+            ),
+            // The hash runs over UTF-16 code units, including both halves of 𝄞.
+            (
+                format!(
+                    "/work/{}/{}/\u{1d11e}\u{1d11e}",
+                    "x".repeat(100),
+                    "\u{e9}".repeat(100)
+                ),
+                format!("-work-{}{}-5jt2sd", "x".repeat(100), "-".repeat(94)),
+            ),
+        ];
+        for (cwd, expected) in cases {
+            assert_eq!(claude_project_dir(&cwd), expected, "{cwd:?}");
+        }
+    }
 
     #[test]
     fn discovery_always_includes_agent_transcripts() {
