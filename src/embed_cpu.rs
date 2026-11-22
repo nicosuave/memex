@@ -7,9 +7,9 @@
 //! This builds the session with [`AutoDevicePolicy::PreferCPU`] and otherwise mirrors
 //! fastembed's `TextEmbedding::embed`, reusing its output selection and pooling.
 
+use crate::embed_download::model_repo;
 use anyhow::{Context, Result, anyhow};
 use fastembed::{EmbeddingModel, OutputKey, Pooling, SingleBatchOutput, TextEmbedding};
-use hf_hub::api::sync::{ApiBuilder, ApiRepo};
 use ndarray::Array2;
 use ort::session::Session;
 use ort::session::builder::{AutoDevicePolicy, GraphOptimizationLevel};
@@ -150,18 +150,6 @@ impl CpuTextEmbedding {
             attention_mask_array,
         })
     }
-}
-
-/// Open the model repo in `cache_dir`, laid out as fastembed lays out its cache.
-fn model_repo(model_code: &str, cache_dir: &Path) -> Result<ApiRepo> {
-    let endpoint =
-        std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-    let api = ApiBuilder::new()
-        .with_cache_dir(cache_dir.to_path_buf())
-        .with_endpoint(endpoint)
-        .with_progress(false)
-        .build()?;
-    Ok(api.model(model_code.to_string()))
 }
 
 /// Same padding, truncation and special tokens as fastembed's `load_tokenizer`.

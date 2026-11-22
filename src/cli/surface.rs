@@ -232,7 +232,11 @@ impl Commands {
                     offline,
                 },
                 IndexCommand::Compact { root } => Self::IndexCompact { root },
-                IndexCommand::Embed { model, root } => Self::Embed { model, root },
+                IndexCommand::Embed { model, root } => Self::Embed {
+                    model,
+                    root,
+                    supervised: false,
+                },
                 IndexCommand::Stats { json, root, output } => Self::Stats { json, root, output },
             },
             Self::Web {

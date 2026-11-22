@@ -5,6 +5,7 @@ pub mod daemon_runtime;
 pub mod dream;
 pub mod embed;
 mod embed_cpu;
+mod embed_download;
 pub mod herdr;
 pub mod index;
 pub mod ingest;

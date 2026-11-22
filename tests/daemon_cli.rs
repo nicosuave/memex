@@ -1,13 +1,59 @@
 use reqwest::blocking::Client;
 use serde_json::json;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MCP_PROTOCOL: &str = "2025-11-25";
+
+/// Model cache every child shares: the checkout's ignored `.fastembed_cache`, which the
+/// unit tests also download into. Only the first use on a machine downloads a model.
+fn shared_model_cache() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(".fastembed_cache")
+}
+
+/// Download `bge` into the shared cache once, before an embedding test starts its
+/// deadlines. Concurrent first downloads would fail: hf-hub gives up on another
+/// process's download lock after about five seconds.
+fn warm_shared_model_cache() {
+    static WARM: OnceLock<()> = OnceLock::new();
+    WARM.get_or_init(|| {
+        let dirs = TestDirs::new();
+        dirs.write_config("auto_index_on_search = false\n");
+        std::fs::write(
+            dirs.claude.path().join("session.jsonl"),
+            MINIMAL_CLAUDE_LINE,
+        )
+        .unwrap();
+        let root = dirs.root.path().to_str().unwrap();
+        let mut seed = ChildGuard::spawn(
+            &dirs,
+            &[
+                "index",
+                "--root",
+                root,
+                "--only-source",
+                "claude",
+                "--claude-path",
+                dirs.claude.path().to_str().unwrap(),
+                "--no-embeddings",
+            ],
+        );
+        assert!(seed.wait_for_exit().success(), "{}", seed.diagnostics());
+        let mut embed = ChildGuard::spawn(&dirs, &["embed", "--model", "bge", "--root", root]);
+        // A cold cache downloads about 130 MB here; later runs only load the model.
+        let status = embed.wait_for_exit_within(Duration::from_secs(600));
+        assert!(
+            status.success(),
+            "could not prepare the shared model cache: {}",
+            embed.diagnostics()
+        );
+    });
+}
 
 struct TestDirs {
     root: tempfile::TempDir,
@@ -40,13 +86,15 @@ impl ChildGuard {
         Self::spawn_with_env(dirs, args, &[])
     }
 
-    fn spawn_with_env(dirs: &TestDirs, args: &[&str], environment: &[(&str, &Path)]) -> Self {
+    fn spawn_with_env(dirs: &TestDirs, args: &[&str], environment: &[(&str, &OsStr)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
         command
             .arg("--no-update-check")
             .args(args)
             .env("HOME", dirs.home.path())
             .env("CLAUDE_CONFIG_DIR", dirs.claude.path())
+            // Daemons pass their environment on to embedding workers.
+            .env("HF_HOME", shared_model_cache())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -90,7 +138,11 @@ impl ChildGuard {
     }
 
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        self.wait_for_exit_within(Duration::from_secs(15))
+    }
+
+    fn wait_for_exit_within(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("inspect Memex child") {
                 return status;
@@ -759,7 +811,7 @@ fn daemon_event_mode_indexes_held_open_wal_without_resync() {
             "--poll-interval",
             "3600",
         ],
-        &[("OPENCODE_DATA_DIR", source.path())],
+        &[("OPENCODE_DATA_DIR", source.path().as_os_str())],
     );
     wait_for_session_text(&mut daemon, dirs.root.path(), "before WAL commit");
     let before = std::fs::metadata(&database).unwrap();
@@ -793,6 +845,7 @@ fn daemon_embedding_worker_tracks_new_records_in_events_and_poll_modes() {
     use memex::vector::VectorIndex;
     use std::io::Write;
 
+    warm_shared_model_cache();
     for mode in ["events", "poll"] {
         let dirs = TestDirs::new();
         dirs.write_config("auto_index_on_search = false\n");
@@ -875,6 +928,7 @@ fn poll_daemon_reaps_worker_for_deletion_and_resumes_after_shutdown() {
     use memex::vector::VectorIndex;
     use memex::vector_backfill;
 
+    warm_shared_model_cache();
     let dirs = TestDirs::new();
     dirs.write_config("auto_index_on_search = false\n");
     let original = dirs.claude.path().join("original.jsonl");
@@ -1046,6 +1100,7 @@ fn daemon_embeds_memory_only_startup_and_edits_without_conversation_changes() {
     use memex::config::Paths;
     use memex::vector::VectorIndex;
 
+    warm_shared_model_cache();
     for mode in ["events", "poll"] {
         let dirs = TestDirs::new();
         dirs.write_config("auto_index_on_search = false\n");
@@ -1120,6 +1175,80 @@ fn daemon_embeds_memory_only_startup_and_edits_without_conversation_changes() {
                 .success()
         );
         assert!(daemon.wait_for_exit().success());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_daemon_does_not_leave_its_embedding_worker_downloading() {
+    use memex::config::Paths;
+
+    let dirs = TestDirs::new();
+    dirs.write_config("auto_index_on_search = false\n");
+    std::fs::write(
+        dirs.claude.path().join("session.jsonl"),
+        MINIMAL_CLAUDE_LINE,
+    )
+    .unwrap();
+    // The worker's model download connects here and never gets an answer.
+    let stalled_hub = TcpListener::bind("127.0.0.1:0").unwrap();
+    stalled_hub.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", stalled_hub.local_addr().unwrap());
+    let empty_cache = tempfile::tempdir().unwrap();
+    let mut daemon = ChildGuard::spawn_with_env(
+        &dirs,
+        &[
+            "daemon",
+            "run",
+            "--root",
+            dirs.root.path().to_str().unwrap(),
+            "--only-source",
+            "claude",
+            "--claude-path",
+            dirs.claude.path().to_str().unwrap(),
+            "--embeddings",
+            "--model",
+            "bge",
+            "--poll-interval",
+            "1",
+            "--watch-mode",
+            "poll",
+        ],
+        &[
+            ("HF_HOME", empty_cache.path().as_os_str()),
+            ("HF_ENDPOINT", OsStr::new(&endpoint)),
+            ("NO_PROXY", OsStr::new("*")),
+        ],
+    );
+    let paths = Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let _download = loop {
+        daemon.assert_running();
+        match stalled_hub.accept() {
+            Ok((connection, _)) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("stalled hub failed: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "embedding worker did not start its model download: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(memex::lease::is_embedding_held(&paths));
+
+    // SIGKILL leaves the daemon no chance to stop its worker itself.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while memex::lease::is_embedding_held(&paths) {
+        assert!(
+            Instant::now() < deadline,
+            "embedding worker outlived its killed daemon: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

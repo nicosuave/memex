@@ -895,6 +895,8 @@ impl EmbedderHandle {
                 // availability probe, so this is where ONNX Runtime gets loaded.
                 init_onnx_runtime()?;
                 let cache_dir = runtime.resolved_model_cache_dir()?;
+                // Download within time limits first; both loaders below then read the cache.
+                crate::embed_download::ensure_model_files(model_type, &cache_dir)?;
                 let effective_provider = runtime.execution_provider.effective();
                 if effective_provider == ExecutionProviderChoice::Cpu {
                     return Ok(Self {
