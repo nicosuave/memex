@@ -271,6 +271,10 @@ plus the durable per-session event revision when `event_sequence` is available.
 Without that revision, same-count replacements or edits that leave both maxima
 unchanged require an index rebuild; direct middle-row deletions are detected.
 
+Tool calls in `message`/`part` sessions are indexed as a `tool_use` record holding the
+input and, once the tool has finished, a `tool_result` record holding its output or error.
+Legacy JSON storage does not index tool calls.
+
 The default scan indexes Pi sessions from `~/.pi/agent/sessions` and Oh My Pi sessions
 separately from `~/.omp/agent/sessions` plus named profile session directories.
 
