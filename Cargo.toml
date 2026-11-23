@@ -46,6 +46,7 @@ signal-hook = "0.3"
 simd-json = { version = "0.13", features = ["serde"] }
 tantivy = { version = "0.22", features = ["quickwit"] }
 usearch = "2"
+llm-prices = "1.8.0"
 toml = "0.8"
 toml_edit = "0.22"
 walkdir = "2.5"
