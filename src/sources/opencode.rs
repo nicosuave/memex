@@ -33,7 +33,8 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// cursors must be re-derived once.
 /// v4 removes legacy resurrection, splits tool records, and strengthens change detection.
 /// v6 drops synthetic and ignored v1 text parts, so every v1 session must rehydrate once.
-pub const DATABASE_STATE_VERSION: u32 = 6;
+/// v7 indexes v1 tool parts as `tool_use`/`tool_result` records, so they rehydrate once more.
+pub const DATABASE_STATE_VERSION: u32 = 7;
 
 pub fn matches_path(path: &str) -> bool {
     (path.contains("opencode/storage/message") || path.contains("opencode\\storage\\message"))
@@ -950,27 +951,83 @@ fn session_links_from_value(value: &BorrowedValue<'_>) -> SessionLinks {
 }
 
 /// What one v1 part (legacy JSON file or SQLite `part` row) contributes to the transcript.
-enum PartText<'a> {
+enum PartContent<'a> {
     Text(&'a str),
     Reasoning(&'a str),
+    Tool(PartTool),
     Skip,
+}
+
+/// The call recorded by one v1 `tool` part and, once the tool has finished, its result.
+#[derive(Debug)]
+struct PartTool {
+    call_id: Option<String>,
+    name: String,
+    input: Option<String>,
+    output: Option<String>,
+    is_error: bool,
 }
 
 /// Mirrors OpenCode's own projection: only `text` parts are conversation text, and of those,
 /// `synthetic` ones are injected by OpenCode itself while `ignored` ones are withheld from the
-/// model, so neither is indexed. Reasoning is returned separately so callers can make it opt-in.
-fn classify_part<'a>(part: &'a BorrowedValue<'_>) -> PartText<'a> {
+/// model, so neither is indexed. Reasoning and tool calls are returned separately so callers
+/// can make reasoning opt-in and give each call its own records.
+fn classify_part<'a>(part: &'a BorrowedValue<'_>) -> PartContent<'a> {
     let flag = |key: &str| part.get(key).and_then(|value| value.as_bool()) == Some(true);
     let text = part.get("text").and_then(|value| value.as_str());
     match part.get("type").and_then(|kind| kind.as_str()) {
         Some("text") if !flag("synthetic") && !flag("ignored") => text
             .filter(|text| !text.is_empty())
-            .map_or(PartText::Skip, PartText::Text),
+            .map_or(PartContent::Skip, PartContent::Text),
         Some("reasoning") => text
             .map(str::trim)
             .filter(|text| !text.is_empty())
-            .map_or(PartText::Skip, PartText::Reasoning),
-        _ => PartText::Skip,
+            .map_or(PartContent::Skip, PartContent::Reasoning),
+        Some("tool") => part_tool(part).map_or(PartContent::Skip, PartContent::Tool),
+        _ => PartContent::Skip,
+    }
+}
+
+/// Read upstream's v1 `ToolPart`: `tool` and `callID` beside a `state` whose `status` is
+/// `pending`, `running`, `completed` or `error`. Every status carries `input`; only a completed
+/// call has `output` and only a failed one has `error`, so a call still in flight yields no
+/// result. A part with none of these fields contributes nothing.
+fn part_tool(part: &BorrowedValue<'_>) -> Option<PartTool> {
+    let name = v2_string_field(part, "tool");
+    let state = part.get("state");
+    let state_text = |key: &str| {
+        state
+            .and_then(|state| state.get(key))
+            .and_then(part_value_text)
+    };
+    let input = state_text("input");
+    let is_error = state
+        .and_then(|state| state.get("status"))
+        .and_then(|status| status.as_str())
+        == Some("error");
+    let output = state_text("output")
+        .or_else(|| state_text("error"))
+        .or_else(|| is_error.then(|| "[tool error]".to_string()));
+    if name.is_none() && input.is_none() && output.is_none() {
+        return None;
+    }
+    Some(PartTool {
+        call_id: v2_string_field(part, "callID"),
+        name: name.unwrap_or_else(|| "unknown".to_string()),
+        input,
+        output,
+        is_error,
+    })
+}
+
+/// A string as written, any other non-null JSON value in its serialized form.
+fn part_value_text(value: &BorrowedValue<'_>) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    match value.as_str() {
+        Some(text) => Some(text.to_string()),
+        None => serde_json::to_string(value).ok(),
     }
 }
 
@@ -1054,11 +1111,12 @@ pub(crate) fn parse_index_records(
                 continue;
             };
             match classify_part(&part) {
-                PartText::Text(text) => text_parts.push(text.to_string()),
-                PartText::Reasoning(text) if include_reasoning => {
+                PartContent::Text(text) => text_parts.push(text.to_string()),
+                PartContent::Reasoning(text) if include_reasoning => {
                     reasoning_parts.push(text.to_string());
                 }
-                PartText::Reasoning(_) | PartText::Skip => {}
+                // Tool calls are indexed only from the SQLite store.
+                PartContent::Reasoning(_) | PartContent::Tool(_) | PartContent::Skip => {}
             }
         }
         for (index, text) in reasoning_parts.into_iter().enumerate() {
@@ -1120,6 +1178,20 @@ struct ModernMessage {
     timestamp: u64,
     role: String,
     text_parts: Vec<String>,
+    tools: Vec<ModernTool>,
+}
+
+/// One `tool` part of a v1 message, kept with the `part` row id that identifies it.
+#[derive(Debug)]
+struct ModernTool {
+    part_id: String,
+    tool: PartTool,
+}
+
+/// The indexed content of one v1 `part` row.
+enum ModernPart {
+    Text(String),
+    Tool(PartTool),
 }
 
 /// Project one modern SQLite session into records.  This is kept separate from the legacy
@@ -1249,7 +1321,7 @@ fn collect_modern_messages(
     let mut current: Option<ModernMessage> = None;
     let mut malformed_message_ids = HashSet::new();
     for row in rows {
-        let (message_id, timestamp, message_data, _part_id, part_data) = row?;
+        let (message_id, timestamp, message_data, part_id, part_data) = row?;
         if current
             .as_ref()
             .is_some_and(|message| message.id != message_id)
@@ -1283,26 +1355,28 @@ fn collect_modern_messages(
                 timestamp,
                 role,
                 text_parts: Vec::new(),
+                tools: Vec::new(),
             });
         }
-        let text = match parse_modern_value(part_data, |value| {
+        let part = match parse_modern_value(part_data, |value| {
             Ok(match classify_part(value) {
-                PartText::Text(text) => Some(text.to_string()),
-                PartText::Reasoning(_) | PartText::Skip => None,
+                PartContent::Text(text) => Some(ModernPart::Text(text.to_string())),
+                PartContent::Tool(tool) => Some(ModernPart::Tool(tool)),
+                PartContent::Reasoning(_) | PartContent::Skip => None,
             })
         })? {
-            ModernJson::Valid(text) => text,
+            ModernJson::Valid(part) => part,
             ModernJson::Malformed => {
                 diagnostics.malformed_json_lines += 1;
                 continue;
             }
         };
-        let Some(text) = text else { continue };
-        current
-            .as_mut()
-            .expect("current message was initialized")
-            .text_parts
-            .push(text);
+        let message = current.as_mut().expect("current message was initialized");
+        match part {
+            Some(ModernPart::Text(text)) => message.text_parts.push(text),
+            Some(ModernPart::Tool(tool)) => message.tools.push(ModernTool { part_id, tool }),
+            None => {}
+        }
     }
     if let Some(message) = current {
         messages.push(message);
@@ -1352,6 +1426,10 @@ fn enumerate_session_from_connection(
     }))
 }
 
+/// Emit one v1 message: its joined text, then each tool call in part order as a `tool_use`
+/// record and, once the tool has finished, a `tool_result` record in the same turn. This is the
+/// form the KiloCode and ZCode parsers give the same part shape. Queries match only `text`, so
+/// it carries the call's input and the result's output.
 fn emit_modern_message(
     message: ModernMessage,
     session_id: &str,
@@ -1361,27 +1439,63 @@ fn emit_modern_message(
     next_doc_id: &AtomicU64,
     emit: &mut impl FnMut(Record) -> Result<()>,
 ) -> Result<()> {
-    if message.text_parts.is_empty() {
-        return Ok(());
-    }
-    let mut record_links = links.record_links();
-    record_links.event_id = Some(message.id);
-    emit(Record {
+    let ModernMessage {
+        id: message_id,
+        timestamp,
+        role,
+        text_parts,
+        tools,
+    } = message;
+    let source_path = path.to_string_lossy().to_string();
+    let record = |role: &str, text: String, links: RecordLinks, turn_id: u32| Record {
         source: SourceKind::Opencode,
         doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
-        ts: message.timestamp,
+        ts: timestamp,
         project: "opencode".to_string(),
         session_id: session_id.to_string(),
-        turn_id: *turn_id,
-        role: message.role,
-        text: message.text_parts.join("\n"),
+        turn_id,
+        role: role.to_string(),
+        text,
         tool_name: None,
         tool_input: None,
         tool_output: None,
-        links: record_links,
-        source_path: path.to_string_lossy().to_string(),
-    })?;
-    *turn_id = turn_id.saturating_add(1);
+        links,
+        source_path: source_path.clone(),
+    };
+    if !text_parts.is_empty() {
+        let mut text_links = links.record_links();
+        text_links.event_id = Some(message_id);
+        emit(record(&role, text_parts.join("\n"), text_links, *turn_id))?;
+        *turn_id = turn_id.saturating_add(1);
+    }
+    for ModernTool { part_id, tool } in tools {
+        let call_id = tool.call_id.unwrap_or_else(|| part_id.clone());
+        let mut use_links = links.record_links();
+        use_links.event_id = Some(call_id.clone());
+        emit(Record {
+            tool_name: Some(tool.name.clone()),
+            tool_input: tool.input.clone(),
+            ..record(
+                "tool_use",
+                tool.input.unwrap_or_default(),
+                use_links,
+                *turn_id,
+            )
+        })?;
+        if let Some(output) = tool.output {
+            let mut result_links = links.record_links();
+            result_links.event_id = Some(format!("{part_id}:result"));
+            result_links.parent_event_id = Some(call_id.clone());
+            result_links.parent_tool_use_id = Some(call_id);
+            result_links.tool_result_is_error = Some(tool.is_error);
+            emit(Record {
+                tool_name: Some(tool.name),
+                tool_output: Some(output.clone()),
+                ..record("tool_result", output, result_links, *turn_id)
+            })?;
+        }
+        *turn_id = turn_id.saturating_add(1);
+    }
     Ok(())
 }
 
@@ -2452,6 +2566,230 @@ mod tests {
         assert_eq!(records[0].source_path, path.to_string_lossy());
         assert_eq!(records[0].project, "opencode");
         assert_eq!(records[0].ts, 100);
+    }
+
+    fn insert_v1_part(
+        connection: &Connection,
+        id: &str,
+        message_id: &str,
+        data: serde_json::Value,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3)",
+                params![id, message_id, data.to_string()],
+            )
+            .unwrap();
+    }
+
+    /// A v1 session shaped like OpenCode's own: a prompt, an assistant step with prose and two
+    /// finished tool calls, and a tool-only step whose call is still pending.
+    fn v1_tool_session_fixture(path: &Path, bash_output: &str) {
+        let connection = modern_fixture(path);
+        for (id, time_created, role) in [
+            ("msg_1", 100_i64, "user"),
+            ("msg_2", 200_i64, "assistant"),
+            ("msg_3", 300_i64, "assistant"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message VALUES (?1, 's_root', ?2, ?3)",
+                    params![
+                        id,
+                        time_created,
+                        serde_json::json!({"role": role}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        for (id, message_id, data) in [
+            (
+                "prt_01",
+                "msg_1",
+                serde_json::json!({"type": "text", "text": "list the files"}),
+            ),
+            (
+                "prt_02",
+                "msg_1",
+                serde_json::json!({"type": "text", "text": "injected", "synthetic": true}),
+            ),
+            ("prt_03", "msg_2", serde_json::json!({"type": "step-start"})),
+            (
+                "prt_04",
+                "msg_2",
+                serde_json::json!({"type": "text", "text": "Listing them now."}),
+            ),
+            (
+                "prt_05",
+                "msg_2",
+                serde_json::json!({
+                    "type": "tool",
+                    "callID": "call_bash",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "ls"},
+                        "output": bash_output,
+                        "title": "ls",
+                        "metadata": {"exit": 0},
+                        "time": {"start": 210, "end": 220}
+                    }
+                }),
+            ),
+            (
+                "prt_06",
+                "msg_2",
+                serde_json::json!({
+                    "type": "tool",
+                    "callID": "call_read",
+                    "tool": "read",
+                    "state": {
+                        "status": "error",
+                        "input": {"filePath": "/missing"},
+                        "error": "File not found",
+                        "time": {"start": 230, "end": 240}
+                    }
+                }),
+            ),
+            (
+                "prt_07",
+                "msg_2",
+                serde_json::json!({"type": "step-finish", "reason": "tool-calls"}),
+            ),
+            (
+                "prt_08",
+                "msg_3",
+                serde_json::json!({"type": "text", "text": "withheld", "ignored": true}),
+            ),
+            (
+                "prt_09",
+                "msg_3",
+                serde_json::json!({
+                    "type": "tool",
+                    "callID": "call_grep",
+                    "tool": "grep",
+                    "state": {"status": "pending", "input": {}, "raw": ""}
+                }),
+            ),
+        ] {
+            insert_v1_part(&connection, id, message_id, data);
+        }
+    }
+
+    #[test]
+    fn v1_tool_parts_hydrate_tool_use_and_tool_result_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        v1_tool_session_fixture(&path, "notes.txt");
+
+        let records = parse_database_session(&path, "s_root", 0, &AtomicU64::new(1)).unwrap();
+        let summary = records
+            .iter()
+            .map(|record| {
+                (
+                    record.role.as_str(),
+                    record.turn_id,
+                    record.links.event_id.as_deref().unwrap(),
+                    record.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("user", 0, "msg_1", "list the files"),
+                ("assistant", 1, "msg_2", "Listing them now."),
+                ("tool_use", 2, "call_bash", r#"{"command":"ls"}"#),
+                ("tool_result", 2, "prt_05:result", "notes.txt"),
+                ("tool_use", 3, "call_read", r#"{"filePath":"/missing"}"#),
+                ("tool_result", 3, "prt_06:result", "File not found"),
+                ("tool_use", 4, "call_grep", "{}"),
+            ]
+        );
+
+        assert!(records[..2].iter().all(|record| {
+            record.tool_name.is_none()
+                && record.tool_input.is_none()
+                && record.tool_output.is_none()
+        }));
+        let (bash_use, bash_result) = (&records[2], &records[3]);
+        assert_eq!(bash_use.tool_name.as_deref(), Some("bash"));
+        assert_eq!(bash_use.tool_input.as_deref(), Some(r#"{"command":"ls"}"#));
+        assert_eq!(bash_use.tool_output, None);
+        assert_eq!(bash_use.ts, 200);
+        assert_eq!(bash_result.tool_name.as_deref(), Some("bash"));
+        assert_eq!(bash_result.tool_input, None);
+        assert_eq!(bash_result.tool_output.as_deref(), Some("notes.txt"));
+        assert_eq!(
+            bash_result.links.parent_tool_use_id.as_deref(),
+            Some("call_bash")
+        );
+        assert_eq!(
+            bash_result.links.parent_event_id.as_deref(),
+            Some("call_bash")
+        );
+        assert_eq!(bash_result.links.tool_result_is_error, Some(false));
+
+        let read_result = &records[5];
+        assert_eq!(read_result.tool_name.as_deref(), Some("read"));
+        assert_eq!(read_result.tool_output.as_deref(), Some("File not found"));
+        assert_eq!(read_result.links.tool_result_is_error, Some(true));
+
+        let pending_use = &records[6];
+        assert_eq!(pending_use.tool_name.as_deref(), Some("grep"));
+        assert_eq!(pending_use.tool_input.as_deref(), Some("{}"));
+        assert_eq!(pending_use.ts, 300);
+        assert!(records.iter().all(|record| {
+            record.source == SourceKind::Opencode
+                && record.links.conversation_kind.as_deref() == Some("main")
+        }));
+    }
+
+    #[test]
+    fn v1_tool_output_is_searchable_in_the_real_index() {
+        use crate::index::{QueryOptions, SearchIndex};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        v1_tool_session_fixture(&path, "total 0\noutputonlysentinel.txt");
+        let index = SearchIndex::open_or_create(&temp.path().join("index")).unwrap();
+        let mut writer = index.writer().unwrap();
+        parse_database_records(
+            &path,
+            "s_root",
+            IndexParseState::default(),
+            &AtomicU64::new(1),
+            |record| index.add_record(&mut writer, &record),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+
+        let matches = index
+            .search(&QueryOptions {
+                query: "outputonlysentinel".to_string(),
+                project: None,
+                role: None,
+                tool: None,
+                session_id: None,
+                session_scope: None,
+                source: None,
+                since: None,
+                until: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        let result = &matches[0].1;
+        assert_eq!(result.role, "tool_result");
+        assert_eq!(result.session_id, "s_root");
+        assert_eq!(result.tool_name.as_deref(), Some("bash"));
+        assert_eq!(
+            result.tool_output.as_deref(),
+            Some("total 0\noutputonlysentinel.txt")
+        );
+        assert_eq!(
+            result.links.parent_tool_use_id.as_deref(),
+            Some("call_bash")
+        );
     }
 
     #[test]
